@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ptolemy-core = { path = "../ptolemy-core" }
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

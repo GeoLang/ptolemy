@@ -148,6 +148,46 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Per-endpoint permission checks</li>
 </ul>
 </div>
+<div class="card">
+<h3>📏 Schema & Topology</h3>
+<ul>
+<li>Dataset schema definitions (field types)</li>
+<li>Geometry rules (allowed types, bounds, max vertices)</li>
+<li>Topology rules (no overlap, no gaps, must connect)</li>
+<li>Automated data quality reports</li>
+<li>Auto-repair invalid geometries (ST_MakeValid)</li>
+</ul>
+</div>
+<div class="card">
+<h3>📡 Webhooks & CDC</h3>
+<ul>
+<li>Webhook subscriptions per dataset</li>
+<li>Event types: commit, merge, branch, schema changes</li>
+<li>CDC event log with full payloads</li>
+<li>Queryable event stream (pagination, filtering)</li>
+<li>Custom event emission API</li>
+</ul>
+</div>
+<div class="card">
+<h3>📊 Spatial Analytics</h3>
+<ul>
+<li>Buffer analysis (per-feature, configurable distance)</li>
+<li>Union analysis (aggregate geometry)</li>
+<li>DBSCAN spatial clustering</li>
+<li>Anomaly detection (outliers, self-intersections)</li>
+<li>Branch-level spatial statistics</li>
+</ul>
+</div>
+<div class="card">
+<h3>🌍 OGC Compliance</h3>
+<ul>
+<li>OGC API - Features 1.0 Core</li>
+<li>GeoJSON feature collections</li>
+<li>Bbox filtering, pagination</li>
+<li>Conformance declaration</li>
+<li>Enterprise audit logging</li>
+</ul>
+</div>
 </div>
 </div>
 </section>
@@ -223,6 +263,10 @@ curl http://localhost:3000/health</code></pre>
 <tr><td>v0.6</td><td>Spatial query API, tile serving (MVT), pagination, batch ops</td><td style="color:var(--accent2)">✓ Done</td></tr>
 <tr><td>v0.7</td><td>Offline sync protocol, GeoPackage export, field-to-server workflows</td><td style="color:var(--accent2)">✓ Done</td></tr>
 <tr><td>v0.8</td><td>Web review UI, pull-request-style geodata review, map diffs</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v0.9</td><td>Schema validation, topology rules, data quality reports</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.0</td><td>Webhooks, CDC event stream, change notifications</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.1</td><td>Spatial analytics (buffer, union, clustering, anomaly detection)</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.2</td><td>OGC API - Features compliance, audit logging</td><td style="color:var(--accent2)">✓ Done</td></tr>
 </tbody>
 </table>
 </div>

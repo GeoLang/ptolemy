@@ -2012,6 +2012,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "time",
  "tokio",
  "tower-http",
@@ -2058,6 +2059,7 @@ name = "ptolemy-storage"
 version = "0.1.0"
 dependencies = [
  "ptolemy-core",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror 2.0.18",

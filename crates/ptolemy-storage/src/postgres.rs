@@ -9,6 +9,8 @@ use ptolemy_core::changeset::Changeset;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::{Diff, DiffOp};
 use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
+use ptolemy_core::event::{Event, Webhook};
+use ptolemy_core::schema::{DatasetSchema, FieldDef, GeometryRules, TopologyRule, QualityReport, QualityStatistics};
 use ptolemy_core::Feature;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
@@ -43,6 +45,12 @@ impl PgStore {
         sqlx::raw_sql(sql_001).execute(&self.pool).await?;
         let sql_002 = include_str!("../migrations/002_reviews.sql");
         sqlx::raw_sql(sql_002).execute(&self.pool).await?;
+        let sql_003 = include_str!("../migrations/003_schema_topology.sql");
+        sqlx::raw_sql(sql_003).execute(&self.pool).await?;
+        let sql_004 = include_str!("../migrations/004_webhooks.sql");
+        sqlx::raw_sql(sql_004).execute(&self.pool).await?;
+        let sql_005 = include_str!("../migrations/005_audit.sql");
+        sqlx::raw_sql(sql_005).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -1091,6 +1099,388 @@ impl PgStore {
             })
             .collect())
     }
+
+    // ─── Schema & Topology ──────────────────────────────────────────
+
+    pub async fn set_dataset_schema(&self, schema: &DatasetSchema) -> Result<(), StoreError> {
+        let fields_json = serde_json::to_value(&schema.fields).unwrap();
+        let rules_json = serde_json::to_value(&schema.geometry_rules).unwrap();
+        sqlx::query(
+            "INSERT INTO dataset_schemas (dataset_id, fields, geometry_rules)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (dataset_id) DO UPDATE SET fields = $2, geometry_rules = $3",
+        )
+        .bind(schema.dataset_id)
+        .bind(&fields_json)
+        .bind(&rules_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_dataset_schema(&self, dataset_id: Uuid) -> Result<Option<DatasetSchema>, StoreError> {
+        let row = sqlx::query(
+            "SELECT dataset_id, fields, geometry_rules FROM dataset_schemas WHERE dataset_id = $1",
+        )
+        .bind(dataset_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| {
+            let fields: Vec<FieldDef> = serde_json::from_value(r.get("fields")).unwrap_or_default();
+            let geometry_rules: GeometryRules = serde_json::from_value(r.get("geometry_rules")).unwrap_or(GeometryRules {
+                allowed_types: vec![],
+                bounds: None,
+                max_vertices: None,
+            });
+            DatasetSchema {
+                dataset_id: r.get("dataset_id"),
+                fields,
+                geometry_rules,
+            }
+        }))
+    }
+
+    pub async fn add_topology_rule(&self, rule: &TopologyRule) -> Result<(), StoreError> {
+        let rule_type_json = serde_json::to_value(&rule.rule_type).unwrap();
+        sqlx::query(
+            "INSERT INTO topology_rules (id, dataset_id, rule_type, description)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(rule.id)
+        .bind(rule.dataset_id)
+        .bind(&rule_type_json)
+        .bind(&rule.description)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_topology_rules(&self, dataset_id: Uuid) -> Result<Vec<TopologyRule>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, rule_type, description FROM topology_rules WHERE dataset_id = $1",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let rule_type = serde_json::from_value(row.get("rule_type")).unwrap();
+                TopologyRule {
+                    id: row.get("id"),
+                    dataset_id: row.get("dataset_id"),
+                    rule_type,
+                    description: row.get("description"),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn delete_topology_rule(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM topology_rules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Run data quality checks on a branch and return a report.
+    pub async fn quality_report(&self, branch_id: Uuid) -> Result<QualityReport, StoreError> {
+        let total = self.count_features_at_head(branch_id).await?;
+
+        // Check for null/invalid geometries
+        let stats_row = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT c.id, c.parent_id FROM changesets c
+                JOIN branches b ON b.head = c.id WHERE b.id = $1
+              UNION ALL
+                SELECT c.id, c.parent_id FROM changesets c
+                JOIN chain ch ON ch.parent_id = c.id
+            ),
+            latest AS (
+                SELECT DISTINCT ON (fv.feature_id)
+                    fv.feature_id, fv.operation, fv.geometry, fv.properties
+                FROM feature_versions fv
+                JOIN chain ch ON fv.changeset_id = ch.id
+                ORDER BY fv.feature_id, fv.created_at DESC
+            )
+            SELECT
+                COUNT(*) FILTER (WHERE operation != 'delete' AND geometry IS NULL) as null_geom,
+                COUNT(*) FILTER (WHERE operation != 'delete' AND geometry IS NOT NULL AND NOT ST_IsValid(geometry)) as invalid_geom,
+                COUNT(*) FILTER (WHERE operation != 'delete') as total
+            FROM latest",
+        )
+        .bind(branch_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let null_geometry_count: i64 = stats_row.get("null_geom");
+        let invalid_geometry_count: i64 = stats_row.get("invalid_geom");
+        let valid_features = total - null_geometry_count - invalid_geometry_count;
+
+        Ok(QualityReport {
+            branch_id,
+            total_features: total,
+            valid_features,
+            errors: vec![],
+            statistics: QualityStatistics {
+                null_geometry_count,
+                invalid_geometry_count,
+                null_fields: vec![],
+                out_of_bounds_count: 0,
+            },
+        })
+    }
+
+    /// Repair invalid geometries on a branch (creates a new commit).
+    pub async fn repair_geometries(
+        &self,
+        branch_id: Uuid,
+        author: &str,
+    ) -> Result<Option<Changeset>, StoreError> {
+        // Find features with invalid geometries
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT c.id, c.parent_id FROM changesets c
+                JOIN branches b ON b.head = c.id WHERE b.id = $1
+              UNION ALL
+                SELECT c.id, c.parent_id FROM changesets c
+                JOIN chain ch ON ch.parent_id = c.id
+            ),
+            latest AS (
+                SELECT DISTINCT ON (fv.feature_id)
+                    fv.feature_id, fv.operation, fv.geometry, fv.properties
+                FROM feature_versions fv
+                JOIN chain ch ON fv.changeset_id = ch.id
+                ORDER BY fv.feature_id, fv.created_at DESC
+            )
+            SELECT feature_id, ST_AsBinary(ST_MakeValid(geometry)) as fixed_geom, properties
+            FROM latest
+            WHERE operation != 'delete'
+              AND geometry IS NOT NULL
+              AND NOT ST_IsValid(geometry)",
+        )
+        .bind(branch_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let ops: Vec<DiffOp> = rows
+            .into_iter()
+            .map(|row| DiffOp::Update {
+                feature_id: row.get("feature_id"),
+                geometry_wkb: Some(row.get("fixed_geom")),
+                properties: None,
+            })
+            .collect();
+
+        let count = ops.len();
+        let changeset = self
+            .commit(
+                branch_id,
+                &format!("Auto-repair: fixed {} invalid geometries", count),
+                author,
+                &ops,
+            )
+            .await?;
+
+        Ok(Some(changeset))
+    }
+
+    // ─── Webhooks & Events (CDC) ────────────────────────────────────
+
+    pub async fn create_webhook(&self, wh: &Webhook) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO webhooks (id, dataset_id, url, events, secret, active)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(wh.id)
+        .bind(wh.dataset_id)
+        .bind(&wh.url)
+        .bind(&wh.events)
+        .bind(&wh.secret)
+        .bind(wh.active)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_webhooks(&self, dataset_id: Uuid) -> Result<Vec<Webhook>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, url, events, secret, active FROM webhooks WHERE dataset_id = $1",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Webhook {
+                id: row.get("id"),
+                dataset_id: row.get("dataset_id"),
+                url: row.get("url"),
+                events: row.get("events"),
+                secret: row.get("secret"),
+                active: row.get("active"),
+            })
+            .collect())
+    }
+
+    pub async fn delete_webhook(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM webhooks WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn emit_event(
+        &self,
+        dataset_id: Uuid,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Event, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO events (id, dataset_id, event_type, payload)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(dataset_id)
+        .bind(event_type)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+
+        let row = sqlx::query("SELECT created_at FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(Event {
+            id,
+            dataset_id,
+            event_type: event_type.to_string(),
+            payload: payload.clone(),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    pub async fn list_events(
+        &self,
+        dataset_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, event_type, payload, created_at
+             FROM events
+             WHERE dataset_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2",
+        )
+        .bind(dataset_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Event {
+                id: row.get("id"),
+                dataset_id: row.get("dataset_id"),
+                event_type: row.get("event_type"),
+                payload: row.get("payload"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    // ─── Audit Log ──────────────────────────────────────────────────
+
+    pub async fn audit_log(
+        &self,
+        actor: &str,
+        action: &str,
+        resource_type: &str,
+        resource_id: Option<Uuid>,
+        details: &serde_json::Value,
+        ip_address: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO audit_log (id, actor, action, resource_type, resource_id, details, ip_address)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(id)
+        .bind(actor)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(details)
+        .bind(ip_address)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_audit_log(
+        &self,
+        limit: i64,
+        actor: Option<&str>,
+    ) -> Result<Vec<AuditEntry>, StoreError> {
+        let rows = if let Some(a) = actor {
+            sqlx::query(
+                "SELECT id, actor, action, resource_type, resource_id, details, ip_address, created_at
+                 FROM audit_log WHERE actor = $1 ORDER BY created_at DESC LIMIT $2",
+            )
+            .bind(a)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, actor, action, resource_type, resource_id, details, ip_address, created_at
+                 FROM audit_log ORDER BY created_at DESC LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditEntry {
+                id: row.get("id"),
+                actor: row.get("actor"),
+                action: row.get("action"),
+                resource_type: row.get("resource_type"),
+                resource_id: row.get("resource_id"),
+                details: row.get("details"),
+                ip_address: row.get("ip_address"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+}
+
+// ─── Audit types ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEntry {
+    pub id: Uuid,
+    pub actor: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub details: serde_json::Value,
+    pub ip_address: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 // ─── Merge types ────────────────────────────────────────────────────

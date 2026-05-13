@@ -2,12 +2,16 @@
 // License, v. 3.0. If a copy of the AGPL was not distributed with this
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
+pub mod analytics;
 pub mod auth;
 pub mod metrics;
+pub mod ogc;
 pub mod oidc;
+pub mod quality;
 pub mod review;
 pub mod routes;
 pub mod sync;
+pub mod webhook;
 pub mod ws;
 
 use axum::{middleware, Router};
@@ -36,6 +40,10 @@ pub fn app(state: AppState) -> Router {
         .nest("/api/v1", routes::v1_routes())
         .nest("/api/v1", sync::sync_routes())
         .nest("/api/v1", review::review_routes())
+        .nest("/api/v1", quality::quality_routes())
+        .nest("/api/v1", webhook::webhook_routes())
+        .nest("/api/v1", analytics::analytics_routes())
+        .nest("/api/v1", ogc::ogc_routes())
         .merge(oidc::oidc_routes())
         .nest("/ws", ws::ws_routes(event_bus))
         .merge(metrics::metrics_routes(prom_handle))

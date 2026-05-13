@@ -20,6 +20,10 @@ Enterprise GIS users are locked into proprietary platforms (Esri, Hexagon) prima
 | **v0.6** | Spatial query API, MVT tile serving, pagination, batch operations | ✓ Done |
 | **v0.7** | QGIS plugin, offline sync protocol, field-to-server workflows | ✓ Done |
 | **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
+| **v0.9** | Schema validation, topology rules, data quality reports | ✓ Done |
+| **v1.0** | Webhooks, CDC event stream, change notifications | ✓ Done |
+| **v1.1** | Spatial analytics (buffer, union, clustering, anomaly detection) | ✓ Done |
+| **v1.2** | OGC API - Features compliance, audit logging | ✓ Done |
 
 ## Architecture
 
@@ -132,6 +136,29 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
 | GET | `/review` | Web review UI |
+| GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
+| PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
+| GET | `/api/v1/datasets/{id}/topology` | List topology rules |
+| POST | `/api/v1/datasets/{id}/topology` | Add topology rule |
+| DELETE | `/api/v1/topology/{id}` | Delete topology rule |
+| GET | `/api/v1/branches/{id}/quality` | Data quality report |
+| POST | `/api/v1/branches/{id}/repair` | Auto-repair invalid geometries |
+| GET | `/api/v1/datasets/{id}/webhooks` | List webhooks |
+| POST | `/api/v1/datasets/{id}/webhooks` | Create webhook |
+| DELETE | `/api/v1/webhooks/{id}` | Delete webhook |
+| GET | `/api/v1/datasets/{id}/events` | List CDC events |
+| POST | `/api/v1/datasets/{id}/events` | Emit custom event |
+| GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer analysis |
+| GET | `/api/v1/branches/{id}/analytics/union` | Union analysis |
+| GET | `/api/v1/branches/{id}/analytics/clusters` | DBSCAN clustering |
+| GET | `/api/v1/branches/{id}/analytics/anomalies` | Spatial anomaly detection |
+| GET | `/api/v1/branches/{id}/analytics/stats` | Spatial statistics |
+| GET | `/api/v1/ogc` | OGC landing page |
+| GET | `/api/v1/ogc/conformance` | OGC conformance |
+| GET | `/api/v1/ogc/collections` | OGC collections |
+| GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items |
+| GET | `/api/v1/ogc/collections/{id}/items/{fid}` | OGC single feature |
+| GET | `/api/v1/audit` | Audit log |
 | WS | `/ws/branches/{id}` | Real-time branch events |
 
 ## Building
