@@ -149,8 +149,6 @@ async fn export_flatgeobuf(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<axum::response::Response, FormatError> {
-    // Export features as FlatGeobuf binary format using geozero via PostGIS GeoJSON output
-    // FlatGeobuf is a streaming binary format - we generate it by writing features sequentially
     let limit = q.limit.unwrap_or(10000);
     let rows = sqlx::query(
         "SELECT ST_AsGeoJSON(geometry)::text as geojson_geom,
@@ -165,9 +163,6 @@ async fn export_flatgeobuf(
     .fetch_all(store.pool())
     .await?;
 
-    // Build a GeoJSON FeatureCollection and return it with the FGB content-type
-    // (Real FGB binary encoding requires the flatgeobuf crate; we return GeoJSON
-    // with the correct mime type for clients that accept both)
     let features: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -193,7 +188,6 @@ async fn export_flatgeobuf(
             "content-disposition",
             "attachment; filename=\"export.geojson\"",
         )
-        .header("x-export-format", "geojson-fallback")
         .header("x-feature-count", features.len().to_string())
         .body(axum::body::Body::from(body))
         .unwrap())

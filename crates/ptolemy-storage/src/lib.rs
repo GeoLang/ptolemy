@@ -5,7 +5,8 @@
 pub mod postgres;
 
 pub use postgres::{
-    Attachment, AttachmentMeta, AuditEntry, ChangeFeedEntry, ConflictInfo, FeatureLock,
-    MergeResult, PgStore, ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult,
-    TopologyRepair, TopologyViolation,
+    Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry, CompactionResult,
+    CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeResult, PgStore,
+    ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult, TopologyRepair,
+    TopologyViolation,
 };

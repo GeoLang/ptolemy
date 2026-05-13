@@ -78,6 +78,8 @@ impl PgStore {
         sqlx::raw_sql(sql_016).execute(&self.pool).await?;
         let sql_017 = include_str!("../migrations/017_temporal_attachments_replication.sql");
         sqlx::raw_sql(sql_017).execute(&self.pool).await?;
+        let sql_018 = include_str!("../migrations/018_rbac_compaction.sql");
+        sqlx::raw_sql(sql_018).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2276,6 +2278,339 @@ impl PgStore {
         .await?;
         Ok(())
     }
+
+    // ─── RBAC: Per-dataset and Per-branch Permissions ───────────────────
+
+    pub async fn grant_dataset_permission(
+        &self,
+        dataset_id: Uuid,
+        user_id: &str,
+        permission: &str,
+        granted_by: &str,
+    ) -> Result<DatasetPermission, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO dataset_permissions (id, dataset_id, user_id, permission, granted_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (dataset_id, user_id)
+             DO UPDATE SET permission = $4, granted_by = $5, granted_at = now()",
+        )
+        .bind(id)
+        .bind(dataset_id)
+        .bind(user_id)
+        .bind(permission)
+        .bind(granted_by)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(DatasetPermission {
+            id,
+            dataset_id,
+            user_id: user_id.to_string(),
+            permission: permission.to_string(),
+            granted_by: granted_by.to_string(),
+            granted_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    pub async fn revoke_dataset_permission(
+        &self,
+        dataset_id: Uuid,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM dataset_permissions WHERE dataset_id = $1 AND user_id = $2")
+            .bind(dataset_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_dataset_permissions(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<DatasetPermission>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, user_id, permission, granted_by, granted_at
+             FROM dataset_permissions WHERE dataset_id = $1 ORDER BY granted_at",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| DatasetPermission {
+                id: r.get("id"),
+                dataset_id: r.get("dataset_id"),
+                user_id: r.get("user_id"),
+                permission: r.get("permission"),
+                granted_by: r.get("granted_by"),
+                granted_at: r.get("granted_at"),
+            })
+            .collect())
+    }
+
+    /// Check if a user has at least the specified permission level on a dataset.
+    /// Permission hierarchy: admin > write > read.
+    pub async fn check_dataset_permission(
+        &self,
+        dataset_id: Uuid,
+        user_id: &str,
+        required: &str,
+    ) -> Result<bool, StoreError> {
+        let row = sqlx::query(
+            "SELECT permission FROM dataset_permissions
+             WHERE dataset_id = $1 AND user_id = $2",
+        )
+        .bind(dataset_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = row {
+            let perm: String = r.get("permission");
+            Ok(permission_level(&perm) >= permission_level(required))
+        } else {
+            // Check org membership fallback
+            let org_row = sqlx::query(
+                "SELECT om.role FROM org_members om
+                 JOIN datasets d ON d.org_id = om.org_id
+                 WHERE d.id = $1 AND om.user_id = $2",
+            )
+            .bind(dataset_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some(r) = org_row {
+                let role: String = r.get("role");
+                Ok(org_role_to_permission(&role) >= permission_level(required))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    pub async fn grant_branch_permission(
+        &self,
+        branch_id: Uuid,
+        user_id: &str,
+        permission: &str,
+        granted_by: &str,
+    ) -> Result<BranchPermission, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO branch_permissions (id, branch_id, user_id, permission, granted_by)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (branch_id, user_id)
+             DO UPDATE SET permission = $4, granted_by = $5, granted_at = now()",
+        )
+        .bind(id)
+        .bind(branch_id)
+        .bind(user_id)
+        .bind(permission)
+        .bind(granted_by)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(BranchPermission {
+            id,
+            branch_id,
+            user_id: user_id.to_string(),
+            permission: permission.to_string(),
+            granted_by: granted_by.to_string(),
+            granted_at: OffsetDateTime::now_utc(),
+        })
+    }
+
+    pub async fn revoke_branch_permission(
+        &self,
+        branch_id: Uuid,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM branch_permissions WHERE branch_id = $1 AND user_id = $2")
+            .bind(branch_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn check_branch_permission(
+        &self,
+        branch_id: Uuid,
+        user_id: &str,
+        required: &str,
+    ) -> Result<bool, StoreError> {
+        // Check direct branch permission first
+        let row = sqlx::query(
+            "SELECT permission FROM branch_permissions
+             WHERE branch_id = $1 AND user_id = $2",
+        )
+        .bind(branch_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = row {
+            let perm: String = r.get("permission");
+            return Ok(permission_level(&perm) >= permission_level(required));
+        }
+
+        // Fallback: check dataset-level permission
+        let ds_row = sqlx::query(
+            "SELECT dp.permission FROM dataset_permissions dp
+             JOIN branches b ON b.dataset_id = dp.dataset_id
+             WHERE b.id = $1 AND dp.user_id = $2",
+        )
+        .bind(branch_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = ds_row {
+            let perm: String = r.get("permission");
+            return Ok(permission_level(&perm) >= permission_level(required));
+        }
+
+        // Fallback: check org membership
+        let org_row = sqlx::query(
+            "SELECT om.role FROM org_members om
+             JOIN datasets d ON d.org_id = om.org_id
+             JOIN branches b ON b.dataset_id = d.id
+             WHERE b.id = $1 AND om.user_id = $2",
+        )
+        .bind(branch_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = org_row {
+            let role: String = r.get("role");
+            Ok(org_role_to_permission(&role) >= permission_level(required))
+        } else {
+            Ok(false)
+        }
+    }
+
+    // ─── Version Compaction / Garbage Collection ────────────────────────
+
+    /// Compact old feature versions on a branch, keeping only the N most
+    /// recent versions per feature. Returns the number of versions removed.
+    pub async fn compact_versions(
+        &self,
+        branch_id: Uuid,
+        keep_latest: i32,
+    ) -> Result<CompactionResult, StoreError> {
+        let run_id = Uuid::now_v7();
+        let branch = self.get_branch(branch_id).await?;
+
+        // Count versions before
+        let before: i64 = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM feature_versions fv
+             JOIN changesets c ON fv.changeset_id = c.id
+             WHERE c.branch_id = $1",
+        )
+        .bind(branch_id)
+        .fetch_one(&self.pool)
+        .await?
+        .get("cnt");
+
+        // Record compaction run
+        sqlx::query(
+            "INSERT INTO compaction_runs (id, dataset_id, branch_id, versions_before, keep_latest, status)
+             VALUES ($1, $2, $3, $4, $5, 'running')",
+        )
+        .bind(run_id)
+        .bind(branch.dataset_id)
+        .bind(branch_id)
+        .bind(before)
+        .bind(keep_latest)
+        .execute(&self.pool)
+        .await?;
+
+        // Delete old versions, keeping the N most recent per feature
+        let deleted = sqlx::query(
+            "WITH ranked AS (
+                SELECT fv.id,
+                    ROW_NUMBER() OVER (PARTITION BY fv.feature_id ORDER BY fv.created_at DESC) as rn
+                FROM feature_versions fv
+                JOIN changesets c ON fv.changeset_id = c.id
+                WHERE c.branch_id = $1
+            )
+            DELETE FROM feature_versions
+            WHERE id IN (SELECT id FROM ranked WHERE rn > $2)",
+        )
+        .bind(branch_id)
+        .bind(keep_latest)
+        .execute(&self.pool)
+        .await?;
+
+        let removed = deleted.rows_affected() as i64;
+        let after = before - removed;
+
+        // Estimate bytes freed (rough: ~200 bytes per version row)
+        let bytes_freed = removed * 200;
+
+        // Update compaction run record
+        sqlx::query(
+            "UPDATE compaction_runs
+             SET versions_after = $2, versions_removed = $3, bytes_freed = $4,
+                 completed_at = now(), status = 'completed'
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .bind(after)
+        .bind(removed)
+        .bind(bytes_freed)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(CompactionResult {
+            run_id,
+            branch_id,
+            versions_before: before,
+            versions_after: after,
+            versions_removed: removed,
+            bytes_freed,
+        })
+    }
+
+    /// List past compaction runs for a dataset.
+    pub async fn list_compaction_runs(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<CompactionRun>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, branch_id, versions_before, versions_after,
+                    versions_removed, bytes_freed, keep_latest, started_at, completed_at, status
+             FROM compaction_runs
+             WHERE dataset_id = $1
+             ORDER BY started_at DESC
+             LIMIT 50",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| CompactionRun {
+                id: r.get("id"),
+                dataset_id: r.get("dataset_id"),
+                branch_id: r.get("branch_id"),
+                versions_before: r.get("versions_before"),
+                versions_after: r.get("versions_after"),
+                versions_removed: r.get("versions_removed"),
+                bytes_freed: r.get("bytes_freed"),
+                keep_latest: r.get("keep_latest"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                status: r.get("status"),
+            })
+            .collect())
+    }
 }
 
 // ─── Audit types ────────────────────────────────────────────────────
@@ -2437,7 +2772,80 @@ pub struct ReplicationPeer {
     pub created_at: OffsetDateTime,
 }
 
+// ─── RBAC types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetPermission {
+    pub id: Uuid,
+    pub dataset_id: Uuid,
+    pub user_id: String,
+    pub permission: String,
+    pub granted_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub granted_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchPermission {
+    pub id: Uuid,
+    pub branch_id: Uuid,
+    pub user_id: String,
+    pub permission: String,
+    pub granted_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub granted_at: OffsetDateTime,
+}
+
+// ─── Compaction types ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionResult {
+    pub run_id: Uuid,
+    pub branch_id: Uuid,
+    pub versions_before: i64,
+    pub versions_after: i64,
+    pub versions_removed: i64,
+    pub bytes_freed: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionRun {
+    pub id: Uuid,
+    pub dataset_id: Uuid,
+    pub branch_id: Option<Uuid>,
+    pub versions_before: i64,
+    pub versions_after: i64,
+    pub versions_removed: i64,
+    pub bytes_freed: i64,
+    pub keep_latest: i32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    pub status: String,
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────
+
+/// Permission level: higher = more access.
+fn permission_level(perm: &str) -> u8 {
+    match perm {
+        "admin" => 3,
+        "write" => 2,
+        "read" => 1,
+        _ => 0,
+    }
+}
+
+/// Map org role to permission level.
+fn org_role_to_permission(role: &str) -> u8 {
+    match role {
+        "admin" | "owner" => 3,
+        "editor" | "member" => 2,
+        "viewer" => 1,
+        _ => 0,
+    }
+}
 
 fn op_feature_id(op: &DiffOp) -> Uuid {
     match op {
