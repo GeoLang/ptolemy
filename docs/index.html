@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ptolemy — Open-Source Enterprise Geodatabase</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.6}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.container{max-width:1100px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--border);padding:64px 0 40px;text-align:center}
+header h1{font-size:3.5rem;color:var(--heading);margin-bottom:12px}
+header .tagline{font-size:1.3rem;color:var(--muted);max-width:750px;margin:0 auto}
+.badges{margin-top:20px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.badges img{height:24px}
+.hero{display:flex;gap:16px;justify-content:center;margin-top:28px;flex-wrap:wrap}
+.hero a{background:var(--accent);color:#fff;padding:12px 28px;border-radius:6px;font-weight:600;font-size:1rem;transition:opacity .2s}
+.hero a:hover{text-decoration:none;opacity:.85}
+.hero a.secondary{background:var(--card);border:1px solid var(--border)}
+section{padding:56px 0}
+section h2{font-size:1.9rem;color:var(--heading);margin-bottom:28px;border-bottom:1px solid var(--border);padding-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.card h3{color:var(--heading);margin-bottom:8px;font-size:1.1rem}
+.card ul{list-style:none;padding:0;margin:0}
+.card ul li{padding:3px 0;color:var(--text);font-size:.9rem}
+.card ul li::before{content:"✓ ";color:var(--accent2);font-weight:bold}
+code{background:#1c2128;padding:2px 6px;border-radius:4px;font-size:.85em;color:#f0f6fc}
+pre{background:#1c2128;border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;font-size:.85rem;color:#f0f6fc;margin:12px 0}
+table{width:100%;border-collapse:collapse;margin:12px 0}
+th,td{padding:12px 16px;text-align:left;border-bottom:1px solid var(--border);font-size:.9rem}
+th{color:var(--heading);background:var(--card);position:sticky;top:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-top:24px}
+.stat{text-align:center;padding:20px;background:var(--card);border:1px solid var(--border);border-radius:8px}
+.stat .num{font-size:2rem;color:var(--heading);font-weight:bold}
+.stat .label{color:var(--muted);font-size:.85rem;margin-top:4px}
+footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
+@media(max-width:600px){header h1{font-size:2.2rem}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+<div class="container">
+<h1>🗺️ Ptolemy</h1>
+<p class="tagline">Open-source versioned enterprise geodatabase — Git-like collaboration for geospatial features, powered by PostgreSQL/PostGIS.</p>
+<div class="badges">
+<img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
+<img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
+<img src="https://img.shields.io/badge/PostgreSQL-PostGIS-336791" alt="PostGIS">
+<img src="https://img.shields.io/badge/API-REST-green" alt="REST API">
+</div>
+<div class="hero">
+<a href="https://github.com/TileTopia-HQ/ptolemy">GitHub</a>
+<a href="https://github.com/TileTopia-HQ/ptolemy#quick-start" class="secondary">Quick Start</a>
+<a href="#architecture" class="secondary">Architecture</a>
+</div>
+<div class="stats">
+<div class="stat"><div class="num">4</div><div class="label">Rust crates</div></div>
+<div class="stat"><div class="num">Git-like</div><div class="label">Branching model</div></div>
+<div class="stat"><div class="num">$0</div><div class="label">Per month</div></div>
+<div class="stat"><div class="num">∞</div><div class="label">Features stored</div></div>
+</div>
+</div>
+</header>
+
+<section>
+<div class="container">
+<h2>Features</h2>
+<div class="grid">
+<div class="card">
+<h3>🔀 Versioned Geodata</h3>
+<ul>
+<li>Git-like branching & merging for features</li>
+<li>Full changeset history with diffs</li>
+<li>Branch-level isolation for concurrent edits</li>
+<li>Conflict detection & resolution</li>
+<li>Time-travel queries (any revision)</li>
+</ul>
+</div>
+<div class="card">
+<h3>🗄️ PostGIS Backend</h3>
+<ul>
+<li>PostgreSQL + PostGIS for spatial indexing</li>
+<li>GeoJSON feature storage</li>
+<li>Spatial queries (intersect, within, buffer)</li>
+<li>Full ACID transactions</li>
+<li>Connection pooling (sqlx)</li>
+</ul>
+</div>
+<div class="card">
+<h3>🌐 REST API</h3>
+<ul>
+<li>Axum-based async HTTP server</li>
+<li>Dataset, branch, and feature CRUD</li>
+<li>GeoJSON import/export</li>
+<li>Changeset commit workflow</li>
+<li>Health checks & readiness probes</li>
+</ul>
+</div>
+<div class="card">
+<h3>🤝 Collaboration</h3>
+<ul>
+<li>Multi-user concurrent editing</li>
+<li>Named branches per team/task</li>
+<li>Review & merge workflows</li>
+<li>Audit trail for all changes</li>
+<li>Role-based access control (planned)</li>
+</ul>
+</div>
+<div class="card">
+<h3>📐 Geospatial Types</h3>
+<ul>
+<li>Point, LineString, Polygon, Multi-*</li>
+<li>Arbitrary JSON properties per feature</li>
+<li>Schema-on-read flexibility</li>
+<li>UUID v7 for time-ordered IDs</li>
+<li>WKB/GeoJSON interchange</li>
+</ul>
+</div>
+<div class="card">
+<h3>🚀 Deployment</h3>
+<ul>
+<li>Single binary CLI (<code>ptolemy serve</code>)</li>
+<li>Docker-ready</li>
+<li>ENV-based configuration</li>
+<li>Prometheus metrics (planned)</li>
+<li>Horizontal scaling (planned)</li>
+</ul>
+</div>
+</div>
+</div>
+</section>
+
+<section id="architecture">
+<div class="container">
+<h2>Architecture</h2>
+<div class="grid">
+<div class="card">
+<h3>ptolemy-core</h3>
+<ul>
+<li>Domain types: Dataset, Branch, Changeset, Feature, Diff</li>
+<li>Serialization with serde</li>
+<li>Zero external runtime deps</li>
+</ul>
+</div>
+<div class="card">
+<h3>ptolemy-storage</h3>
+<ul>
+<li>Abstract Store trait</li>
+<li>PostgreSQL/PostGIS implementation</li>
+<li>Pluggable backend architecture</li>
+</ul>
+</div>
+<div class="card">
+<h3>ptolemy-api</h3>
+<ul>
+<li>Axum 0.8 HTTP router</li>
+<li>Tower middleware (tracing, CORS)</li>
+<li>Typed JSON responses</li>
+</ul>
+</div>
+<div class="card">
+<h3>ptolemy-cli</h3>
+<ul>
+<li>Clap-based CLI</li>
+<li><code>ptolemy serve --bind 0.0.0.0:3000</code></li>
+<li>Future: import, export, branch commands</li>
+</ul>
+</div>
+</div>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Quick Start</h2>
+<pre><code># Clone and build
+git clone https://github.com/TileTopia-HQ/ptolemy.git
+cd ptolemy
+cargo build --release
+
+# Start with a PostGIS database
+export DATABASE_URL="postgres://user:pass@localhost/ptolemy"
+./target/release/ptolemy serve --bind 0.0.0.0:3000
+
+# Check health
+curl http://localhost:3000/health</code></pre>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Roadmap</h2>
+<table>
+<thead><tr><th>Version</th><th>Milestone</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>v0.1</td><td>Core types, Store trait, API skeleton, CLI</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v0.2</td><td>SQL migrations, full CRUD, branching, changesets</td><td style="color:var(--muted)">Next</td></tr>
+<tr><td>v0.3</td><td>Diff engine, merge/conflict resolution, spatial queries</td><td style="color:var(--muted)">Planned</td></tr>
+<tr><td>v0.4</td><td>Auth (OIDC/RBAC), WebSocket collaboration, CLI workflows</td><td style="color:var(--muted)">Planned</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<footer>
+<div class="container">
+<p>Ptolemy is AGPL-3.0 licensed open source from <a href="https://github.com/TileTopia-HQ">TileTopia HQ</a>.</p>
+</div>
+</footer>
+</body>
+</html>
