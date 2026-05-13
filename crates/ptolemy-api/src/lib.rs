@@ -60,6 +60,8 @@ pub type AppState = Arc<PgStore>;
 
 /// The embedded review UI HTML.
 const REVIEW_UI_HTML: &str = include_str!("../../../docs/review.html");
+/// The embedded conflict resolution UI HTML.
+const CONFLICTS_UI_HTML: &str = include_str!("../../../docs/conflicts.html");
 
 pub fn app(state: AppState) -> Router {
     let event_bus = Arc::new(EventBus::new(1024));
@@ -68,6 +70,7 @@ pub fn app(state: AppState) -> Router {
 
     Router::new()
         .route("/review", get(|| async { Html(REVIEW_UI_HTML) }))
+        .route("/conflicts", get(|| async { Html(CONFLICTS_UI_HTML) }))
         .nest("/api/v1", routes::v1_routes())
         .nest("/api/v1", sync::sync_routes())
         .nest("/api/v1", review::review_routes())

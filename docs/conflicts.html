@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ptolemy — Conflict Resolution</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922;--muted:#8b949e;--purple:#a371f7}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.6;display:flex;flex-direction:column;min-height:100vh}
+a{color:var(--accent);text-decoration:none;cursor:pointer}a:hover{text-decoration:underline}
+header{background:var(--card);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:16px}
+header h1{font-size:1.3rem;color:var(--heading)}
+header .subtitle{color:var(--muted);font-size:.9rem}
+.btn{padding:8px 16px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:.9rem;transition:all .15s}
+.btn:hover{border-color:var(--accent);transform:translateY(-1px)}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-success{background:var(--green);color:#fff;border-color:var(--green)}
+.btn-danger{background:var(--red);color:#fff;border-color:var(--red)}
+.btn-warning{background:var(--orange);color:#000;border-color:var(--orange)}
+.btn.active{border-color:var(--accent);box-shadow:0 0 0 2px rgba(88,166,255,.3)}
+
+main{flex:1;padding:16px;display:grid;grid-template-columns:320px 1fr;grid-template-rows:auto 1fr;gap:16px;height:calc(100vh - 56px)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}
+
+/* Sidebar */
+.sidebar{grid-row:1/-1;overflow-y:auto}
+.conflict-item{padding:12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
+.conflict-item:hover{background:#1c2128}
+.conflict-item.active{background:#1c2128;border-left:3px solid var(--accent)}
+.conflict-item .fid{font-family:monospace;font-size:.8rem;color:var(--muted)}
+.conflict-item .type{font-size:.75rem;padding:2px 6px;border-radius:4px;display:inline-block;margin-top:4px}
+.type-geometry{background:#f8514933;color:var(--red)}
+.type-property{background:#d2992233;color:var(--orange)}
+.type-full{background:#a371f733;color:var(--purple)}
+.type-delete{background:#8b949e33;color:var(--muted)}
+
+/* Map area */
+.map-container{position:relative;border-radius:8px;overflow:hidden;border:1px solid var(--border)}
+.map-container #map{height:100%;width:100%}
+.map-legend{position:absolute;top:10px;right:10px;z-index:1000;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 12px;font-size:.8rem}
+.map-legend .legend-item{display:flex;align-items:center;gap:6px;margin:4px 0}
+.legend-dot{width:12px;height:12px;border-radius:50%}
+
+/* Controls */
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.resolution-panel{padding:16px}
+.resolution-panel h3{color:var(--heading);margin-bottom:12px}
+.resolution-options{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.resolution-btn{padding:10px 16px;border-radius:6px;border:2px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:.85rem;transition:all .15s}
+.resolution-btn:hover{border-color:var(--accent)}
+.resolution-btn.selected{border-color:var(--green);background:#23863622}
+.props-diff{background:var(--bg);border-radius:6px;padding:12px;font-family:monospace;font-size:.8rem;overflow-x:auto;max-height:200px;overflow-y:auto}
+.prop-added{color:var(--green)}
+.prop-removed{color:var(--red)}
+.prop-changed{color:var(--orange)}
+.progress-bar{height:4px;background:var(--border);border-radius:2px;margin:8px 0;overflow:hidden}
+.progress-bar .fill{height:100%;background:var(--green);transition:width .3s}
+.summary{color:var(--muted);font-size:.85rem;margin-bottom:8px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ Ptolemy Conflict Resolution</h1>
+  <span class="subtitle" id="merge-info">Select a merge to resolve conflicts</span>
+  <div style="flex:1"></div>
+  <button class="btn btn-success" id="btn-apply" onclick="applyResolutions()" disabled>Apply Resolutions</button>
+</header>
+
+<main>
+  <!-- Sidebar: conflict list -->
+  <div class="sidebar card" id="sidebar">
+    <div style="margin-bottom:12px">
+      <div class="controls">
+        <input type="text" id="target-branch" placeholder="Target Branch ID" style="flex:1;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.85rem">
+        <input type="text" id="source-branch" placeholder="Source Branch ID" style="flex:1;padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:.85rem">
+        <button class="btn btn-primary" onclick="loadPreview()">Preview</button>
+      </div>
+    </div>
+    <div class="summary" id="conflict-summary">No conflicts loaded</div>
+    <div class="progress-bar"><div class="fill" id="progress-fill" style="width:0%"></div></div>
+    <div id="conflict-list"></div>
+  </div>
+
+  <!-- Map -->
+  <div class="map-container">
+    <div id="map"></div>
+    <div class="map-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>Ours (target)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f85149"></div>Theirs (source)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#8b949e"></div>Base (ancestor)</div>
+    </div>
+  </div>
+
+  <!-- Resolution panel (below map, shown when conflict selected) -->
+  <!-- Moved to overlay -->
+</main>
+
+<!-- Resolution panel overlay -->
+<div id="resolution-panel" class="card resolution-panel hidden" style="position:fixed;bottom:0;left:336px;right:0;z-index:1001;border-radius:8px 8px 0 0;max-height:40vh;overflow-y:auto">
+  <div class="flex-between" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <h3 id="resolution-title">Resolve Feature</h3>
+    <button class="btn" onclick="closePanel()">✕</button>
+  </div>
+  <div class="resolution-options" id="resolution-options">
+    <button class="resolution-btn" data-strategy="ours" onclick="selectStrategy('ours')">
+      ✅ Accept Ours
+    </button>
+    <button class="resolution-btn" data-strategy="theirs" onclick="selectStrategy('theirs')">
+      ↩️ Accept Theirs
+    </button>
+    <button class="resolution-btn" data-strategy="auto_merge" onclick="selectStrategy('auto_merge')">
+      🔀 Auto-Merge
+    </button>
+    <button class="resolution-btn" data-strategy="delete" onclick="selectStrategy('delete')">
+      🗑️ Delete
+    </button>
+  </div>
+  <div class="props-diff" id="props-diff"></div>
+</div>
+
+<script>
+const API_BASE = '/api/v1';
+let map, oursLayer, theirsLayer, baseLayer;
+let conflicts = [];
+let resolutions = {};
+let currentConflict = null;
+
+// Initialize map
+document.addEventListener('DOMContentLoaded', () => {
+  map = L.map('map').setView([0, 0], 2);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap'
+  }).addTo(map);
+
+  oursLayer = L.geoJSON(null, {
+    style: { color: '#3fb950', weight: 3, opacity: 0.8, fillOpacity: 0.2 },
+    pointToLayer: (f, ll) => L.circleMarker(ll, { radius: 8, color: '#3fb950', fillOpacity: 0.5 })
+  }).addTo(map);
+
+  theirsLayer = L.geoJSON(null, {
+    style: { color: '#f85149', weight: 3, opacity: 0.8, fillOpacity: 0.2, dashArray: '5,5' },
+    pointToLayer: (f, ll) => L.circleMarker(ll, { radius: 8, color: '#f85149', fillOpacity: 0.5 })
+  }).addTo(map);
+
+  baseLayer = L.geoJSON(null, {
+    style: { color: '#8b949e', weight: 2, opacity: 0.5, fillOpacity: 0.1, dashArray: '2,4' },
+    pointToLayer: (f, ll) => L.circleMarker(ll, { radius: 6, color: '#8b949e', fillOpacity: 0.3 })
+  }).addTo(map);
+});
+
+async function api(path, opts = {}) {
+  const resp = await fetch(API_BASE + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts
+  });
+  return resp.json();
+}
+
+async function loadPreview() {
+  const target = document.getElementById('target-branch').value.trim();
+  const source = document.getElementById('source-branch').value.trim();
+  if (!target || !source) return alert('Enter both branch IDs');
+
+  document.getElementById('merge-info').textContent = `Merging ${source.slice(0,8)}… → ${target.slice(0,8)}…`;
+
+  const data = await api(`/branches/${target}/merge/${source}/preview`);
+
+  if (data.error) {
+    alert('Error: ' + data.error);
+    return;
+  }
+
+  conflicts = data.conflicts || [];
+  resolutions = {};
+
+  // Pre-fill suggestions
+  conflicts.forEach(c => {
+    if (c.suggestion === 'auto_merge_properties') {
+      resolutions[c.feature_id] = 'auto_merge';
+    }
+  });
+
+  updateSummary();
+  renderConflictList();
+
+  // Show all conflict geometries on map
+  oursLayer.clearLayers();
+  theirsLayer.clearLayers();
+  baseLayer.clearLayers();
+
+  if (data.conflicts_geojson && data.conflicts_geojson.features) {
+    const fc = data.conflicts_geojson;
+    fc.features.forEach(f => {
+      if (f.properties.side === 'ours') oursLayer.addData(f);
+      else if (f.properties.side === 'theirs') theirsLayer.addData(f);
+      else if (f.properties.side === 'base') baseLayer.addData(f);
+    });
+
+    const bounds = L.geoJSON(fc).getBounds();
+    if (bounds.isValid()) map.fitBounds(bounds, { padding: [50, 50] });
+  }
+}
+
+function updateSummary() {
+  const resolved = Object.keys(resolutions).length;
+  const total = conflicts.length;
+  document.getElementById('conflict-summary').textContent =
+    `${resolved}/${total} conflicts resolved`;
+  document.getElementById('progress-fill').style.width = `${(resolved / Math.max(total, 1)) * 100}%`;
+  document.getElementById('btn-apply').disabled = (resolved < total);
+}
+
+function renderConflictList() {
+  const list = document.getElementById('conflict-list');
+  list.innerHTML = conflicts.map((c, i) => {
+    const resolved = resolutions[c.feature_id] ? ' ✓' : '';
+    const typeClass = c.conflict_type === 'geometry_conflict' ? 'type-geometry'
+      : c.conflict_type === 'property_conflict' ? 'type-property'
+      : c.conflict_type === 'delete_modify' ? 'type-delete' : 'type-full';
+    return `
+      <div class="conflict-item ${currentConflict === i ? 'active' : ''}" onclick="selectConflict(${i})">
+        <div class="fid">${c.feature_id.slice(0, 8)}…${resolved}</div>
+        <span class="type ${typeClass}">${c.conflict_type.replace('_', ' ')}</span>
+      </div>`;
+  }).join('');
+}
+
+function selectConflict(idx) {
+  currentConflict = idx;
+  const c = conflicts[idx];
+  renderConflictList();
+
+  // Zoom map to this conflict's geometry
+  oursLayer.clearLayers();
+  theirsLayer.clearLayers();
+  baseLayer.clearLayers();
+
+  if (c.ours_geometry) oursLayer.addData({ type: 'Feature', geometry: c.ours_geometry, properties: {} });
+  if (c.theirs_geometry) theirsLayer.addData({ type: 'Feature', geometry: c.theirs_geometry, properties: {} });
+  if (c.base_geometry) baseLayer.addData({ type: 'Feature', geometry: c.base_geometry, properties: {} });
+
+  const allBounds = L.featureGroup([oursLayer, theirsLayer, baseLayer]).getBounds();
+  if (allBounds.isValid()) map.fitBounds(allBounds, { padding: [50, 50] });
+
+  // Show resolution panel
+  showResolutionPanel(c);
+}
+
+function showResolutionPanel(c) {
+  const panel = document.getElementById('resolution-panel');
+  panel.classList.remove('hidden');
+  document.getElementById('resolution-title').textContent =
+    `Resolve: ${c.feature_id.slice(0, 12)}… (${c.conflict_type.replace('_', ' ')})`;
+
+  // Highlight current selection
+  const current = resolutions[c.feature_id];
+  document.querySelectorAll('.resolution-btn').forEach(btn => {
+    btn.classList.toggle('selected', btn.dataset.strategy === current);
+  });
+
+  // Show property diff
+  renderPropsDiff(c);
+}
+
+function renderPropsDiff(c) {
+  const div = document.getElementById('props-diff');
+  const ours = c.ours_properties || {};
+  const theirs = c.theirs_properties || {};
+  const allKeys = [...new Set([...Object.keys(ours), ...Object.keys(theirs)])];
+
+  let html = '<strong>Property Differences:</strong>\n';
+  allKeys.forEach(k => {
+    const ov = JSON.stringify(ours[k]);
+    const tv = JSON.stringify(theirs[k]);
+    if (ov === tv) {
+      html += `  ${k}: ${ov}\n`;
+    } else if (!ours[k]) {
+      html += `<span class="prop-added">+ ${k}: ${tv}</span>\n`;
+    } else if (!theirs[k]) {
+      html += `<span class="prop-removed">- ${k}: ${ov}</span>\n`;
+    } else {
+      html += `<span class="prop-changed">~ ${k}: ${ov} → ${tv}</span>\n`;
+    }
+  });
+  div.innerHTML = `<pre>${html}</pre>`;
+}
+
+function selectStrategy(strategy) {
+  if (currentConflict === null) return;
+  const c = conflicts[currentConflict];
+  resolutions[c.feature_id] = strategy;
+
+  document.querySelectorAll('.resolution-btn').forEach(btn => {
+    btn.classList.toggle('selected', btn.dataset.strategy === strategy);
+  });
+
+  updateSummary();
+  renderConflictList();
+
+  // Auto-advance to next unresolved conflict
+  const nextUnresolved = conflicts.findIndex((c, i) => i > currentConflict && !resolutions[c.feature_id]);
+  if (nextUnresolved >= 0) {
+    setTimeout(() => selectConflict(nextUnresolved), 300);
+  }
+}
+
+function closePanel() {
+  document.getElementById('resolution-panel').classList.add('hidden');
+  currentConflict = null;
+}
+
+async function applyResolutions() {
+  const target = document.getElementById('target-branch').value.trim();
+  const source = document.getElementById('source-branch').value.trim();
+  const author = prompt('Author name for merge commit:');
+  if (!author) return;
+
+  const resArr = conflicts.map(c => ({
+    feature_id: c.feature_id,
+    strategy: resolutions[c.feature_id] || 'ours'
+  }));
+
+  const result = await api(`/branches/${target}/merge/${source}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({
+      resolutions: resArr,
+      author,
+      message: `Merge with ${conflicts.length} conflicts resolved`
+    })
+  });
+
+  if (result.success) {
+    alert(`✅ Merge complete! Changeset: ${result.changeset_id}`);
+    conflicts = [];
+    resolutions = {};
+    updateSummary();
+    renderConflictList();
+    closePanel();
+  } else {
+    alert('❌ Error: ' + (result.error || JSON.stringify(result)));
+  }
+}
+</script>
+</body>
+</html>
