@@ -23,6 +23,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Add cargo to PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # Ensure rustup has completed installation
+          if command -v rustup &> /dev/null; then
+            rustup default stable
+          fi
+      - name: Verify toolchain
+        run: rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
@@ -49,10 +59,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Add cargo to PATH (macOS)
         if: runner.os == 'macOS'
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - uses: Swatinem/rust-cache@v2
+        run: |
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if command -v rustup &> /dev/null; then
+            rustup default stable
+          fi
       - name: Verify toolchain
         run: rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
         run: cargo test --lib --all
 
@@ -117,6 +131,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Add cargo to PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          if command -v rustup &> /dev/null; then
+            rustup default stable
+          fi
+      - name: Verify toolchain
+        run: rustc --version && cargo --version
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
