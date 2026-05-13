@@ -1,0 +1,20 @@
+[package]
+name = "ptolemy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ptolemy"
+path = "src/main.rs"
+
+[dependencies]
+ptolemy-api = { path = "../ptolemy-api" }
+ptolemy-storage = { path = "../ptolemy-storage" }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/ptolemy-core",
+    "crates/ptolemy-api",
+    "crates/ptolemy-cli",
+    "crates/ptolemy-storage",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/TileTopia-HQ/ptolemy"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+geo-types = "0.7"
+geozero = { version = "0.14", features = ["with-wkb", "with-geojson"] }
+time = { version = "0.3", features = ["serde"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
