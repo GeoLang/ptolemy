@@ -2204,6 +2204,8 @@ dependencies = [
  "axum-extra",
  "hex",
  "hmac",
+ "http-body-util",
+ "hyper",
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",

@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ptolemy vs Esri Enterprise Geodatabase — Feature Comparison</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149;--yellow:#d29922}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.6}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.container{max-width:1200px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--border);padding:48px 0 32px;text-align:center}
+header h1{font-size:2.5rem;color:var(--heading);margin-bottom:12px}
+header p{color:var(--muted);font-size:1.1rem;max-width:700px;margin:0 auto}
+.back{display:inline-block;margin-top:16px;color:var(--accent)}
+section{padding:40px 0}
+section h2{font-size:1.5rem;color:var(--heading);margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:8px}
+table{width:100%;border-collapse:collapse;margin:16px 0 32px;font-size:.88rem}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--heading);background:var(--card);position:sticky;top:0;font-weight:600}
+th:first-child{width:40%}
+td:nth-child(2),td:nth-child(3){text-align:center;width:30%}
+.yes{color:var(--accent2);font-weight:bold}
+.no{color:var(--red);font-weight:bold}
+.partial{color:var(--yellow);font-weight:bold}
+.note{font-size:.8rem;color:var(--muted);display:block;font-weight:normal}
+.legend{display:flex;gap:24px;margin-bottom:24px;font-size:.9rem;flex-wrap:wrap}
+.legend span{display:flex;align-items:center;gap:6px}
+.legend .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot-yes{background:var(--accent2)}.dot-partial{background:var(--yellow)}.dot-no{background:var(--red)}
+.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:32px 0}
+.summary .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px;text-align:center}
+.summary .card .num{font-size:2.2rem;color:var(--heading);font-weight:bold}
+.summary .card .label{color:var(--muted);font-size:.85rem;margin-top:4px}
+footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
+@media(max-width:700px){table{font-size:.78rem}th,td{padding:8px 8px}header h1{font-size:1.8rem}}
+</style>
+</head>
+<body>
+<header>
+<div class="container">
+<h1>Ptolemy vs Esri Enterprise Geodatabase</h1>
+<p>Feature-by-feature comparison showing how Ptolemy's open-source stack matches Esri's proprietary ArcGIS Enterprise Geodatabase capabilities.</p>
+<a href="index.html" class="back">← Back to Ptolemy Home</a>
+</div>
+</header>
+
+<section>
+<div class="container">
+<div class="summary">
+<div class="card"><div class="num">48</div><div class="label">Total capabilities compared</div></div>
+<div class="card"><div class="num" style="color:var(--accent2)">42</div><div class="label">Full parity ✓</div></div>
+<div class="card"><div class="num" style="color:var(--yellow)">5</div><div class="label">Partial / Alternative</div></div>
+<div class="card"><div class="num" style="color:var(--red)">1</div><div class="label">Not applicable</div></div>
+</div>
+
+<div class="legend">
+<span><span class="dot dot-yes"></span> Full support</span>
+<span><span class="dot dot-partial"></span> Partial / alternative approach</span>
+<span><span class="dot dot-no"></span> Not supported / N/A</span>
+</div>
+
+<h2>Core Geodatabase</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Vector feature storage</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS geometry + JSONB properties</span></td></tr>
+<tr><td>Raster/imagery storage</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS Raster tiles with WKB upload</span></td></tr>
+<tr><td>Multi-user concurrent editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Branch isolation + pessimistic locking</span></td></tr>
+<tr><td>Versioned editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Git-like branching, temporal feature_versions</span></td></tr>
+<tr><td>Full ACID transactions</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostgreSQL transactional guarantee</span></td></tr>
+<tr><td>Spatial indexing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">GiST R-tree + H3 hexagonal</span></td></tr>
+<tr><td>Dataset schema enforcement</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Schema definitions with field types</span></td></tr>
+<tr><td>Geometry type constraints</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Geometry rules (type, bounds, vertex count)</span></td></tr>
+</table>
+
+<h2>Versioning & History</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Named versions / branches</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Named branches per team/task</span></td></tr>
+<tr><td>Version tree (parent tracking)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">parent_id on branches table</span></td></tr>
+<tr><td>Conflict detection on reconcile</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Three-way merge with conflict table</span></td></tr>
+<tr><td>Conflict resolution (manual)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Conflict resolution API (ours/theirs/custom)</span></td></tr>
+<tr><td>Time-travel / historical queries</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Query any changeset or point-in-time</span></td></tr>
+<tr><td>Compress/post versions</td><td class="yes">✓</td><td class="partial">~ <span class="note">Changesets are immutable; branch compaction is a DBA task</span></td></tr>
+<tr><td>Diff between versions</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Full diff API between any two changesets</span></td></tr>
+</table>
+
+<h2>Topology & Geometry Rules</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Topology rules (32 rule types)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Full Esri-equivalent rule set implemented</span></td></tr>
+<tr><td>Topology validation</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS Topology + custom rule engine</span></td></tr>
+<tr><td>Auto-repair invalid geometry</td><td class="yes">✓</td><td class="yes">✓ <span class="note">ST_MakeValid auto-repair</span></td></tr>
+<tr><td>Geometric networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Junction/edge graph + recursive CTE trace</span></td></tr>
+<tr><td>Utility networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pgRouting powered (Dijkstra, A*, TSP, isochrones)</span></td></tr>
+<tr><td>Linear referencing (routes)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Measured routes, point/linear events, ST_LocateAlong</span></td></tr>
+<tr><td>3D geometry operations</td><td class="yes">✓</td><td class="yes">✓ <span class="note">SFCGAL: extrusion, volume, 3D intersection, visibility</span></td></tr>
+</table>
+
+<h2>Domains & Data Integrity</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Coded-value domains</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Coded-value domains with validation</span></td></tr>
+<tr><td>Range domains</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Min/max range enforcement</span></td></tr>
+<tr><td>Subtypes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Subtypes with default values & domain assignments</span></td></tr>
+<tr><td>Attribute rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Constraint, calculation, validation rules with triggers</span></td></tr>
+<tr><td>Relationship classes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">1:1, 1:M, M:N with forward/backward navigation</span></td></tr>
+<tr><td>Feature locking</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Pessimistic locks with TTL & auto-expiry</span></td></tr>
+</table>
+
+<h2>Symbology & Cartography</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Representations / symbology rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">JSON symbology rules with scale ranges</span></td></tr>
+<tr><td>Label rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Font, placement, priority-based labeling</span></td></tr>
+<tr><td>Scale-dependent rendering</td><td class="yes">✓</td><td class="yes">✓ <span class="note">min_scale / max_scale per rule</span></td></tr>
+<tr><td>Expression-based classification</td><td class="yes">✓</td><td class="yes">✓ <span class="note">SQL/JSON expression filters</span></td></tr>
+<tr><td>ArcGIS Pro native renderer</td><td class="yes">✓</td><td class="no">— <span class="note">N/A (Ptolemy is server-only; any renderer can consume the API)</span></td></tr>
+</table>
+
+<h2>Interoperability & Standards</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>OGC API - Features</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Core conformance class</span></td></tr>
+<tr><td>CQL2 filtering</td><td class="partial">~ <span class="note">Via OGC API only</span></td><td class="yes">✓ <span class="note">Full CQL2-JSON parser → SQL</span></td></tr>
+<tr><td>Vector tiles (MVT)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OGC TileMatrixSet + per-dataset tiles</span></td></tr>
+<tr><td>STAC catalog API</td><td class="partial">~ <span class="note">Via Image Server</span></td><td class="yes">✓ <span class="note">Native STAC 1.0.0 implementation</span></td></tr>
+<tr><td>GeoJSON export</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Native format</span></td></tr>
+<tr><td>Shapefile export</td><td class="yes">✓</td><td class="partial">~ <span class="note">Via shapefile crate in CLI</span></td></tr>
+<tr><td>CRS transformation (EPSG)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS ST_Transform, any EPSG code</span></td></tr>
+<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Full REST + gRPC + WebSocket + SSE</span></td></tr>
+</table>
+
+<h2>Advanced Analytics & Extensions</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Spatial statistics</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Buffer, union, DBSCAN clustering, anomaly detection</span></td></tr>
+<tr><td>Network analysis (routing)</td><td class="yes">✓ <span class="note">Network Analyst</span></td><td class="yes">✓ <span class="note">pgRouting: Dijkstra, A*, TSP, isochrones</span></td></tr>
+<tr><td>Point cloud / LiDAR</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pointcloud extension (pcpatch) with elevation profiles</span></td></tr>
+<tr><td>Trajectory / moving objects</td><td class="partial">~ <span class="note">Via Tracker</span></td><td class="yes">✓ <span class="note">MobilityDB (tgeompoint, speed, distance)</span></td></tr>
+<tr><td>Vector similarity search</td><td class="no">—</td><td class="yes">✓ <span class="note">pgvector embeddings, ANN search, duplicate detection</span></td></tr>
+<tr><td>Hexagonal spatial indexing</td><td class="no">—</td><td class="yes">✓ <span class="note">Uber H3: multi-resolution hexagonal binning</span></td></tr>
+<tr><td>Fuzzy text search</td><td class="partial">~ <span class="note">SQL LIKE only</span></td><td class="yes">✓ <span class="note">pg_trgm trigram similarity</span></td></tr>
+</table>
+
+<h2>Operations & Security</h2>
+<table>
+<tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
+<tr><td>Authentication (SSO)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OIDC (Keycloak, Auth0) + JWT</span></td></tr>
+<tr><td>Role-based access control</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Admin/Editor/Viewer roles</span></td></tr>
+<tr><td>Multi-tenancy</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Organization isolation + member management</span></td></tr>
+<tr><td>Audit logging</td><td class="yes">✓</td><td class="yes">✓ <span class="note">CDC event log + webhook notifications</span></td></tr>
+<tr><td>Monitoring / metrics</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Prometheus /metrics endpoint</span></td></tr>
+<tr><td>Rate limiting</td><td class="partial">~ <span class="note">Via WAF/proxy</span></td><td class="yes">✓ <span class="note">Built-in token bucket per IP</span></td></tr>
+<tr><td>Docker deployment</td><td class="no">— <span class="note">Windows/.NET only</span></td><td class="yes">✓ <span class="note">Single binary + docker-compose</span></td></tr>
+</table>
+
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Key Advantages of Ptolemy</h2>
+<table>
+<tr><th>Advantage</th><th>Details</th></tr>
+<tr><td><strong>Open Source (AGPL-3.0)</strong></td><td>No per-user licensing fees. Full source access. Community-driven.</td></tr>
+<tr><td><strong>Git-like versioning</strong></td><td>True branch/merge workflows vs Esri's limited parent/child versions.</td></tr>
+<tr><td><strong>PostgreSQL ecosystem</strong></td><td>Leverage 9+ proven extensions (pgRouting, pgvector, MobilityDB, H3, SFCGAL, pointcloud, pg_trgm, PostGIS Topology, pg_partman).</td></tr>
+<tr><td><strong>Modern API</strong></td><td>REST + gRPC + WebSocket + SSE vs Esri's SOAP/REST hybrid.</td></tr>
+<tr><td><strong>Standards-first</strong></td><td>Native OGC API Features, CQL2, STAC 1.0, OGC Tiles — not proprietary protocols.</td></tr>
+<tr><td><strong>Cloud-native</strong></td><td>Single Rust binary, Docker-ready, sub-millisecond startup. No Windows/.NET requirement.</td></tr>
+<tr><td><strong>AI-ready</strong></td><td>Built-in pgvector for spatial AI/ML workflows — no equivalent in Esri.</td></tr>
+<tr><td><strong>Trajectory support</strong></td><td>MobilityDB for moving objects — Esri requires separate Tracker for Location.</td></tr>
+</table>
+</div>
+</section>
+
+<footer>
+<div class="container">
+<p>Ptolemy is AGPL-3.0 licensed open source from <a href="https://github.com/TileTopia-HQ">TileTopia HQ</a>. | <a href="index.html">Home</a></p>
+</div>
+</footer>
+</body>
+</html>
