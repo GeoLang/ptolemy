@@ -9,6 +9,7 @@ ptolemy-core = { path = "../ptolemy-core" }
 ptolemy-storage = { path = "../ptolemy-storage" }
 axum.workspace = true
 axum-extra.workspace = true
+base64 = "0.22"
 hex = "0.4"
 hmac.workspace = true
 jsonwebtoken = { workspace = true }

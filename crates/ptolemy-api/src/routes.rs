@@ -40,6 +40,8 @@ pub fn v1_routes() -> Router<AppState> {
         )
         .route("/branches/{id}/features/within", post(features_within))
         .route("/branches/{id}/features/count", get(features_count))
+        // Temporal query
+        .route("/branches/{id}/features/at", get(features_at_time))
         // MVT tiles
         .route("/branches/{id}/tiles/{z}/{x}/{y}", get(mvt_tile))
         // Commits
@@ -285,6 +287,40 @@ async fn features_count(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let count = store.count_features_at_head(branch_id).await?;
     Ok(Json(serde_json::json!({"count": count})))
+}
+
+// ─── Temporal Query ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TemporalParams {
+    /// ISO 8601 timestamp to query features "as of"
+    at: String,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+async fn features_at_time(
+    State(store): State<AppState>,
+    Path(branch_id): Path<Uuid>,
+    Query(params): Query<TemporalParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let at =
+        time::OffsetDateTime::parse(&params.at, &time::format_description::well_known::Rfc3339)
+            .map_err(|e| AppError::BadRequest(format!("invalid timestamp (use RFC 3339): {e}")))?;
+
+    let limit = params.limit.clamp(1, 10000);
+    let features = store
+        .features_at_time(branch_id, at, limit, params.offset)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "branch_id": branch_id,
+        "at": params.at,
+        "features": features,
+        "count": features.len(),
+    })))
 }
 
 // ─── MVT Tiles ──────────────────────────────────────────────────────

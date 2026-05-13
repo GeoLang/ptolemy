@@ -3,6 +3,7 @@
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
 pub mod analytics;
+pub mod attachments;
 pub mod auth;
 pub mod cartography;
 pub mod catalog;
@@ -26,8 +27,10 @@ pub mod quality;
 pub mod raster;
 pub mod rate_limit;
 pub mod relationships;
+pub mod replication;
 pub mod review;
 pub mod routes;
+pub mod schema_evolution;
 pub mod sfcgal;
 pub mod sse;
 pub mod stac;
@@ -98,6 +101,9 @@ pub fn app(state: AppState) -> Router {
         .nest("/api/v1", stac::stac_routes())
         .nest("/api/v1", formats::format_routes())
         .nest("/api/v1", qgis::qgis_routes())
+        .nest("/api/v1", attachments::attachment_routes())
+        .nest("/api/v1", schema_evolution::schema_routes())
+        .nest("/api/v1", replication::replication_routes())
         .nest("/api/v1", sse::sse_routes(sse_broadcast))
         .merge(oidc::oidc_routes())
         .nest("/ws", ws::ws_routes(event_bus))

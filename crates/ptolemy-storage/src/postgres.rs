@@ -76,6 +76,8 @@ impl PgStore {
         sqlx::raw_sql(sql_015).execute(&self.pool).await?;
         let sql_016 = include_str!("../migrations/016_features_view.sql");
         sqlx::raw_sql(sql_016).execute(&self.pool).await?;
+        let sql_017 = include_str!("../migrations/017_temporal_attachments_replication.sql");
+        sqlx::raw_sql(sql_017).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2011,6 +2013,269 @@ impl PgStore {
         }
         Ok(blocked)
     }
+
+    // ─── Feature Attachments ────────────────────────────────────────────
+
+    pub async fn create_attachment(&self, attachment: &Attachment) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO attachments (id, feature_id, branch_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(attachment.id)
+        .bind(attachment.feature_id)
+        .bind(attachment.branch_id)
+        .bind(&attachment.name)
+        .bind(&attachment.content_type)
+        .bind(attachment.size_bytes)
+        .bind(&attachment.data)
+        .bind(&attachment.thumbnail)
+        .bind(&attachment.metadata)
+        .bind(&attachment.created_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_attachments(
+        &self,
+        feature_id: Uuid,
+        branch_id: Uuid,
+    ) -> Result<Vec<AttachmentMeta>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, feature_id, branch_id, name, content_type, size_bytes, metadata, created_by, created_at
+             FROM attachments
+             WHERE feature_id = $1 AND branch_id = $2
+             ORDER BY created_at DESC",
+        )
+        .bind(feature_id)
+        .bind(branch_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AttachmentMeta {
+                id: row.get("id"),
+                feature_id: row.get("feature_id"),
+                branch_id: row.get("branch_id"),
+                name: row.get("name"),
+                content_type: row.get("content_type"),
+                size_bytes: row.get("size_bytes"),
+                metadata: row.get("metadata"),
+                created_by: row.get("created_by"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    pub async fn get_attachment(&self, id: Uuid) -> Result<Attachment, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, feature_id, branch_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
+             FROM attachments WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("attachment {id}")))?;
+
+        Ok(Attachment {
+            id: row.get("id"),
+            feature_id: row.get("feature_id"),
+            branch_id: row.get("branch_id"),
+            name: row.get("name"),
+            content_type: row.get("content_type"),
+            size_bytes: row.get("size_bytes"),
+            data: row.get("data"),
+            thumbnail: row.get("thumbnail"),
+            metadata: row.get("metadata"),
+            created_by: row.get("created_by"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    pub async fn delete_attachment(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM attachments WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ─── Schema Evolution ───────────────────────────────────────────────
+
+    pub async fn apply_schema_migration(
+        &self,
+        migration: &SchemaMigration,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO schema_migrations (id, dataset_id, version, description, migration_type, field_name, old_definition, new_definition, applied_by, rollback_sql)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(migration.id)
+        .bind(migration.dataset_id)
+        .bind(migration.version)
+        .bind(&migration.description)
+        .bind(&migration.migration_type)
+        .bind(&migration.field_name)
+        .bind(&migration.old_definition)
+        .bind(&migration.new_definition)
+        .bind(&migration.applied_by)
+        .bind(&migration.rollback_sql)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_schema_migrations(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<SchemaMigration>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, dataset_id, version, description, migration_type, field_name, old_definition, new_definition, applied_by, applied_at, rollback_sql
+             FROM schema_migrations
+             WHERE dataset_id = $1
+             ORDER BY version ASC",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| SchemaMigration {
+                id: row.get("id"),
+                dataset_id: row.get("dataset_id"),
+                version: row.get("version"),
+                description: row.get("description"),
+                migration_type: row.get("migration_type"),
+                field_name: row.get("field_name"),
+                old_definition: row.get("old_definition"),
+                new_definition: row.get("new_definition"),
+                applied_by: row.get("applied_by"),
+                applied_at: row.get("applied_at"),
+                rollback_sql: row.get("rollback_sql"),
+            })
+            .collect())
+    }
+
+    pub async fn get_schema_version(&self, dataset_id: Uuid) -> Result<i32, StoreError> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(version), 0) as version FROM schema_migrations WHERE dataset_id = $1",
+        )
+        .bind(dataset_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("version"))
+    }
+
+    // ─── Replication / Change Feed ──────────────────────────────────────
+
+    pub async fn append_change_feed(
+        &self,
+        changeset_id: Uuid,
+        branch_id: Uuid,
+        operation_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<i64, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO change_feed (changeset_id, branch_id, operation_type, payload)
+             VALUES ($1, $2, $3, $4)
+             RETURNING sequence_id",
+        )
+        .bind(changeset_id)
+        .bind(branch_id)
+        .bind(operation_type)
+        .bind(payload)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("sequence_id"))
+    }
+
+    pub async fn get_change_feed(
+        &self,
+        branch_id: Uuid,
+        since_sequence: i64,
+        limit: i64,
+    ) -> Result<Vec<ChangeFeedEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT sequence_id, changeset_id, branch_id, operation_type, payload, created_at
+             FROM change_feed
+             WHERE branch_id = $1 AND sequence_id > $2
+             ORDER BY sequence_id ASC
+             LIMIT $3",
+        )
+        .bind(branch_id)
+        .bind(since_sequence)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ChangeFeedEntry {
+                sequence_id: row.get("sequence_id"),
+                changeset_id: row.get("changeset_id"),
+                branch_id: row.get("branch_id"),
+                operation_type: row.get("operation_type"),
+                payload: row.get("payload"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    pub async fn register_peer(&self, peer: &ReplicationPeer) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO replication_peers (id, name, endpoint_url, direction, status)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (name) DO UPDATE SET endpoint_url = $3, direction = $4, status = $5",
+        )
+        .bind(peer.id)
+        .bind(&peer.name)
+        .bind(&peer.endpoint_url)
+        .bind(&peer.direction)
+        .bind(&peer.status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_peers(&self) -> Result<Vec<ReplicationPeer>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, name, endpoint_url, last_sync_changeset, last_sync_at, direction, status, created_at
+             FROM replication_peers ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ReplicationPeer {
+                id: row.get("id"),
+                name: row.get("name"),
+                endpoint_url: row.get("endpoint_url"),
+                last_sync_changeset: row.get("last_sync_changeset"),
+                last_sync_at: row.get("last_sync_at"),
+                direction: row.get("direction"),
+                status: row.get("status"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    pub async fn update_peer_sync(
+        &self,
+        peer_id: Uuid,
+        changeset_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE replication_peers SET last_sync_changeset = $2, last_sync_at = now() WHERE id = $1",
+        )
+        .bind(peer_id)
+        .bind(changeset_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 // ─── Audit types ────────────────────────────────────────────────────
@@ -2090,6 +2355,86 @@ pub struct TopologyRepair {
     pub feature_id: Uuid,
     pub rule: String,
     pub action: String,
+}
+
+// ─── Attachment types ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    pub id: Uuid,
+    pub feature_id: Uuid,
+    pub branch_id: Uuid,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    #[serde(skip_serializing)]
+    pub data: Vec<u8>,
+    #[serde(skip_serializing)]
+    pub thumbnail: Option<Vec<u8>>,
+    pub metadata: serde_json::Value,
+    pub created_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Attachment metadata without binary data (for listing).
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentMeta {
+    pub id: Uuid,
+    pub feature_id: Uuid,
+    pub branch_id: Uuid,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub metadata: serde_json::Value,
+    pub created_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+// ─── Schema Evolution types ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SchemaMigration {
+    pub id: Uuid,
+    pub dataset_id: Uuid,
+    pub version: i32,
+    pub description: String,
+    pub migration_type: String,
+    pub field_name: Option<String>,
+    pub old_definition: Option<serde_json::Value>,
+    pub new_definition: Option<serde_json::Value>,
+    pub applied_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub applied_at: OffsetDateTime,
+    pub rollback_sql: Option<String>,
+}
+
+// ─── Replication types ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ChangeFeedEntry {
+    pub sequence_id: i64,
+    pub changeset_id: Uuid,
+    pub branch_id: Uuid,
+    pub operation_type: String,
+    pub payload: serde_json::Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ReplicationPeer {
+    pub id: Uuid,
+    pub name: String,
+    pub endpoint_url: Option<String>,
+    pub last_sync_changeset: Option<Uuid>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_sync_at: Option<OffsetDateTime>,
+    pub direction: String,
+    pub status: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
