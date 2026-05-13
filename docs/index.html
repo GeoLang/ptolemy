@@ -188,6 +188,53 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Enterprise audit logging</li>
 </ul>
 </div>
+<div class="card">
+<h3>🔒 Feature Locking</h3>
+<ul>
+<li>Pessimistic locking per feature/branch</li>
+<li>Configurable lock duration & auto-expiry</li>
+<li>Lock checks enforced on commit</li>
+<li>Conflict prevention for high-contention edits</li>
+<li>Lock listing & manual release</li>
+</ul>
+</div>
+<div class="card">
+<h3>⏱️ Temporal Queries</h3>
+<ul>
+<li>Query features at any point in time</li>
+<li>Time-travel across branch history</li>
+<li>Historical state reconstruction</li>
+<li>Audit-friendly snapshotting</li>
+</ul>
+</div>
+<div class="card">
+<h3>📂 Data Catalog</h3>
+<ul>
+<li>Full-text search across datasets</li>
+<li>Tag-based organization & filtering</li>
+<li>Rich metadata (source, license, attribution)</li>
+<li>Keyword indexing</li>
+</ul>
+</div>
+<div class="card">
+<h3>🏢 Multi-Tenancy</h3>
+<ul>
+<li>Organization-level isolation</li>
+<li>Member management & roles</li>
+<li>Per-org dataset scoping</li>
+<li>Rate limiting per IP (token bucket)</li>
+</ul>
+</div>
+<div class="card">
+<h3>⚡ gRPC & Background Jobs</h3>
+<ul>
+<li>Binary protocol for bulk import/export</li>
+<li>Protobuf message format (prost)</li>
+<li>Scheduled lock cleanup & event pruning</li>
+<li>Quality alert background checks</li>
+<li>Conflict resolution API</li>
+</ul>
+</div>
 </div>
 </div>
 </section>
@@ -267,6 +314,10 @@ curl http://localhost:3000/health</code></pre>
 <tr><td>v1.0</td><td>Webhooks, CDC event stream, change notifications</td><td style="color:var(--accent2)">✓ Done</td></tr>
 <tr><td>v1.1</td><td>Spatial analytics (buffer, union, clustering, anomaly detection)</td><td style="color:var(--accent2)">✓ Done</td></tr>
 <tr><td>v1.2</td><td>OGC API - Features compliance, audit logging</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.3</td><td>Webhook delivery engine, schema enforcement, topology gate</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.4</td><td>SSE streaming, feature locking, temporal queries</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.5</td><td>Data catalog, multi-tenancy, rate limiting</td><td style="color:var(--accent2)">✓ Done</td></tr>
+<tr><td>v1.6</td><td>Background jobs, conflict resolution API, gRPC bulk ops</td><td style="color:var(--accent2)">✓ Done</td></tr>
 </tbody>
 </table>
 </div>

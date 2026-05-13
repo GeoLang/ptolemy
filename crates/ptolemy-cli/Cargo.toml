@@ -15,8 +15,10 @@ ptolemy-storage = { path = "../ptolemy-storage" }
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+geozero.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json.workspace = true
+shapefile = "0.6"
 sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true

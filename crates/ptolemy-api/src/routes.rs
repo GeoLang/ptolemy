@@ -422,7 +422,25 @@ async fn commit(
         })
         .collect();
 
-    let changeset = store.commit(branch_id, &req.message, &req.author, &ops?).await?;
+    let ops = ops?;
+
+    // Schema validation (if dataset has a schema defined)
+    let branch = store.get_branch(branch_id).await?;
+    let validation_errors = store.validate_commit(branch.dataset_id, &ops).await?;
+    if !validation_errors.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Schema validation failed: {} error(s) — {}",
+            validation_errors.len(),
+            validation_errors
+                .iter()
+                .take(5)
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+
+    let changeset = store.commit(branch_id, &req.message, &req.author, &ops).await?;
     Ok((StatusCode::CREATED, Json(changeset)))
 }
 

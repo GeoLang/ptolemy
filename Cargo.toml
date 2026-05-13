@@ -17,6 +17,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -24,14 +25,24 @@ uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 geo-types = "0.7"
 geozero = { version = "0.14", features = ["with-wkb", "with-geojson"] }
 time = { version = "0.3", features = ["serde"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+tower = { version = "0.5", features = ["limit", "buffer"] }
 jsonwebtoken = "9"
+hmac = "0.12"
+sha2 = "0.10"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 openidconnect = { version = "4", features = ["reqwest-blocking"] }
 reqwest = { version = "0.12", features = ["json"] }
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["sync"] }

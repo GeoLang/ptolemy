@@ -123,3 +123,124 @@ pub struct FieldNullCount {
     pub field_name: String,
     pub null_count: i64,
 }
+
+// ─── Schema Validation ──────────────────────────────────────────────
+
+impl DatasetSchema {
+    /// Validate a feature's properties against this schema.
+    /// Returns a list of validation errors (empty = valid).
+    pub fn validate_properties(
+        &self,
+        feature_id: Uuid,
+        properties: &serde_json::Value,
+    ) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        let obj = match properties.as_object() {
+            Some(o) => o,
+            None => {
+                errors.push(ValidationError {
+                    feature_id,
+                    field: None,
+                    rule: "properties_type".into(),
+                    message: "properties must be a JSON object".into(),
+                });
+                return errors;
+            }
+        };
+
+        for field in &self.fields {
+            let value = obj.get(&field.name);
+
+            // Required check
+            if field.required && (value.is_none() || value == Some(&serde_json::Value::Null)) {
+                errors.push(ValidationError {
+                    feature_id,
+                    field: Some(field.name.clone()),
+                    rule: "required".into(),
+                    message: format!("field '{}' is required", field.name),
+                });
+                continue;
+            }
+
+            let Some(val) = value else { continue };
+            if val.is_null() {
+                continue;
+            }
+
+            // Type check
+            let type_ok = match field.field_type {
+                FieldType::String => val.is_string(),
+                FieldType::Integer => val.is_i64() || val.is_u64(),
+                FieldType::Float => val.is_f64() || val.is_i64() || val.is_u64(),
+                FieldType::Boolean => val.is_boolean(),
+                FieldType::Array => val.is_array(),
+                FieldType::Object => val.is_object(),
+            };
+
+            if !type_ok {
+                errors.push(ValidationError {
+                    feature_id,
+                    field: Some(field.name.clone()),
+                    rule: "type".into(),
+                    message: format!(
+                        "field '{}' expected type {:?}, got {}",
+                        field.name,
+                        field.field_type,
+                        json_type_name(val)
+                    ),
+                });
+                continue;
+            }
+
+            // Allowed values check
+            if !field.allowed_values.is_empty() && !field.allowed_values.contains(val) {
+                errors.push(ValidationError {
+                    feature_id,
+                    field: Some(field.name.clone()),
+                    rule: "allowed_values".into(),
+                    message: format!(
+                        "field '{}' value not in allowed set",
+                        field.name
+                    ),
+                });
+            }
+
+            // Numeric range check
+            if let Some(num) = val.as_f64() {
+                if let Some(min) = field.min {
+                    if num < min {
+                        errors.push(ValidationError {
+                            feature_id,
+                            field: Some(field.name.clone()),
+                            rule: "min".into(),
+                            message: format!("field '{}' value {} < min {}", field.name, num, min),
+                        });
+                    }
+                }
+                if let Some(max) = field.max {
+                    if num > max {
+                        errors.push(ValidationError {
+                            feature_id,
+                            field: Some(field.name.clone()),
+                            rule: "max".into(),
+                            message: format!("field '{}' value {} > max {}", field.name, num, max),
+                        });
+                    }
+                }
+            }
+        }
+
+        errors
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}

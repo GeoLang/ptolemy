@@ -24,6 +24,10 @@ Enterprise GIS users are locked into proprietary platforms (Esri, Hexagon) prima
 | **v1.0** | Webhooks, CDC event stream, change notifications | ✓ Done |
 | **v1.1** | Spatial analytics (buffer, union, clustering, anomaly detection) | ✓ Done |
 | **v1.2** | OGC API - Features compliance, audit logging | ✓ Done |
+| **v1.3** | Webhook delivery engine, schema enforcement, topology gate | ✓ Done |
+| **v1.4** | SSE streaming, feature locking, temporal queries | ✓ Done |
+| **v1.5** | Data catalog, multi-tenancy, rate limiting | ✓ Done |
+| **v1.6** | Background jobs, conflict resolution API, gRPC bulk ops | ✓ Done |
 
 ## Architecture
 
@@ -159,6 +163,24 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items |
 | GET | `/api/v1/ogc/collections/{id}/items/{fid}` | OGC single feature |
 | GET | `/api/v1/audit` | Audit log |
+| GET | `/api/v1/branches/{id}/locks` | List feature locks |
+| POST | `/api/v1/branches/{id}/locks` | Lock a feature |
+| DELETE | `/api/v1/branches/{bid}/locks/{fid}` | Unlock a feature |
+| GET | `/api/v1/branches/{id}/features?at=` | Temporal query (features at time) |
+| GET | `/api/v1/catalog/search` | Search datasets (text + tags) |
+| GET | `/api/v1/datasets/{id}/tags` | List dataset tags |
+| POST | `/api/v1/datasets/{id}/tags` | Add tag |
+| DELETE | `/api/v1/datasets/{id}/tags/{tag}` | Remove tag |
+| GET | `/api/v1/datasets/{id}/metadata` | Get dataset metadata |
+| PUT | `/api/v1/datasets/{id}/metadata` | Set dataset metadata |
+| GET | `/api/v1/orgs` | List organizations |
+| POST | `/api/v1/orgs` | Create organization |
+| GET | `/api/v1/orgs/{id}/members` | List members |
+| POST | `/api/v1/orgs/{id}/members` | Add member |
+| GET | `/api/v1/orgs/{id}/datasets` | Org datasets |
+| GET | `/api/v1/conflicts/{id}` | List merge conflicts |
+| POST | `/api/v1/conflicts/{id}/resolve` | Resolve conflicts |
+| GET | `/api/v1/events/stream` | SSE real-time event stream |
 | WS | `/ws/branches/{id}` | Real-time branch events |
 
 ## Building

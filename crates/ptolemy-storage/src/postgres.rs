@@ -51,6 +51,12 @@ impl PgStore {
         sqlx::raw_sql(sql_004).execute(&self.pool).await?;
         let sql_005 = include_str!("../migrations/005_audit.sql");
         sqlx::raw_sql(sql_005).execute(&self.pool).await?;
+        let sql_006 = include_str!("../migrations/006_locks.sql");
+        sqlx::raw_sql(sql_006).execute(&self.pool).await?;
+        let sql_007 = include_str!("../migrations/007_catalog.sql");
+        sqlx::raw_sql(sql_007).execute(&self.pool).await?;
+        let sql_008 = include_str!("../migrations/008_tenancy.sql");
+        sqlx::raw_sql(sql_008).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -173,6 +179,32 @@ impl PgStore {
     // ─── Changeset / Commit ─────────────────────────────────────────
 
     /// Create a new changeset and advance the branch head.
+    /// Validate commit operations against the dataset schema (if one exists).
+    /// Returns validation errors. Empty = all valid.
+    pub async fn validate_commit(
+        &self,
+        dataset_id: Uuid,
+        operations: &[DiffOp],
+    ) -> Result<Vec<ptolemy_core::schema::ValidationError>, StoreError> {
+        let schema = self.get_dataset_schema(dataset_id).await?;
+        let Some(schema) = schema else {
+            return Ok(vec![]); // No schema = no validation
+        };
+
+        let mut errors = Vec::new();
+        for op in operations {
+            match op {
+                DiffOp::Insert { feature_id, properties, .. }
+                | DiffOp::Update { feature_id, properties: Some(properties), .. } => {
+                    let errs = schema.validate_properties(*feature_id, properties);
+                    errors.extend(errs);
+                }
+                _ => {}
+            }
+        }
+        Ok(errors)
+    }
+
     pub async fn commit(
         &self,
         branch_id: Uuid,
@@ -1466,6 +1498,207 @@ impl PgStore {
             })
             .collect())
     }
+
+    // ─── Temporal Queries ─────────────────────────────────────────────
+
+    /// Get features as they existed at a specific point in time on a branch.
+    pub async fn features_at_time(
+        &self,
+        branch_id: Uuid,
+        at: OffsetDateTime,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Feature>, StoreError> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                -- Find the changeset that was head at the given time
+                SELECT c.id, c.parent_id FROM changesets c
+                WHERE c.branch_id = $1 AND c.created_at <= $2
+                ORDER BY c.created_at DESC LIMIT 1
+              UNION ALL
+                SELECT c.id, c.parent_id FROM changesets c
+                JOIN chain ch ON ch.parent_id = c.id
+            ),
+            latest AS (
+                SELECT DISTINCT ON (fv.feature_id)
+                    fv.feature_id, fv.operation,
+                    ST_AsGeoJSON(fv.geometry)::jsonb as geojson,
+                    fv.properties
+                FROM feature_versions fv
+                JOIN chain ch ON fv.changeset_id = ch.id
+                WHERE fv.created_at <= $2
+                ORDER BY fv.feature_id, fv.created_at DESC
+            )
+            SELECT feature_id, geojson, properties
+            FROM latest
+            WHERE operation != 'delete'
+            LIMIT $3 OFFSET $4",
+        )
+        .bind(branch_id)
+        .bind(at)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let geojson: Option<serde_json::Value> = row.get("geojson");
+                let geom_str = geojson.map(|g| g.to_string()).unwrap_or_default();
+                Feature {
+                    id: row.get("feature_id"),
+                    dataset_id: Uuid::nil(),
+                    geometry_wkb: geom_str.into_bytes(),
+                    properties: row.get("properties"),
+                }
+            })
+            .collect())
+    }
+
+    // ─── Feature Locks ──────────────────────────────────────────────
+
+    pub async fn lock_feature(
+        &self,
+        feature_id: Uuid,
+        branch_id: Uuid,
+        locked_by: &str,
+        duration_minutes: i64,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Clean up expired locks first
+        sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+
+        // Check if already locked by someone else
+        let existing = sqlx::query(
+            "SELECT locked_by FROM feature_locks WHERE feature_id = $1 AND branch_id = $2 AND expires_at > now()",
+        )
+        .bind(feature_id)
+        .bind(branch_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = existing {
+            let owner: String = row.get("locked_by");
+            if owner != locked_by {
+                return Err(StoreError::Conflict(format!(
+                    "feature {} is locked by '{}'",
+                    feature_id, owner
+                )));
+            }
+            // Refresh lock
+            sqlx::query(
+                "UPDATE feature_locks SET expires_at = now() + make_interval(mins => $3), reason = $4
+                 WHERE feature_id = $1 AND branch_id = $2",
+            )
+            .bind(feature_id)
+            .bind(branch_id)
+            .bind(duration_minutes as f64)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO feature_locks (feature_id, branch_id, locked_by, expires_at, reason)
+                 VALUES ($1, $2, $3, now() + make_interval(mins => $4), $5)",
+            )
+            .bind(feature_id)
+            .bind(branch_id)
+            .bind(locked_by)
+            .bind(duration_minutes as f64)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn unlock_feature(
+        &self,
+        feature_id: Uuid,
+        branch_id: Uuid,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        let existing = sqlx::query(
+            "SELECT locked_by FROM feature_locks WHERE feature_id = $1 AND branch_id = $2",
+        )
+        .bind(feature_id)
+        .bind(branch_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = existing {
+            let owner: String = row.get("locked_by");
+            if owner != actor {
+                return Err(StoreError::Conflict(format!(
+                    "cannot unlock: feature {} is locked by '{}'",
+                    feature_id, owner
+                )));
+            }
+        }
+
+        sqlx::query("DELETE FROM feature_locks WHERE feature_id = $1 AND branch_id = $2")
+            .bind(feature_id)
+            .bind(branch_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_locks(&self, branch_id: Uuid) -> Result<Vec<FeatureLock>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT feature_id, branch_id, locked_by, locked_at, expires_at, reason
+             FROM feature_locks WHERE branch_id = $1 AND expires_at > now()",
+        )
+        .bind(branch_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| FeatureLock {
+                feature_id: row.get("feature_id"),
+                branch_id: row.get("branch_id"),
+                locked_by: row.get("locked_by"),
+                locked_at: row.get("locked_at"),
+                expires_at: row.get("expires_at"),
+                reason: row.get("reason"),
+            })
+            .collect())
+    }
+
+    /// Check if any operations touch locked features.
+    pub async fn check_locks(
+        &self,
+        branch_id: Uuid,
+        actor: &str,
+        operations: &[DiffOp],
+    ) -> Result<Vec<Uuid>, StoreError> {
+        let mut blocked = Vec::new();
+        for op in operations {
+            let fid = match op {
+                DiffOp::Update { feature_id, .. } | DiffOp::Delete { feature_id } => *feature_id,
+                DiffOp::Insert { .. } => continue,
+            };
+            let row = sqlx::query(
+                "SELECT locked_by FROM feature_locks
+                 WHERE feature_id = $1 AND branch_id = $2 AND expires_at > now()",
+            )
+            .bind(fid)
+            .bind(branch_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(r) = row {
+                let owner: String = r.get("locked_by");
+                if owner != actor {
+                    blocked.push(fid);
+                }
+            }
+        }
+        Ok(blocked)
+    }
 }
 
 // ─── Audit types ────────────────────────────────────────────────────
@@ -1483,9 +1716,21 @@ pub struct AuditEntry {
     pub created_at: OffsetDateTime,
 }
 
-// ─── Merge types ────────────────────────────────────────────────────
+// ─── Lock types ─────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeatureLock {
+    pub feature_id: Uuid,
+    pub branch_id: Uuid,
+    pub locked_by: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub locked_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    pub reason: Option<String>,
+}
+
+// ─── Merge types ────────────────────────────────────────────────────]
 pub enum MergeResult {
     Success(Changeset),
     Conflicts(Vec<ConflictInfo>),
