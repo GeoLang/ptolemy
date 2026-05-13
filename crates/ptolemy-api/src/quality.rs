@@ -11,7 +11,9 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
-use ptolemy_core::schema::{DatasetSchema, FieldDef, GeometryRules, TopologyRule, TopologyRuleType, QualityReport};
+use ptolemy_core::schema::{
+    DatasetSchema, FieldDef, GeometryRules, QualityReport, TopologyRule, TopologyRuleType,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -166,7 +168,10 @@ impl IntoResponse for QualityError {
             }
             QualityError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

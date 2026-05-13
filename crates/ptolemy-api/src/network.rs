@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -19,9 +19,15 @@ use crate::AppState;
 
 pub fn network_routes() -> Router<AppState> {
     Router::new()
-        .route("/datasets/{id}/networks", get(list_networks).post(create_network))
+        .route(
+            "/datasets/{id}/networks",
+            get(list_networks).post(create_network),
+        )
         .route("/networks/{id}", get(get_network))
-        .route("/networks/{id}/junctions", get(list_junctions).post(add_junction))
+        .route(
+            "/networks/{id}/junctions",
+            get(list_junctions).post(add_junction),
+        )
         .route("/networks/{id}/edges", get(list_edges).post(add_edge))
         .route("/networks/{id}/trace", post(trace_network))
         .route("/networks/{id}/shortest-path", post(shortest_path))
@@ -67,12 +73,16 @@ async fn list_networks(
     .fetch_all(store.pool())
     .await?;
 
-    Ok(Json(rows.into_iter().map(|r| Network {
-        id: r.get("id"),
-        dataset_id: r.get("dataset_id"),
-        name: r.get("name"),
-        network_type: r.get("network_type"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Network {
+                id: r.get("id"),
+                dataset_id: r.get("dataset_id"),
+                name: r.get("name"),
+                network_type: r.get("network_type"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -82,7 +92,9 @@ struct CreateNetworkRequest {
     network_type: String,
 }
 
-fn default_network_type() -> String { "geometric".into() }
+fn default_network_type() -> String {
+    "geometric".into()
+}
 
 async fn create_network(
     State(store): State<AppState>,
@@ -90,10 +102,24 @@ async fn create_network(
     Json(req): Json<CreateNetworkRequest>,
 ) -> Result<(StatusCode, Json<Network>), NetworkError> {
     let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO networks (id, dataset_id, name, network_type) VALUES ($1, $2, $3, $4)")
-        .bind(id).bind(dataset_id).bind(&req.name).bind(&req.network_type)
-        .execute(store.pool()).await?;
-    Ok((StatusCode::CREATED, Json(Network { id, dataset_id, name: req.name, network_type: req.network_type })))
+    sqlx::query(
+        "INSERT INTO networks (id, dataset_id, name, network_type) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(dataset_id)
+    .bind(&req.name)
+    .bind(&req.network_type)
+    .execute(store.pool())
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Network {
+            id,
+            dataset_id,
+            name: req.name,
+            network_type: req.network_type,
+        }),
+    ))
 }
 
 async fn get_network(
@@ -101,9 +127,16 @@ async fn get_network(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Network>, NetworkError> {
     let r = sqlx::query("SELECT id, dataset_id, name, network_type FROM networks WHERE id = $1")
-        .bind(id).fetch_optional(store.pool()).await?
+        .bind(id)
+        .fetch_optional(store.pool())
+        .await?
         .ok_or(NetworkError::NotFound)?;
-    Ok(Json(Network { id: r.get("id"), dataset_id: r.get("dataset_id"), name: r.get("name"), network_type: r.get("network_type") }))
+    Ok(Json(Network {
+        id: r.get("id"),
+        dataset_id: r.get("dataset_id"),
+        name: r.get("name"),
+        network_type: r.get("network_type"),
+    }))
 }
 
 async fn list_junctions(
@@ -113,9 +146,15 @@ async fn list_junctions(
     let rows = sqlx::query(
         "SELECT id, feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson FROM network_junctions WHERE network_id = $1",
     ).bind(network_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| Junction {
-        id: r.get("id"), feature_id: r.get("feature_id"), geometry: r.get("geojson"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Junction {
+                id: r.get("id"),
+                feature_id: r.get("feature_id"),
+                geometry: r.get("geojson"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -134,9 +173,22 @@ async fn add_junction(
     sqlx::query(
         "INSERT INTO network_junctions (id, network_id, feature_id, geometry)
          VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))",
-    ).bind(id).bind(network_id).bind(req.feature_id).bind(req.lng).bind(req.lat)
-    .execute(store.pool()).await?;
-    Ok((StatusCode::CREATED, Json(Junction { id, feature_id: req.feature_id, geometry: None })))
+    )
+    .bind(id)
+    .bind(network_id)
+    .bind(req.feature_id)
+    .bind(req.lng)
+    .bind(req.lat)
+    .execute(store.pool())
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Junction {
+            id,
+            feature_id: req.feature_id,
+            geometry: None,
+        }),
+    ))
 }
 
 async fn list_edges(
@@ -146,11 +198,18 @@ async fn list_edges(
     let rows = sqlx::query(
         "SELECT id, feature_id, from_junction, to_junction, cost, enabled FROM network_edges WHERE network_id = $1",
     ).bind(network_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| Edge {
-        id: r.get("id"), feature_id: r.get("feature_id"),
-        from_junction: r.get("from_junction"), to_junction: r.get("to_junction"),
-        cost: r.get("cost"), enabled: r.get("enabled"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Edge {
+                id: r.get("id"),
+                feature_id: r.get("feature_id"),
+                from_junction: r.get("from_junction"),
+                to_junction: r.get("to_junction"),
+                cost: r.get("cost"),
+                enabled: r.get("enabled"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -162,7 +221,9 @@ struct AddEdgeRequest {
     cost: f64,
 }
 
-fn default_cost() -> f64 { 1.0 }
+fn default_cost() -> f64 {
+    1.0
+}
 
 async fn add_edge(
     State(store): State<AppState>,
@@ -173,8 +234,15 @@ async fn add_edge(
     sqlx::query(
         "INSERT INTO network_edges (id, network_id, feature_id, from_junction, to_junction, cost)
          VALUES ($1, $2, $3, $4, $5, $6)",
-    ).bind(id).bind(network_id).bind(req.feature_id).bind(req.from_junction).bind(req.to_junction).bind(req.cost)
-    .execute(store.pool()).await?;
+    )
+    .bind(id)
+    .bind(network_id)
+    .bind(req.feature_id)
+    .bind(req.from_junction)
+    .bind(req.to_junction)
+    .bind(req.cost)
+    .execute(store.pool())
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -190,7 +258,9 @@ struct TraceRequest {
     direction: String,
 }
 
-fn default_direction() -> String { "both".into() }
+fn default_direction() -> String {
+    "both".into()
+}
 
 #[derive(Serialize)]
 struct TraceResult {
@@ -251,12 +321,22 @@ async fn trace_network(
         let j: Uuid = row.get("junction");
         let e: Uuid = row.get("edge_id");
         let c: f64 = row.get("cost");
-        if !junctions.contains(&j) { junctions.push(j); }
-        if !edges.contains(&e) { edges.push(e); }
-        if c > total_cost { total_cost = c; }
+        if !junctions.contains(&j) {
+            junctions.push(j);
+        }
+        if !edges.contains(&e) {
+            edges.push(e);
+        }
+        if c > total_cost {
+            total_cost = c;
+        }
     }
 
-    Ok(Json(TraceResult { junctions_reached: junctions, edges_traversed: edges, total_cost }))
+    Ok(Json(TraceResult {
+        junctions_reached: junctions,
+        edges_traversed: edges,
+        total_cost,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -295,7 +375,12 @@ async fn shortest_path(
     .await?;
 
     if rows.is_empty() {
-        return Ok(Json(PathResult { found: false, path_junctions: vec![], path_edges: vec![], total_cost: 0.0 }));
+        return Ok(Json(PathResult {
+            found: false,
+            path_junctions: vec![],
+            path_edges: vec![],
+            total_cost: 0.0,
+        }));
     }
 
     let mut path_junctions = Vec::new();
@@ -307,11 +392,20 @@ async fn shortest_path(
         let agg: f64 = row.get("agg_cost");
         // Convert bigint back to UUID via lookup
         path_junctions.push(Uuid::from_u128(node as u128));
-        if edge >= 0 { path_edges.push(Uuid::from_u128(edge as u128)); }
-        if agg > total_cost { total_cost = agg; }
+        if edge >= 0 {
+            path_edges.push(Uuid::from_u128(edge as u128));
+        }
+        if agg > total_cost {
+            total_cost = agg;
+        }
     }
 
-    Ok(Json(PathResult { found: true, path_junctions, path_edges, total_cost }))
+    Ok(Json(PathResult {
+        found: true,
+        path_junctions,
+        path_edges,
+        total_cost,
+    }))
 }
 
 // ─── A* (heuristic shortest path) ──────────────────────────────────
@@ -348,7 +442,12 @@ async fn astar_path(
     .await?;
 
     if rows.is_empty() {
-        return Ok(Json(PathResult { found: false, path_junctions: vec![], path_edges: vec![], total_cost: 0.0 }));
+        return Ok(Json(PathResult {
+            found: false,
+            path_junctions: vec![],
+            path_edges: vec![],
+            total_cost: 0.0,
+        }));
     }
 
     let mut path_junctions = Vec::new();
@@ -359,11 +458,20 @@ async fn astar_path(
         let edge: i64 = row.get("edge");
         let agg: f64 = row.get("agg_cost");
         path_junctions.push(Uuid::from_u128(node as u128));
-        if edge >= 0 { path_edges.push(Uuid::from_u128(edge as u128)); }
-        if agg > total_cost { total_cost = agg; }
+        if edge >= 0 {
+            path_edges.push(Uuid::from_u128(edge as u128));
+        }
+        if agg > total_cost {
+            total_cost = agg;
+        }
     }
 
-    Ok(Json(PathResult { found: true, path_junctions, path_edges, total_cost }))
+    Ok(Json(PathResult {
+        found: true,
+        path_junctions,
+        path_edges,
+        total_cost,
+    }))
 }
 
 // ─── Driving Distance / Isochrone ───────────────────────────────────
@@ -407,12 +515,19 @@ async fn driving_distance(
     .fetch_all(store.pool())
     .await?;
 
-    let nodes: Vec<IsochroneNode> = rows.iter().map(|r| IsochroneNode {
-        node: r.get("node"), edge: r.get("edge"),
-        cost: r.get("cost"), agg_cost: r.get("agg_cost"),
-    }).collect();
+    let nodes: Vec<IsochroneNode> = rows
+        .iter()
+        .map(|r| IsochroneNode {
+            node: r.get("node"),
+            edge: r.get("edge"),
+            cost: r.get("cost"),
+            agg_cost: r.get("agg_cost"),
+        })
+        .collect();
 
-    Ok(Json(IsochroneResult { reachable_nodes: nodes }))
+    Ok(Json(IsochroneResult {
+        reachable_nodes: nodes,
+    }))
 }
 
 // ─── TSP (Traveling Salesman Problem) ───────────────────────────────
@@ -436,7 +551,11 @@ async fn tsp_tour(
 ) -> Result<Json<TspResult>, NetworkError> {
     // First compute cost matrix, then run TSP
     let start = req.start_junction.map(|u| u.as_u128() as i64).unwrap_or(0);
-    let ids: Vec<i64> = req.junction_ids.iter().map(|u| u.as_u128() as i64).collect();
+    let ids: Vec<i64> = req
+        .junction_ids
+        .iter()
+        .map(|u| u.as_u128() as i64)
+        .collect();
 
     let rows = sqlx::query(
         "SELECT seq, node, cost, agg_cost
@@ -461,10 +580,15 @@ async fn tsp_tour(
     for row in &rows {
         ordered.push(row.get::<i64, _>("node"));
         let agg: f64 = row.get("agg_cost");
-        if agg > total { total = agg; }
+        if agg > total {
+            total = agg;
+        }
     }
 
-    Ok(Json(TspResult { ordered_nodes: ordered, total_cost: total }))
+    Ok(Json(TspResult {
+        ordered_nodes: ordered,
+        total_cost: total,
+    }))
 }
 
 #[derive(Serialize)]
@@ -483,7 +607,10 @@ async fn check_connectivity(
         "SELECT
             (SELECT COUNT(*) FROM network_junctions WHERE network_id = $1) as junctions,
             (SELECT COUNT(*) FROM network_edges WHERE network_id = $1) as edges",
-    ).bind(network_id).fetch_one(store.pool()).await?;
+    )
+    .bind(network_id)
+    .fetch_one(store.pool())
+    .await?;
 
     // Use pgRouting connectedComponents for accurate component count
     let components = sqlx::query(
@@ -493,9 +620,14 @@ async fn check_connectivity(
                      e.cost FROM network_edges e
               WHERE e.network_id = ''' || $1::text || ''' AND e.enabled = TRUE'
          )",
-    ).bind(network_id).fetch_optional(store.pool()).await?;
+    )
+    .bind(network_id)
+    .fetch_optional(store.pool())
+    .await?;
 
-    let num_components = components.map(|r| r.get::<i64, _>("num_components")).unwrap_or(0);
+    let num_components = components
+        .map(|r| r.get::<i64, _>("num_components"))
+        .unwrap_or(0);
 
     let isolated = sqlx::query(
         "SELECT j.id FROM network_junctions j
@@ -505,7 +637,10 @@ async fn check_connectivity(
              WHERE e.network_id = $1
                AND (e.from_junction = j.id OR e.to_junction = j.id)
            )",
-    ).bind(network_id).fetch_all(store.pool()).await?;
+    )
+    .bind(network_id)
+    .fetch_all(store.pool())
+    .await?;
 
     Ok(Json(ConnectivityReport {
         total_junctions: stats.get("junctions"),
@@ -517,15 +652,25 @@ async fn check_connectivity(
 
 // ─── Error ──────────────────────────────────────────────────────────
 
-enum NetworkError { Db(sqlx::Error), NotFound }
+enum NetworkError {
+    Db(sqlx::Error),
+    NotFound,
+}
 
-impl From<sqlx::Error> for NetworkError { fn from(e: sqlx::Error) -> Self { NetworkError::Db(e) } }
+impl From<sqlx::Error> for NetworkError {
+    fn from(e: sqlx::Error) -> Self {
+        NetworkError::Db(e)
+    }
+}
 
 impl IntoResponse for NetworkError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             NetworkError::NotFound => (StatusCode::NOT_FOUND, "network not found".to_string()),
-            NetworkError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            NetworkError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

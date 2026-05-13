@@ -5,13 +5,13 @@
 //! JWT authentication and RBAC middleware.
 
 use axum::{
+    Json,
     extract::Request,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 
 /// JWT claims structure.
@@ -71,10 +71,7 @@ impl AuthConfig {
 
 /// Middleware that validates JWT tokens from the Authorization header.
 /// If auth is disabled (no PTOLEMY_JWT_SECRET), all requests pass through.
-pub async fn auth_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let config = AuthConfig::from_env();
 
     if !config.enabled {
@@ -119,10 +116,7 @@ pub async fn auth_middleware(
 }
 
 /// Require write permission (admin or editor role).
-pub async fn require_write(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn require_write(request: Request, next: Next) -> Response {
     let config = AuthConfig::from_env();
     if !config.enabled {
         return next.run(request).await;
@@ -145,8 +139,14 @@ pub async fn require_write(
 }
 
 /// Generate a JWT token (for testing/admin use).
-pub fn generate_token(secret: &str, sub: &str, name: &str, roles: Vec<Role>, ttl_secs: u64) -> String {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+pub fn generate_token(
+    secret: &str,
+    sub: &str,
+    name: &str,
+    roles: Vec<Role>,
+    ttl_secs: u64,
+) -> String {
+    use jsonwebtoken::{EncodingKey, Header, encode};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -175,5 +175,11 @@ pub fn generate_token_from_env(sub: &str, name: &str, roles: &[Role]) -> Result<
     if !config.enabled {
         return Err("JWT secret not configured (set PTOLEMY_JWT_SECRET)".into());
     }
-    Ok(generate_token(&config.secret, sub, name, roles.to_vec(), 86400))
+    Ok(generate_token(
+        &config.secret,
+        sub,
+        name,
+        roles.to_vec(),
+        86400,
+    ))
 }

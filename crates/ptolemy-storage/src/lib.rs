@@ -5,4 +5,3 @@
 pub mod postgres;
 
 pub use postgres::{AuditEntry, ConflictInfo, FeatureLock, MergeResult, PgStore, StoreError};
-

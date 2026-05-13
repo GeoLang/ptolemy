@@ -128,11 +128,9 @@ async fn quality_check_alert(store: &PgStore) -> Result<(), sqlx::Error> {
 }
 
 async fn cleanup_old_events(store: &PgStore) -> Result<(), sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM events WHERE created_at < now() - interval '30 days'",
-    )
-    .execute(store.pool())
-    .await?;
+    let result = sqlx::query("DELETE FROM events WHERE created_at < now() - interval '30 days'")
+        .execute(store.pool())
+        .await?;
     let count = result.rows_affected();
     if count > 0 {
         info!(count, "Cleaned up old events");

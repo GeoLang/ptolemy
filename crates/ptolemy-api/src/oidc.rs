@@ -146,10 +146,7 @@ async fn oidc_callback(Query(params): Query<CallbackParams>) -> Response {
     };
 
     // Exchange code for token
-    let token_url = format!(
-        "{}/protocol/openid-connect/token",
-        config.issuer_url
-    );
+    let token_url = format!("{}/protocol/openid-connect/token", config.issuer_url);
 
     let client = reqwest::Client::new();
     let token_resp = client
@@ -199,10 +196,7 @@ async fn oidc_callback(Query(params): Query<CallbackParams>) -> Response {
     };
 
     // Fetch user info
-    let userinfo_url = format!(
-        "{}/protocol/openid-connect/userinfo",
-        config.issuer_url
-    );
+    let userinfo_url = format!("{}/protocol/openid-connect/userinfo", config.issuer_url);
 
     let access_token = oidc_token["access_token"].as_str().unwrap_or_default();
     let userinfo_resp = client

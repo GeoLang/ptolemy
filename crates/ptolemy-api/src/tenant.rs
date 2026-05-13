@@ -22,7 +22,10 @@ pub fn tenant_routes() -> Router<AppState> {
         .route("/orgs", get(list_orgs).post(create_org))
         .route("/orgs/{id}", get(get_org))
         .route("/orgs/{id}/members", get(list_members).post(add_member))
-        .route("/orgs/{id}/members/{user_id}", axum::routing::delete(remove_member))
+        .route(
+            "/orgs/{id}/members/{user_id}",
+            axum::routing::delete(remove_member),
+        )
         .route("/orgs/{id}/datasets", get(org_datasets))
 }
 
@@ -39,9 +42,7 @@ struct OrgMember {
     role: String,
 }
 
-async fn list_orgs(
-    State(store): State<AppState>,
-) -> Result<Json<Vec<Organization>>, TenantError> {
+async fn list_orgs(State(store): State<AppState>) -> Result<Json<Vec<Organization>>, TenantError> {
     let rows = sqlx::query("SELECT id, name, slug FROM organizations ORDER BY name")
         .fetch_all(store.pool())
         .await?;
@@ -205,7 +206,10 @@ impl IntoResponse for TenantError {
             TenantError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             TenantError::Db(e) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

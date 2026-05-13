@@ -69,7 +69,9 @@ async fn unlock_feature(
     Path((branch_id, feature_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, LockError> {
     // In production, actor would come from auth token
-    store.unlock_feature(feature_id, branch_id, "system").await?;
+    store
+        .unlock_feature(feature_id, branch_id, "system")
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -96,7 +98,10 @@ impl IntoResponse for LockError {
             }
             LockError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

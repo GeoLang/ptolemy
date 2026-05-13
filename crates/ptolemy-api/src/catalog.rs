@@ -21,8 +21,14 @@ pub fn catalog_routes() -> Router<AppState> {
     Router::new()
         .route("/catalog/search", get(search_datasets))
         .route("/datasets/{id}/tags", get(list_tags).post(add_tag))
-        .route("/datasets/{id}/tags/{tag}", axum::routing::delete(remove_tag))
-        .route("/datasets/{id}/metadata", get(get_metadata).put(set_metadata))
+        .route(
+            "/datasets/{id}/tags/{tag}",
+            axum::routing::delete(remove_tag),
+        )
+        .route(
+            "/datasets/{id}/metadata",
+            get(get_metadata).put(set_metadata),
+        )
 }
 
 // ─── Search ─────────────────────────────────────────────────────────

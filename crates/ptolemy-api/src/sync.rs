@@ -192,16 +192,16 @@ async fn sync_push(
     let branch = store.get_branch(req.branch_id).await?;
 
     // Check if client is behind
-    if let (Some(base), Some(head)) = (req.base_changeset, branch.head) {
-        if base != head {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(PushResponse::BehindHead {
-                    current_head: head,
-                    client_base: req.base_changeset,
-                }),
-            ));
-        }
+    if let (Some(base), Some(head)) = (req.base_changeset, branch.head)
+        && base != head
+    {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(PushResponse::BehindHead {
+                current_head: head,
+                client_base: req.base_changeset,
+            }),
+        ));
     }
 
     // Convert sync ops to DiffOps
@@ -327,7 +327,10 @@ impl IntoResponse for SyncError {
             }
             SyncError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             SyncError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };

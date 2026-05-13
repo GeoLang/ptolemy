@@ -5,12 +5,12 @@
 //! Prometheus metrics middleware and endpoint.
 
 use axum::{
+    Router,
     extract::Request,
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -21,11 +21,13 @@ static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 /// Initialize the Prometheus metrics recorder. Safe to call multiple times (idempotent).
 pub fn init_metrics() -> PrometheusHandle {
-    PROMETHEUS_HANDLE.get_or_init(|| {
-        PrometheusBuilder::new()
-            .install_recorder()
-            .expect("failed to install Prometheus recorder")
-    }).clone()
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("failed to install Prometheus recorder")
+        })
+        .clone()
 }
 
 /// Middleware that records request duration and status code.

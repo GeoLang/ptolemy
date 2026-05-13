@@ -246,7 +246,10 @@ impl IntoResponse for ReviewError {
             }
             ReviewError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             ReviewError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };

@@ -26,7 +26,9 @@ fn point_wkb(x: f64, y: f64) -> Vec<u8> {
 async fn setup() -> PgStore {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
-    let pool = PgPool::connect(&url).await.expect("Failed to connect to database");
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("Failed to connect to database");
 
     // Clean slate
     sqlx::raw_sql(
@@ -34,7 +36,7 @@ async fn setup() -> PgStore {
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
          DROP TABLE IF EXISTS branches CASCADE;
-         DROP TABLE IF EXISTS datasets CASCADE;"
+         DROP TABLE IF EXISTS datasets CASCADE;",
     )
     .execute(&pool)
     .await
@@ -245,7 +247,12 @@ async fn test_commit_delete_feature() {
         .unwrap();
 
     store
-        .commit(branch.id, "Delete", "alice", &[DiffOp::Delete { feature_id: f1 }])
+        .commit(
+            branch.id,
+            "Delete",
+            "alice",
+            &[DiffOp::Delete { feature_id: f1 }],
+        )
         .await
         .unwrap();
 
@@ -490,7 +497,10 @@ async fn test_merge_no_conflicts() {
         .unwrap();
 
     // Merge feature -> main (no conflicts: different features modified)
-    let result = store.merge(feature_branch.id, main.id, "alice").await.unwrap();
+    let result = store
+        .merge(feature_branch.id, main.id, "alice")
+        .await
+        .unwrap();
     match result {
         MergeResult::Success(changeset) => {
             assert!(changeset.message.contains("Merge"));
@@ -568,7 +578,10 @@ async fn test_merge_with_conflicts() {
         .unwrap();
 
     // Merge should detect conflict
-    let result = store.merge(feature_branch.id, main.id, "alice").await.unwrap();
+    let result = store
+        .merge(feature_branch.id, main.id, "alice")
+        .await
+        .unwrap();
     match result {
         MergeResult::Conflicts(conflicts) => {
             assert_eq!(conflicts.len(), 1);
@@ -632,7 +645,10 @@ async fn test_merge_same_change_no_conflict() {
         .await
         .unwrap();
 
-    let result = store.merge(feature_branch.id, main.id, "alice").await.unwrap();
+    let result = store
+        .merge(feature_branch.id, main.id, "alice")
+        .await
+        .unwrap();
     match result {
         MergeResult::Success(_) => {} // Good — same operation = no conflict
         MergeResult::Conflicts(c) => panic!("Expected no conflict for identical ops, got {c:?}"),
@@ -754,7 +770,10 @@ async fn test_empty_commit() {
     let branch = create_test_branch(&store, ds.id, "main").await;
 
     // Commit with no operations (allowed, like an empty git commit)
-    let c = store.commit(branch.id, "Empty", "alice", &[]).await.unwrap();
+    let c = store
+        .commit(branch.id, "Empty", "alice", &[])
+        .await
+        .unwrap();
     assert_eq!(c.message, "Empty");
 
     let updated = store.get_branch(branch.id).await.unwrap();
@@ -771,7 +790,12 @@ async fn test_delete_nonexistent_feature_at_head() {
 
     // Delete a feature that was never inserted — should still record the op
     store
-        .commit(branch.id, "Ghost delete", "alice", &[DiffOp::Delete { feature_id: f1 }])
+        .commit(
+            branch.id,
+            "Ghost delete",
+            "alice",
+            &[DiffOp::Delete { feature_id: f1 }],
+        )
         .await
         .unwrap();
 

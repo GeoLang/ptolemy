@@ -13,7 +13,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "ptolemy", about = "Versioned geodatabase & collaboration platform")]
+#[command(
+    name = "ptolemy",
+    about = "Versioned geodatabase & collaboration platform"
+)]
 struct Cli {
     /// PostgreSQL connection URL
     #[arg(long, env = "DATABASE_URL")]
@@ -248,7 +251,10 @@ async fn main() -> anyhow::Result<()> {
             DatasetCmd::List => {
                 let datasets = store.list_datasets().await?;
                 for ds in datasets {
-                    println!("{} | {} | srid={} | {}", ds.id, ds.name, ds.srid, ds.created_by);
+                    println!(
+                        "{} | {} | srid={} | {}",
+                        ds.id, ds.name, ds.srid, ds.created_by
+                    );
                 }
             }
             DatasetCmd::Show { id } => {
@@ -284,7 +290,10 @@ async fn main() -> anyhow::Result<()> {
             BranchCmd::List { dataset } => {
                 let branches = store.list_branches(dataset).await?;
                 for b in branches {
-                    let head_str = b.head.map(|h| h.to_string()).unwrap_or_else(|| "(empty)".to_string());
+                    let head_str = b
+                        .head
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "(empty)".to_string());
                     println!("{} | {} | head={}", b.id, b.name, head_str);
                 }
             }
@@ -332,8 +341,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Log { branch, limit } => {
             let history = store.get_branch_history(branch, limit).await?;
             for cs in history {
-                let parent = cs.parent_id.map(|p| p.to_string()).unwrap_or_else(|| "(root)".to_string());
-                println!("{} | {} | {} | parent={}", cs.id, cs.author, cs.message, parent);
+                let parent = cs
+                    .parent_id
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "(root)".to_string());
+                println!(
+                    "{} | {} | {} | parent={}",
+                    cs.id, cs.author, cs.message, parent
+                );
             }
         }
 
@@ -407,9 +422,9 @@ fn parse_geom_type(s: &str) -> GeometryType {
 /// Parse a GeoJSON FeatureCollection into DiffOps (inserts).
 fn parse_geojson_to_ops(content: &str) -> anyhow::Result<Vec<DiffOp>> {
     let v: serde_json::Value = serde_json::from_str(content)?;
-    let features = v["features"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Expected GeoJSON FeatureCollection with 'features' array"))?;
+    let features = v["features"].as_array().ok_or_else(|| {
+        anyhow::anyhow!("Expected GeoJSON FeatureCollection with 'features' array")
+    })?;
 
     let mut ops = Vec::with_capacity(features.len());
     for f in features {
@@ -550,7 +565,8 @@ fn wkb_to_geojson_geometry(wkb: &[u8]) -> serde_json::Value {
                     let offset = 9 + i * 16;
                     if offset + 16 <= wkb.len() {
                         let x = f64::from_le_bytes(wkb[offset..offset + 8].try_into().unwrap());
-                        let y = f64::from_le_bytes(wkb[offset + 8..offset + 16].try_into().unwrap());
+                        let y =
+                            f64::from_le_bytes(wkb[offset + 8..offset + 16].try_into().unwrap());
                         coords.push(json!([x, y]));
                     }
                 }
@@ -569,13 +585,16 @@ fn wkb_to_geojson_geometry(wkb: &[u8]) -> serde_json::Value {
                     if offset + 4 > wkb.len() {
                         break;
                     }
-                    let n = u32::from_le_bytes(wkb[offset..offset + 4].try_into().unwrap()) as usize;
+                    let n =
+                        u32::from_le_bytes(wkb[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let mut coords = Vec::with_capacity(n);
                     for _ in 0..n {
                         if offset + 16 <= wkb.len() {
                             let x = f64::from_le_bytes(wkb[offset..offset + 8].try_into().unwrap());
-                            let y = f64::from_le_bytes(wkb[offset + 8..offset + 16].try_into().unwrap());
+                            let y = f64::from_le_bytes(
+                                wkb[offset + 8..offset + 16].try_into().unwrap(),
+                            );
                             coords.push(json!([x, y]));
                             offset += 16;
                         }

@@ -207,14 +207,20 @@ impl IntoResponse for ConflictError {
         let (status, message) = match self {
             ConflictError::Db(e) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             ConflictError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
                 (StatusCode::NOT_FOUND, msg)
             }
             ConflictError::Store(e) => {
                 tracing::error!("Store error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

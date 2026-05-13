@@ -8,8 +8,8 @@
 //! binary protocol efficiency (bulk feature import/export, streaming).
 
 use prost::Message;
-use std::sync::Arc;
 use ptolemy_storage::PgStore;
+use std::sync::Arc;
 
 /// gRPC service state.
 pub struct GrpcService {

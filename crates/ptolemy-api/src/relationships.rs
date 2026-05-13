@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -19,9 +19,18 @@ use crate::AppState;
 
 pub fn relationship_routes() -> Router<AppState> {
     Router::new()
-        .route("/datasets/{id}/relationships", get(list_classes).post(create_class))
-        .route("/relationship-classes/{id}", get(get_class).delete(delete_class))
-        .route("/relationship-classes/{id}/records", get(list_records).post(create_record))
+        .route(
+            "/datasets/{id}/relationships",
+            get(list_classes).post(create_class),
+        )
+        .route(
+            "/relationship-classes/{id}",
+            get(get_class).delete(delete_class),
+        )
+        .route(
+            "/relationship-classes/{id}/records",
+            get(list_records).post(create_record),
+        )
         .route("/relationship-records/{id}", delete(delete_record))
         .route("/features/{id}/related", get(get_related_features))
 }
@@ -48,15 +57,25 @@ async fn list_classes(
          FROM relationship_classes
          WHERE origin_dataset_id = $1 OR destination_dataset_id = $1
          ORDER BY name",
-    ).bind(dataset_id).fetch_all(store.pool()).await?;
+    )
+    .bind(dataset_id)
+    .fetch_all(store.pool())
+    .await?;
 
-    Ok(Json(rows.into_iter().map(|r| RelationshipClass {
-        id: r.get("id"), name: r.get("name"),
-        origin_dataset_id: r.get("origin_dataset_id"),
-        destination_dataset_id: r.get("destination_dataset_id"),
-        rel_type: r.get("rel_type"), cardinality: r.get("cardinality"),
-        forward_label: r.get("forward_label"), backward_label: r.get("backward_label"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| RelationshipClass {
+                id: r.get("id"),
+                name: r.get("name"),
+                origin_dataset_id: r.get("origin_dataset_id"),
+                destination_dataset_id: r.get("destination_dataset_id"),
+                rel_type: r.get("rel_type"),
+                cardinality: r.get("cardinality"),
+                forward_label: r.get("forward_label"),
+                backward_label: r.get("backward_label"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -73,8 +92,12 @@ struct CreateClassRequest {
     #[serde(default)]
     backward_label: String,
 }
-fn default_rel_type() -> String { "simple".into() }
-fn default_cardinality() -> String { "one_to_many".into() }
+fn default_rel_type() -> String {
+    "simple".into()
+}
+fn default_cardinality() -> String {
+    "one_to_many".into()
+}
 
 async fn create_class(
     State(store): State<AppState>,
@@ -100,13 +123,20 @@ async fn get_class(
         "SELECT id, name, origin_dataset_id, destination_dataset_id,
                 rel_type, cardinality, forward_label, backward_label
          FROM relationship_classes WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(RelError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(RelError::NotFound)?;
     Ok(Json(RelationshipClass {
-        id: r.get("id"), name: r.get("name"),
+        id: r.get("id"),
+        name: r.get("name"),
         origin_dataset_id: r.get("origin_dataset_id"),
         destination_dataset_id: r.get("destination_dataset_id"),
-        rel_type: r.get("rel_type"), cardinality: r.get("cardinality"),
-        forward_label: r.get("forward_label"), backward_label: r.get("backward_label"),
+        rel_type: r.get("rel_type"),
+        cardinality: r.get("cardinality"),
+        forward_label: r.get("forward_label"),
+        backward_label: r.get("backward_label"),
     }))
 }
 
@@ -114,7 +144,10 @@ async fn delete_class(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, RelError> {
-    sqlx::query("DELETE FROM relationship_classes WHERE id = $1").bind(id).execute(store.pool()).await?;
+    sqlx::query("DELETE FROM relationship_classes WHERE id = $1")
+        .bind(id)
+        .execute(store.pool())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -135,11 +168,20 @@ async fn list_records(
     let rows = sqlx::query(
         "SELECT id, origin_feature_id, destination_feature_id, properties
          FROM relationship_records WHERE class_id = $1",
-    ).bind(class_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| RelRecord {
-        id: r.get("id"), origin_feature_id: r.get("origin_feature_id"),
-        destination_feature_id: r.get("destination_feature_id"), properties: r.get("properties"),
-    }).collect()))
+    )
+    .bind(class_id)
+    .fetch_all(store.pool())
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| RelRecord {
+                id: r.get("id"),
+                origin_feature_id: r.get("origin_feature_id"),
+                destination_feature_id: r.get("destination_feature_id"),
+                properties: r.get("properties"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -168,7 +210,10 @@ async fn delete_record(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, RelError> {
-    sqlx::query("DELETE FROM relationship_records WHERE id = $1").bind(id).execute(store.pool()).await?;
+    sqlx::query("DELETE FROM relationship_records WHERE id = $1")
+        .bind(id)
+        .execute(store.pool())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -191,13 +236,22 @@ async fn get_related_features(
              FROM relationship_records rr
              JOIN relationship_classes rc ON rc.id = rr.class_id
              WHERE rr.origin_feature_id = $1",
-        ).bind(feature_id).fetch_all(store.pool()).await?;
-        rows.into_iter().map(|r| serde_json::json!({
-            "feature_id": r.get::<Uuid, _>("destination_feature_id"),
-            "class": r.get::<String, _>("class_name"),
-            "label": r.get::<String, _>("forward_label"),
-        })).collect::<Vec<_>>()
-    } else { vec![] };
+        )
+        .bind(feature_id)
+        .fetch_all(store.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "feature_id": r.get::<Uuid, _>("destination_feature_id"),
+                    "class": r.get::<String, _>("class_name"),
+                    "label": r.get::<String, _>("forward_label"),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
 
     let backward = if dir != "forward" {
         let rows = sqlx::query(
@@ -205,13 +259,22 @@ async fn get_related_features(
              FROM relationship_records rr
              JOIN relationship_classes rc ON rc.id = rr.class_id
              WHERE rr.destination_feature_id = $1",
-        ).bind(feature_id).fetch_all(store.pool()).await?;
-        rows.into_iter().map(|r| serde_json::json!({
-            "feature_id": r.get::<Uuid, _>("origin_feature_id"),
-            "class": r.get::<String, _>("class_name"),
-            "label": r.get::<String, _>("backward_label"),
-        })).collect::<Vec<_>>()
-    } else { vec![] };
+        )
+        .bind(feature_id)
+        .fetch_all(store.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "feature_id": r.get::<Uuid, _>("origin_feature_id"),
+                    "class": r.get::<String, _>("class_name"),
+                    "label": r.get::<String, _>("backward_label"),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
 
     Ok(Json(serde_json::json!({
         "forward": forward,
@@ -219,13 +282,23 @@ async fn get_related_features(
     })))
 }
 
-enum RelError { Db(sqlx::Error), NotFound }
-impl From<sqlx::Error> for RelError { fn from(e: sqlx::Error) -> Self { RelError::Db(e) } }
+enum RelError {
+    Db(sqlx::Error),
+    NotFound,
+}
+impl From<sqlx::Error> for RelError {
+    fn from(e: sqlx::Error) -> Self {
+        RelError::Db(e)
+    }
+}
 impl IntoResponse for RelError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             RelError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
-            RelError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            RelError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

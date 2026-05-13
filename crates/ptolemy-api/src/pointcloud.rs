@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -19,9 +19,15 @@ use crate::AppState;
 
 pub fn pointcloud_routes() -> Router<AppState> {
     Router::new()
-        .route("/datasets/{id}/pointclouds", get(list_catalogs).post(create_catalog))
+        .route(
+            "/datasets/{id}/pointclouds",
+            get(list_catalogs).post(create_catalog),
+        )
         .route("/pointclouds/{id}", get(get_catalog))
-        .route("/pointclouds/{id}/patches", get(list_patches).post(add_patch))
+        .route(
+            "/pointclouds/{id}/patches",
+            get(list_patches).post(add_patch),
+        )
         .route("/pointclouds/{id}/query", post(spatial_query))
         .route("/pointclouds/{id}/stats", get(catalog_stats))
         .route("/pointclouds/{id}/profile", post(elevation_profile))
@@ -43,11 +49,21 @@ async fn list_catalogs(
     let rows = sqlx::query(
         "SELECT id, name, srid, schema_xml, created_at::text as ts
          FROM pointcloud_catalogs WHERE dataset_id = $1 ORDER BY name",
-    ).bind(dataset_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| PointCloudCatalog {
-        id: r.get("id"), name: r.get("name"), srid: r.get("srid"),
-        schema_xml: r.get("schema_xml"), created_at: r.get("ts"),
-    }).collect()))
+    )
+    .bind(dataset_id)
+    .fetch_all(store.pool())
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| PointCloudCatalog {
+                id: r.get("id"),
+                name: r.get("name"),
+                srid: r.get("srid"),
+                schema_xml: r.get("schema_xml"),
+                created_at: r.get("ts"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -57,7 +73,9 @@ struct CreateCatalogRequest {
     srid: i32,
     schema_xml: Option<String>,
 }
-fn default_srid() -> i32 { 4326 }
+fn default_srid() -> i32 {
+    4326
+}
 
 async fn create_catalog(
     State(store): State<AppState>,
@@ -68,8 +86,14 @@ async fn create_catalog(
     sqlx::query(
         "INSERT INTO pointcloud_catalogs (id, dataset_id, name, srid, schema_xml)
          VALUES ($1, $2, $3, $4, $5)",
-    ).bind(id).bind(dataset_id).bind(&req.name).bind(req.srid).bind(&req.schema_xml)
-    .execute(store.pool()).await?;
+    )
+    .bind(id)
+    .bind(dataset_id)
+    .bind(&req.name)
+    .bind(req.srid)
+    .bind(&req.schema_xml)
+    .execute(store.pool())
+    .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -80,10 +104,17 @@ async fn get_catalog(
     let r = sqlx::query(
         "SELECT id, name, srid, schema_xml, created_at::text as ts
          FROM pointcloud_catalogs WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(PcError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(PcError::NotFound)?;
     Ok(Json(PointCloudCatalog {
-        id: r.get("id"), name: r.get("name"), srid: r.get("srid"),
-        schema_xml: r.get("schema_xml"), created_at: r.get("ts"),
+        id: r.get("id"),
+        name: r.get("name"),
+        srid: r.get("srid"),
+        schema_xml: r.get("schema_xml"),
+        created_at: r.get("ts"),
     }))
 }
 
@@ -101,11 +132,19 @@ async fn list_patches(
     let rows = sqlx::query(
         "SELECT id, num_points, ST_AsGeoJSON(bounds)::jsonb as bounds_geojson
          FROM pointcloud_patches WHERE catalog_id = $1",
-    ).bind(catalog_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| PatchInfo {
-        id: r.get("id"), num_points: r.get("num_points"),
-        bounds: r.get("bounds_geojson"),
-    }).collect()))
+    )
+    .bind(catalog_id)
+    .fetch_all(store.pool())
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| PatchInfo {
+                id: r.get("id"),
+                num_points: r.get("num_points"),
+                bounds: r.get("bounds_geojson"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -122,13 +161,21 @@ async fn add_patch(
     Json(req): Json<AddPatchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), PcError> {
     let id = Uuid::now_v7();
-    let wkb = hex::decode(&req.bounds_wkb_hex).map_err(|_| PcError::Bad("invalid bounds hex".into()))?;
-    let patch_data = hex::decode(&req.patch_hex).map_err(|_| PcError::Bad("invalid patch hex".into()))?;
+    let wkb =
+        hex::decode(&req.bounds_wkb_hex).map_err(|_| PcError::Bad("invalid bounds hex".into()))?;
+    let patch_data =
+        hex::decode(&req.patch_hex).map_err(|_| PcError::Bad("invalid patch hex".into()))?;
     sqlx::query(
         "INSERT INTO pointcloud_patches (id, catalog_id, bounds, num_points, pa)
          VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::pcpatch)",
-    ).bind(id).bind(catalog_id).bind(&wkb).bind(req.num_points).bind(&patch_data)
-    .execute(store.pool()).await?;
+    )
+    .bind(id)
+    .bind(catalog_id)
+    .bind(&wkb)
+    .bind(req.num_points)
+    .bind(&patch_data)
+    .execute(store.pool())
+    .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -151,16 +198,30 @@ async fn spatial_query(
          FROM pointcloud_patches
          WHERE catalog_id = $1
            AND bounds && ST_MakeEnvelope($2, $3, $4, $5, 4326)",
-    ).bind(catalog_id).bind(req.min_x).bind(req.min_y).bind(req.max_x).bind(req.max_y)
-    .fetch_all(store.pool()).await?;
+    )
+    .bind(catalog_id)
+    .bind(req.min_x)
+    .bind(req.min_y)
+    .bind(req.max_x)
+    .bind(req.max_y)
+    .fetch_all(store.pool())
+    .await?;
 
-    let patches: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "id": r.get::<Uuid, _>("id"),
-        "num_points": r.get::<i32, _>("num_points"),
-        "bounds": r.get::<Option<serde_json::Value>, _>("bounds_geojson"),
-    })).collect();
+    let patches: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.get::<Uuid, _>("id"),
+                "num_points": r.get::<i32, _>("num_points"),
+                "bounds": r.get::<Option<serde_json::Value>, _>("bounds_geojson"),
+            })
+        })
+        .collect();
 
-    let total_points: i64 = rows.iter().map(|r| r.get::<i32, _>("num_points") as i64).sum();
+    let total_points: i64 = rows
+        .iter()
+        .map(|r| r.get::<i32, _>("num_points") as i64)
+        .sum();
     Ok(Json(serde_json::json!({
         "patches": patches,
         "total_points": total_points,
@@ -178,7 +239,10 @@ async fn catalog_stats(
                 COALESCE(SUM(num_points), 0) as total_points,
                 ST_AsGeoJSON(ST_Extent(bounds))::jsonb as extent
          FROM pointcloud_patches WHERE catalog_id = $1",
-    ).bind(catalog_id).fetch_one(store.pool()).await?;
+    )
+    .bind(catalog_id)
+    .fetch_one(store.pool())
+    .await?;
 
     Ok(Json(serde_json::json!({
         "patch_count": row.get::<i64, _>("patch_count"),
@@ -194,7 +258,9 @@ struct ProfileRequest {
     #[serde(default = "default_samples")]
     num_samples: i32,
 }
-fn default_samples() -> i32 { 100 }
+fn default_samples() -> i32 {
+    100
+}
 
 async fn elevation_profile(
     State(store): State<AppState>,
@@ -229,27 +295,47 @@ async fn elevation_profile(
             FROM samples s
         )
         SELECT fraction, lng, lat, elevation FROM elevations ORDER BY fraction",
-    ).bind(catalog_id).bind(&wkb).bind(req.num_samples)
-    .fetch_all(store.pool()).await?;
+    )
+    .bind(catalog_id)
+    .bind(&wkb)
+    .bind(req.num_samples)
+    .fetch_all(store.pool())
+    .await?;
 
-    let profile: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "fraction": r.get::<f64, _>("fraction"),
-        "lng": r.get::<f64, _>("lng"),
-        "lat": r.get::<f64, _>("lat"),
-        "elevation": r.get::<Option<f64>, _>("elevation"),
-    })).collect();
+    let profile: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "fraction": r.get::<f64, _>("fraction"),
+                "lng": r.get::<f64, _>("lng"),
+                "lat": r.get::<f64, _>("lat"),
+                "elevation": r.get::<Option<f64>, _>("elevation"),
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({"profile": profile})))
 }
 
-enum PcError { Db(sqlx::Error), NotFound, Bad(String) }
-impl From<sqlx::Error> for PcError { fn from(e: sqlx::Error) -> Self { PcError::Db(e) } }
+enum PcError {
+    Db(sqlx::Error),
+    NotFound,
+    Bad(String),
+}
+impl From<sqlx::Error> for PcError {
+    fn from(e: sqlx::Error) -> Self {
+        PcError::Db(e)
+    }
+}
 impl IntoResponse for PcError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             PcError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             PcError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
-            PcError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            PcError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

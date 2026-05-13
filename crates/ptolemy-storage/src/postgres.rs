@@ -4,14 +4,16 @@
 
 //! PostgreSQL/PostGIS backend for the versioned feature store.
 
+use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::{Diff, DiffOp};
-use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
 use ptolemy_core::event::{Event, Webhook};
-use ptolemy_core::schema::{DatasetSchema, FieldDef, GeometryRules, TopologyRule, QualityReport, QualityStatistics};
-use ptolemy_core::Feature;
+use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
+use ptolemy_core::schema::{
+    DatasetSchema, FieldDef, GeometryRules, QualityReport, QualityStatistics, TopologyRule,
+};
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -210,8 +212,16 @@ impl PgStore {
         let mut errors = Vec::new();
         for op in operations {
             match op {
-                DiffOp::Insert { feature_id, properties, .. }
-                | DiffOp::Update { feature_id, properties: Some(properties), .. } => {
+                DiffOp::Insert {
+                    feature_id,
+                    properties,
+                    ..
+                }
+                | DiffOp::Update {
+                    feature_id,
+                    properties: Some(properties),
+                    ..
+                } => {
                     let errs = schema.validate_properties(*feature_id, properties);
                     errors.extend(errs);
                 }
@@ -231,10 +241,11 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
 
         // Get current branch head
-        let branch_row = sqlx::query("SELECT head, dataset_id FROM branches WHERE id = $1 FOR UPDATE")
-            .bind(branch_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let branch_row =
+            sqlx::query("SELECT head, dataset_id FROM branches WHERE id = $1 FOR UPDATE")
+                .bind(branch_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let parent_id: Option<Uuid> = branch_row.get("head");
         let dataset_id: Uuid = branch_row.get("dataset_id");
 
@@ -353,10 +364,7 @@ impl PgStore {
     // ─── Feature Queries ────────────────────────────────────────────
 
     /// Get the current state of all features on a branch (at its head).
-    pub async fn list_features_at_head(
-        &self,
-        branch_id: Uuid,
-    ) -> Result<Vec<Feature>, StoreError> {
+    pub async fn list_features_at_head(&self, branch_id: Uuid) -> Result<Vec<Feature>, StoreError> {
         let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
                 SELECT c.id, c.parent_id
@@ -587,11 +595,8 @@ impl PgStore {
         let mut conflicts: Vec<ConflictInfo> = Vec::new();
 
         // All features touched by either side
-        let all_features: std::collections::HashSet<Uuid> = ours_map
-            .keys()
-            .chain(theirs_map.keys())
-            .copied()
-            .collect();
+        let all_features: std::collections::HashSet<Uuid> =
+            ours_map.keys().chain(theirs_map.keys()).copied().collect();
 
         for fid in all_features {
             match (ours_map.get(&fid), theirs_map.get(&fid)) {
@@ -910,10 +915,7 @@ impl PgStore {
     }
 
     /// Count features at branch head.
-    pub async fn count_features_at_head(
-        &self,
-        branch_id: Uuid,
-    ) -> Result<i64, StoreError> {
+    pub async fn count_features_at_head(&self, branch_id: Uuid) -> Result<i64, StoreError> {
         let row = sqlx::query(
             "WITH RECURSIVE chain AS (
                 SELECT c.id, c.parent_id
@@ -1093,13 +1095,12 @@ impl PgStore {
         status: &MergeRequestStatus,
     ) -> Result<(), StoreError> {
         let status_str = format!("{:?}", status).to_lowercase();
-        let result = sqlx::query(
-            "UPDATE merge_requests SET status = $1, updated_at = now() WHERE id = $2",
-        )
-        .bind(&status_str)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("UPDATE merge_requests SET status = $1, updated_at = now() WHERE id = $2")
+                .bind(&status_str)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
 
         if result.rows_affected() == 0 {
             return Err(StoreError::NotFound(format!("merge_request {id}")));
@@ -1166,7 +1167,10 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn get_dataset_schema(&self, dataset_id: Uuid) -> Result<Option<DatasetSchema>, StoreError> {
+    pub async fn get_dataset_schema(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Option<DatasetSchema>, StoreError> {
         let row = sqlx::query(
             "SELECT dataset_id, fields, geometry_rules FROM dataset_schemas WHERE dataset_id = $1",
         )
@@ -1176,11 +1180,12 @@ impl PgStore {
 
         Ok(row.map(|r| {
             let fields: Vec<FieldDef> = serde_json::from_value(r.get("fields")).unwrap_or_default();
-            let geometry_rules: GeometryRules = serde_json::from_value(r.get("geometry_rules")).unwrap_or(GeometryRules {
-                allowed_types: vec![],
-                bounds: None,
-                max_vertices: None,
-            });
+            let geometry_rules: GeometryRules = serde_json::from_value(r.get("geometry_rules"))
+                .unwrap_or(GeometryRules {
+                    allowed_types: vec![],
+                    bounds: None,
+                    max_vertices: None,
+                });
             DatasetSchema {
                 dataset_id: r.get("dataset_id"),
                 fields,
@@ -1204,7 +1209,10 @@ impl PgStore {
         Ok(())
     }
 
-    pub async fn list_topology_rules(&self, dataset_id: Uuid) -> Result<Vec<TopologyRule>, StoreError> {
+    pub async fn list_topology_rules(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<TopologyRule>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, dataset_id, rule_type, description FROM topology_rules WHERE dataset_id = $1",
         )

@@ -65,12 +65,12 @@ async fn deliver_with_retries(client: &Client, job: &DeliveryJob, max_retries: u
             .header("X-Ptolemy-Delivery", job.event_id.to_string());
 
         // HMAC signature if secret is configured
-        if let Some(secret) = &job.webhook.secret {
-            if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
-                mac.update(&body_bytes);
-                let signature = hex::encode(mac.finalize().into_bytes());
-                request = request.header("X-Ptolemy-Signature", format!("sha256={signature}"));
-            }
+        if let Some(secret) = &job.webhook.secret
+            && let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes())
+        {
+            mac.update(&body_bytes);
+            let signature = hex::encode(mac.finalize().into_bytes());
+            request = request.header("X-Ptolemy-Signature", format!("sha256={signature}"));
         }
 
         match request.body(body_bytes.clone()).send().await {

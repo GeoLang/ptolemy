@@ -145,7 +145,12 @@ pub enum TopologyRuleType {
     /// Geometry must be valid (well-formed)
     MustBeValid,
     /// Features must be within a defined extent
-    MustBeWithinExtent { min_x: f64, min_y: f64, max_x: f64, max_y: f64 },
+    MustBeWithinExtent {
+        min_x: f64,
+        min_y: f64,
+        max_x: f64,
+        max_y: f64,
+    },
     /// Vertex count must not exceed limit
     MaxVertexCount { max: usize },
 }
@@ -257,34 +262,31 @@ impl DatasetSchema {
                     feature_id,
                     field: Some(field.name.clone()),
                     rule: "allowed_values".into(),
-                    message: format!(
-                        "field '{}' value not in allowed set",
-                        field.name
-                    ),
+                    message: format!("field '{}' value not in allowed set", field.name),
                 });
             }
 
             // Numeric range check
             if let Some(num) = val.as_f64() {
-                if let Some(min) = field.min {
-                    if num < min {
-                        errors.push(ValidationError {
-                            feature_id,
-                            field: Some(field.name.clone()),
-                            rule: "min".into(),
-                            message: format!("field '{}' value {} < min {}", field.name, num, min),
-                        });
-                    }
+                if let Some(min) = field.min
+                    && num < min
+                {
+                    errors.push(ValidationError {
+                        feature_id,
+                        field: Some(field.name.clone()),
+                        rule: "min".into(),
+                        message: format!("field '{}' value {} < min {}", field.name, num, min),
+                    });
                 }
-                if let Some(max) = field.max {
-                    if num > max {
-                        errors.push(ValidationError {
-                            feature_id,
-                            field: Some(field.name.clone()),
-                            rule: "max".into(),
-                            message: format!("field '{}' value {} > max {}", field.name, num, max),
-                        });
-                    }
+                if let Some(max) = field.max
+                    && num > max
+                {
+                    errors.push(ValidationError {
+                        feature_id,
+                        field: Some(field.name.clone()),
+                        rule: "max".into(),
+                        message: format!("field '{}' value {} > max {}", field.name, num, max),
+                    });
                 }
             }
         }

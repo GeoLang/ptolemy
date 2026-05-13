@@ -39,9 +39,9 @@ pub mod vector_search;
 pub mod webhook;
 pub mod ws;
 
-use axum::{middleware, Router};
 use axum::response::Html;
 use axum::routing::get;
+use axum::{Router, middleware};
 use ptolemy_storage::PgStore;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;

@@ -13,8 +13,11 @@ env:
 
 jobs:
   check:
-    name: Check & Clippy
-    runs-on: ubuntu-latest
+    name: Check & Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,8 +38,11 @@ jobs:
       - run: cargo fmt --all -- --check
 
   test-unit:
-    name: Unit Tests
-    runs-on: ubuntu-latest
+    name: Unit Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -80,14 +86,26 @@ jobs:
           "
 
       - name: Run storage integration tests
-        run: cargo test -p ptolemy-storage --test integration
+        run: cargo test -p ptolemy-storage --test integration -- --test-threads=1
 
       - name: Run API integration tests
-        run: cargo test -p ptolemy-api --test api_integration
+        run: cargo test -p ptolemy-api --test api_integration -- --test-threads=1
 
   build:
-    name: Build Release
-    runs-on: ubuntu-latest
+    name: Build Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: ptolemy-linux-amd64
+            binary: target/release/ptolemy
+          - os: windows-latest
+            artifact: ptolemy-windows-amd64
+            binary: target/release/ptolemy.exe
+          - os: macos-latest
+            artifact: ptolemy-macos-arm64
+            binary: target/release/ptolemy
     needs: [check, fmt, test-unit]
     steps:
       - uses: actions/checkout@v4
@@ -96,8 +114,8 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: ptolemy-linux-amd64
-          path: target/release/ptolemy
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
 
   docker:
     name: Docker Build

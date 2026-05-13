@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -51,12 +51,21 @@ async fn list_routes(
     let rows = sqlx::query(
         "SELECT id, name, total_length, ST_AsGeoJSON(geometry)::jsonb as geojson
          FROM routes WHERE dataset_id = $1 ORDER BY name",
-    ).bind(dataset_id).fetch_all(store.pool()).await?;
+    )
+    .bind(dataset_id)
+    .fetch_all(store.pool())
+    .await?;
 
-    Ok(Json(rows.into_iter().map(|r| Route {
-        id: r.get("id"), name: r.get("name"),
-        total_length: r.get("total_length"), geometry: r.get("geojson"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Route {
+                id: r.get("id"),
+                name: r.get("name"),
+                total_length: r.get("total_length"),
+                geometry: r.get("geojson"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -71,7 +80,8 @@ async fn create_route(
     Json(req): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), LrsError> {
     let id = Uuid::now_v7();
-    let wkb = hex::decode(&req.geometry_wkb_hex).map_err(|_| LrsError::Bad("invalid hex".into()))?;
+    let wkb =
+        hex::decode(&req.geometry_wkb_hex).map_err(|_| LrsError::Bad("invalid hex".into()))?;
     sqlx::query(
         "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
          VALUES ($1, $2, $3, ST_GeomFromWKB($4, 4326), ST_Length(ST_GeomFromWKB($4, 4326)::geography))",
@@ -87,7 +97,12 @@ async fn get_route(
     let r = sqlx::query(
         "SELECT id, name, total_length, ST_AsGeoJSON(geometry)::jsonb as geojson FROM routes WHERE id = $1",
     ).bind(id).fetch_optional(store.pool()).await?.ok_or(LrsError::NotFound)?;
-    Ok(Json(Route { id: r.get("id"), name: r.get("name"), total_length: r.get("total_length"), geometry: r.get("geojson") }))
+    Ok(Json(Route {
+        id: r.get("id"),
+        name: r.get("name"),
+        total_length: r.get("total_length"),
+        geometry: r.get("geojson"),
+    }))
 }
 
 async fn list_events(
@@ -98,13 +113,23 @@ async fn list_events(
         "SELECT id, event_type, from_measure, to_measure, properties,
                 ST_AsGeoJSON(geometry)::jsonb as geojson
          FROM route_events WHERE route_id = $1 ORDER BY from_measure",
-    ).bind(route_id).fetch_all(store.pool()).await?;
+    )
+    .bind(route_id)
+    .fetch_all(store.pool())
+    .await?;
 
-    Ok(Json(rows.into_iter().map(|r| RouteEvent {
-        id: r.get("id"), event_type: r.get("event_type"),
-        from_measure: r.get("from_measure"), to_measure: r.get("to_measure"),
-        properties: r.get("properties"), geometry: r.get("geojson"),
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| RouteEvent {
+                id: r.get("id"),
+                event_type: r.get("event_type"),
+                from_measure: r.get("from_measure"),
+                to_measure: r.get("to_measure"),
+                properties: r.get("properties"),
+                geometry: r.get("geojson"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -163,8 +188,13 @@ async fn locate_point(
         "SELECT ST_LineLocatePoint(geometry, ST_SetSRID(ST_MakePoint($2, $3), 4326)) as fraction,
                 total_length
          FROM routes WHERE id = $1",
-    ).bind(route_id).bind(q.lng).bind(q.lat)
-    .fetch_optional(store.pool()).await?.ok_or(LrsError::NotFound)?;
+    )
+    .bind(route_id)
+    .bind(q.lng)
+    .bind(q.lat)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(LrsError::NotFound)?;
 
     let fraction: f64 = row.get("fraction");
     let length: Option<f64> = row.get("total_length");
@@ -196,23 +226,39 @@ async fn get_subline(
             )
          )::jsonb as geojson
          FROM routes WHERE id = $1",
-    ).bind(route_id).bind(q.from_measure).bind(q.to_measure)
-    .fetch_optional(store.pool()).await?.ok_or(LrsError::NotFound)?;
+    )
+    .bind(route_id)
+    .bind(q.from_measure)
+    .bind(q.to_measure)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(LrsError::NotFound)?;
 
     Ok(Json(row.get("geojson")))
 }
 
 // ─── Error ──────────────────────────────────────────────────────────
 
-enum LrsError { Db(sqlx::Error), NotFound, Bad(String) }
-impl From<sqlx::Error> for LrsError { fn from(e: sqlx::Error) -> Self { LrsError::Db(e) } }
+enum LrsError {
+    Db(sqlx::Error),
+    NotFound,
+    Bad(String),
+}
+impl From<sqlx::Error> for LrsError {
+    fn from(e: sqlx::Error) -> Self {
+        LrsError::Db(e)
+    }
+}
 
 impl IntoResponse for LrsError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             LrsError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             LrsError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
-            LrsError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            LrsError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -34,7 +34,9 @@ struct IndexH3Request {
     #[serde(default = "default_resolution")]
     resolution: i32,
 }
-fn default_resolution() -> i32 { 7 }
+fn default_resolution() -> i32 {
+    7
+}
 
 async fn index_features_h3(
     State(store): State<AppState>,
@@ -48,8 +50,11 @@ async fn index_features_h3(
          WHERE fv.changeset_id = c.id
            AND c.branch_id = $1
            AND fv.geometry IS NOT NULL",
-    ).bind(branch_id).bind(req.resolution)
-    .execute(store.pool()).await?;
+    )
+    .bind(branch_id)
+    .bind(req.resolution)
+    .execute(store.pool())
+    .await?;
 
     Ok(Json(serde_json::json!({
         "indexed": result.rows_affected(),
@@ -79,12 +84,19 @@ async fn get_hexagons(
     ).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(1000))
     .fetch_all(store.pool()).await?;
 
-    let hexagons: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "cell": r.get::<String, _>("cell"),
-        "boundary": r.get::<serde_json::Value, _>("boundary"),
-    })).collect();
+    let hexagons: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "cell": r.get::<String, _>("cell"),
+                "boundary": r.get::<serde_json::Value, _>("boundary"),
+            })
+        })
+        .collect();
 
-    Ok(Json(serde_json::json!({"hexagons": hexagons, "count": hexagons.len()})))
+    Ok(Json(
+        serde_json::json!({"hexagons": hexagons, "count": hexagons.len()}),
+    ))
 }
 
 /// Aggregate feature counts by H3 hex.
@@ -101,13 +113,22 @@ async fn aggregate_by_hex(
          GROUP BY cell
          ORDER BY feature_count DESC
          LIMIT $3",
-    ).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(500))
-    .fetch_all(store.pool()).await?;
+    )
+    .bind(branch_id)
+    .bind(q.resolution)
+    .bind(q.limit.unwrap_or(500))
+    .fetch_all(store.pool())
+    .await?;
 
-    let cells: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "cell": r.get::<String, _>("cell"),
-        "count": r.get::<i64, _>("feature_count"),
-    })).collect();
+    let cells: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "cell": r.get::<String, _>("cell"),
+                "count": r.get::<i64, _>("feature_count"),
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({"cells": cells})))
 }
@@ -119,20 +140,28 @@ struct NeighborQuery {
     #[serde(default = "default_k")]
     k: i32,
 }
-fn default_k() -> i32 { 1 }
+fn default_k() -> i32 {
+    1
+}
 
 async fn hex_neighbors(
     State(store): State<AppState>,
     Path(_branch_id): Path<Uuid>,
     Query(q): Query<NeighborQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
-    let rows = sqlx::query(
-        "SELECT h3_grid_disk($1::h3index, $2) as neighbors",
-    ).bind(&q.cell).bind(q.k)
-    .fetch_all(store.pool()).await?;
+    let rows = sqlx::query("SELECT h3_grid_disk($1::h3index, $2) as neighbors")
+        .bind(&q.cell)
+        .bind(q.k)
+        .fetch_all(store.pool())
+        .await?;
 
-    let neighbors: Vec<String> = rows.iter().map(|r| r.get::<String, _>("neighbors")).collect();
-    Ok(Json(serde_json::json!({"cell": q.cell, "k": q.k, "neighbors": neighbors})))
+    let neighbors: Vec<String> = rows
+        .iter()
+        .map(|r| r.get::<String, _>("neighbors"))
+        .collect();
+    Ok(Json(
+        serde_json::json!({"cell": q.cell, "k": q.k, "neighbors": neighbors}),
+    ))
 }
 
 /// Compact a set of hexagons to the minimal representation.
@@ -152,7 +181,9 @@ async fn compact_hexes(
     .fetch_one(store.pool()).await?;
 
     let compacted: Option<Vec<String>> = row.get("compacted");
-    Ok(Json(serde_json::json!({"compacted": compacted.unwrap_or_default()})))
+    Ok(Json(
+        serde_json::json!({"compacted": compacted.unwrap_or_default()}),
+    ))
 }
 
 /// Convert a lat/lng point to an H3 cell.
@@ -172,7 +203,9 @@ async fn point_to_cell(
         "SELECT h3_lat_lng_to_cell(ST_SetSRID(ST_MakePoint($1, $2), 4326)::point, $3)::text as cell",
     ).bind(q.lng).bind(q.lat).bind(q.resolution)
     .fetch_one(store.pool()).await?;
-    Ok(Json(serde_json::json!({"cell": row.get::<String, _>("cell"), "resolution": q.resolution})))
+    Ok(Json(
+        serde_json::json!({"cell": row.get::<String, _>("cell"), "resolution": q.resolution}),
+    ))
 }
 
 /// Get the boundary polygon of an H3 cell.
@@ -187,17 +220,29 @@ async fn cell_boundary(
 ) -> Result<Json<serde_json::Value>, H3Error> {
     let row = sqlx::query(
         "SELECT ST_AsGeoJSON(h3_cell_to_boundary($1::h3index)::geometry)::jsonb as boundary",
-    ).bind(&q.cell)
-    .fetch_one(store.pool()).await?;
+    )
+    .bind(&q.cell)
+    .fetch_one(store.pool())
+    .await?;
     Ok(Json(row.get("boundary")))
 }
 
-enum H3Error { Db(sqlx::Error) }
-impl From<sqlx::Error> for H3Error { fn from(e: sqlx::Error) -> Self { H3Error::Db(e) } }
+enum H3Error {
+    Db(sqlx::Error),
+}
+impl From<sqlx::Error> for H3Error {
+    fn from(e: sqlx::Error) -> Self {
+        H3Error::Db(e)
+    }
+}
 impl IntoResponse for H3Error {
     fn into_response(self) -> axum::response::Response {
         let H3Error::Db(e) = self;
         tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "internal error"}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal error"})),
+        )
+            .into_response()
     }
 }

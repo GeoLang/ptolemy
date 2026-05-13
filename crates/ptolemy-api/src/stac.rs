@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -59,32 +59,37 @@ async fn stac_collections(
          JOIN datasets d ON d.id = rc.dataset_id
          LEFT JOIN raster_tiles rt ON rt.catalog_id = rc.id
          GROUP BY rc.id, rc.name, rc.srid, rc.pixel_type, rc.num_bands, d.name",
-    ).fetch_all(store.pool()).await?;
+    )
+    .fetch_all(store.pool())
+    .await?;
 
-    let collections: Vec<serde_json::Value> = rows.iter().map(|r| {
-        let id: Uuid = r.get("id");
-        serde_json::json!({
-            "type": "Collection",
-            "id": id,
-            "title": r.get::<String, _>("name"),
-            "description": format!("{} raster catalog", r.get::<String, _>("dataset_name")),
-            "stac_version": "1.0.0",
-            "license": "proprietary",
-            "extent": {
-                "spatial": {"bbox": [[-180, -90, 180, 90]]},
-                "temporal": {"interval": [[null, null]]}
-            },
-            "summaries": {
-                "srid": r.get::<i32, _>("srid"),
-                "pixel_type": r.get::<String, _>("pixel_type"),
-                "num_bands": r.get::<i32, _>("num_bands"),
-            },
-            "links": [
-                {"rel": "self", "href": format!("/api/v1/stac/collections/{id}")},
-                {"rel": "items", "href": format!("/api/v1/stac/collections/{id}/items")},
-            ]
+    let collections: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            serde_json::json!({
+                "type": "Collection",
+                "id": id,
+                "title": r.get::<String, _>("name"),
+                "description": format!("{} raster catalog", r.get::<String, _>("dataset_name")),
+                "stac_version": "1.0.0",
+                "license": "proprietary",
+                "extent": {
+                    "spatial": {"bbox": [[-180, -90, 180, 90]]},
+                    "temporal": {"interval": [[null, null]]}
+                },
+                "summaries": {
+                    "srid": r.get::<i32, _>("srid"),
+                    "pixel_type": r.get::<String, _>("pixel_type"),
+                    "num_bands": r.get::<i32, _>("num_bands"),
+                },
+                "links": [
+                    {"rel": "self", "href": format!("/api/v1/stac/collections/{id}")},
+                    {"rel": "items", "href": format!("/api/v1/stac/collections/{id}/items")},
+                ]
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(Json(serde_json::json!({
         "collections": collections,
@@ -101,7 +106,11 @@ async fn stac_collection(
          FROM raster_catalogs rc
          JOIN datasets d ON d.id = rc.dataset_id
          WHERE rc.id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(StacError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(StacError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "type": "Collection",
@@ -132,7 +141,10 @@ async fn stac_items(
                 ST_XMax(bounds) as xmax, ST_YMax(bounds) as ymax
          FROM raster_tiles WHERE catalog_id = $1
          ORDER BY zoom_level LIMIT 100",
-    ).bind(catalog_id).fetch_all(store.pool()).await?;
+    )
+    .bind(catalog_id)
+    .fetch_all(store.pool())
+    .await?;
 
     let features: Vec<serde_json::Value> = rows.iter().map(|r| {
         let tile_id: Uuid = r.get("id");
@@ -175,8 +187,12 @@ async fn stac_item(
                 ST_XMin(bounds) as xmin, ST_YMin(bounds) as ymin,
                 ST_XMax(bounds) as xmax, ST_YMax(bounds) as ymax
          FROM raster_tiles WHERE id = $1 AND catalog_id = $2",
-    ).bind(item_id).bind(catalog_id)
-    .fetch_optional(store.pool()).await?.ok_or(StacError::NotFound)?;
+    )
+    .bind(item_id)
+    .bind(catalog_id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(StacError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "type": "Feature",
@@ -206,6 +222,7 @@ async fn stac_item(
 #[derive(Deserialize)]
 struct StacSearchQuery {
     bbox: Option<String>,
+    #[allow(dead_code)]
     datetime: Option<String>,
     limit: Option<i64>,
     collections: Option<String>,
@@ -219,7 +236,10 @@ async fn stac_search(
     let mut conditions = vec!["1=1".to_string()];
 
     if let Some(bbox) = &q.bbox {
-        let coords: Vec<f64> = bbox.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let coords: Vec<f64> = bbox
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
         if coords.len() == 4 {
             conditions.push(format!(
                 "bounds && ST_MakeEnvelope({}, {}, {}, {}, 4326)",
@@ -230,7 +250,11 @@ async fn stac_search(
 
     if let Some(colls) = &q.collections {
         let ids: Vec<&str> = colls.split(',').collect();
-        let in_clause = ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+        let in_clause = ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
         conditions.push(format!("catalog_id::text IN ({})", in_clause));
     }
 
@@ -240,17 +264,25 @@ async fn stac_search(
          FROM raster_tiles WHERE {where_clause} LIMIT $1"
     );
 
-    let rows = sqlx::query(&query).bind(limit).fetch_all(store.pool()).await?;
+    let rows = sqlx::query(&query)
+        .bind(limit)
+        .fetch_all(store.pool())
+        .await?;
 
-    let features: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "type": "Feature",
-        "stac_version": "1.0.0",
-        "id": r.get::<Uuid, _>("id"),
-        "geometry": r.get::<Option<serde_json::Value>, _>("geometry"),
-        "properties": {"zoom_level": r.get::<i32, _>("zoom_level"), "datetime": null},
-        "links": [],
-        "assets": {},
-    })).collect();
+    let features: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": r.get::<Uuid, _>("id"),
+                "geometry": r.get::<Option<serde_json::Value>, _>("geometry"),
+                "properties": {"zoom_level": r.get::<i32, _>("zoom_level"), "datetime": null},
+                "links": [],
+                "assets": {},
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "type": "FeatureCollection",
@@ -259,13 +291,23 @@ async fn stac_search(
     })))
 }
 
-enum StacError { Db(sqlx::Error), NotFound }
-impl From<sqlx::Error> for StacError { fn from(e: sqlx::Error) -> Self { StacError::Db(e) } }
+enum StacError {
+    Db(sqlx::Error),
+    NotFound,
+}
+impl From<sqlx::Error> for StacError {
+    fn from(e: sqlx::Error) -> Self {
+        StacError::Db(e)
+    }
+}
 impl IntoResponse for StacError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             StacError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
-            StacError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            StacError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

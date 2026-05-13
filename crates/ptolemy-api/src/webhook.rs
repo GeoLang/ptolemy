@@ -19,7 +19,10 @@ use crate::AppState;
 
 pub fn webhook_routes() -> Router<AppState> {
     Router::new()
-        .route("/datasets/{id}/webhooks", get(list_webhooks).post(create_webhook))
+        .route(
+            "/datasets/{id}/webhooks",
+            get(list_webhooks).post(create_webhook),
+        )
         .route("/webhooks/{id}", delete(delete_webhook))
         .route("/datasets/{id}/events", get(list_events).post(emit_event))
 }
@@ -100,7 +103,9 @@ async fn emit_event(
     Path(dataset_id): Path<Uuid>,
     Json(req): Json<EmitEventRequest>,
 ) -> Result<(StatusCode, Json<Event>), WebhookError> {
-    let event = store.emit_event(dataset_id, &req.event_type, &req.payload).await?;
+    let event = store
+        .emit_event(dataset_id, &req.event_type, &req.payload)
+        .await?;
     Ok((StatusCode::CREATED, Json(event)))
 }
 
@@ -127,7 +132,10 @@ impl IntoResponse for WebhookError {
             }
             WebhookError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

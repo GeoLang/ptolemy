@@ -8,9 +8,9 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use ptolemy_api::{app, AppState};
+use ptolemy_api::{AppState, app};
 use ptolemy_storage::postgres::PgStore;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -34,7 +34,7 @@ async fn setup_app() -> (axum::Router, AppState) {
          DROP TABLE IF EXISTS pointcloud_catalogs CASCADE;
          DROP TABLE IF EXISTS datasets CASCADE;
          DROP TABLE IF EXISTS dataset_metadata CASCADE;
-         DROP TABLE IF EXISTS dataset_tags CASCADE;"
+         DROP TABLE IF EXISTS dataset_tags CASCADE;",
     )
     .execute(&pool)
     .await
@@ -83,12 +83,17 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
 
 /// Helper: create a dataset via API, return its ID.
 async fn create_dataset(app: &axum::Router) -> Uuid {
-    let (status, body) = post_json(app, "/api/v1/datasets", json!({
-        "name": format!("test_{}", Uuid::now_v7()),
-        "geometry_type": "point",
-        "srid": 4326,
-        "created_by": "test"
-    })).await;
+    let (status, body) = post_json(
+        app,
+        "/api/v1/datasets",
+        json!({
+            "name": format!("test_{}", Uuid::now_v7()),
+            "geometry_type": "point",
+            "srid": 4326,
+            "created_by": "test"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "create dataset: {body}");
     let id_str = body["id"].as_str().unwrap();
     Uuid::parse_str(id_str).unwrap()
@@ -100,7 +105,8 @@ async fn create_branch(app: &axum::Router, dataset_id: Uuid, name: &str) -> Uuid
         app,
         &format!("/api/v1/datasets/{dataset_id}/branches"),
         json!({"name": name, "created_by": "test"}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "create branch: {body}");
     let id_str = body["id"].as_str().unwrap();
     Uuid::parse_str(id_str).unwrap()
@@ -116,11 +122,15 @@ async fn commit_features(app: &axum::Router, branch_id: Uuid, ops: Value) -> Uui
             "author": "test",
             "operations": ops,
         }),
-    ).await;
-    assert!(status == StatusCode::CREATED || status == StatusCode::OK,
-        "commit failed with {status}: {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "commit failed with {status}: {body}"
+    );
     // The response is a Changeset struct serialized as JSON
-    let id_str = body["id"].as_str()
+    let id_str = body["id"]
+        .as_str()
         .expect(&format!("commit response has no 'id' field: {body}"));
     Uuid::parse_str(id_str).unwrap()
 }
@@ -212,7 +222,8 @@ async fn test_spatial_query_bbox() {
     let (status, body) = get_json(
         &app,
         &format!("/api/v1/branches/{branch_id}/features/bbox?min_x=0&min_y=0&max_x=3&max_y=3"),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.as_array().unwrap().len() >= 1);
 
@@ -220,7 +231,8 @@ async fn test_spatial_query_bbox() {
     let (status, body) = get_json(
         &app,
         &format!("/api/v1/branches/{branch_id}/features/bbox?min_x=10&min_y=10&max_x=20&max_y=20"),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().unwrap().len(), 0);
 }
@@ -240,9 +252,14 @@ async fn test_branch_history() {
     commit_features(&app, branch_id, json!([
         {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
     ])).await;
-    commit_features(&app, branch_id, json!([
-        {"type": "update", "feature_id": f1.to_string(), "properties": {"v": 2}}
-    ])).await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"v": 2}}
+        ]),
+    )
+    .await;
 
     let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/history")).await;
     assert_eq!(status, StatusCode::OK);
@@ -282,7 +299,10 @@ async fn test_merge_branches() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    assert!(status == StatusCode::OK || status == StatusCode::CREATED, "merge status: {status}");
+    assert!(
+        status == StatusCode::OK || status == StatusCode::CREATED,
+        "merge status: {status}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -299,7 +319,8 @@ async fn test_raster_catalog_and_tiles() {
         &app,
         &format!("/api/v1/datasets/{ds_id}/rasters"),
         json!({"name": "imagery", "srid": 4326, "pixel_type": "uint8", "num_bands": 3}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "create catalog: {body}");
     let catalog_id = body["id"].as_str().unwrap();
 
@@ -333,7 +354,8 @@ async fn test_pointcloud_catalog() {
         &app,
         &format!("/api/v1/datasets/{ds_id}/pointclouds"),
         json!({"name": "lidar_scan", "srid": 4326}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "create pc catalog: {body}");
     let catalog_id = body["id"].as_str().unwrap();
 
@@ -369,7 +391,11 @@ async fn test_export_geojson() {
         {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "Park"}}
     ])).await;
 
-    let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/export/geojson")).await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/export/geojson"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["type"], "FeatureCollection");
     assert!(body["features"].as_array().unwrap().len() >= 1);
@@ -395,11 +421,19 @@ async fn test_export_csv() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(ct.contains("csv"), "expected csv content-type, got {ct}");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let csv = String::from_utf8_lossy(&bytes);
-    assert!(csv.contains("id,longitude,latitude"), "CSV header missing: {csv}");
+    assert!(
+        csv.contains("id,longitude,latitude"),
+        "CSV header missing: {csv}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -418,9 +452,13 @@ async fn test_crs_transform() {
         &app,
         &format!("/api/v1/branches/{branch_id}/transform"),
         json!({"from_srid": 4326, "to_srid": 3857, "geometry_wkb_hex": point_hex}),
-    ).await;
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "transform: {status} {body}");
-    assert!(body["geometry"].is_object() || body["wkb_hex"].is_string(), "transform body: {body}");
+    assert!(
+        body["geometry"].is_object() || body["wkb_hex"].is_string(),
+        "transform body: {body}"
+    );
 }
 
 #[tokio::test]
@@ -429,10 +467,7 @@ async fn test_crs_search() {
     let ds_id = create_dataset(&app).await;
     let branch_id = create_branch(&app, ds_id, "main").await;
 
-    let (status, body) = get_json(
-        &app,
-        "/api/v1/crs/search?q=WGS+84",
-    ).await;
+    let (status, body) = get_json(&app, "/api/v1/crs/search?q=WGS+84").await;
     assert_eq!(status, StatusCode::OK, "crs search: {body}");
     assert!(body["results"].as_array().unwrap().len() >= 1);
 }
@@ -463,9 +498,12 @@ async fn test_cql2_filter() {
                 "args": [{"property": "pop"}, 500]
             }
         }),
-    ).await;
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "cql2 filter: {status} {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "cql2 filter: {status} {body}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -533,9 +571,12 @@ async fn test_buffer_analysis() {
     let (status, body) = get_json(
         &app,
         &format!("/api/v1/branches/{branch_id}/analytics/buffer?feature_id={f1}&distance=0.01"),
-    ).await;
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "buffer: {status} {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "buffer: {status} {body}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -548,10 +589,7 @@ async fn test_topology_validate() {
     let ds_id = create_dataset(&app).await;
 
     // List topologies for dataset
-    let (status, _body) = get_json(
-        &app,
-        &format!("/api/v1/datasets/{ds_id}/topologies"),
-    ).await;
+    let (status, _body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/topologies")).await;
     assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
 }
 
@@ -576,11 +614,15 @@ async fn test_sfcgal_extrude() {
         &app,
         &format!("/api/v1/branches/{branch_id}/3d/extrude"),
         json!({"feature_id": f1.to_string(), "height": 10.0}),
-    ).await;
+    )
+    .await;
     // SFCGAL might not be installed, or feature might not be in view yet — accept 404/500
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR
-        || status == StatusCode::NOT_FOUND,
-        "sfcgal extrude: {status} {body}");
+    assert!(
+        status == StatusCode::OK
+            || status == StatusCode::INTERNAL_SERVER_ERROR
+            || status == StatusCode::NOT_FOUND,
+        "sfcgal extrude: {status} {body}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -603,10 +645,13 @@ async fn test_h3_index_features() {
         &app,
         &format!("/api/v1/branches/{branch_id}/h3/index"),
         json!({"resolution": 7}),
-    ).await;
+    )
+    .await;
     // h3-pg might not be installed in test env
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "h3 index: {status} {body}");
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "h3 index: {status} {body}"
+    );
 }
 
 #[tokio::test]
@@ -618,7 +663,8 @@ async fn test_h3_hexagons() {
     let (status, _body) = get_json(
         &app,
         &format!("/api/v1/branches/{branch_id}/h3/hexagons?resolution=7"),
-    ).await;
+    )
+    .await;
     // h3-pg might not be installed
     assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
 }
@@ -643,10 +689,13 @@ async fn test_vector_generate_embeddings() {
         &app,
         &format!("/api/v1/branches/{branch_id}/similarity/embed"),
         json!({"fields": ["name"]}),
-    ).await;
+    )
+    .await;
     // pgvector + pgcrypto might not be installed
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "embed: {status} {body}");
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "embed: {status} {body}"
+    );
     if status == StatusCode::OK {
         assert!(body["embedded"].as_i64().unwrap() >= 1);
     }
@@ -664,9 +713,12 @@ async fn test_vector_similarity_search() {
         &app,
         &format!("/api/v1/branches/{branch_id}/similarity/search"),
         json!({"embedding": embedding, "limit": 5}),
-    ).await;
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "similarity: {status} {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "similarity: {status} {body}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -681,12 +733,11 @@ async fn test_network_shortest_path() {
 
     // Network routes need a network ID, not branch ID
     // Just verify the route group exists
-    let (status, _body) = get_json(
-        &app,
-        &format!("/api/v1/datasets/{ds_id}/networks"),
-    ).await;
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "network list: {status}");
+    let (status, _body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/networks")).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "network list: {status}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -699,10 +750,7 @@ async fn test_trajectory_list() {
     let ds_id = create_dataset(&app).await;
     let branch_id = create_branch(&app, ds_id, "main").await;
 
-    let (status, _body) = get_json(
-        &app,
-        &format!("/api/v1/datasets/{ds_id}/trajectories"),
-    ).await;
+    let (status, _body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/trajectories")).await;
     // MobilityDB might not be installed
     assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
 }
@@ -721,8 +769,12 @@ async fn test_webhook_crud() {
         &app,
         &format!("/api/v1/datasets/{ds_id}/webhooks"),
         json!({"url": "https://example.com/hook", "events": ["commit"]}),
-    ).await;
-    assert!(status == StatusCode::CREATED || status == StatusCode::OK, "webhook create: {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "webhook create: {body}"
+    );
 
     // List webhooks
     let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/webhooks")).await;
@@ -750,9 +802,14 @@ async fn test_feature_locking() {
         &app,
         &format!("/api/v1/branches/{branch_id}/locks"),
         json!({"feature_id": f1.to_string(), "owner": "alice"}),
-    ).await;
-    assert!(status == StatusCode::CREATED || status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "lock: {status} {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED
+            || status == StatusCode::OK
+            || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "lock: {status} {body}"
+    );
 
     // List locks
     let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/locks")).await;
@@ -784,9 +841,14 @@ async fn test_create_organization() {
         &app,
         "/api/v1/orgs",
         json!({"name": "TestOrg", "owner": "admin"}),
-    ).await;
-    assert!(status == StatusCode::CREATED || status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "create org: {status} {body}");
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED
+            || status == StatusCode::OK
+            || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "create org: {status} {body}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

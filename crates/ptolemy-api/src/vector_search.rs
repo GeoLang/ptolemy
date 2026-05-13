@@ -22,7 +22,10 @@ pub fn vector_routes() -> Router<AppState> {
         .route("/branches/{id}/similarity/search", post(similarity_search))
         .route("/branches/{id}/similarity/duplicates", get(find_duplicates))
         .route("/branches/{id}/similarity/embed", post(generate_embeddings))
-        .route("/branches/{id}/similarity/cluster", post(cluster_by_embedding))
+        .route(
+            "/branches/{id}/similarity/cluster",
+            post(cluster_by_embedding),
+        )
 }
 
 /// Search for features similar to a given embedding vector.
@@ -34,8 +37,12 @@ struct SimilaritySearchRequest {
     #[serde(default = "default_threshold")]
     threshold: f64,
 }
-fn default_limit() -> i64 { 10 }
-fn default_threshold() -> f64 { 0.8 }
+fn default_limit() -> i64 {
+    10
+}
+fn default_threshold() -> f64 {
+    0.8
+}
 
 #[derive(Serialize)]
 struct SimilarityResult {
@@ -48,7 +55,14 @@ async fn similarity_search(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<SimilaritySearchRequest>,
 ) -> Result<Json<Vec<SimilarityResult>>, VectorError> {
-    let embedding_str = format!("[{}]", req.embedding.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+    let embedding_str = format!(
+        "[{}]",
+        req.embedding
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 
     let rows = sqlx::query(
         "SELECT DISTINCT ON (fv.feature_id) fv.feature_id as id,
@@ -59,12 +73,22 @@ async fn similarity_search(
            AND 1 - (fv.embedding <=> $2::vector) > $3
          ORDER BY fv.feature_id, fv.created_at DESC, fv.embedding <=> $2::vector
          LIMIT $4",
-    ).bind(branch_id).bind(&embedding_str).bind(req.threshold).bind(req.limit)
-    .fetch_all(store.pool()).await?;
+    )
+    .bind(branch_id)
+    .bind(&embedding_str)
+    .bind(req.threshold)
+    .bind(req.limit)
+    .fetch_all(store.pool())
+    .await?;
 
-    Ok(Json(rows.iter().map(|r| SimilarityResult {
-        feature_id: r.get("id"), score: r.get("score"),
-    }).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| SimilarityResult {
+                feature_id: r.get("id"),
+                score: r.get("score"),
+            })
+            .collect(),
+    ))
 }
 
 /// Find potential duplicate features based on embedding similarity.
@@ -74,7 +98,9 @@ struct DuplicateQuery {
     threshold: f64,
     limit: Option<i64>,
 }
-fn dup_threshold() -> f64 { 0.95 }
+fn dup_threshold() -> f64 {
+    0.95
+}
 
 #[derive(Serialize)]
 struct DuplicatePair {
@@ -103,13 +129,22 @@ async fn find_duplicates(
         WHERE 1 - (a.embedding <=> b.embedding) > $2
         ORDER BY similarity DESC
         LIMIT $3",
-    ).bind(branch_id).bind(q.threshold).bind(q.limit.unwrap_or(100))
-    .fetch_all(store.pool()).await?;
+    )
+    .bind(branch_id)
+    .bind(q.threshold)
+    .bind(q.limit.unwrap_or(100))
+    .fetch_all(store.pool())
+    .await?;
 
-    Ok(Json(rows.iter().map(|r| DuplicatePair {
-        feature_a: r.get("a_id"), feature_b: r.get("b_id"),
-        similarity: r.get("similarity"),
-    }).collect()))
+    Ok(Json(
+        rows.iter()
+            .map(|r| DuplicatePair {
+                feature_a: r.get("a_id"),
+                feature_b: r.get("b_id"),
+                similarity: r.get("similarity"),
+            })
+            .collect(),
+    ))
 }
 
 /// Generate embeddings for features based on their properties (simplified).
@@ -126,12 +161,18 @@ async fn generate_embeddings(
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<serde_json::Value>, VectorError> {
     // Generate deterministic property-based embeddings using pgcrypto
-    let fields_expr = req.fields.iter()
+    let fields_expr = req
+        .fields
+        .iter()
         .map(|f| format!("COALESCE(fv.properties->>'{}', '')", f.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(" || ' ' || ");
 
-    let props_expr = if fields_expr.is_empty() { "fv.properties::text".to_string() } else { fields_expr };
+    let props_expr = if fields_expr.is_empty() {
+        "fv.properties::text".to_string()
+    } else {
+        fields_expr
+    };
 
     let query = format!(
         "UPDATE feature_versions fv
@@ -149,8 +190,13 @@ async fn generate_embeddings(
         props = props_expr,
     );
 
-    let result = sqlx::query(&query).bind(branch_id).execute(store.pool()).await?;
-    Ok(Json(serde_json::json!({"embedded": result.rows_affected(), "dimensions": 256})))
+    let result = sqlx::query(&query)
+        .bind(branch_id)
+        .execute(store.pool())
+        .await?;
+    Ok(Json(
+        serde_json::json!({"embedded": result.rows_affected(), "dimensions": 256}),
+    ))
 }
 
 /// Cluster features by embedding similarity using k-means (via pgvector).
@@ -159,7 +205,9 @@ struct ClusterRequest {
     #[serde(default = "default_clusters")]
     num_clusters: i32,
 }
-fn default_clusters() -> i32 { 5 }
+fn default_clusters() -> i32 {
+    5
+}
 
 async fn cluster_by_embedding(
     State(store): State<AppState>,
@@ -187,21 +235,38 @@ async fn cluster_by_embedding(
     ).bind(branch_id).bind(req.num_clusters)
     .fetch_all(store.pool()).await?;
 
-    let clusters: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "cluster": r.get::<i64, _>("kmeans_cluster"),
-        "count": r.get::<i64, _>("count"),
-        "feature_ids": r.get::<Vec<Uuid>, _>("feature_ids"),
-    })).collect();
+    let clusters: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "cluster": r.get::<i64, _>("kmeans_cluster"),
+                "count": r.get::<i64, _>("count"),
+                "feature_ids": r.get::<Vec<Uuid>, _>("feature_ids"),
+            })
+        })
+        .collect();
 
-    Ok(Json(serde_json::json!({"clusters": clusters, "num_clusters": req.num_clusters})))
+    Ok(Json(
+        serde_json::json!({"clusters": clusters, "num_clusters": req.num_clusters}),
+    ))
 }
 
-enum VectorError { Db(sqlx::Error) }
-impl From<sqlx::Error> for VectorError { fn from(e: sqlx::Error) -> Self { VectorError::Db(e) } }
+enum VectorError {
+    Db(sqlx::Error),
+}
+impl From<sqlx::Error> for VectorError {
+    fn from(e: sqlx::Error) -> Self {
+        VectorError::Db(e)
+    }
+}
 impl IntoResponse for VectorError {
     fn into_response(self) -> axum::response::Response {
         let VectorError::Db(e) = self;
         tracing::error!("DB: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "internal error"}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal error"})),
+        )
+            .into_response()
     }
 }

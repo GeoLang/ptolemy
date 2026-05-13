@@ -325,7 +325,10 @@ impl IntoResponse for AnalyticsError {
             AnalyticsError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AnalyticsError::Store(e) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

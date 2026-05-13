@@ -13,8 +13,8 @@ use axum::{
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 /// Rate limiter configuration.
 #[derive(Clone)]
@@ -71,10 +71,7 @@ impl RateLimiter {
 }
 
 /// Axum middleware that enforces rate limits.
-pub async fn rate_limit_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
     // Extract IP from connection info or X-Forwarded-For
     let ip = request
         .headers()
@@ -85,20 +82,17 @@ pub async fn rate_limit_middleware(
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
 
     // Get rate limiter from extensions
-    let limiter = request
-        .extensions()
-        .get::<RateLimiter>()
-        .cloned();
+    let limiter = request.extensions().get::<RateLimiter>().cloned();
 
-    if let Some(limiter) = limiter {
-        if !limiter.check(ip).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("Retry-After", "60")],
-                "rate limit exceeded",
-            )
-                .into_response();
-        }
+    if let Some(limiter) = limiter
+        && !limiter.check(ip).await
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", "60")],
+            "rate limit exceeded",
+        )
+            .into_response();
     }
 
     next.run(request).await

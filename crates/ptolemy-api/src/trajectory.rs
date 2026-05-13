@@ -19,13 +19,19 @@ use crate::AppState;
 
 pub fn trajectory_routes() -> Router<AppState> {
     Router::new()
-        .route("/datasets/{id}/trajectories", get(list_trajectories).post(create_trajectory))
+        .route(
+            "/datasets/{id}/trajectories",
+            get(list_trajectories).post(create_trajectory),
+        )
         .route("/trajectories/{id}", get(get_trajectory))
         .route("/trajectories/{id}/at", get(position_at_time))
         .route("/trajectories/{id}/speed", get(trajectory_speed))
         .route("/trajectories/{id}/distance", get(trajectory_distance))
         .route("/trajectories/{id}/simplify", post(simplify_trajectory))
-        .route("/datasets/{id}/trajectories/nearest", post(nearest_approach))
+        .route(
+            "/datasets/{id}/trajectories/nearest",
+            post(nearest_approach),
+        )
 }
 
 #[derive(Serialize)]
@@ -46,11 +52,21 @@ async fn list_trajectories(
                 lower(period)::text as start_time,
                 upper(period)::text as end_time
          FROM trajectories WHERE dataset_id = $1 ORDER BY period",
-    ).bind(dataset_id).fetch_all(store.pool()).await?;
-    Ok(Json(rows.into_iter().map(|r| Trajectory {
-        id: r.get("id"), name: r.get("name"), feature_id: r.get("feature_id"),
-        start_time: r.get("start_time"), end_time: r.get("end_time"),
-    }).collect()))
+    )
+    .bind(dataset_id)
+    .fetch_all(store.pool())
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| Trajectory {
+                id: r.get("id"),
+                name: r.get("name"),
+                feature_id: r.get("feature_id"),
+                start_time: r.get("start_time"),
+                end_time: r.get("end_time"),
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -76,7 +92,9 @@ async fn create_trajectory(
     let id = Uuid::now_v7();
 
     // Build MobilityDB tgeompoint from points
-    let instants: Vec<String> = req.points.iter()
+    let instants: Vec<String> = req
+        .points
+        .iter()
         .map(|p| format!("POINT({} {})@{}", p.lng, p.lat, p.timestamp))
         .collect();
     let tgeompoint_str = format!("[{}]", instants.join(", "));
@@ -84,8 +102,14 @@ async fn create_trajectory(
     sqlx::query(
         "INSERT INTO trajectories (id, dataset_id, feature_id, name, trip, period)
          VALUES ($1, $2, $3, $4, $5::tgeompoint, period($5::tgeompoint))",
-    ).bind(id).bind(dataset_id).bind(req.feature_id).bind(&req.name).bind(&tgeompoint_str)
-    .execute(store.pool()).await?;
+    )
+    .bind(id)
+    .bind(dataset_id)
+    .bind(req.feature_id)
+    .bind(&req.name)
+    .bind(&tgeompoint_str)
+    .execute(store.pool())
+    .await?;
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
@@ -101,7 +125,11 @@ async fn get_trajectory(
                 ST_AsGeoJSON(trajectory(trip))::jsonb as path_geojson,
                 numInstants(trip) as num_points
          FROM trajectories WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "id": r.get::<Uuid, _>("id"),
@@ -128,8 +156,12 @@ async fn position_at_time(
     let r = sqlx::query(
         "SELECT ST_AsGeoJSON(valueAtTimestamp(trip, $2::timestamptz))::jsonb as position
          FROM trajectories WHERE id = $1",
-    ).bind(id).bind(&q.timestamp)
-    .fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(id)
+    .bind(&q.timestamp)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "timestamp": q.timestamp,
@@ -147,7 +179,11 @@ async fn trajectory_speed(
                 maxValue(speed(trip)) as max_speed,
                 length(trip)::float as total_distance
          FROM trajectories WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "avg_speed": r.get::<Option<f64>, _>("avg_speed"),
@@ -165,7 +201,11 @@ async fn trajectory_distance(
         "SELECT length(trip)::float as distance,
                 duration(period)::text as duration
          FROM trajectories WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(id)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "distance_meters": r.get::<Option<f64>, _>("distance"),
@@ -179,7 +219,9 @@ struct SimplifyRequest {
     #[serde(default = "default_tolerance")]
     tolerance: f64,
 }
-fn default_tolerance() -> f64 { 0.0001 }
+fn default_tolerance() -> f64 {
+    0.0001
+}
 
 async fn simplify_trajectory(
     State(store): State<AppState>,
@@ -190,8 +232,12 @@ async fn simplify_trajectory(
         "SELECT numInstants(trip) as before_count,
                 numInstants(simplify(trip, $2)) as after_count
          FROM trajectories WHERE id = $1",
-    ).bind(id).bind(req.tolerance)
-    .fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(id)
+    .bind(req.tolerance)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "points_before": r.get::<Option<i32>, _>("before_count"),
@@ -217,8 +263,12 @@ async fn nearest_approach(
                 nearestApproachInstant(a.trip, b.trip)::text as instant
          FROM trajectories a, trajectories b
          WHERE a.id = $1 AND b.id = $2",
-    ).bind(req.trajectory_a).bind(req.trajectory_b)
-    .fetch_optional(store.pool()).await?.ok_or(TrajError::NotFound)?;
+    )
+    .bind(req.trajectory_a)
+    .bind(req.trajectory_b)
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "distance": r.get::<Option<f64>, _>("distance"),
@@ -226,13 +276,23 @@ async fn nearest_approach(
     })))
 }
 
-enum TrajError { Db(sqlx::Error), NotFound }
-impl From<sqlx::Error> for TrajError { fn from(e: sqlx::Error) -> Self { TrajError::Db(e) } }
+enum TrajError {
+    Db(sqlx::Error),
+    NotFound,
+}
+impl From<sqlx::Error> for TrajError {
+    fn from(e: sqlx::Error) -> Self {
+        TrajError::Db(e)
+    }
+}
 impl IntoResponse for TrajError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             TrajError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
-            TrajError::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            TrajError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

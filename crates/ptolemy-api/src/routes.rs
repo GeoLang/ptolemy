@@ -25,13 +25,19 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/datasets", get(list_datasets).post(create_dataset))
         .route("/datasets/{id}", get(get_dataset))
         // Branches
-        .route("/datasets/{dataset_id}/branches", get(list_branches).post(create_branch))
+        .route(
+            "/datasets/{dataset_id}/branches",
+            get(list_branches).post(create_branch),
+        )
         .route("/branches/{id}", get(get_branch))
         .route("/branches/{id}/history", get(get_branch_history))
         .route("/branches/{id}/features", get(list_features))
         // Spatial queries
         .route("/branches/{id}/features/bbox", get(features_bbox))
-        .route("/branches/{id}/features/intersects", post(features_intersects))
+        .route(
+            "/branches/{id}/features/intersects",
+            post(features_intersects),
+        )
         .route("/branches/{id}/features/within", post(features_within))
         .route("/branches/{id}/features/count", get(features_count))
         // MVT tiles
@@ -40,7 +46,10 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/branches/{id}/commit", post(commit))
         .route("/branches/{id}/batch", post(batch_commit))
         // Merge
-        .route("/branches/{target_id}/merge/{source_id}", post(merge_branches))
+        .route(
+            "/branches/{target_id}/merge/{source_id}",
+            post(merge_branches),
+        )
         // Diff
         .route("/diff/{from_id}/{to_id}", get(diff_changesets))
 }
@@ -177,7 +186,7 @@ async fn list_features(
     Path(id): Path<Uuid>,
     Query(params): Query<FeatureListParams>,
 ) -> Result<Json<FeaturePage>, AppError> {
-    let limit = params.limit.min(10000).max(1);
+    let limit = params.limit.clamp(1, 10000);
     let features = store
         .list_features_paginated(id, params.cursor, limit)
         .await?;
@@ -215,9 +224,16 @@ async fn features_bbox(
     Path(branch_id): Path<Uuid>,
     Query(params): Query<BboxParams>,
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
-    let limit = params.limit.min(10000).max(1);
+    let limit = params.limit.clamp(1, 10000);
     let features = store
-        .features_in_bbox(branch_id, params.min_x, params.min_y, params.max_x, params.max_y, limit)
+        .features_in_bbox(
+            branch_id,
+            params.min_x,
+            params.min_y,
+            params.max_x,
+            params.max_y,
+            limit,
+        )
         .await?;
     Ok(Json(features))
 }
@@ -237,7 +253,7 @@ async fn features_intersects(
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
     let geojson_str = serde_json::to_string(&req.geometry)
         .map_err(|e| AppError::BadRequest(format!("invalid geometry: {e}")))?;
-    let limit = req.limit.min(10000).max(1);
+    let limit = req.limit.clamp(1, 10000);
     let features = store
         .features_intersecting(branch_id, &geojson_str, limit)
         .await?;
@@ -251,7 +267,7 @@ async fn features_within(
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
     let geojson_str = serde_json::to_string(&req.geometry)
         .map_err(|e| AppError::BadRequest(format!("invalid geometry: {e}")))?;
-    let limit = req.limit.min(10000).max(1);
+    let limit = req.limit.clamp(1, 10000);
     let features = store
         .features_within(branch_id, &geojson_str, limit)
         .await?;
@@ -336,7 +352,9 @@ async fn batch_commit(
 
     let ops = ops?;
     let op_count = ops.len();
-    let changeset = store.commit(branch_id, &req.message, &req.author, &ops).await?;
+    let changeset = store
+        .commit(branch_id, &req.message, &req.author, &ops)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(BatchCommitResponse {
@@ -440,7 +458,9 @@ async fn commit(
         )));
     }
 
-    let changeset = store.commit(branch_id, &req.message, &req.author, &ops).await?;
+    let changeset = store
+        .commit(branch_id, &req.message, &req.author, &ops)
+        .await?;
     Ok((StatusCode::CREATED, Json(changeset)))
 }
 
@@ -521,7 +541,10 @@ impl IntoResponse for AppError {
             }
             AppError::Store(ptolemy_storage::StoreError::Db(e)) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };

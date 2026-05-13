@@ -6,12 +6,12 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -33,11 +33,14 @@ struct Cql2FilterRequest {
     /// CQL2-JSON filter object
     filter: serde_json::Value,
     #[serde(default = "default_filter_lang")]
+    #[allow(dead_code)]
     filter_lang: String,
     limit: Option<i64>,
     offset: Option<i64>,
 }
-fn default_filter_lang() -> String { "cql2-json".into() }
+fn default_filter_lang() -> String {
+    "cql2-json".into()
+}
 
 async fn cql2_filter(
     State(store): State<AppState>,
@@ -58,15 +61,23 @@ async fn cql2_filter(
     );
 
     let rows = sqlx::query(&query)
-        .bind(branch_id).bind(limit).bind(offset)
-        .fetch_all(store.pool()).await?;
+        .bind(branch_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(store.pool())
+        .await?;
 
-    let features: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
-        "type": "Feature",
-        "id": r.get::<Uuid, _>("id"),
-        "geometry": r.get::<Option<serde_json::Value>, _>("geojson"),
-        "properties": r.get::<serde_json::Value, _>("properties"),
-    })).collect();
+    let features: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": "Feature",
+                "id": r.get::<Uuid, _>("id"),
+                "geometry": r.get::<Option<serde_json::Value>, _>("geojson"),
+                "properties": r.get::<serde_json::Value, _>("properties"),
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "type": "FeatureCollection",
@@ -80,34 +91,44 @@ async fn cql2_filter(
 fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
     match filter.get("op").and_then(|v| v.as_str()) {
         Some("and") => {
-            let args = filter.get("args").and_then(|a| a.as_array())
+            let args = filter
+                .get("args")
+                .and_then(|a| a.as_array())
                 .ok_or(Cql2Error::Bad("'and' requires 'args' array".into()))?;
             let clauses: Result<Vec<String>, _> = args.iter().map(cql2_to_sql).collect();
             Ok(format!("({})", clauses?.join(" AND ")))
         }
         Some("or") => {
-            let args = filter.get("args").and_then(|a| a.as_array())
+            let args = filter
+                .get("args")
+                .and_then(|a| a.as_array())
                 .ok_or(Cql2Error::Bad("'or' requires 'args' array".into()))?;
             let clauses: Result<Vec<String>, _> = args.iter().map(cql2_to_sql).collect();
             Ok(format!("({})", clauses?.join(" OR ")))
         }
         Some("not") => {
-            let args = filter.get("args").and_then(|a| a.as_array())
+            let args = filter
+                .get("args")
+                .and_then(|a| a.as_array())
                 .ok_or(Cql2Error::Bad("'not' requires 'args' array".into()))?;
             let inner = cql2_to_sql(&args[0])?;
             Ok(format!("NOT ({})", inner))
         }
-        Some(op @ ("=" | "eq")) => binary_op(filter, "="),
-        Some(op @ ("<" | "lt")) => binary_op(filter, "<"),
-        Some(op @ (">" | "gt")) => binary_op(filter, ">"),
-        Some(op @ ("<=" | "lte")) => binary_op(filter, "<="),
-        Some(op @ (">=" | "gte")) => binary_op(filter, ">="),
-        Some(op @ ("!=" | "neq")) => binary_op(filter, "!="),
+        Some("=" | "eq") => binary_op(filter, "="),
+        Some("<" | "lt") => binary_op(filter, "<"),
+        Some(">" | "gt") => binary_op(filter, ">"),
+        Some("<=" | "lte") => binary_op(filter, "<="),
+        Some(">=" | "gte") => binary_op(filter, ">="),
+        Some("!=" | "neq") => binary_op(filter, "!="),
         Some("like") => {
             let args = get_args(filter)?;
             let prop = extract_property(&args[0])?;
             let pattern = extract_literal(&args[1])?;
-            Ok(format!("properties->>'{}' LIKE {}", sanitize_field(&prop), sanitize_value(&pattern)))
+            Ok(format!(
+                "properties->>'{}' LIKE {}",
+                sanitize_field(&prop),
+                sanitize_value(&pattern)
+            ))
         }
         Some("between") => {
             let args = get_args(filter)?;
@@ -116,23 +137,32 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
             let high = extract_literal(&args[2])?;
             Ok(format!(
                 "(properties->>'{prop}')::float BETWEEN {low} AND {high}",
-                prop = sanitize_field(&prop), low = sanitize_value(&low), high = sanitize_value(&high)
+                prop = sanitize_field(&prop),
+                low = sanitize_value(&low),
+                high = sanitize_value(&high)
             ))
         }
         Some("in") => {
             let args = get_args(filter)?;
             let prop = extract_property(&args[0])?;
-            let values: Vec<String> = args[1..].iter()
+            let values: Vec<String> = args[1..]
+                .iter()
                 .map(|v| extract_literal(v).map(|s| sanitize_value(&s)))
                 .collect::<Result<_, _>>()?;
-            Ok(format!("properties->>'{}' IN ({})", sanitize_field(&prop), values.join(", ")))
+            Ok(format!(
+                "properties->>'{}' IN ({})",
+                sanitize_field(&prop),
+                values.join(", ")
+            ))
         }
         Some("s_intersects") => {
             let args = get_args(filter)?;
             let geom = &args[1];
             Ok(format!(
                 "ST_Intersects(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom).unwrap_or_default().replace('\'', "''")
+                serde_json::to_string(geom)
+                    .unwrap_or_default()
+                    .replace('\'', "''")
             ))
         }
         Some("s_within") => {
@@ -140,7 +170,9 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
             let geom = &args[1];
             Ok(format!(
                 "ST_Within(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom).unwrap_or_default().replace('\'', "''")
+                serde_json::to_string(geom)
+                    .unwrap_or_default()
+                    .replace('\'', "''")
             ))
         }
         Some("s_contains") => {
@@ -148,7 +180,9 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
             let geom = &args[1];
             Ok(format!(
                 "ST_Contains(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom).unwrap_or_default().replace('\'', "''")
+                serde_json::to_string(geom)
+                    .unwrap_or_default()
+                    .replace('\'', "''")
             ))
         }
         Some("isNull") => {
@@ -156,7 +190,9 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
             let prop = extract_property(&args[0])?;
             Ok(format!("properties->>'{}' IS NULL", sanitize_field(&prop)))
         }
-        Some(unknown) => Err(Cql2Error::Bad(format!("unsupported CQL2 operator: {unknown}"))),
+        Some(unknown) => Err(Cql2Error::Bad(format!(
+            "unsupported CQL2 operator: {unknown}"
+        ))),
         None => {
             // Might be a simple equality shorthand: {"property": "value"}
             Err(Cql2Error::Bad("filter must have an 'op' field".into()))
@@ -165,7 +201,10 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
 }
 
 fn get_args(filter: &serde_json::Value) -> Result<Vec<serde_json::Value>, Cql2Error> {
-    filter.get("args").and_then(|a| a.as_array()).cloned()
+    filter
+        .get("args")
+        .and_then(|a| a.as_array())
+        .cloned()
         .ok_or(Cql2Error::Bad("missing 'args' array".into()))
 }
 
@@ -173,8 +212,12 @@ fn binary_op(filter: &serde_json::Value, sql_op: &str) -> Result<String, Cql2Err
     let args = get_args(filter)?;
     let prop = extract_property(&args[0])?;
     let val = extract_literal(&args[1])?;
-    Ok(format!("(properties->>'{prop}') {sql_op} {val}",
-        prop = sanitize_field(&prop), sql_op = sql_op, val = sanitize_value(&val)))
+    Ok(format!(
+        "(properties->>'{prop}') {sql_op} {val}",
+        prop = sanitize_field(&prop),
+        sql_op = sql_op,
+        val = sanitize_value(&val)
+    ))
 }
 
 fn extract_property(v: &serde_json::Value) -> Result<String, Cql2Error> {
@@ -198,7 +241,9 @@ fn extract_literal(v: &serde_json::Value) -> Result<String, Cql2Error> {
 
 /// Sanitize field names (prevent SQL injection in property names).
 fn sanitize_field(name: &str) -> String {
-    name.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect()
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect()
 }
 
 /// Sanitize literal values.
@@ -265,6 +310,7 @@ async fn tile_matrix_set(Path(tms): Path<String>) -> Result<Json<serde_json::Val
 
 /// Serve an OGC vector tile (MVT format).
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct TileParams {
     id: Uuid,
     tms: String,
@@ -290,8 +336,13 @@ async fn ogc_tile(
             WHERE b.dataset_id = $1
               AND ST_Intersects(f.geometry, ST_TileEnvelope($2, $3, $4))
          ) tile",
-    ).bind(dataset_id).bind(z).bind(x).bind(y)
-    .fetch_one(store.pool()).await?;
+    )
+    .bind(dataset_id)
+    .bind(z)
+    .bind(x)
+    .bind(y)
+    .fetch_one(store.pool())
+    .await?;
 
     let mvt: Vec<u8> = row.get("mvt");
     Ok((
@@ -301,16 +352,27 @@ async fn ogc_tile(
             ("cache-control", "public, max-age=3600"),
         ],
         mvt,
-    ).into_response())
+    )
+        .into_response())
 }
 
-enum Cql2Error { Db(sqlx::Error), Bad(String) }
-impl From<sqlx::Error> for Cql2Error { fn from(e: sqlx::Error) -> Self { Cql2Error::Db(e) } }
+enum Cql2Error {
+    Db(sqlx::Error),
+    Bad(String),
+}
+impl From<sqlx::Error> for Cql2Error {
+    fn from(e: sqlx::Error) -> Self {
+        Cql2Error::Db(e)
+    }
+}
 impl IntoResponse for Cql2Error {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             Cql2Error::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
-            Cql2Error::Db(e) => { tracing::error!("DB: {e}"); (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()) }
+            Cql2Error::Db(e) => {
+                tracing::error!("DB: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

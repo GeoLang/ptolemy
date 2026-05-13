@@ -52,7 +52,8 @@ struct Link {
 async fn landing() -> Json<LandingPage> {
     Json(LandingPage {
         title: "Ptolemy OGC API".into(),
-        description: "OGC API - Features compliant interface to Ptolemy versioned GIS database".into(),
+        description: "OGC API - Features compliant interface to Ptolemy versioned GIS database"
+            .into(),
         links: vec![
             Link {
                 href: "/api/v1/ogc".into(),
@@ -106,9 +107,7 @@ struct Collections {
     collections: Vec<Collection>,
 }
 
-async fn collections(
-    State(store): State<AppState>,
-) -> Result<Json<Collections>, OgcError> {
+async fn collections(State(store): State<AppState>) -> Result<Json<Collections>, OgcError> {
     let rows = sqlx::query("SELECT id, name FROM datasets ORDER BY name")
         .fetch_all(store.pool())
         .await?;
@@ -197,13 +196,12 @@ async fn items(
     let branch_id = if let Some(b) = q.branch {
         b
     } else {
-        let row = sqlx::query(
-            "SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1",
-        )
-        .bind(dataset_id)
-        .fetch_optional(store.pool())
-        .await?
-        .ok_or_else(|| OgcError::NotFound("no main branch".into()))?;
+        let row =
+            sqlx::query("SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1")
+                .bind(dataset_id)
+                .fetch_optional(store.pool())
+                .await?
+                .ok_or_else(|| OgcError::NotFound("no main branch".into()))?;
         row.get("id")
     };
 
@@ -369,14 +367,20 @@ impl IntoResponse for OgcError {
             OgcError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             OgcError::Store(e) => {
                 tracing::error!("Database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
             OgcError::StoreErr(ptolemy_storage::StoreError::NotFound(msg)) => {
                 (StatusCode::NOT_FOUND, msg)
             }
             OgcError::StoreErr(e) => {
                 tracing::error!("Store error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
             }
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
