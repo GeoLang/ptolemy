@@ -13,6 +13,7 @@ pub mod cql2;
 pub mod delivery;
 pub mod domains;
 pub mod formats;
+pub mod geoprocessing;
 pub mod grpc;
 pub mod h3;
 pub mod jobs;
@@ -87,6 +88,7 @@ pub fn app(state: AppState) -> Router {
         .nest("/api/v1", quality::quality_routes())
         .nest("/api/v1", webhook::webhook_routes())
         .nest("/api/v1", analytics::analytics_routes())
+        .nest("/api/v1", geoprocessing::geoprocessing_routes())
         .nest("/api/v1", ogc::ogc_routes())
         .nest("/api/v1", locks::lock_routes())
         .nest("/api/v1", catalog::catalog_routes())
