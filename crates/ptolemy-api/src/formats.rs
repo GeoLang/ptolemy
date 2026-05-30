@@ -23,6 +23,8 @@ pub fn format_routes() -> Router<AppState> {
         .route("/branches/{id}/export/geojson", get(export_geojson))
         .route("/branches/{id}/export/csv", get(export_csv))
         .route("/branches/{id}/export/flatgeobuf", get(export_flatgeobuf))
+        .route("/branches/{id}/import/geojson", post(import_geojson))
+        .route("/branches/{id}/import/csv", post(import_csv))
         .route("/branches/{id}/transform", post(transform_crs))
         .route("/branches/{id}/reproject", post(reproject_features))
         .route("/crs/search", get(search_crs))
@@ -191,6 +193,295 @@ async fn export_flatgeobuf(
         .header("x-feature-count", features.len().to_string())
         .body(axum::body::Body::from(body))
         .unwrap())
+}
+
+// ─── Import: GeoJSON ────────────────────────────────────────────────
+
+fn default_import_message() -> String {
+    "GeoJSON import".to_string()
+}
+
+fn default_author() -> String {
+    "import".to_string()
+}
+
+#[derive(serde::Serialize)]
+struct ImportResult {
+    imported: usize,
+    skipped: usize,
+    changeset_id: Option<Uuid>,
+    errors: Vec<String>,
+}
+
+async fn import_geojson(
+    State(store): State<AppState>,
+    Path(branch_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ImportResult>, FormatError> {
+    let features = body
+        .get("features")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| {
+            FormatError::Bad("expected GeoJSON FeatureCollection with 'features' array".into())
+        })?;
+
+    let message = body
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("GeoJSON import");
+    let author = body
+        .get("author")
+        .and_then(|a| a.as_str())
+        .unwrap_or("import");
+
+    if features.len() > 50_000 {
+        return Err(FormatError::Bad(
+            "maximum 50,000 features per import".into(),
+        ));
+    }
+
+    // Create changeset
+    let changeset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
+         SELECT $1, $2, head, $3, $4, NOW()
+         FROM branches WHERE id = $2",
+    )
+    .bind(changeset_id)
+    .bind(branch_id)
+    .bind(message)
+    .bind(author)
+    .execute(store.pool())
+    .await?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = Vec::new();
+
+    for (i, feature) in features.iter().enumerate() {
+        let geometry = feature.get("geometry");
+        let properties = feature
+            .get("properties")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        let geom_json = match geometry {
+            Some(g) if !g.is_null() => serde_json::to_string(g).unwrap_or_default(),
+            _ => {
+                skipped += 1;
+                errors.push(format!("feature {i}: no geometry"));
+                continue;
+            }
+        };
+
+        let feature_id = Uuid::now_v7();
+        let result = sqlx::query(
+            "INSERT INTO feature_versions (id, feature_id, changeset_id, operation, geometry, properties, created_at)
+             VALUES ($1, $2, $3, 'insert', ST_SetSRID(ST_GeomFromGeoJSON($4), 4326), $5, NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(feature_id)
+        .bind(changeset_id)
+        .bind(&geom_json)
+        .bind(&properties)
+        .execute(store.pool())
+        .await;
+
+        match result {
+            Ok(_) => imported += 1,
+            Err(e) => {
+                skipped += 1;
+                errors.push(format!("feature {i}: {e}"));
+            }
+        }
+    }
+
+    // Update branch head
+    sqlx::query("UPDATE branches SET head = $1 WHERE id = $2")
+        .bind(changeset_id)
+        .bind(branch_id)
+        .execute(store.pool())
+        .await?;
+
+    Ok(Json(ImportResult {
+        imported,
+        skipped,
+        changeset_id: Some(changeset_id),
+        errors,
+    }))
+}
+
+// ─── Import: CSV ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ImportCsvRequest {
+    /// CSV content as a string.
+    csv: String,
+    /// Column name for longitude (default: "longitude" or "lng" or "lon" or "x").
+    lng_column: Option<String>,
+    /// Column name for latitude (default: "latitude" or "lat" or "y").
+    lat_column: Option<String>,
+    /// Changeset message.
+    #[serde(default = "default_import_message")]
+    message: String,
+    /// Author.
+    #[serde(default = "default_author")]
+    author: String,
+}
+
+async fn import_csv(
+    State(store): State<AppState>,
+    Path(branch_id): Path<Uuid>,
+    Json(req): Json<ImportCsvRequest>,
+) -> Result<Json<ImportResult>, FormatError> {
+    let lines: Vec<&str> = req.csv.lines().collect();
+    if lines.is_empty() {
+        return Err(FormatError::Bad("empty CSV".into()));
+    }
+
+    let headers: Vec<&str> = lines[0]
+        .split(',')
+        .map(|h| h.trim().trim_matches('"'))
+        .collect();
+
+    // Find lng/lat columns
+    let lng_col = req.lng_column.as_deref().unwrap_or("");
+    let lat_col = req.lat_column.as_deref().unwrap_or("");
+
+    let lng_idx = headers.iter().position(|h| {
+        let h_lower = h.to_lowercase();
+        if !lng_col.is_empty() {
+            h_lower == lng_col.to_lowercase()
+        } else {
+            matches!(h_lower.as_str(), "longitude" | "lng" | "lon" | "x")
+        }
+    });
+    let lat_idx = headers.iter().position(|h| {
+        let h_lower = h.to_lowercase();
+        if !lat_col.is_empty() {
+            h_lower == lat_col.to_lowercase()
+        } else {
+            matches!(h_lower.as_str(), "latitude" | "lat" | "y")
+        }
+    });
+
+    let (lng_idx, lat_idx) = match (lng_idx, lat_idx) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            return Err(FormatError::Bad(
+                "could not find longitude/latitude columns; specify lng_column and lat_column"
+                    .into(),
+            ));
+        }
+    };
+
+    if lines.len() > 50_001 {
+        return Err(FormatError::Bad("maximum 50,000 rows per import".into()));
+    }
+
+    // Create changeset
+    let changeset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
+         SELECT $1, $2, head, $3, $4, NOW()
+         FROM branches WHERE id = $2",
+    )
+    .bind(changeset_id)
+    .bind(branch_id)
+    .bind(&req.message)
+    .bind(&req.author)
+    .execute(store.pool())
+    .await?;
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = Vec::new();
+
+    for (row_num, line) in lines.iter().enumerate().skip(1) {
+        let cols: Vec<&str> = line
+            .split(',')
+            .map(|c| c.trim().trim_matches('"'))
+            .collect();
+        if cols.len() <= lng_idx.max(lat_idx) {
+            skipped += 1;
+            errors.push(format!("row {row_num}: not enough columns"));
+            continue;
+        }
+
+        let lng: f64 = match cols[lng_idx].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                errors.push(format!("row {row_num}: invalid longitude"));
+                continue;
+            }
+        };
+        let lat: f64 = match cols[lat_idx].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                errors.push(format!("row {row_num}: invalid latitude"));
+                continue;
+            }
+        };
+
+        // Build properties from all other columns
+        let mut props = serde_json::Map::new();
+        for (i, header) in headers.iter().enumerate() {
+            if i != lng_idx
+                && i != lat_idx
+                && let Some(&val) = cols.get(i)
+            {
+                props.insert(
+                    header.to_string(),
+                    if let Ok(n) = val.parse::<f64>() {
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(n)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        )
+                    } else {
+                        serde_json::Value::String(val.to_string())
+                    },
+                );
+            }
+        }
+
+        let feature_id = Uuid::now_v7();
+        let result = sqlx::query(
+            "INSERT INTO feature_versions (id, feature_id, changeset_id, operation, geometry, properties, created_at)
+             VALUES ($1, $2, $3, 'insert', ST_SetSRID(ST_MakePoint($4, $5), 4326), $6, NOW())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(feature_id)
+        .bind(changeset_id)
+        .bind(lng)
+        .bind(lat)
+        .bind(serde_json::Value::Object(props))
+        .execute(store.pool())
+        .await;
+
+        match result {
+            Ok(_) => imported += 1,
+            Err(e) => {
+                skipped += 1;
+                errors.push(format!("row {row_num}: {e}"));
+            }
+        }
+    }
+
+    // Update branch head
+    sqlx::query("UPDATE branches SET head = $1 WHERE id = $2")
+        .bind(changeset_id)
+        .bind(branch_id)
+        .execute(store.pool())
+        .await?;
+
+    Ok(Json(ImportResult {
+        imported,
+        skipped,
+        changeset_id: Some(changeset_id),
+        errors,
+    }))
 }
 
 // ─── CRS Transform ─────────────────────────────────────────────────
