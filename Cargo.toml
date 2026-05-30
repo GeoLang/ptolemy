@@ -12,6 +12,8 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/TileTopia-HQ/ptolemy"
+authors = ["TileTopia <tiletopia@proton.me>"]
+description = "Tile server for vector and raster map tiles"
 rust-version = "1.88"
 
 [workspace.dependencies]
