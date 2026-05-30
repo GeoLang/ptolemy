@@ -35,7 +35,7 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 geo-types = "0.7"
 geozero = { version = "0.14", features = ["with-wkb", "with-geojson"] }
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 tower = { version = "0.5", features = ["limit", "buffer"] }
 jsonwebtoken = "9"
