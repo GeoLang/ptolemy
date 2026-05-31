@@ -1,5 +1,8 @@
 # Ptolemy
 
+[![CI](https://github.com/GeoLang/ptolemy/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/ptolemy/actions)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+
 **Open-source enterprise geodatabase & collaboration platform.**
 
 Ptolemy provides versioned spatial data management — branch, commit, diff, and merge geographic datasets with git-like workflows. Built on PostGIS, designed for teams.
