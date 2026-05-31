@@ -2756,6 +2756,7 @@ dependencies = [
  "ptolemy-storage",
  "rusqlite",
  "serde_json",
+ "sha2",
  "shapefile",
  "sqlx",
  "time",

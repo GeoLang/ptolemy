@@ -371,6 +371,50 @@ client but any JSON structure will work.
 | GET | `/api/v1/crs/search?q=` | Search coordinate systems |
 | GET | `/api/v1/crs/{srid}` | Get CRS details |
 
+## CLI Commands
+
+### Data Import
+
+Import geospatial data from multiple formats (auto-detected by file extension):
+
+```bash
+# Import GeoJSON
+ptolemy import --dataset <id> --branch main --file data.geojson
+
+# Import Shapefile (reads .shp + .dbf)
+ptolemy import --dataset <id> --branch main --file parcels.shp
+
+# Import GeoPackage
+ptolemy import --dataset <id> --branch main --file terrain.gpkg
+```
+
+### API Keys
+
+Manage programmatic access keys (SHA-256 hashed, never stored in plaintext):
+
+```bash
+# Create a new key (shown only once!)
+ptolemy apikey create --name "CI Pipeline" --role editor
+
+# List active keys (shows prefix only)
+ptolemy apikey list
+
+# Revoke by prefix or full key
+ptolemy apikey revoke ptk_abc123
+```
+
+### Backup & Restore
+
+Database backup/restore using PostgreSQL native tools:
+
+```bash
+# Backup to a compressed dump
+ptolemy backup --output ptolemy_backup.dump
+
+# Restore from dump
+ptolemy restore --input ptolemy_backup.dump
+```
+
 ## Building
 
 ```bash

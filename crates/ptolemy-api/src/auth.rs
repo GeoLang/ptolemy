@@ -69,7 +69,8 @@ impl AuthConfig {
     }
 }
 
-/// Middleware that validates JWT tokens from the Authorization header.
+/// Middleware that validates JWT tokens or API keys from request headers.
+/// Checks Authorization: Bearer <jwt> first, then X-API-Key header.
 /// If auth is disabled (no PTOLEMY_JWT_SECRET), all requests pass through.
 pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let config = AuthConfig::from_env();
@@ -83,37 +84,56 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
 
+    // Try JWT Bearer token first
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    let Some(token) = token else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "missing authorization header"})),
-        )
-            .into_response();
-    };
+    if let Some(token) = token {
+        let key = DecodingKey::from_secret(config.secret.as_bytes());
+        let validation = Validation::default();
 
-    let key = DecodingKey::from_secret(config.secret.as_bytes());
-    let validation = Validation::default();
-
-    match decode::<Claims>(token, &key, &validation) {
-        Ok(data) => {
-            // Attach claims to request extensions for downstream handlers
-            let mut request = request;
-            request.extensions_mut().insert(data.claims);
-            next.run(request).await
-        }
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": format!("invalid token: {e}")})),
-        )
-            .into_response(),
+        return match decode::<Claims>(token, &key, &validation) {
+            Ok(data) => {
+                let mut request = request;
+                request.extensions_mut().insert(data.claims);
+                next.run(request).await
+            }
+            Err(e) => (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": format!("invalid token: {e}")})),
+            )
+                .into_response(),
+        };
     }
+
+    // Try API key (X-API-Key header)
+    let api_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(_api_key) = api_key {
+        // API key validation is done by the api_key_middleware (requires DB access).
+        // If we reach here, the key header is present — let it through to be validated
+        // by the stateful layer. Attach a marker so downstream knows to check.
+        let mut request = request;
+        request.extensions_mut().insert(ApiKeyPresent);
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "missing authorization header"})),
+    )
+        .into_response()
 }
+
+/// Marker type indicating an API key was presented (needs DB validation).
+#[derive(Clone)]
+pub struct ApiKeyPresent;
 
 /// Require write permission (admin or editor role).
 pub async fn require_write(request: Request, next: Next) -> Response {

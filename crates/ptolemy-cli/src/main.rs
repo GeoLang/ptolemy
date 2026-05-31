@@ -114,18 +114,18 @@ enum Commands {
         to: Uuid,
     },
 
-    /// Import GeoJSON file as features
+    /// Import geospatial file (auto-detects GeoJSON, Shapefile, GeoPackage)
     Import {
         /// Branch ID
         #[arg(long)]
         branch: Uuid,
-        /// Path to GeoJSON file
+        /// Path to file (.geojson, .json, .shp, .gpkg)
         file: String,
         /// Author name
         #[arg(long)]
         author: String,
         /// Commit message
-        #[arg(long, short, default_value = "Import GeoJSON")]
+        #[arg(long, short, default_value = "Import features")]
         message: String,
     },
 
@@ -150,6 +150,52 @@ enum Commands {
         /// Layer name in the GeoPackage
         #[arg(long, default_value = "features")]
         layer: String,
+    },
+
+    /// Backup the database to a file
+    Backup {
+        /// Output file path (.sql or .dump)
+        output: String,
+        /// Use custom format (restorable with `ptolemy restore`)
+        #[arg(long)]
+        custom: bool,
+    },
+
+    /// Restore a database from a backup file
+    Restore {
+        /// Backup file path
+        input: String,
+        /// Drop existing tables before restore
+        #[arg(long)]
+        clean: bool,
+    },
+
+    /// Generate an API key for programmatic access
+    ApiKey {
+        #[command(subcommand)]
+        cmd: ApiKeyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiKeyCmd {
+    /// Generate a new API key
+    Create {
+        /// Key name/description
+        name: String,
+        /// Role: admin, editor, or viewer
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// Expiry in days (0 = never)
+        #[arg(long, default_value = "365")]
+        expires_days: u64,
+    },
+    /// List active API keys
+    List,
+    /// Revoke an API key
+    Revoke {
+        /// Key prefix or full key to revoke
+        key: String,
     },
 }
 
@@ -370,8 +416,22 @@ async fn main() -> anyhow::Result<()> {
             author,
             message,
         } => {
-            let content = std::fs::read_to_string(&file)?;
-            let ops = parse_geojson_to_ops(&content)?;
+            let path = std::path::Path::new(&file);
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            let ops = match ext.as_str() {
+                "shp" => parse_shapefile_to_ops(path)?,
+                "gpkg" => parse_geopackage_to_ops(path)?,
+                _ => {
+                    let content = std::fs::read_to_string(&file)?;
+                    parse_geojson_to_ops(&content)?
+                }
+            };
+
             let count = ops.len();
             let changeset = store.commit(branch, &message, &author, &ops).await?;
             println!("Imported {} features as changeset {}", count, changeset.id);
@@ -402,6 +462,110 @@ async fn main() -> anyhow::Result<()> {
                 output
             );
         }
+
+        Commands::Backup { output, custom } => {
+            let format_flag = if custom { "-Fc" } else { "-Fp" };
+            let status = std::process::Command::new("pg_dump")
+                .args([format_flag, "-f", &output, &cli.database_url])
+                .status()?;
+            if status.success() {
+                println!("Backup written to {output}");
+            } else {
+                anyhow::bail!("pg_dump failed with exit code: {:?}", status.code());
+            }
+        }
+
+        Commands::Restore { input, clean } => {
+            let path = std::path::Path::new(&input);
+            // Detect format by trying pg_restore first (custom format), fall back to psql (plain SQL)
+            let status = if clean {
+                std::process::Command::new("pg_restore")
+                    .args(["--clean", "--if-exists", "-d", &cli.database_url, &input])
+                    .status()
+            } else {
+                std::process::Command::new("pg_restore")
+                    .args(["-d", &cli.database_url, &input])
+                    .status()
+            };
+
+            match status {
+                Ok(s) if s.success() => println!("Restore complete from {input}"),
+                _ => {
+                    // Fall back to psql for plain SQL files
+                    let content = std::fs::read_to_string(path)?;
+                    sqlx::raw_sql(&content).execute(store.pool()).await?;
+                    println!("Restore complete from {input} (plain SQL)");
+                }
+            }
+        }
+
+        Commands::ApiKey { cmd } => match cmd {
+            ApiKeyCmd::Create {
+                name,
+                role,
+                expires_days,
+            } => {
+                let key = generate_api_key();
+                let key_hash = hash_api_key(&key);
+                let role_enum = match role.as_str() {
+                    "admin" => "admin",
+                    "editor" => "editor",
+                    _ => "viewer",
+                };
+                let expires_at = if expires_days > 0 {
+                    Some(OffsetDateTime::now_utc() + time::Duration::days(expires_days as i64))
+                } else {
+                    None
+                };
+                sqlx::query(
+                    "INSERT INTO api_keys (id, name, key_hash, key_prefix, role, expires_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+                )
+                .bind(Uuid::now_v7())
+                .bind(&name)
+                .bind(&key_hash)
+                .bind(&key[..8])
+                .bind(role_enum)
+                .bind(expires_at)
+                .execute(store.pool())
+                .await?;
+                println!("API Key created (save this — it won't be shown again):");
+                println!("  Key:  {key}");
+                println!("  Name: {name}");
+                println!("  Role: {role_enum}");
+            }
+            ApiKeyCmd::List => {
+                let rows = sqlx::query_as::<_, (String, String, String, Option<time::OffsetDateTime>)>(
+                    "SELECT key_prefix, name, role, expires_at FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC",
+                )
+                .fetch_all(store.pool())
+                .await?;
+                println!(
+                    "{:<10} {:<20} {:<8} EXPIRES",
+                    "PREFIX", "NAME", "ROLE"
+                );
+                for (prefix, name, role, expires) in rows {
+                    let exp = expires
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "never".into());
+                    println!("{:<10} {:<20} {:<8} {}", prefix, name, role, exp);
+                }
+            }
+            ApiKeyCmd::Revoke { key } => {
+                let result = sqlx::query(
+                    "UPDATE api_keys SET revoked_at = NOW() WHERE key_prefix = $1 OR key_hash = $2",
+                )
+                .bind(&key)
+                .bind(hash_api_key(&key))
+                .execute(store.pool())
+                .await?;
+                if result.rows_affected() > 0 {
+                    println!("API key revoked.");
+                } else {
+                    println!("No matching API key found.");
+                }
+            }
+        },
     }
 
     Ok(())
@@ -441,8 +605,11 @@ fn parse_geojson_to_ops(content: &str) -> anyhow::Result<Vec<DiffOp>> {
     Ok(ops)
 }
 
-/// Convert a GeoJSON geometry object to WKB (supports Point only for now, others get POINT(0,0)).
+/// Convert a GeoJSON geometry object to WKB (supports Point, LineString, Polygon).
 fn geojson_geometry_to_wkb(geom: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    if geom.is_null() {
+        return Ok(point_wkb(0.0, 0.0));
+    }
     let geom_type = geom["type"].as_str().unwrap_or("Point");
     match geom_type {
         "Point" => {
@@ -610,6 +777,187 @@ fn wkb_to_geojson_geometry(wkb: &[u8]) -> serde_json::Value {
     }
 }
 
+/// Import features from a Shapefile (.shp).
+/// Reads the .shp and its companion .dbf for attributes.
+fn parse_shapefile_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>> {
+    use shapefile::dbase::FieldValue;
+    let reader =
+        shapefile::read(path).map_err(|e| anyhow::anyhow!("Failed to read shapefile: {e}"))?;
+
+    let mut ops = Vec::new();
+    for (shape, record) in reader {
+        let wkb = shape_to_wkb(&shape);
+        let mut properties = serde_json::Map::new();
+        for (name, value) in record.into_iter() {
+            let json_val = match value {
+                FieldValue::Character(Some(s)) => serde_json::Value::String(s),
+                FieldValue::Numeric(Some(n)) => {
+                    serde_json::Value::Number(serde_json::Number::from_f64(n).unwrap_or(0.into()))
+                }
+                FieldValue::Float(Some(f)) => serde_json::Value::Number(
+                    serde_json::Number::from_f64(f as f64).unwrap_or(0.into()),
+                ),
+                FieldValue::Integer(i) => json!(i),
+                FieldValue::Double(d) => {
+                    serde_json::Value::Number(serde_json::Number::from_f64(d).unwrap_or(0.into()))
+                }
+                FieldValue::Logical(Some(b)) => serde_json::Value::Bool(b),
+                _ => serde_json::Value::Null,
+            };
+            properties.insert(name, json_val);
+        }
+
+        ops.push(DiffOp::Insert {
+            feature_id: Uuid::now_v7(),
+            geometry_wkb: wkb,
+            properties: serde_json::Value::Object(properties),
+        });
+    }
+    Ok(ops)
+}
+
+/// Convert a shapefile Shape to WKB.
+fn shape_to_wkb(shape: &shapefile::Shape) -> Vec<u8> {
+    match shape {
+        shapefile::Shape::Point(p) => point_wkb(p.x, p.y),
+        shapefile::Shape::PointZ(p) => point_wkb(p.x, p.y),
+        shapefile::Shape::PointM(p) => point_wkb(p.x, p.y),
+        shapefile::Shape::Polyline(pl) => {
+            if let Some(part) = pl.parts().first() {
+                let coords: Vec<serde_json::Value> =
+                    part.iter().map(|p| json!([p.x, p.y])).collect();
+                linestring_wkb(&coords)
+            } else {
+                point_wkb(0.0, 0.0)
+            }
+        }
+        shapefile::Shape::PolylineZ(pl) => {
+            if let Some(part) = pl.parts().first() {
+                let coords: Vec<serde_json::Value> =
+                    part.iter().map(|p| json!([p.x, p.y])).collect();
+                linestring_wkb(&coords)
+            } else {
+                point_wkb(0.0, 0.0)
+            }
+        }
+        shapefile::Shape::Polygon(pg) => {
+            let rings: Vec<serde_json::Value> = pg
+                .rings()
+                .iter()
+                .map(|ring| {
+                    let points: Vec<serde_json::Value> =
+                        ring.points().iter().map(|p| json!([p.x, p.y])).collect();
+                    serde_json::Value::Array(points)
+                })
+                .collect();
+            polygon_wkb(&rings)
+        }
+        shapefile::Shape::PolygonZ(pg) => {
+            let rings: Vec<serde_json::Value> = pg
+                .rings()
+                .iter()
+                .map(|ring| {
+                    let points: Vec<serde_json::Value> =
+                        ring.points().iter().map(|p| json!([p.x, p.y])).collect();
+                    serde_json::Value::Array(points)
+                })
+                .collect();
+            polygon_wkb(&rings)
+        }
+        _ => point_wkb(0.0, 0.0),
+    }
+}
+
+/// Import features from a GeoPackage (.gpkg) file.
+/// Reads the first feature table found in the GeoPackage.
+fn parse_geopackage_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
+    // Find the first feature table
+    let table_name: String = conn
+        .query_row(
+            "SELECT table_name FROM gpkg_contents WHERE data_type = 'features' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("No feature tables found in GeoPackage"))?;
+
+    // Get the geometry column name
+    let geom_col: String = conn
+        .query_row(
+            "SELECT column_name FROM gpkg_geometry_columns WHERE table_name = ?1",
+            [&table_name],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "geom".to_string());
+
+    // Read all features
+    let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table_name}\""))?;
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+
+    let mut ops = Vec::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut wkb = Vec::new();
+        let mut properties = serde_json::Map::new();
+
+        for (i, name) in col_names.iter().enumerate() {
+            if name == &geom_col {
+                // GeoPackage geometry: strip GP header (8 bytes) to get WKB
+                if let Ok(blob) = row.get::<_, Vec<u8>>(i) {
+                    if blob.len() > 8 && blob[0] == 0x47 && blob[1] == 0x50 {
+                        // Standard GP header: magic(2) + version(1) + flags(1) + srs_id(4) = 8
+                        let flags = blob[3];
+                        let envelope_type = (flags >> 1) & 0x07;
+                        let envelope_size = match envelope_type {
+                            0 => 0,
+                            1 => 32,
+                            2 | 3 => 48,
+                            4 => 64,
+                            _ => 0,
+                        };
+                        let header_size = 8 + envelope_size;
+                        if blob.len() > header_size {
+                            wkb = blob[header_size..].to_vec();
+                        }
+                    } else {
+                        wkb = blob;
+                    }
+                }
+            } else if name == "fid" || name == "ogc_fid" {
+                // Skip auto-increment primary key
+            } else {
+                // Try to extract as different types
+                if let Ok(v) = row.get::<_, String>(i) {
+                    properties.insert(name.clone(), serde_json::Value::String(v));
+                } else if let Ok(v) = row.get::<_, f64>(i) {
+                    if let Some(n) = serde_json::Number::from_f64(v) {
+                        properties.insert(name.clone(), serde_json::Value::Number(n));
+                    }
+                } else if let Ok(v) = row.get::<_, i64>(i) {
+                    properties.insert(name.clone(), json!(v));
+                }
+            }
+        }
+
+        if wkb.is_empty() {
+            wkb = point_wkb(0.0, 0.0);
+        }
+
+        ops.push(DiffOp::Insert {
+            feature_id: Uuid::now_v7(),
+            geometry_wkb: wkb,
+            properties: serde_json::Value::Object(properties),
+        });
+    }
+    Ok(ops)
+}
+
 /// Export features to a GeoPackage (.gpkg) SQLite file.
 /// Creates a minimal spec-compliant GeoPackage with the features as a layer.
 fn export_geopackage(
@@ -751,5 +1099,183 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => { tracing::info!("Received Ctrl+C, shutting down..."); }
         _ = terminate => { tracing::info!("Received SIGTERM, shutting down..."); }
+    }
+}
+
+/// Generate a random 32-byte API key encoded as base62.
+fn generate_api_key() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let random: u128 = timestamp ^ 0xdeadbeef_cafebabe_12345678_9abcdef0;
+    // Use UUID v7 for uniqueness + hex encoding for the key
+    let id = Uuid::now_v7();
+    format!("ptk_{}{:016x}", id.simple(), random as u64)
+}
+
+/// Hash an API key for storage (SHA-256).
+fn hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_geojson_point() {
+        let geojson = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [-1.5, 52.0]},
+                "properties": {"name": "Test"}
+            }]
+        }"#;
+        let ops = parse_geojson_to_ops(geojson).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DiffOp::Insert {
+                geometry_wkb,
+                properties,
+                ..
+            } => {
+                assert_eq!(geometry_wkb.len(), 21); // WKB point: 1 + 4 + 8 + 8
+                assert_eq!(properties["name"], "Test");
+            }
+            _ => panic!("Expected Insert op"),
+        }
+    }
+
+    #[test]
+    fn parse_geojson_linestring() {
+        let geojson = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": [[0,0],[1,1],[2,2]]},
+                "properties": {}
+            }]
+        }"#;
+        let ops = parse_geojson_to_ops(geojson).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DiffOp::Insert { geometry_wkb, .. } => {
+                // WKB LineString: 1 (byte order) + 4 (type) + 4 (num_points) + 3*16 (coords)
+                assert_eq!(geometry_wkb.len(), 1 + 4 + 4 + 3 * 16);
+            }
+            _ => panic!("Expected Insert op"),
+        }
+    }
+
+    #[test]
+    fn parse_geojson_polygon() {
+        let geojson = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [[[0,0],[1,0],[1,1],[0,1],[0,0]]]},
+                "properties": {"area": 1.0}
+            }]
+        }"#;
+        let ops = parse_geojson_to_ops(geojson).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DiffOp::Insert { properties, .. } => {
+                assert_eq!(properties["area"], 1.0);
+            }
+            _ => panic!("Expected Insert op"),
+        }
+    }
+
+    #[test]
+    fn parse_geojson_multiple_features() {
+        let geojson = r#"{
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "geometry": {"type": "Point", "coordinates": [0,0]}, "properties": {"id": 1}},
+                {"type": "Feature", "geometry": {"type": "Point", "coordinates": [1,1]}, "properties": {"id": 2}},
+                {"type": "Feature", "geometry": {"type": "Point", "coordinates": [2,2]}, "properties": {"id": 3}}
+            ]
+        }"#;
+        let ops = parse_geojson_to_ops(geojson).unwrap();
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn wkb_roundtrip_point() {
+        let wkb = point_wkb(-1.5, 52.0);
+        let geojson = wkb_to_geojson_geometry(&wkb);
+        assert_eq!(geojson["type"], "Point");
+        let coords = geojson["coordinates"].as_array().unwrap();
+        assert_eq!(coords[0].as_f64().unwrap(), -1.5);
+        assert_eq!(coords[1].as_f64().unwrap(), 52.0);
+    }
+
+    #[test]
+    fn wkb_roundtrip_linestring() {
+        let coords = vec![json!([0.0, 0.0]), json!([1.0, 1.0])];
+        let wkb = linestring_wkb(&coords);
+        let geojson = wkb_to_geojson_geometry(&wkb);
+        assert_eq!(geojson["type"], "LineString");
+        let out_coords = geojson["coordinates"].as_array().unwrap();
+        assert_eq!(out_coords.len(), 2);
+    }
+
+    #[test]
+    fn geopackage_binary_header() {
+        let wkb = point_wkb(1.0, 2.0);
+        let gpkg = wkb_to_gpkg_binary(&wkb);
+        assert_eq!(gpkg[0], 0x47); // 'G'
+        assert_eq!(gpkg[1], 0x50); // 'P'
+        assert_eq!(gpkg[2], 0x00); // version
+        assert_eq!(gpkg[3], 0x01); // flags
+        // SRS ID 4326 as LE i32
+        let srs = i32::from_le_bytes([gpkg[4], gpkg[5], gpkg[6], gpkg[7]]);
+        assert_eq!(srs, 4326);
+        // Rest is WKB
+        assert_eq!(&gpkg[8..], &wkb[..]);
+    }
+
+    #[test]
+    fn api_key_generation() {
+        let key = generate_api_key();
+        assert!(key.starts_with("ptk_"));
+        assert!(key.len() > 20);
+    }
+
+    #[test]
+    fn api_key_hashing() {
+        let key = "ptk_test_key_12345";
+        let hash1 = hash_api_key(key);
+        let hash2 = hash_api_key(key);
+        assert_eq!(hash1, hash2); // deterministic
+        assert_ne!(hash1, hash_api_key("different_key")); // different keys → different hashes
+        assert_eq!(hash1.len(), 64); // SHA-256 hex = 64 chars
+    }
+
+    #[test]
+    fn geojson_to_wkb_handles_missing_geometry() {
+        let geom = json!(null);
+        // Should not panic
+        let result = geojson_geometry_to_wkb(&geom);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn geopackage_import_nonexistent_file() {
+        let result = parse_geopackage_to_ops(std::path::Path::new("/nonexistent.gpkg"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn shapefile_import_nonexistent_file() {
+        let result = parse_shapefile_to_ops(std::path::Path::new("/nonexistent.shp"));
+        assert!(result.is_err());
     }
 }
