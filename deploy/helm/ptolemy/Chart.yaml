@@ -1,0 +1,13 @@
+apiVersion: v2
+name: ptolemy
+description: Versioned geospatial data store with PostGIS
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - geospatial
+  - postgis
+  - versioning
+  - vector-data
+maintainers:
+  - name: GeoLang

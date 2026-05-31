@@ -22,10 +22,25 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://ptolemy:ptolemy@db/ptolemy
-      RUST_LOG: info
+      RUST_LOG: info,ptolemy=debug
+      PTOLEMY_JWT_SECRET: change-me-in-production
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     command: ["ptolemy", "serve", "--bind", "0.0.0.0:3000", "--database-url", "postgres://ptolemy:ptolemy@db/ptolemy"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
 
 volumes:
   pgdata:

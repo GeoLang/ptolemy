@@ -21,6 +21,8 @@ use crate::AppState;
 pub fn v1_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(liveness))
+        .route("/readyz", get(readiness))
         // Datasets
         .route("/datasets", get(list_datasets).post(create_dataset))
         .route("/datasets/{id}", get(get_dataset))
@@ -65,6 +67,19 @@ pub fn v1_routes() -> Router<AppState> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Liveness probe — always returns 200 if the process is running.
+async fn liveness() -> &'static str {
+    "ok"
+}
+
+/// Readiness probe — checks database connectivity.
+async fn readiness(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
+    match sqlx::query("SELECT 1").execute(state.pool()).await {
+        Ok(_) => (axum::http::StatusCode::OK, "ready"),
+        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready"),
+    }
 }
 
 // ─── Datasets ───────────────────────────────────────────────────────

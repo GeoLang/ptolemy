@@ -1,0 +1,45 @@
+replicaCount: 1
+
+image:
+  repository: ptolemy
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ptolemy.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+postgresql:
+  enabled: true
+  auth:
+    username: ptolemy
+    password: ptolemy
+    database: ptolemy
+  postgis:
+    enabled: true
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+env:
+  RUST_LOG: "info,ptolemy=debug"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
