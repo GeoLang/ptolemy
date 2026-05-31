@@ -43,7 +43,7 @@ tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 tower = { version = "0.5", features = ["limit", "buffer"] }
 jsonwebtoken = "9"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 openidconnect = { version = "4", features = ["reqwest-blocking"] }
