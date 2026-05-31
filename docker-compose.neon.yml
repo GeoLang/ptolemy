@@ -1,0 +1,43 @@
+# Ptolemy — local container pointing at Neon (serverless PostGIS)
+#
+# Usage:
+#   1. Copy .env.neon.example to .env.neon and fill in your Neon connection string
+#   2. Run:  docker compose -f docker-compose.neon.yml --env-file .env.neon up --build
+#
+# This runs Ptolemy in Docker locally but uses Neon as the database,
+# so there is no local PostGIS container. Useful for:
+#   - Testing against production-like serverless Postgres
+#   - Developing without heavy local DB resource usage
+#   - Sharing a database across team members
+
+services:
+  ptolemy:
+    build: .
+    environment:
+      DATABASE_URL: ${NEON_DATABASE_URL}
+      RUST_LOG: info,ptolemy=debug
+      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:-change-me-in-production}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command:
+      - ptolemy
+      - serve
+      - --bind
+      - "0.0.0.0:3000"
+      - --database-url
+      - "${NEON_DATABASE_URL}"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+[package]
+name = "ptolemy-mongodb"
+description = "MongoDB data store plugin for Ptolemy — GeoJSON features via MongoDB geospatial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ptolemy-core = { path = "../ptolemy-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+mongodb = "3"

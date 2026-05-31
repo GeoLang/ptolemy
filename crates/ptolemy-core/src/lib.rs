@@ -5,6 +5,7 @@
 pub mod branch;
 pub mod changeset;
 pub mod dataset;
+pub mod datastore;
 pub mod diff;
 pub mod event;
 pub mod feature;
@@ -14,6 +15,10 @@ pub mod schema;
 pub use branch::Branch;
 pub use changeset::Changeset;
 pub use dataset::Dataset;
+pub use datastore::{
+    Bbox, BoxFuture, DataStore, DataStoreError, DataStoreRegistry, FeatureQuery, StoreCapabilities,
+    StoreResult,
+};
 pub use event::{Event, EventType, Webhook};
 pub use feature::Feature;
 pub use review::{MergeRequest, MergeRequestStatus, ReviewComment};

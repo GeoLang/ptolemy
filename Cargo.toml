@@ -4,6 +4,9 @@ members = [
     "crates/ptolemy-api",
     "crates/ptolemy-cli",
     "crates/ptolemy-storage",
+    "crates/ptolemy-elasticsearch",
+    "crates/ptolemy-mongodb",
+    "crates/ptolemy-geopackage",
 ]
 resolver = "2"
 

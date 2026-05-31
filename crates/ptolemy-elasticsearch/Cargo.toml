@@ -1,0 +1,15 @@
+[package]
+name = "ptolemy-elasticsearch"
+description = "Elasticsearch/OpenSearch data store plugin for Ptolemy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ptolemy-core = { path = "../ptolemy-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
