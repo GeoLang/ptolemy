@@ -8,10 +8,10 @@
 //! against an external OIDC provider (Keycloak, Auth0, Google, Azure AD, etc.)
 //!
 //! Environment variables:
-//!   PTOLEMY_OIDC_ISSUER_URL   — The OIDC issuer URL (e.g. https://keycloak.example.com/realms/ptolemy)
+//!   PTOLEMY_OIDC_ISSUER_URL   — The OIDC issuer URL (e.g. `https://keycloak.example.com/realms/ptolemy`)
 //!   PTOLEMY_OIDC_CLIENT_ID    — OAuth2 client ID
 //!   PTOLEMY_OIDC_CLIENT_SECRET — OAuth2 client secret
-//!   PTOLEMY_OIDC_REDIRECT_URL — Callback URL (e.g. http://localhost:3000/auth/oidc/callback)
+//!   PTOLEMY_OIDC_REDIRECT_URL — Callback URL (e.g. `http://localhost:3000/auth/oidc/callback`)
 
 use axum::{
     Json, Router,
