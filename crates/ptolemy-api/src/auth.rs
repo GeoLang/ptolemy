@@ -70,7 +70,7 @@ impl AuthConfig {
 }
 
 /// Middleware that validates JWT tokens or API keys from request headers.
-/// Checks Authorization: Bearer <jwt> first, then X-API-Key header.
+/// Checks `Authorization: Bearer <jwt>` first, then `X-API-Key` header.
 /// If auth is disabled (no PTOLEMY_JWT_SECRET), all requests pass through.
 pub async fn auth_middleware(request: Request, next: Next) -> Response {
     let config = AuthConfig::from_env();
