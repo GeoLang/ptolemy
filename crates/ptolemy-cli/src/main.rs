@@ -540,10 +540,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .fetch_all(store.pool())
                 .await?;
-                println!(
-                    "{:<10} {:<20} {:<8} EXPIRES",
-                    "PREFIX", "NAME", "ROLE"
-                );
+                println!("{:<10} {:<20} {:<8} EXPIRES", "PREFIX", "NAME", "ROLE");
                 for (prefix, name, role, expires) in rows {
                     let exp = expires
                         .map(|e| e.to_string())
