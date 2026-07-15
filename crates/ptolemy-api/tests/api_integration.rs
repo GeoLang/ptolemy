@@ -34,7 +34,8 @@ async fn setup_app() -> (axum::Router, AppState) {
          DROP TABLE IF EXISTS pointcloud_catalogs CASCADE;
          DROP TABLE IF EXISTS datasets CASCADE;
          DROP TABLE IF EXISTS dataset_metadata CASCADE;
-         DROP TABLE IF EXISTS dataset_tags CASCADE;",
+         DROP TABLE IF EXISTS dataset_tags CASCADE;
+         DROP TABLE IF EXISTS _sqlx_migrations CASCADE;",
     )
     .execute(&pool)
     .await

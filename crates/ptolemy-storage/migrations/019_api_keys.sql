@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix);
-CREATE INDEX idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 
 -- Styles table for layer styling/symbology
 CREATE TABLE IF NOT EXISTS styles (

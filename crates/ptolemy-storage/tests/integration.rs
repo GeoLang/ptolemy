@@ -36,7 +36,8 @@ async fn setup() -> PgStore {
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
          DROP TABLE IF EXISTS branches CASCADE;
-         DROP TABLE IF EXISTS datasets CASCADE;",
+         DROP TABLE IF EXISTS datasets CASCADE;
+         DROP TABLE IF EXISTS _sqlx_migrations CASCADE;",
     )
     .execute(&pool)
     .await

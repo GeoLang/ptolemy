@@ -261,6 +261,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve { bind } => {
+            // migrations are idempotent; running them here means the server
+            // can never come up against an unmigrated database
+            store.migrate().await?;
             let app = ptolemy_api::app(store.clone());
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("Ptolemy listening on {bind}");

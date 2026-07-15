@@ -44,42 +44,12 @@ impl PgStore {
 
     /// Run migrations embedded in this crate.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let sql_001 = include_str!("../migrations/001_initial.sql");
-        sqlx::raw_sql(sql_001).execute(&self.pool).await?;
-        let sql_002 = include_str!("../migrations/002_reviews.sql");
-        sqlx::raw_sql(sql_002).execute(&self.pool).await?;
-        let sql_003 = include_str!("../migrations/003_schema_topology.sql");
-        sqlx::raw_sql(sql_003).execute(&self.pool).await?;
-        let sql_004 = include_str!("../migrations/004_webhooks.sql");
-        sqlx::raw_sql(sql_004).execute(&self.pool).await?;
-        let sql_005 = include_str!("../migrations/005_audit.sql");
-        sqlx::raw_sql(sql_005).execute(&self.pool).await?;
-        let sql_006 = include_str!("../migrations/006_locks.sql");
-        sqlx::raw_sql(sql_006).execute(&self.pool).await?;
-        let sql_007 = include_str!("../migrations/007_catalog.sql");
-        sqlx::raw_sql(sql_007).execute(&self.pool).await?;
-        let sql_008 = include_str!("../migrations/008_tenancy.sql");
-        sqlx::raw_sql(sql_008).execute(&self.pool).await?;
-        let sql_009 = include_str!("../migrations/009_networks.sql");
-        sqlx::raw_sql(sql_009).execute(&self.pool).await?;
-        let sql_010 = include_str!("../migrations/010_linear_ref.sql");
-        sqlx::raw_sql(sql_010).execute(&self.pool).await?;
-        let sql_011 = include_str!("../migrations/011_raster.sql");
-        sqlx::raw_sql(sql_011).execute(&self.pool).await?;
-        let sql_012 = include_str!("../migrations/012_domains_rules.sql");
-        sqlx::raw_sql(sql_012).execute(&self.pool).await?;
-        let sql_013 = include_str!("../migrations/013_relationships.sql");
-        sqlx::raw_sql(sql_013).execute(&self.pool).await?;
-        let sql_014 = include_str!("../migrations/014_cartography.sql");
-        sqlx::raw_sql(sql_014).execute(&self.pool).await?;
-        let sql_015 = include_str!("../migrations/015_extensions.sql");
-        sqlx::raw_sql(sql_015).execute(&self.pool).await?;
-        let sql_016 = include_str!("../migrations/016_features_view.sql");
-        sqlx::raw_sql(sql_016).execute(&self.pool).await?;
-        let sql_017 = include_str!("../migrations/017_temporal_attachments_replication.sql");
-        sqlx::raw_sql(sql_017).execute(&self.pool).await?;
-        let sql_018 = include_str!("../migrations/018_rbac_compaction.sql");
-        sqlx::raw_sql(sql_018).execute(&self.pool).await?;
+        // sqlx tracks applied migrations in _sqlx_migrations, so this is
+        // idempotent and picks up new migration files automatically
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|e| StoreError::Db(sqlx::Error::Migrate(Box::new(e))))?;
         Ok(())
     }
 
