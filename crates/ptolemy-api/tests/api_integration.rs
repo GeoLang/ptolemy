@@ -558,6 +558,34 @@ async fn test_stac_collections() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn test_geoprocessing_merge() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    // two adjacent unit squares: (0..1, 0..1) and (1..2, 0..1)
+    let sq1 = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    let sq2 = "01030000000100000005000000000000000000F03F0000000000000000000000000000004000000000000000000000000000000040000000000000F03F000000000000F03F000000000000F03F000000000000F03F0000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": sq1, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": sq2, "properties": {}}
+    ])).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/merge"),
+        json!({"feature_ids": [f1.to_string(), f2.to_string()]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "merge: {body}");
+    assert!(body["geometry"].is_object(), "merge geometry: {body}");
+    // union of two 1x1 degree squares near the equator is ~2.45e10 m^2
+    let area = body["area_sq_meters"].as_f64().unwrap();
+    assert!(area > 1.0e10 && area < 1.0e11, "merge area: {area}");
+}
+
+#[tokio::test]
 async fn test_buffer_analysis() {
     let (app, _) = setup_app().await;
     let ds_id = create_dataset(&app).await;

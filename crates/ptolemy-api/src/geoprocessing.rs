@@ -268,7 +268,7 @@ async fn dissolve(
              properties->>'{key}' as group_key,
              COUNT(*) as cnt,
              ST_AsGeoJSON(ST_Union(geometry))::jsonb as geojson,
-             COALESCE(ST_Area(ST_Union(geometry::geography)), 0) as area
+             COALESCE(ST_Area(ST_Union(geometry)::geography), 0) as area
          FROM live
          WHERE properties->>'{key}' IS NOT NULL
          GROUP BY properties->>'{key}'",
@@ -732,7 +732,7 @@ async fn merge_features(
         "{LIVE_FEATURES_CTE}
          SELECT
              ST_AsGeoJSON(ST_Union(geometry))::jsonb as geojson,
-             COALESCE(ST_Area(ST_Union(geometry::geography)), 0) as area
+             COALESCE(ST_Area(ST_Union(geometry)::geography), 0) as area
          FROM live
          WHERE feature_id = ANY($2::uuid[])"
     ))
