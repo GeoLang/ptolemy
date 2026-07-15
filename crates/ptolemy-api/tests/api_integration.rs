@@ -571,8 +571,10 @@ async fn test_parcel_search_finds_match_beyond_limit_window() {
                    "geometry_wkb_hex": point_hex, "properties": {"apn": format!("DECOY-{i}")}})
         })
         .collect();
-    ops.push(json!({"type": "insert", "feature_id": Uuid::now_v7().to_string(),
-                    "geometry_wkb_hex": point_hex, "properties": {"apn": "TARGET-99"}}));
+    ops.push(
+        json!({"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                    "geometry_wkb_hex": point_hex, "properties": {"apn": "TARGET-99"}}),
+    );
     commit_features(&app, branch_id, json!(ops)).await;
 
     let (status, body) = get_json(
