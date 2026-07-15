@@ -9,12 +9,13 @@ pub mod datastore;
 pub mod diff;
 pub mod event;
 pub mod feature;
+pub mod geoconvert;
 pub mod review;
 pub mod schema;
 
 pub use branch::Branch;
 pub use changeset::Changeset;
-pub use dataset::Dataset;
+pub use dataset::{Dataset, GeometryType};
 pub use datastore::{
     Bbox, BoxFuture, DataStore, DataStoreError, DataStoreRegistry, FeatureQuery, StoreCapabilities,
     StoreResult,

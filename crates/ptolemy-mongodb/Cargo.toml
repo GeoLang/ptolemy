@@ -12,4 +12,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "v5"] }
+time = { workspace = true }
+futures-util = "0.3"
 mongodb = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

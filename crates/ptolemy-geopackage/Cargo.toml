@@ -12,4 +12,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "v5"] }
+time = { workspace = true }
+geozero = { version = "0.14", default-features = false, features = ["with-wkb", "with-geojson"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
