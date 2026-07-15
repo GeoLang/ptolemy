@@ -1021,6 +1021,64 @@ impl PgStore {
             .collect())
     }
 
+    /// Search live features whose text property contains the query,
+    /// case-insensitive. The filter runs in SQL so the limit applies to
+    /// matches, not to an arbitrary prefix of the branch.
+    pub async fn search_features_by_property(
+        &self,
+        branch_id: Uuid,
+        key: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<Feature>, StoreError> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT c.id, c.parent_id
+                FROM changesets c
+                JOIN branches b ON b.head = c.id
+                WHERE b.id = $1
+              UNION ALL
+                SELECT c.id, c.parent_id
+                FROM changesets c
+                JOIN chain ch ON ch.parent_id = c.id
+            ),
+            latest AS (
+                SELECT DISTINCT ON (fv.feature_id)
+                    fv.feature_id, fv.dataset_id, fv.operation,
+                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
+                FROM feature_versions fv
+                JOIN chain ch ON fv.changeset_id = ch.id
+                ORDER BY fv.feature_id, fv.created_at DESC
+            )
+            SELECT feature_id, dataset_id, geometry_wkb, properties
+            FROM latest
+            WHERE operation != 'delete'
+              AND properties->>$2 ILIKE '%' || $3 || '%'
+            ORDER BY feature_id
+            LIMIT $4",
+        )
+        .bind(branch_id)
+        .bind(key)
+        .bind(escaped)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Feature {
+                id: row.get("feature_id"),
+                dataset_id: row.get("dataset_id"),
+                geometry_wkb: row.get("geometry_wkb"),
+                properties: row.get("properties"),
+            })
+            .collect())
+    }
+
     // ─── Spatial Queries ────────────────────────────────────────────
 
     /// Get features within a bounding box.

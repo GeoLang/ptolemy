@@ -558,6 +558,35 @@ async fn test_stac_collections() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn test_parcel_search_finds_match_beyond_limit_window() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    // many decoys so a limit-scaled candidate fetch cannot cover the branch
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    let mut ops: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                   "geometry_wkb_hex": point_hex, "properties": {"apn": format!("DECOY-{i}")}})
+        })
+        .collect();
+    ops.push(json!({"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                    "geometry_wkb_hex": point_hex, "properties": {"apn": "TARGET-99"}}));
+    commit_features(&app, branch_id, json!(ops)).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/parcels/search?branch_id={branch_id}&type=apn&q=TARGET-99&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search: {body}");
+    let hits = body.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "search must filter in sql, got: {body}");
+    assert_eq!(hits[0]["apn"], "TARGET-99");
+}
+
+#[tokio::test]
 async fn test_geoprocessing_merge() {
     let (app, _) = setup_app().await;
     let ds_id = create_dataset(&app).await;

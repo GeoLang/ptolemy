@@ -84,24 +84,15 @@ async fn parcel_search(
                 .await
                 .map_err(RealEstateError::Store)?
         }
-        "apn" | "address" | "owner" => {
-            // Get all features and filter by property match
-            let all = store
-                .list_features_paginated(params.branch_id, None, limit * 10)
-                .await
-                .map_err(RealEstateError::Store)?;
-            let q = params.q.unwrap_or_default().to_lowercase();
-            let field = params.search_type.as_str();
-            all.into_iter()
-                .filter(|f| {
-                    f.properties
-                        .get(field)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| s.to_lowercase().contains(&q))
-                })
-                .take(limit as usize)
-                .collect()
-        }
+        "apn" | "address" | "owner" => store
+            .search_features_by_property(
+                params.branch_id,
+                params.search_type.as_str(),
+                &params.q.unwrap_or_default(),
+                limit,
+            )
+            .await
+            .map_err(RealEstateError::Store)?,
         _ => {
             return Err(RealEstateError::BadRequest(
                 "type must be apn, address, owner, or bbox".into(),
