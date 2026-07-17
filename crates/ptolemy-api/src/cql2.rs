@@ -212,8 +212,10 @@ fn binary_op(filter: &serde_json::Value, sql_op: &str) -> Result<String, Cql2Err
     let args = get_args(filter)?;
     let prop = extract_property(&args[0])?;
     let val = extract_literal(&args[1])?;
+    // jsonb ->> yields text; numeric literals need a cast on the property side
+    let cast = if args[1].is_number() { "::numeric" } else { "" };
     Ok(format!(
-        "(properties->>'{prop}') {sql_op} {val}",
+        "(properties->>'{prop}'){cast} {sql_op} {val}",
         prop = sanitize_field(&prop),
         sql_op = sql_op,
         val = sanitize_value(&val)

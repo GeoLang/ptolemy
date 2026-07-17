@@ -9,7 +9,7 @@ use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
 use ptolemy_storage::postgres::{MergeResult, PgStore};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -721,6 +721,795 @@ async fn test_merge_base_finding() {
     // Merge base should be c1
     let base = store.find_merge_base(c2.id, c3.id).await.unwrap();
     assert_eq!(base, Some(c1.id));
+}
+
+/// Fork a new branch at another branch's current head.
+async fn fork_branch(store: &PgStore, dataset_id: Uuid, from_branch: Uuid, name: &str) -> Branch {
+    let parent = store.get_branch(from_branch).await.unwrap();
+    let branch = Branch {
+        id: Uuid::now_v7(),
+        dataset_id,
+        name: name.to_string(),
+        head: parent.head,
+        created_at: OffsetDateTime::now_utc(),
+        created_by: "test".to_string(),
+    };
+    store.create_branch(&branch).await.unwrap();
+    branch
+}
+
+/// Snapshot a branch head as feature_id -> (geometry_wkb, properties).
+async fn snapshot(
+    store: &PgStore,
+    branch_id: Uuid,
+) -> std::collections::BTreeMap<Uuid, (Vec<u8>, serde_json::Value)> {
+    store
+        .list_features_at_head(branch_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.id, (f.geometry_wkb, f.properties)))
+        .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Merge Depth Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_merge_conflict_geometry_edit_edit() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Park"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    // Both sides move the same feature to different places
+    store
+        .commit(
+            main.id,
+            "Alice moves",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(1.0, 1.0)),
+                properties: Some(json!({"name": "Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            feature.id,
+            "Bob moves",
+            "bob",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(2.0, 2.0)),
+                properties: Some(json!({"name": "Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    match result {
+        MergeResult::Conflicts(conflicts) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].feature_id, f1);
+            assert!(matches!(conflicts[0].ours, DiffOp::Update { .. }));
+            assert!(matches!(conflicts[0].theirs, DiffOp::Update { .. }));
+        }
+        MergeResult::Success(_) => panic!("Expected geometry edit-edit conflict"),
+    }
+}
+
+#[tokio::test]
+async fn test_merge_conflict_attribute_edit_edit() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Park"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    // Both sides rename the same feature differently, geometry untouched
+    store
+        .commit(
+            main.id,
+            "Alice renames",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(0.0, 0.0)),
+                properties: Some(json!({"name": "North Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            feature.id,
+            "Bob renames",
+            "bob",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(0.0, 0.0)),
+                properties: Some(json!({"name": "South Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    match result {
+        MergeResult::Conflicts(conflicts) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].feature_id, f1);
+        }
+        MergeResult::Success(_) => panic!("Expected attribute edit-edit conflict"),
+    }
+}
+
+#[tokio::test]
+async fn test_merge_conflict_delete_vs_edit_both_directions() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: f1,
+                    geometry_wkb: point_wkb(0.0, 0.0),
+                    properties: json!({"name": "A"}),
+                },
+                DiffOp::Insert {
+                    feature_id: f2,
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({"name": "B"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    // f1: target deletes, source edits. f2: target edits, source deletes.
+    store
+        .commit(
+            main.id,
+            "Alice deletes f1, edits f2",
+            "alice",
+            &[
+                DiffOp::Delete { feature_id: f1 },
+                DiffOp::Update {
+                    feature_id: f2,
+                    geometry_wkb: Some(point_wkb(1.5, 1.5)),
+                    properties: Some(json!({"name": "B"})),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            feature.id,
+            "Bob edits f1, deletes f2",
+            "bob",
+            &[
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(0.5, 0.5)),
+                    properties: Some(json!({"name": "A"})),
+                },
+                DiffOp::Delete { feature_id: f2 },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    match result {
+        MergeResult::Conflicts(mut conflicts) => {
+            conflicts.sort_by_key(|c| c.feature_id);
+            let mut expected = [f1, f2];
+            expected.sort();
+            assert_eq!(conflicts.len(), 2);
+            assert_eq!(conflicts[0].feature_id, expected[0]);
+            assert_eq!(conflicts[1].feature_id, expected[1]);
+            for c in &conflicts {
+                let delete_on_one_side = matches!(c.ours, DiffOp::Delete { .. })
+                    ^ matches!(c.theirs, DiffOp::Delete { .. });
+                assert!(delete_on_one_side, "expected delete-vs-edit shape: {c:?}");
+            }
+        }
+        MergeResult::Success(_) => panic!("Expected delete-vs-edit conflicts"),
+    }
+}
+
+/// Edits to DIFFERENT attributes of the same feature still conflict:
+/// merge is feature-level (ops_equal compares whole ops), not attribute-level.
+#[tokio::test]
+async fn test_merge_different_attributes_same_feature_conflicts() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Park", "capacity": 100}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    store
+        .commit(
+            main.id,
+            "Alice edits name",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(0.0, 0.0)),
+                properties: Some(json!({"name": "Central Park", "capacity": 100})),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            feature.id,
+            "Bob edits capacity",
+            "bob",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(0.0, 0.0)),
+                properties: Some(json!({"name": "Park", "capacity": 250})),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    match result {
+        MergeResult::Conflicts(conflicts) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].feature_id, f1);
+        }
+        MergeResult::Success(_) => {
+            panic!("Merge is feature-level; disjoint attribute edits must conflict")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_merge_disjoint_feature_sets_clean() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Base"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    let f2 = Uuid::now_v7();
+    let f3 = Uuid::now_v7();
+    let f4 = Uuid::now_v7();
+    // Main: insert f2 and update f1. Feature: insert f3 and f4.
+    store
+        .commit(
+            main.id,
+            "Main work",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: f2,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({"name": "Main2"}),
+                },
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(0.1, 0.1)),
+                    properties: Some(json!({"name": "Base v2"})),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            feature.id,
+            "Feature work",
+            "bob",
+            &[
+                DiffOp::Insert {
+                    feature_id: f3,
+                    geometry_wkb: point_wkb(3.0, 3.0),
+                    properties: json!({"name": "Feat3"}),
+                },
+                DiffOp::Insert {
+                    feature_id: f4,
+                    geometry_wkb: point_wkb(4.0, 4.0),
+                    properties: json!({"name": "Feat4"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let MergeResult::Success(_) = result else {
+        panic!("Expected clean merge of disjoint feature sets");
+    };
+
+    let merged = snapshot(&store, main.id).await;
+    assert_eq!(merged.len(), 4);
+    assert_eq!(merged[&f1].1["name"], "Base v2");
+    assert_eq!(merged[&f2].1["name"], "Main2");
+    assert_eq!(merged[&f3].1["name"], "Feat3");
+    assert_eq!(merged[&f4].1["name"], "Feat4");
+}
+
+/// Round-trip: diff(pre-merge head, merge commit) applied on top of the
+/// pre-merge head must reproduce the merged state exactly.
+#[tokio::test]
+async fn test_diff_round_trip_after_merge() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Base"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    let f2 = Uuid::now_v7();
+    let f3 = Uuid::now_v7();
+    // Feature branch: update f1, insert f2. Main: insert f3.
+    store
+        .commit(
+            feature.id,
+            "Feature work",
+            "bob",
+            &[
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(9.0, 9.0)),
+                    properties: Some(json!({"name": "Base moved"})),
+                },
+                DiffOp::Insert {
+                    feature_id: f2,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({"name": "Feat2"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .commit(
+            main.id,
+            "Main work",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f3,
+                geometry_wkb: point_wkb(3.0, 3.0),
+                properties: json!({"name": "Main3"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let pre_merge_head = store.get_branch(main.id).await.unwrap().head.unwrap();
+
+    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let MergeResult::Success(merge_cs) = result else {
+        panic!("Expected clean merge");
+    };
+
+    // Replay the diff onto a branch parked at the pre-merge head
+    let diff = store.diff(Some(pre_merge_head), merge_cs.id).await.unwrap();
+    let replay = Branch {
+        id: Uuid::now_v7(),
+        dataset_id: ds.id,
+        name: "replay".to_string(),
+        head: Some(pre_merge_head),
+        created_at: OffsetDateTime::now_utc(),
+        created_by: "test".to_string(),
+    };
+    store.create_branch(&replay).await.unwrap();
+    store
+        .commit(replay.id, "Replay diff", "test", &diff.operations)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot(&store, replay.id).await,
+        snapshot(&store, main.id).await,
+        "diff(a,b) applied to a must equal b"
+    );
+}
+
+#[tokio::test]
+async fn test_merge_idempotent_remerge() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Base"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    let f2 = Uuid::now_v7();
+    store
+        .commit(
+            feature.id,
+            "Feature work",
+            "bob",
+            &[
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(9.0, 9.0)),
+                    properties: Some(json!({"name": "Base moved"})),
+                },
+                DiffOp::Insert {
+                    feature_id: f2,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({"name": "Feat2"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let first = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let MergeResult::Success(_) = first else {
+        panic!("Expected first merge to succeed");
+    };
+    let after_first = snapshot(&store, main.id).await;
+
+    // Re-merging an already-merged branch must not conflict or change state
+    let second = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let MergeResult::Success(_) = second else {
+        panic!("Re-merge of merged branch must not conflict");
+    };
+    assert_eq!(snapshot(&store, main.id).await, after_first);
+}
+
+#[tokio::test]
+async fn test_concurrent_commits_same_branch_no_lost_update() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let fa = Uuid::now_v7();
+    let fb = Uuid::now_v7();
+    let ops_a = [DiffOp::Insert {
+        feature_id: fa,
+        geometry_wkb: point_wkb(1.0, 1.0),
+        properties: json!({"who": "a"}),
+    }];
+    let ops_b = [DiffOp::Insert {
+        feature_id: fb,
+        geometry_wkb: point_wkb(2.0, 2.0),
+        properties: json!({"who": "b"}),
+    }];
+    let (ra, rb) = tokio::join!(
+        store.commit(branch.id, "A", "alice", &ops_a),
+        store.commit(branch.id, "B", "bob", &ops_b),
+    );
+    let ca = ra.unwrap();
+    let cb = rb.unwrap();
+
+    // One commit must be the parent of the other; neither may be lost
+    let parents = [ca.parent_id, cb.parent_id];
+    assert!(
+        parents.contains(&None)
+            && (parents.contains(&Some(ca.id)) || parents.contains(&Some(cb.id))),
+        "commits must chain, got parents {parents:?}"
+    );
+    let history = store.get_branch_history(branch.id, 100).await.unwrap();
+    assert_eq!(history.len(), 2);
+    let features = snapshot(&store, branch.id).await;
+    assert_eq!(features.len(), 2);
+    assert!(features.contains_key(&fa) && features.contains_key(&fb));
+}
+
+/// A partial update (geometry or properties omitted) must fill the gap from
+/// the committing branch's own state, never from another branch.
+#[tokio::test]
+async fn test_partial_update_does_not_leak_across_branches() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: f1,
+                geometry_wkb: point_wkb(0.0, 0.0),
+                properties: json!({"name": "Park"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    // The other branch moves f1 and renames it
+    store
+        .commit(
+            feature.id,
+            "Bob moves and renames",
+            "bob",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(9.0, 9.0)),
+                properties: Some(json!({"name": "Bob's Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let main_before = snapshot(&store, main.id).await;
+
+    // Properties-only update on main: geometry must stay main's, not Bob's
+    store
+        .commit(
+            main.id,
+            "Alice renames only",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: None,
+                properties: Some(json!({"name": "Alice's Park"})),
+            }],
+        )
+        .await
+        .unwrap();
+    let main_after = snapshot(&store, main.id).await;
+    assert_eq!(
+        main_after[&f1].0, main_before[&f1].0,
+        "geometry-preserving update pulled geometry from another branch"
+    );
+    assert_eq!(main_after[&f1].1["name"], "Alice's Park");
+
+    // Geometry-only update on main: properties must stay main's, not Bob's
+    store
+        .commit(
+            main.id,
+            "Alice nudges only",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: f1,
+                geometry_wkb: Some(point_wkb(0.5, 0.5)),
+                properties: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let main_final = snapshot(&store, main.id).await;
+    assert_eq!(
+        main_final[&f1].1["name"], "Alice's Park",
+        "properties-preserving update pulled properties from another branch"
+    );
+
+    // The other branch is untouched throughout
+    let feature_state = snapshot(&store, feature.id).await;
+    assert_eq!(feature_state[&f1].1["name"], "Bob's Park");
+}
+
+#[tokio::test]
+async fn test_insert_then_update_same_feature_in_one_commit() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    store
+        .commit(
+            branch.id,
+            "Insert and update",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: f1,
+                    geometry_wkb: point_wkb(0.0, 0.0),
+                    properties: json!({"v": 1}),
+                },
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(1.0, 1.0)),
+                    properties: Some(json!({"v": 2})),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let features = snapshot(&store, branch.id).await;
+    assert_eq!(features.len(), 1);
+    assert_eq!(
+        features[&f1].1["v"], 2,
+        "later op in the same commit must win"
+    );
+}
+
+/// The "features" SQL view must resolve each branch by walking its ancestor
+/// chain: forks see pre-fork features, and each branch sees its own edits.
+#[tokio::test]
+async fn test_features_view_inherits_pre_fork_features() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+    store
+        .commit(
+            main.id,
+            "Initial",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: f1,
+                    geometry_wkb: point_wkb(0.0, 0.0),
+                    properties: json!({"name": "Park"}),
+                },
+                DiffOp::Insert {
+                    feature_id: f2,
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({"name": "School"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let feature = fork_branch(&store, ds.id, main.id, "feature").await;
+
+    // Edit f1 and add f3 on the fork only
+    let f3 = Uuid::now_v7();
+    store
+        .commit(
+            feature.id,
+            "Fork work",
+            "bob",
+            &[
+                DiffOp::Update {
+                    feature_id: f1,
+                    geometry_wkb: Some(point_wkb(9.0, 9.0)),
+                    properties: Some(json!({"name": "Bob's Park"})),
+                },
+                DiffOp::Insert {
+                    feature_id: f3,
+                    geometry_wkb: point_wkb(3.0, 3.0),
+                    properties: json!({"name": "Cafe"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    async fn view_features(
+        store: &PgStore,
+        branch_id: Uuid,
+    ) -> std::collections::BTreeMap<Uuid, serde_json::Value> {
+        sqlx::query("SELECT id, properties FROM features WHERE branch_id = $1")
+            .bind(branch_id)
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<Uuid, _>("id"),
+                    r.get::<serde_json::Value, _>("properties"),
+                )
+            })
+            .collect()
+    }
+
+    // Fork sees inherited f2, its own f1 edit, and its new f3
+    let fork_view = view_features(&store, feature.id).await;
+    assert_eq!(fork_view.len(), 3, "fork must see inherited features");
+    assert_eq!(fork_view[&f1]["name"], "Bob's Park");
+    assert_eq!(fork_view[&f2]["name"], "School");
+    assert_eq!(fork_view[&f3]["name"], "Cafe");
+
+    // Main still sees its own versions, untouched by the fork
+    let main_view = view_features(&store, main.id).await;
+    assert_eq!(main_view.len(), 2);
+    assert_eq!(main_view[&f1]["name"], "Park");
+    assert_eq!(main_view[&f2]["name"], "School");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

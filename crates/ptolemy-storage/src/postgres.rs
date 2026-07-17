@@ -265,15 +265,23 @@ impl PgStore {
                     geometry_wkb,
                     properties,
                 } => {
+                    // fill omitted fields from this branch's own chain, never other branches
                     let geom = if let Some(wkb) = geometry_wkb {
                         wkb.clone()
                     } else {
                         let row = sqlx::query(
-                            "SELECT ST_AsBinary(geometry) as geom FROM feature_versions
-                             WHERE feature_id = $1 AND operation != 'delete'
-                             ORDER BY created_at DESC LIMIT 1",
+                            "WITH RECURSIVE chain AS (
+                                SELECT id, parent_id FROM changesets WHERE id = $2
+                              UNION ALL
+                                SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
+                            )
+                            SELECT ST_AsBinary(fv.geometry) as geom FROM feature_versions fv
+                            JOIN chain ch ON fv.changeset_id = ch.id
+                            WHERE fv.feature_id = $1 AND fv.operation != 'delete'
+                            ORDER BY fv.id DESC LIMIT 1",
                         )
                         .bind(feature_id)
+                        .bind(changeset_id)
                         .fetch_one(&mut *tx)
                         .await?;
                         row.get::<Vec<u8>, _>("geom")
@@ -282,11 +290,18 @@ impl PgStore {
                         p.clone()
                     } else {
                         let row = sqlx::query(
-                            "SELECT properties FROM feature_versions
-                             WHERE feature_id = $1 AND operation != 'delete'
-                             ORDER BY created_at DESC LIMIT 1",
+                            "WITH RECURSIVE chain AS (
+                                SELECT id, parent_id FROM changesets WHERE id = $2
+                              UNION ALL
+                                SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
+                            )
+                            SELECT fv.properties FROM feature_versions fv
+                            JOIN chain ch ON fv.changeset_id = ch.id
+                            WHERE fv.feature_id = $1 AND fv.operation != 'delete'
+                            ORDER BY fv.id DESC LIMIT 1",
                         )
                         .bind(feature_id)
+                        .bind(changeset_id)
                         .fetch_one(&mut *tx)
                         .await?;
                         row.get::<serde_json::Value, _>("properties")
@@ -357,7 +372,7 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, dataset_id, geometry_wkb, properties
             FROM latest
@@ -395,7 +410,7 @@ impl PgStore {
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
             WHERE fv.feature_id = $1
-            ORDER BY fv.created_at DESC
+            ORDER BY fv.created_at DESC, fv.id DESC
             LIMIT 1",
         )
         .bind(feature_id)
@@ -443,7 +458,7 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN new_changesets nc ON fv.changeset_id = nc.id
-                ORDER BY fv.feature_id, fv.created_at DESC",
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
             )
             .bind(from_id)
             .bind(to_changeset)
@@ -461,7 +476,7 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC",
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
             )
             .bind(to_changeset)
             .fetch_all(&self.pool)
@@ -508,9 +523,9 @@ impl PgStore {
         let row = sqlx::query(
             "WITH RECURSIVE
             ancestors_a AS (
-                SELECT id, parent_id FROM changesets WHERE id = $1
+                SELECT id, parent_id, 0 AS depth FROM changesets WHERE id = $1
               UNION ALL
-                SELECT c.id, c.parent_id FROM changesets c JOIN ancestors_a a ON a.parent_id = c.id
+                SELECT c.id, c.parent_id, a.depth + 1 FROM changesets c JOIN ancestors_a a ON a.parent_id = c.id
             ),
             ancestors_b AS (
                 SELECT id, parent_id FROM changesets WHERE id = $2
@@ -519,6 +534,7 @@ impl PgStore {
             )
             SELECT a.id FROM ancestors_a a
             JOIN ancestors_b b ON a.id = b.id
+            ORDER BY a.depth
             LIMIT 1",
         )
         .bind(changeset_a)
@@ -965,7 +981,7 @@ impl PgStore {
                         ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                     FROM feature_versions fv
                     JOIN chain ch ON fv.changeset_id = ch.id
-                    ORDER BY fv.feature_id, fv.created_at DESC
+                    ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
                 )
                 SELECT feature_id, dataset_id, geometry_wkb, properties
                 FROM latest
@@ -996,7 +1012,7 @@ impl PgStore {
                         ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                     FROM feature_versions fv
                     JOIN chain ch ON fv.changeset_id = ch.id
-                    ORDER BY fv.feature_id, fv.created_at DESC
+                    ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
                 )
                 SELECT feature_id, dataset_id, geometry_wkb, properties
                 FROM latest
@@ -1052,7 +1068,7 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, dataset_id, geometry_wkb, properties
             FROM latest
@@ -1108,7 +1124,7 @@ impl PgStore {
                     fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, dataset_id, geometry_wkb, properties
             FROM latest
@@ -1160,7 +1176,7 @@ impl PgStore {
                     fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, dataset_id, geometry_wkb, properties
             FROM latest
@@ -1209,7 +1225,7 @@ impl PgStore {
                     fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, dataset_id, geometry_wkb, properties
             FROM latest
@@ -1252,7 +1268,7 @@ impl PgStore {
                     fv.feature_id, fv.operation
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT COUNT(*) as cnt
             FROM latest
@@ -1291,7 +1307,7 @@ impl PgStore {
                     fv.feature_id, fv.operation, fv.geometry, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             ),
             bounds AS (
                 SELECT ST_TileEnvelope($2::integer, $3::integer, $4::integer) AS geom
@@ -1580,7 +1596,7 @@ impl PgStore {
                     fv.feature_id, fv.operation, fv.geometry, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT
                 COUNT(*) FILTER (WHERE operation != 'delete' AND geometry IS NULL) as null_geom,
@@ -1630,7 +1646,7 @@ impl PgStore {
                     fv.feature_id, fv.operation, fv.geometry, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, ST_AsBinary(ST_MakeValid(geometry)) as fixed_geom, properties
             FROM latest
@@ -1871,7 +1887,7 @@ impl PgStore {
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 WHERE fv.created_at <= $2
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, geojson, properties
             FROM latest
@@ -2562,7 +2578,7 @@ impl PgStore {
         let deleted = sqlx::query(
             "WITH ranked AS (
                 SELECT fv.id,
-                    ROW_NUMBER() OVER (PARTITION BY fv.feature_id ORDER BY fv.created_at DESC) as rn
+                    ROW_NUMBER() OVER (PARTITION BY fv.feature_id ORDER BY fv.created_at DESC, fv.id DESC) as rn
                 FROM feature_versions fv
                 JOIN changesets c ON fv.changeset_id = c.id
                 WHERE c.branch_id = $1

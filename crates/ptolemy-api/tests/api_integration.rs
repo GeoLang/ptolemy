@@ -501,10 +501,77 @@ async fn test_cql2_filter() {
         }),
     )
     .await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "cql2 filter: {status} {body}"
+    assert_eq!(status, StatusCode::OK, "cql2 filter: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn test_cql2_filter_sees_inherited_features_on_fork() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"pop": 1000}}
+    ])).await;
+
+    // Fork from main's head
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/branches"),
+        json!({"name": "fork", "created_by": "test", "fork_from_branch": main_id.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "fork branch: {body}");
+    let fork_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let filter = json!({"filter": {"op": ">", "args": [{"property": "pop"}, 500]}});
+
+    // The fork must see the pre-fork feature
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{fork_id}/features/filter"),
+        filter.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 on fork: {body}");
+    assert_eq!(
+        body["numberReturned"], 1,
+        "fork must see pre-fork feature: {body}"
     );
+
+    // Edit the feature on the fork only
+    commit_features(
+        &app,
+        fork_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"pop": 2000}}
+        ]),
+    )
+    .await;
+
+    // Fork sees its own version
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{fork_id}/features/filter"),
+        filter.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 on fork after edit: {body}");
+    assert_eq!(body["features"][0]["properties"]["pop"], 2000, "{body}");
+
+    // Parent still sees its own version
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main_id}/features/filter"),
+        filter,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 on main: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["properties"]["pop"], 1000, "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
