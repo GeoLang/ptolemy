@@ -23,6 +23,7 @@ pub fn vertical_routes() -> Router<AppState> {
         .route("/sensors/readings", get(sensor_readings))
         // Construction
         .route("/surveys/compare", post(survey_compare))
+        .route("/construction/surveys", get(list_surveys))
         .route("/construction/milestones", get(list_milestones))
         // Agriculture
         .route("/fields", get(list_fields))
@@ -240,6 +241,55 @@ async fn survey_compare(
 }
 
 #[derive(Deserialize)]
+struct SurveyListParams {
+    branch_id: Uuid,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+#[derive(Serialize)]
+struct SurveyInfo {
+    id: Uuid,
+    name: Option<String>,
+    date: Option<String>,
+    point_count: Option<u64>,
+    mean_elevation: Option<f64>,
+}
+
+async fn list_surveys(
+    State(store): State<AppState>,
+    Query(params): Query<SurveyListParams>,
+) -> Result<Json<Vec<SurveyInfo>>, VerticalError> {
+    let features = store
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500))
+        .await
+        .map_err(VerticalError::Store)?;
+
+    let surveys: Vec<SurveyInfo> = features
+        .into_iter()
+        .filter(|f| f.properties.get("survey_name").is_some())
+        .map(|f| {
+            let p = &f.properties;
+            SurveyInfo {
+                id: f.id,
+                name: p
+                    .get("survey_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                date: p
+                    .get("survey_date")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                point_count: p.get("point_count").and_then(|v| v.as_u64()),
+                mean_elevation: p.get("mean_elevation").and_then(|v| v.as_f64()),
+            }
+        })
+        .collect();
+
+    Ok(Json(surveys))
+}
+
+#[derive(Deserialize)]
 struct MilestoneParams {
     branch_id: Uuid,
     #[serde(default = "default_limit")]
@@ -253,6 +303,7 @@ struct Milestone {
     status: Option<String>,
     due_date: Option<String>,
     completion_pct: Option<f64>,
+    planned_pct: Option<f64>,
 }
 
 async fn list_milestones(
@@ -278,6 +329,7 @@ async fn list_milestones(
                 status: p.get("status").and_then(|v| v.as_str()).map(String::from),
                 due_date: p.get("due_date").and_then(|v| v.as_str()).map(String::from),
                 completion_pct: p.get("completion_pct").and_then(|v| v.as_f64()),
+                planned_pct: p.get("planned_pct").and_then(|v| v.as_f64()),
             }
         })
         .collect();
