@@ -13,6 +13,8 @@ pub struct Webhook {
     pub dataset_id: Uuid,
     pub url: String,
     pub events: Vec<String>,
+    // signing secret must never leave the server in a response
+    #[serde(skip_serializing)]
     pub secret: Option<String>,
     pub active: bool,
 }

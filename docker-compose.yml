@@ -23,7 +23,9 @@ services:
     environment:
       DATABASE_URL: postgres://ptolemy:ptolemy@db/ptolemy
       RUST_LOG: info,ptolemy=debug
-      PTOLEMY_JWT_SECRET: change-me-in-production
+      # local dev only: a known secret is no better than none in production.
+      # 32-byte minimum, or the server refuses to start.
+      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:-local-dev-secret-not-for-production}
     ports:
       - "3000:3000"
     healthcheck:

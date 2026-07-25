@@ -219,11 +219,8 @@ async fn oidc_callback(Query(params): Query<CallbackParams>) -> Response {
     };
 
     // Generate a Ptolemy JWT for the user
-    let ptolemy_token = crate::auth::generate_token_from_env(
-        &user_info.sub,
-        user_info.name.as_deref().unwrap_or(&user_info.sub),
-        &[crate::auth::Role::Editor],
-    );
+    let ptolemy_token =
+        crate::auth::generate_token_from_env(&user_info.sub, crate::auth::Role::Editor);
 
     match ptolemy_token {
         Ok(token) => (

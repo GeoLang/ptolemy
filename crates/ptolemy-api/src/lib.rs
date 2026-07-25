@@ -56,7 +56,9 @@ use ptolemy_storage::PgStore;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
-pub use auth::{AuthConfig, Claims, Role, generate_token, generate_token_from_env};
+pub use auth::{
+    Access, AuthConfig, Claims, Role, classify, generate_token, generate_token_from_env,
+};
 pub use delivery::{DeliveryJob, DeliverySender, spawn_delivery_worker};
 pub use jobs::BackgroundJobs;
 pub use metrics::{init_metrics, record_domain_event};
@@ -73,7 +75,15 @@ const REVIEW_UI_HTML: &str = include_str!("../../../docs/review.html");
 /// The embedded conflict resolution UI HTML.
 const CONFLICTS_UI_HTML: &str = include_str!("../../../docs/conflicts.html");
 
+/// Build the router, reading auth config from the environment. Callers that
+/// serve this router must resolve the config with
+/// [`AuthConfig::from_env_strict`] and use [`app_with_auth`], so a missing
+/// secret refuses to start instead of opening every write endpoint.
 pub fn app(state: AppState) -> Router {
+    app_with_auth(state, AuthConfig::from_env())
+}
+
+pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
     let event_bus = Arc::new(EventBus::new(1024));
     let sse_broadcast = Arc::new(SseBroadcast::new(4096));
     let room_relay = Arc::new(RoomRelay::new());
@@ -123,7 +133,7 @@ pub fn app(state: AppState) -> Router {
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
         .layer(middleware::from_fn(metrics::metrics_middleware))
-        .layer(middleware::from_fn(auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

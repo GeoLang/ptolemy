@@ -8,7 +8,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use ptolemy_api::{AppState, app};
+use ptolemy_api::{AppState, AuthConfig, Role, app_with_auth, generate_token};
 use ptolemy_storage::postgres::PgStore;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -16,8 +16,11 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Helper: create the test app from a fresh database.
-async fn setup_app() -> (axum::Router, AppState) {
+/// Secret for the auth-enabled tests. Never a real deployment value.
+const TEST_SECRET: &str = "integration-test-secret-0123456789abcdef";
+
+/// Helper: reset the database and return fresh state.
+async fn fresh_state() -> AppState {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
@@ -44,9 +47,22 @@ async fn setup_app() -> (axum::Router, AppState) {
     let store = PgStore::new(pool);
     store.migrate().await.unwrap();
 
-    let state: AppState = Arc::new(store);
-    let router = app(state.clone());
+    Arc::new(store)
+}
+
+/// Helper: create the test app from a fresh database, with auth off. The bulk
+/// of these tests exercise handlers, not the auth layer; see the
+/// `auth_enabled_*` tests for the enforced behaviour.
+async fn setup_app() -> (axum::Router, AppState) {
+    let state = fresh_state().await;
+    let router = app_with_auth(state.clone(), AuthConfig::disabled());
     (router, state)
+}
+
+/// Helper: create the test app with auth enforced against [`TEST_SECRET`].
+async fn setup_app_authed() -> axum::Router {
+    let state = fresh_state().await;
+    app_with_auth(state, AuthConfig::enabled(TEST_SECRET))
 }
 
 /// Helper: make a JSON POST request and return status + body.
@@ -55,7 +71,8 @@ async fn post_json(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, V
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
-        .header("authorization", "Bearer test-skip") // auth middleware should skip in test
+        // ignored: setup_app builds the router with auth disabled
+        .header("authorization", "Bearer test-skip")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
 
@@ -1792,4 +1809,248 @@ async fn test_qgis_push_updates_live_features_and_inserts_the_rest() {
     assert_eq!(coords, vec![9.0, 9.0], "{pulled}");
     assert_eq!(by_id(f2)["properties"]["name"], "two-new", "{pulled}");
     assert_eq!(by_id(f3)["properties"]["name"], "three-pushed", "{pulled}");
+}
+
+// ─── Auth enforcement (router built with a real secret) ─────────────
+
+/// Helper: send a request with an optional bearer token, return status + body.
+async fn request_as(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let req = match &body {
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(b).unwrap()))
+            .unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+fn token_for(role: Role) -> String {
+    generate_token(TEST_SECRET, "test-user", role, 3600)
+}
+
+/// A correctly signed token whose `exp` is an hour in the past.
+fn expired_token(secret: &str, role: Role) -> String {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        sub: String,
+        exp: usize,
+        role: String,
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as usize;
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &Claims {
+            sub: "test-user".into(),
+            exp: now - 3600,
+            role: role.as_str().to_string(),
+        },
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn new_dataset_body() -> Value {
+    json!({
+        "name": format!("auth_{}", Uuid::now_v7()),
+        "geometry_type": "point",
+        "srid": 4326,
+        "created_by": "test"
+    })
+}
+
+#[tokio::test]
+async fn test_auth_enabled_get_is_anonymous() {
+    let app = setup_app_authed().await;
+    let (status, _) = request_as(&app, "GET", "/api/v1/datasets", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_as(&app, "GET", "/api/v1/health", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_enabled_write_without_token_is_401() {
+    let app = setup_app_authed().await;
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        None,
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn test_auth_enabled_viewer_write_is_403() {
+    let app = setup_app_authed().await;
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&token_for(Role::Viewer)),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn test_auth_enabled_editor_can_commit() {
+    let app = setup_app_authed().await;
+    let editor = token_for(Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = dataset["id"].as_str().unwrap();
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&editor),
+        Some(json!({"name": "main", "created_by": "test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = branch["id"].as_str().unwrap();
+
+    let (status, commit) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&editor),
+        Some(json!({
+            "message": "authed commit",
+            "author": "test",
+            "operations": [{
+                "type": "insert",
+                "feature_id": Uuid::now_v7(),
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {"name": "one"}
+            }]
+        })),
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "commit as editor failed with {status}: {commit}"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_enabled_admin_route_rejects_editor() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&admin),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = dataset["id"].as_str().unwrap();
+
+    let hook = json!({"url": "https://example.invalid/hook", "events": ["commit"]});
+    let uri = format!("/api/v1/datasets/{dataset_id}/webhooks");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &uri,
+        Some(&token_for(Role::Editor)),
+        Some(hook.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request_as(&app, "POST", &uri, Some(&admin), Some(hook)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn test_auth_enabled_rejects_garbage_and_expired_tokens() {
+    let app = setup_app_authed().await;
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some("not-a-jwt"),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // signed with the right secret but expired well past the 60s clock-skew
+    // leeway jsonwebtoken allows by default
+    let expired = expired_token(TEST_SECRET, Role::Admin);
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&expired),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // valid claims, wrong signing key
+    let forged = generate_token(
+        "another-secret-that-is-long-enough-000000",
+        "attacker",
+        Role::Admin,
+        3600,
+    );
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&forged),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn test_auth_enabled_no_api_key_bypass() {
+    let app = setup_app_authed().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/datasets")
+        .header("content-type", "application/json")
+        .header("x-api-key", "anything-at-all")
+        .body(Body::from(serde_json::to_vec(&new_dataset_body()).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

@@ -16,7 +16,9 @@ services:
     environment:
       DATABASE_URL: ${NEON_DATABASE_URL}
       RUST_LOG: info,ptolemy=debug
-      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:-change-me-in-production}
+      # no default: starting a hosted deployment with a known signing secret
+      # is the same as having no auth at all
+      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:?set PTOLEMY_JWT_SECRET to 32+ random bytes}
     ports:
       - "3000:3000"
     healthcheck:

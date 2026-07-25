@@ -42,3 +42,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 sqlx = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# integration tests mint tokens the API layer must reject (expired, forged)
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }

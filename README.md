@@ -120,7 +120,8 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection URL | (required) |
-| `PTOLEMY_JWT_SECRET` | JWT signing secret (enables auth when set) | (disabled) |
+| `PTOLEMY_JWT_SECRET` | JWT signing secret, 32+ bytes (required to serve) | (required) |
+| `PTOLEMY_AUTH_DISABLED` | Set to `true` to serve with auth off | `false` |
 | `PTOLEMY_OIDC_ISSUER_URL` | OIDC provider URL (e.g. Keycloak realm) | (disabled) |
 | `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |
 | `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | — |

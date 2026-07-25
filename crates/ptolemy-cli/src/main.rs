@@ -261,10 +261,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve { bind } => {
+            // resolved before anything else: serving with no JWT secret would
+            // leave every write endpoint open, so refuse to start instead
+            let auth = ptolemy_api::AuthConfig::from_env_strict().map_err(anyhow::Error::msg)?;
             // migrations are idempotent; running them here means the server
             // can never come up against an unmigrated database
             store.migrate().await?;
-            let app = ptolemy_api::app(store.clone());
+            let app = ptolemy_api::app_with_auth(store.clone(), auth);
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("Ptolemy listening on {bind}");
             tracing::info!("Metrics available at http://{bind}/metrics");
