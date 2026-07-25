@@ -135,9 +135,11 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
             let prop = extract_property(&args[0])?;
             let low = extract_literal(&args[1])?;
             let high = extract_literal(&args[2])?;
+            // same guarded cast as binary_op: non-numeric text yields NULL, not an error
+            let prop = sanitize_field(&prop);
             Ok(format!(
-                "(properties->>'{prop}')::float BETWEEN {low} AND {high}",
-                prop = sanitize_field(&prop),
+                "CASE WHEN properties->>'{prop}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$' \
+                 THEN (properties->>'{prop}')::numeric END BETWEEN {low} AND {high}",
                 low = sanitize_value(&low),
                 high = sanitize_value(&high)
             ))
@@ -212,11 +214,20 @@ fn binary_op(filter: &serde_json::Value, sql_op: &str) -> Result<String, Cql2Err
     let args = get_args(filter)?;
     let prop = extract_property(&args[0])?;
     let val = extract_literal(&args[1])?;
-    // jsonb ->> yields text; numeric literals need a cast on the property side
-    let cast = if args[1].is_number() { "::numeric" } else { "" };
+    let prop = sanitize_field(&prop);
+    // jsonb ->> yields text; numeric literals need a cast on the property side.
+    // Guard the cast so rows holding non-numeric text yield NULL (excluded)
+    // instead of erroring the whole query.
+    let lhs = if args[1].is_number() {
+        format!(
+            "CASE WHEN properties->>'{prop}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$' \
+             THEN (properties->>'{prop}')::numeric END"
+        )
+    } else {
+        format!("(properties->>'{prop}')")
+    };
     Ok(format!(
-        "(properties->>'{prop}'){cast} {sql_op} {val}",
-        prop = sanitize_field(&prop),
+        "{lhs} {sql_op} {val}",
         sql_op = sql_op,
         val = sanitize_value(&val)
     ))

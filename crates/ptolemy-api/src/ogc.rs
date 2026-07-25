@@ -224,7 +224,7 @@ async fn items(
                     fv.feature_id, fv.operation, fv.geometry, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
             FROM latest
@@ -256,7 +256,7 @@ async fn items(
                     fv.feature_id, fv.operation, fv.geometry, fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
             FROM latest
@@ -302,7 +302,7 @@ async fn item(
         "SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
          FROM feature_versions
          WHERE feature_id = $1
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(feature_id)
     .fetch_optional(store.pool())

@@ -142,7 +142,7 @@ impl GrpcService {
                     fv.properties
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC
+                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
             SELECT feature_id, geom, properties
             FROM latest

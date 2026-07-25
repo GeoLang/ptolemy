@@ -448,7 +448,7 @@ async fn qgis_pull(
         "SELECT fv.feature_id, ST_AsGeoJSON(fv.geometry)::jsonb as geojson, fv.properties
          FROM feature_versions fv
          WHERE fv.branch_id = $1 AND fv.is_deleted = false
-         ORDER BY fv.created_at DESC
+         ORDER BY fv.created_at DESC, fv.id DESC
          LIMIT $2",
     )
     .bind(branch_id)

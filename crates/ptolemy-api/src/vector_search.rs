@@ -71,7 +71,7 @@ async fn similarity_search(
          JOIN changesets c ON fv.changeset_id = c.id
          WHERE c.branch_id = $1 AND fv.embedding IS NOT NULL
            AND 1 - (fv.embedding <=> $2::vector) > $3
-         ORDER BY fv.feature_id, fv.created_at DESC, fv.embedding <=> $2::vector
+         ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC, fv.embedding <=> $2::vector
          LIMIT $4",
     )
     .bind(branch_id)
@@ -120,7 +120,7 @@ async fn find_duplicates(
             FROM feature_versions fv
             JOIN changesets c ON fv.changeset_id = c.id
             WHERE c.branch_id = $1 AND fv.embedding IS NOT NULL AND fv.operation != 'delete'
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         )
         SELECT a.id as a_id, b.id as b_id,
                1 - (a.embedding <=> b.embedding) as similarity
@@ -221,7 +221,7 @@ async fn cluster_by_embedding(
             FROM feature_versions fv
             JOIN changesets c ON fv.changeset_id = c.id
             WHERE c.branch_id = $1 AND fv.embedding IS NOT NULL AND fv.operation != 'delete'
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         )
         SELECT kmeans_cluster, COUNT(*) as count, array_agg(id) as feature_ids
         FROM (

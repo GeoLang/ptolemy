@@ -68,7 +68,7 @@ latest AS (
         fv.feature_id, fv.geometry, fv.properties, fv.operation
     FROM feature_versions fv
     JOIN chain ch ON fv.changeset_id = ch.id
-    ORDER BY fv.feature_id, fv.created_at DESC
+    ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
 ),
 live AS (
     SELECT feature_id, geometry, properties

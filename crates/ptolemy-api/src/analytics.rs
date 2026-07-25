@@ -52,7 +52,7 @@ async fn buffer_analysis(
             ST_Area(ST_Buffer(geometry::geography, $2)) as area
          FROM feature_versions
          WHERE feature_id = $1
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(q.feature_id)
     .bind(q.distance)
@@ -92,7 +92,7 @@ async fn union_analysis(
             SELECT DISTINCT ON (fv.feature_id) fv.geometry, fv.operation
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         ),
         live AS (
             SELECT geometry FROM latest WHERE operation != 'delete' AND geometry IS NOT NULL
@@ -155,7 +155,7 @@ async fn cluster_analysis(
             SELECT DISTINCT ON (fv.feature_id) fv.geometry, fv.operation
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         ),
         live AS (
             SELECT geometry FROM latest WHERE operation != 'delete' AND geometry IS NOT NULL
@@ -216,7 +216,7 @@ async fn anomaly_detection(
             SELECT DISTINCT ON (fv.feature_id) fv.feature_id, fv.geometry, fv.operation
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         ),
         live AS (
             SELECT feature_id, geometry FROM latest
@@ -280,7 +280,7 @@ async fn spatial_stats(
             SELECT DISTINCT ON (fv.feature_id) fv.geometry, fv.operation
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
-            ORDER BY fv.feature_id, fv.created_at DESC
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
         ),
         live AS (
             SELECT geometry FROM latest WHERE operation != 'delete' AND geometry IS NOT NULL

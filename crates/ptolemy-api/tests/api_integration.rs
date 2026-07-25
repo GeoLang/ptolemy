@@ -574,6 +574,182 @@ async fn test_cql2_filter_sees_inherited_features_on_fork() {
     assert_eq!(body["features"][0]["properties"]["pop"], 1000, "{body}");
 }
 
+#[tokio::test]
+async fn test_cql2_numeric_filter_ignores_non_numeric_property() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let numeric = Uuid::now_v7();
+    let numeric_string = Uuid::now_v7();
+    let text = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": numeric.to_string(), "geometry_wkb_hex": point_hex, "properties": {"pop": 1000}},
+        {"type": "insert", "feature_id": numeric_string.to_string(), "geometry_wkb_hex": point_hex, "properties": {"pop": "250"}},
+        {"type": "insert", "feature_id": text.to_string(), "geometry_wkb_hex": point_hex, "properties": {"pop": "unknown"}}
+    ])).await;
+
+    // The non-numeric row must not blow up the cast
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": ">", "args": [{"property": "pop"}, 500]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 numeric filter: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["id"], numeric.to_string(), "{body}");
+
+    // Numeric strings still compare as numbers
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": "<", "args": [{"property": "pop"}, 500]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 numeric filter: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(
+        body["features"][0]["id"],
+        numeric_string.to_string(),
+        "{body}"
+    );
+
+    // between has the same guarded cast
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": "between", "args": [{"property": "pop"}, 100, 500]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cql2 between filter: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(
+        body["features"][0]["id"],
+        numeric_string.to_string(),
+        "{body}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Conflict Resolution Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: fork a branch off another branch's head, return its ID.
+async fn create_fork(app: &axum::Router, dataset_id: Uuid, name: &str, from: Uuid) -> Uuid {
+    let (status, body) = post_json(
+        app,
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        json!({"name": name, "created_by": "test", "fork_from_branch": from.to_string()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "fork branch: {body}");
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+async fn resolve_theirs(app: &axum::Router, source_id: Uuid, feature_id: Uuid) -> Value {
+    let (status, body) = post_json(
+        app,
+        &format!("/api/v1/conflicts/{source_id}/resolve"),
+        json!({
+            "resolutions": [{"feature_id": feature_id.to_string(), "strategy": "theirs"}],
+            "message": "take theirs",
+            "author": "test",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resolve theirs: {body}");
+    body
+}
+
+#[tokio::test]
+async fn test_resolve_theirs_uses_target_branch_not_newest_write() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}}
+    ])).await;
+
+    // Source branch diverges the feature
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-v1"}}
+        ]),
+    )
+    .await;
+
+    // An unrelated branch writes a newer version of the same feature
+    let other_id = create_fork(&app, ds_id, "other", main_id).await;
+    commit_features(
+        &app,
+        other_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "other-newer"}}
+        ]),
+    )
+    .await;
+
+    resolve_theirs(&app, dev_id, f1).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{dev_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 1, "{body}");
+    assert_eq!(
+        features[0]["properties"]["name"], "main-v1",
+        "theirs must come from the merge target, not another branch: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_resolve_theirs_deletes_when_target_deleted() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}}
+    ])).await;
+
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-v1"}}
+        ]),
+    )
+    .await;
+
+    // Target deletes the feature
+    commit_features(
+        &app,
+        main_id,
+        json!([{"type": "delete", "feature_id": f1.to_string()}]),
+    )
+    .await;
+
+    resolve_theirs(&app, dev_id, f1).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{dev_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["features"].as_array().unwrap().len(),
+        0,
+        "taking theirs after target deleted must delete the feature: {body}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // OGC API Features Tests
 // ═══════════════════════════════════════════════════════════════════════
