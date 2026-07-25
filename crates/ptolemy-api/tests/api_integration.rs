@@ -2054,3 +2054,91 @@ async fn test_auth_enabled_no_api_key_bypass() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ─── Sensitive reads (config/ACL/membership/audit) are admin-only ───
+//
+// Regression guard: these GETs used to be anonymous because classify()
+// returned Public for every GET before checking the path. Each proves the
+// three-way ladder no-token->401, viewer->403, admin->200.
+
+/// Create a dataset in an auth-enabled app with an admin token, return its id.
+async fn create_dataset_authed(app: &axum::Router, admin: &str) -> String {
+    let (status, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(admin),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    dataset["id"].as_str().unwrap().to_string()
+}
+
+/// Assert a GET is 401 without a token, 403 for a viewer, 200 for an admin.
+async fn assert_read_is_admin_only(app: &axum::Router, uri: &str, admin: &str) {
+    let (status, body) = request_as(app, "GET", uri, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no-token GET {uri}: {body}"
+    );
+
+    let (status, body) = request_as(app, "GET", uri, Some(&token_for(Role::Viewer)), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "viewer GET {uri}: {body}");
+
+    let (status, body) = request_as(app, "GET", uri, Some(admin), None).await;
+    assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+}
+
+#[tokio::test]
+async fn test_webhooks_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/webhooks");
+    assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+#[tokio::test]
+async fn test_dataset_permissions_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/permissions");
+    assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+#[tokio::test]
+async fn test_permission_check_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/permissions/some-user/check");
+    assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+#[tokio::test]
+async fn test_orgs_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    assert_read_is_admin_only(&app, "/api/v1/orgs", &admin).await;
+}
+
+#[tokio::test]
+async fn test_audit_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    assert_read_is_admin_only(&app, "/api/v1/audit", &admin).await;
+}
+
+#[tokio::test]
+async fn test_data_read_stays_public_without_token() {
+    let app = setup_app_authed().await;
+    let (status, body) = request_as(&app, "GET", "/api/v1/datasets", None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "anonymous data read must stay open: {body}"
+    );
+}

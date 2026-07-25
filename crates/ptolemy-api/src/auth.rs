@@ -111,6 +111,18 @@ const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
 /// POSTs are public; privilege and delivery-config changes are admin-only;
 /// everything else that mutates needs write access.
 pub fn classify(method: &Method, path: &str) -> Access {
+    // permissions, org membership, webhook config and audit are ACL/config that
+    // both hand out access and exfiltrate data, so they are admin-only for every
+    // method. This must sit above the read-is-public rule below, or an anonymous
+    // GET would leak the ACL, hook list, or membership.
+    if path.contains("/permissions")
+        || path.contains("/webhooks")
+        || path.starts_with("/api/v1/orgs")
+        || path.starts_with("/api/v1/audit")
+    {
+        return Access::Admin;
+    }
+
     if *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS {
         return Access::Public;
     }
@@ -119,13 +131,9 @@ pub fn classify(method: &Method, path: &str) -> Access {
         return Access::Public;
     }
 
-    // granting permissions, org membership, webhook delivery and peer
-    // replication all hand out access or exfiltrate data, so admin only
-    if path.contains("/permissions")
-        || path.contains("/webhooks")
-        || path.starts_with("/api/v1/orgs")
-        || path.starts_with("/api/v1/replication/peers")
-    {
+    // registering a replication peer hands out a data feed, so admin only;
+    // listing peers (GET) stays public under the read rule above
+    if path.starts_with("/api/v1/replication/peers") {
         return Access::Admin;
     }
 
@@ -393,6 +401,38 @@ mod tests {
             (Method::POST, "/api/v1/replication/peers"),
         ] {
             assert_eq!(classify(&method, path), Access::Admin, "{method} {path}");
+        }
+    }
+
+    /// The fix: config/ACL/membership/audit reads must be admin, not public,
+    /// even though they are GETs.
+    #[test]
+    fn classify_sensitive_reads_are_admin() {
+        for path in [
+            "/api/v1/datasets/x/webhooks",
+            "/api/v1/datasets/x/permissions",
+            "/api/v1/datasets/x/permissions/u/check",
+            "/api/v1/branches/x/permissions",
+            "/api/v1/orgs",
+            "/api/v1/orgs/x/members",
+            "/api/v1/audit",
+        ] {
+            assert_eq!(classify(&Method::GET, path), Access::Admin, "GET {path}");
+        }
+    }
+
+    /// The anonymous-viewer product decision: spatial data reads stay public.
+    #[test]
+    fn classify_data_reads_stay_public() {
+        for path in [
+            "/api/v1/datasets",
+            "/api/v1/datasets/x",
+            "/api/v1/branches/x/features",
+            "/api/v1/branches/x/tiles/1/2/3",
+            "/api/v1/branches/x/export/geojson",
+            "/api/v1/replication/peers",
+        ] {
+            assert_eq!(classify(&Method::GET, path), Access::Public, "GET {path}");
         }
     }
 
