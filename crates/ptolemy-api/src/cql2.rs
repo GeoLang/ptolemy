@@ -47,25 +47,26 @@ async fn cql2_filter(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<Cql2FilterRequest>,
 ) -> Result<Json<serde_json::Value>, Cql2Error> {
-    // Parse CQL2-JSON filter into SQL WHERE clause
-    let where_clause = cql2_to_sql(&req.filter)?;
+    // Parse CQL2-JSON filter into SQL WHERE clause. branch_id is $1, so the
+    // filter's own values start at $2 and limit/offset come after them.
+    let (where_clause, binds) = cql2_to_sql(&req.filter, 1)?;
     let limit = req.limit.unwrap_or(100);
     let offset = req.offset.unwrap_or(0);
+    let limit_param = binds.len() + 2;
+    let offset_param = binds.len() + 3;
 
     let query = format!(
         "SELECT id, dataset_id, properties, ST_AsGeoJSON(geometry)::jsonb as geojson
          FROM features
          WHERE branch_id = $1 AND ({where_clause})
-         LIMIT $2 OFFSET $3",
-        where_clause = where_clause
+         LIMIT ${limit_param} OFFSET ${offset_param}"
     );
 
-    let rows = sqlx::query(&query)
-        .bind(branch_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(store.pool())
-        .await?;
+    let mut q = sqlx::query(&query).bind(branch_id);
+    for value in &binds {
+        q = q.bind(value.as_str());
+    }
+    let rows = q.bind(limit).bind(offset).fetch_all(store.pool()).await?;
 
     let features: Vec<serde_json::Value> = rows
         .iter()
@@ -86,111 +87,107 @@ async fn cql2_filter(
     })))
 }
 
-/// Convert CQL2-JSON filter to SQL WHERE clause.
-/// Supports: eq, lt, gt, lte, gte, like, between, in, and, or, not, s_intersects, s_within.
-fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
-    match filter.get("op").and_then(|v| v.as_str()) {
-        Some("and") => {
-            let args = filter
-                .get("args")
-                .and_then(|a| a.as_array())
-                .ok_or(Cql2Error::Bad("'and' requires 'args' array".into()))?;
-            let clauses: Result<Vec<String>, _> = args.iter().map(cql2_to_sql).collect();
-            Ok(format!("({})", clauses?.join(" AND ")))
+/// Collects the bind values for a WHERE fragment. Placeholders continue the
+/// caller's numbering, so `offset` is how many parameters it already bound.
+struct Binds {
+    values: Vec<String>,
+    offset: usize,
+}
+
+impl Binds {
+    fn new(offset: usize) -> Self {
+        Binds {
+            values: Vec::new(),
+            offset,
         }
-        Some("or") => {
-            let args = filter
-                .get("args")
-                .and_then(|a| a.as_array())
-                .ok_or(Cql2Error::Bad("'or' requires 'args' array".into()))?;
-            let clauses: Result<Vec<String>, _> = args.iter().map(cql2_to_sql).collect();
-            Ok(format!("({})", clauses?.join(" OR ")))
+    }
+
+    /// Take a value and return the placeholder that stands for it, e.g. "$2".
+    fn add(&mut self, value: impl Into<String>) -> String {
+        self.values.push(value.into());
+        format!("${}", self.offset + self.values.len())
+    }
+}
+
+/// Rows whose text isn't numeric must yield NULL rather than fail the cast.
+/// Not attacker data: this is only ever interpolated as a constant.
+const NUMERIC_TEXT_RE: &str = r"^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$";
+
+/// Convert CQL2-JSON filter to a SQL WHERE clause plus the values to bind.
+/// Supports: eq, lt, gt, lte, gte, like, between, in, and, or, not, s_intersects, s_within.
+/// Nothing from the request is interpolated into the SQL: property names,
+/// literals and GeoJSON all travel as text bind parameters, numbered from
+/// `params_bound` + 1.
+fn cql2_to_sql(
+    filter: &serde_json::Value,
+    params_bound: usize,
+) -> Result<(String, Vec<String>), Cql2Error> {
+    let mut binds = Binds::new(params_bound);
+    let sql = filter_to_sql(filter, &mut binds)?;
+    Ok((sql, binds.values))
+}
+
+fn filter_to_sql(filter: &serde_json::Value, binds: &mut Binds) -> Result<String, Cql2Error> {
+    match filter.get("op").and_then(|v| v.as_str()) {
+        Some(op @ ("and" | "or")) => {
+            let args = get_args(filter, op, 1)?;
+            let clauses: Result<Vec<String>, _> =
+                args.iter().map(|a| filter_to_sql(a, binds)).collect();
+            let sep = if op == "and" { " AND " } else { " OR " };
+            Ok(format!("({})", clauses?.join(sep)))
         }
         Some("not") => {
-            let args = filter
-                .get("args")
-                .and_then(|a| a.as_array())
-                .ok_or(Cql2Error::Bad("'not' requires 'args' array".into()))?;
-            let inner = cql2_to_sql(&args[0])?;
+            let args = get_args(filter, "not", 1)?;
+            let inner = filter_to_sql(&args[0], binds)?;
             Ok(format!("NOT ({})", inner))
         }
-        Some("=" | "eq") => binary_op(filter, "="),
-        Some("<" | "lt") => binary_op(filter, "<"),
-        Some(">" | "gt") => binary_op(filter, ">"),
-        Some("<=" | "lte") => binary_op(filter, "<="),
-        Some(">=" | "gte") => binary_op(filter, ">="),
-        Some("!=" | "neq") => binary_op(filter, "!="),
+        Some(op @ ("=" | "eq")) => binary_op(filter, op, "=", binds),
+        Some(op @ ("<" | "lt")) => binary_op(filter, op, "<", binds),
+        Some(op @ (">" | "gt")) => binary_op(filter, op, ">", binds),
+        Some(op @ ("<=" | "lte")) => binary_op(filter, op, "<=", binds),
+        Some(op @ (">=" | "gte")) => binary_op(filter, op, ">=", binds),
+        Some(op @ ("!=" | "neq")) => binary_op(filter, op, "!=", binds),
         Some("like") => {
-            let args = get_args(filter)?;
-            let prop = extract_property(&args[0])?;
-            let pattern = extract_literal(&args[1])?;
-            Ok(format!(
-                "properties->>'{}' LIKE {}",
-                sanitize_field(&prop),
-                sanitize_value(&pattern)
-            ))
+            let args = get_args(filter, "like", 2)?;
+            let prop = binds.add(extract_property(&args[0])?);
+            let pattern = binds.add(extract_literal(&args[1])?);
+            Ok(format!("properties->>{prop} LIKE {pattern}"))
         }
         Some("between") => {
-            let args = get_args(filter)?;
-            let prop = extract_property(&args[0])?;
-            let low = extract_literal(&args[1])?;
-            let high = extract_literal(&args[2])?;
+            let args = get_args(filter, "between", 3)?;
+            let prop = binds.add(extract_property(&args[0])?);
+            let low = binds.add(numeric_literal(&args[1], "between")?);
+            let high = binds.add(numeric_literal(&args[2], "between")?);
             // same guarded cast as binary_op: non-numeric text yields NULL, not an error
-            let prop = sanitize_field(&prop);
             Ok(format!(
-                "CASE WHEN properties->>'{prop}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$' \
-                 THEN (properties->>'{prop}')::numeric END BETWEEN {low} AND {high}",
-                low = sanitize_value(&low),
-                high = sanitize_value(&high)
+                "{lhs} BETWEEN {low}::numeric AND {high}::numeric",
+                lhs = numeric_lhs(&prop)
             ))
         }
         Some("in") => {
-            let args = get_args(filter)?;
-            let prop = extract_property(&args[0])?;
+            let args = get_args(filter, "in", 2)?;
+            let prop = binds.add(extract_property(&args[0])?);
             let values: Vec<String> = args[1..]
                 .iter()
-                .map(|v| extract_literal(v).map(|s| sanitize_value(&s)))
+                .map(|v| extract_literal(v).map(|s| binds.add(s)))
                 .collect::<Result<_, _>>()?;
-            Ok(format!(
-                "properties->>'{}' IN ({})",
-                sanitize_field(&prop),
-                values.join(", ")
-            ))
+            Ok(format!("properties->>{prop} IN ({})", values.join(", ")))
         }
-        Some("s_intersects") => {
-            let args = get_args(filter)?;
-            let geom = &args[1];
-            Ok(format!(
-                "ST_Intersects(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom)
-                    .unwrap_or_default()
-                    .replace('\'', "''")
-            ))
-        }
-        Some("s_within") => {
-            let args = get_args(filter)?;
-            let geom = &args[1];
-            Ok(format!(
-                "ST_Within(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom)
-                    .unwrap_or_default()
-                    .replace('\'', "''")
-            ))
-        }
-        Some("s_contains") => {
-            let args = get_args(filter)?;
-            let geom = &args[1];
-            Ok(format!(
-                "ST_Contains(geometry, ST_GeomFromGeoJSON('{}'))",
-                serde_json::to_string(geom)
-                    .unwrap_or_default()
-                    .replace('\'', "''")
-            ))
+        Some(op @ ("s_intersects" | "s_within" | "s_contains")) => {
+            let args = get_args(filter, op, 2)?;
+            require_geometry_column(&args[0], op)?;
+            let geom = binds.add(geojson_geometry(&args[1], op)?.to_string());
+            let func = match op {
+                "s_intersects" => "ST_Intersects",
+                "s_within" => "ST_Within",
+                _ => "ST_Contains",
+            };
+            Ok(format!("{func}(geometry, ST_GeomFromGeoJSON({geom}))"))
         }
         Some("isNull") => {
-            let args = get_args(filter)?;
-            let prop = extract_property(&args[0])?;
-            Ok(format!("properties->>'{}' IS NULL", sanitize_field(&prop)))
+            let args = get_args(filter, "isNull", 1)?;
+            let prop = binds.add(extract_property(&args[0])?);
+            Ok(format!("properties->>{prop} IS NULL"))
         }
         Some(unknown) => Err(Cql2Error::Bad(format!(
             "unsupported CQL2 operator: {unknown}"
@@ -202,35 +199,120 @@ fn cql2_to_sql(filter: &serde_json::Value) -> Result<String, Cql2Error> {
     }
 }
 
-fn get_args(filter: &serde_json::Value) -> Result<Vec<serde_json::Value>, Cql2Error> {
-    filter
+/// Fetch 'args' and check the arity up front, since indexing a short array
+/// would panic on a request an attacker controls.
+fn get_args(
+    filter: &serde_json::Value,
+    op: &str,
+    min: usize,
+) -> Result<Vec<serde_json::Value>, Cql2Error> {
+    let args = filter
         .get("args")
         .and_then(|a| a.as_array())
         .cloned()
-        .ok_or(Cql2Error::Bad("missing 'args' array".into()))
+        .ok_or_else(|| Cql2Error::Bad(format!("'{op}' requires an 'args' array")))?;
+    if args.len() < min {
+        return Err(Cql2Error::Bad(format!(
+            "'{op}' requires at least {min} argument(s), got {}",
+            args.len()
+        )));
+    }
+    Ok(args)
 }
 
-fn binary_op(filter: &serde_json::Value, sql_op: &str) -> Result<String, Cql2Error> {
-    let args = get_args(filter)?;
-    let prop = extract_property(&args[0])?;
-    let val = extract_literal(&args[1])?;
-    let prop = sanitize_field(&prop);
-    // jsonb ->> yields text; numeric literals need a cast on the property side.
-    // Guard the cast so rows holding non-numeric text yield NULL (excluded)
-    // instead of erroring the whole query.
-    let lhs = if args[1].is_number() {
-        format!(
-            "CASE WHEN properties->>'{prop}' ~ '^-?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$' \
-             THEN (properties->>'{prop}')::numeric END"
-        )
+/// jsonb ->> yields text; numeric literals need a cast on the property side.
+/// Guard the cast so rows holding non-numeric text yield NULL (excluded)
+/// instead of erroring the whole query.
+fn numeric_lhs(prop: &str) -> String {
+    format!(
+        "CASE WHEN properties->>{prop} ~ '{NUMERIC_TEXT_RE}' \
+         THEN (properties->>{prop})::numeric END"
+    )
+}
+
+fn binary_op(
+    filter: &serde_json::Value,
+    op: &str,
+    sql_op: &str,
+    binds: &mut Binds,
+) -> Result<String, Cql2Error> {
+    let args = get_args(filter, op, 2)?;
+    let prop = binds.add(extract_property(&args[0])?);
+    let val = binds.add(extract_literal(&args[1])?);
+    if args[1].is_number() {
+        Ok(format!(
+            "{lhs} {sql_op} {val}::numeric",
+            lhs = numeric_lhs(&prop)
+        ))
     } else {
-        format!("(properties->>'{prop}')")
-    };
-    Ok(format!(
-        "{lhs} {sql_op} {val}",
-        sql_op = sql_op,
-        val = sanitize_value(&val)
-    ))
+        Ok(format!("(properties->>{prop}) {sql_op} {val}"))
+    }
+}
+
+/// between compares numerically, so reject non-numeric bounds here instead of
+/// letting the cast fail halfway through the query.
+fn numeric_literal(v: &serde_json::Value, op: &str) -> Result<String, Cql2Error> {
+    let literal = extract_literal(v)?;
+    if literal.parse::<f64>().is_ok() {
+        Ok(literal)
+    } else {
+        Err(Cql2Error::Bad(format!("'{op}' bounds must be numbers")))
+    }
+}
+
+/// The features view has one geometry column, so args[0] of a spatial op must
+/// name it. Anything else is a client mistake; don't silently filter on the
+/// wrong column.
+fn require_geometry_column(v: &serde_json::Value, op: &str) -> Result<(), Cql2Error> {
+    let prop = extract_property(v)?;
+    if prop.eq_ignore_ascii_case("geometry") || prop.eq_ignore_ascii_case("geom") {
+        Ok(())
+    } else {
+        Err(Cql2Error::Bad(format!(
+            "'{op}' first argument must reference the 'geometry' column, got '{prop}'"
+        )))
+    }
+}
+
+/// Check that the value is a GeoJSON geometry and rebuild it from the parsed
+/// JSON, so only recognised members reach PostGIS. Dropping the (RFC 7946
+/// removed) "crs" member also keeps the result in 4326, matching the column.
+fn geojson_geometry(v: &serde_json::Value, op: &str) -> Result<serde_json::Value, Cql2Error> {
+    let obj = v.as_object().ok_or_else(|| {
+        Cql2Error::Bad(format!(
+            "'{op}' second argument must be a GeoJSON geometry object"
+        ))
+    })?;
+    let geom_type = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| Cql2Error::Bad(format!("'{op}' geometry has no 'type' member")))?;
+    // PostGIS matches the type case-insensitively, so accept the client's spelling
+    match geom_type.to_ascii_lowercase().as_str() {
+        "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" => {
+            let coords = obj
+                .get("coordinates")
+                .filter(|c| c.is_array())
+                .ok_or_else(|| {
+                    Cql2Error::Bad(format!("'{op}' geometry has no 'coordinates' array"))
+                })?;
+            Ok(serde_json::json!({"type": geom_type, "coordinates": coords}))
+        }
+        "geometrycollection" => {
+            let geometries = obj
+                .get("geometries")
+                .and_then(|g| g.as_array())
+                .ok_or_else(|| {
+                    Cql2Error::Bad(format!("'{op}' geometry has no 'geometries' array"))
+                })?;
+            let inner: Result<Vec<serde_json::Value>, _> =
+                geometries.iter().map(|g| geojson_geometry(g, op)).collect();
+            Ok(serde_json::json!({"type": geom_type, "geometries": inner?}))
+        }
+        _ => Err(Cql2Error::Bad(format!(
+            "'{op}' unsupported GeoJSON geometry type"
+        ))),
+    }
 }
 
 fn extract_property(v: &serde_json::Value) -> Result<String, Cql2Error> {
@@ -249,22 +331,6 @@ fn extract_literal(v: &serde_json::Value) -> Result<String, Cql2Error> {
         serde_json::Value::Number(n) => Ok(n.to_string()),
         serde_json::Value::Bool(b) => Ok(b.to_string()),
         _ => Err(Cql2Error::Bad("expected literal value".into())),
-    }
-}
-
-/// Sanitize field names (prevent SQL injection in property names).
-fn sanitize_field(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .collect()
-}
-
-/// Sanitize literal values.
-fn sanitize_value(val: &str) -> String {
-    if val.parse::<f64>().is_ok() || val == "true" || val == "false" {
-        val.to_string()
-    } else {
-        format!("'{}'", val.replace('\'', "''"))
     }
 }
 

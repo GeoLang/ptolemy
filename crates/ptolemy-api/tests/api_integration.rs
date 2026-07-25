@@ -1178,3 +1178,618 @@ async fn test_metrics_endpoint() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// QGIS Sync Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: pull a branch through the QGIS sync endpoint.
+async fn qgis_pull(app: &axum::Router, branch_id: Uuid) -> (StatusCode, Value) {
+    get_json(app, &format!("/api/v1/qgis/branches/{branch_id}/sync")).await
+}
+
+/// Helper: feature ids in a QGIS pull response, sorted.
+fn pulled_ids(body: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = body["geojson"]["features"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pull response has no geojson.features: {body}"))
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn test_qgis_pull_returns_branch_features_only() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+    let f3 = Uuid::now_v7();
+
+    let p1 = "0101000000000000000000F03F0000000000000040"; // POINT(1 2)
+    let p2 = "010100000000000000000008400000000000001040"; // POINT(3 4)
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "one"}},
+            {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": p2, "properties": {"name": "two"}}
+        ]),
+    )
+    .await;
+
+    // A feature written on an unrelated branch must not leak into main's pull
+    let other_id = create_fork(&app, ds_id, "other", main_id).await;
+    commit_features(
+        &app,
+        other_id,
+        json!([
+            {"type": "insert", "feature_id": f3.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "three"}}
+        ]),
+    )
+    .await;
+
+    let (status, body) = qgis_pull(&app, main_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut expected = vec![f1.to_string(), f2.to_string()];
+    expected.sort();
+    assert_eq!(pulled_ids(&body), expected, "{body}");
+    assert_eq!(body["up_to_date"], false, "{body}");
+
+    let feats = body["geojson"]["features"].as_array().unwrap();
+    let one = feats.iter().find(|f| f["id"] == f1.to_string()).unwrap();
+    assert_eq!(one["properties"]["name"], "one", "{body}");
+    assert_eq!(one["geometry"]["type"], "Point", "{body}");
+}
+
+#[tokio::test]
+async fn test_qgis_pull_omits_deleted_features() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+
+    let p1 = "0101000000000000000000F03F0000000000000040";
+    let p2 = "010100000000000000000008400000000000001040";
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "one"}},
+            {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": p2, "properties": {"name": "two"}}
+        ]),
+    )
+    .await;
+
+    let (status, before) = qgis_pull(&app, main_id).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(
+        pulled_ids(&before).contains(&f2.to_string()),
+        "f2 should be visible before the delete: {before}"
+    );
+
+    commit_features(
+        &app,
+        main_id,
+        json!([{"type": "delete", "feature_id": f2.to_string()}]),
+    )
+    .await;
+
+    let (status, after) = qgis_pull(&app, main_id).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        pulled_ids(&after),
+        vec![f1.to_string()],
+        "a feature whose latest version is a delete must be gone from the pull: {after}"
+    );
+}
+
+#[tokio::test]
+async fn test_qgis_pull_returns_latest_version_of_a_feature() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let p1 = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "v1"}}
+    ])).await;
+    commit_features(
+        &app,
+        main_id,
+        json!([{"type": "update", "feature_id": f1.to_string(), "properties": {"name": "v2"}}]),
+    )
+    .await;
+
+    let (status, body) = qgis_pull(&app, main_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let feats = body["geojson"]["features"].as_array().unwrap();
+    assert_eq!(feats.len(), 1, "one version per feature: {body}");
+    assert_eq!(feats[0]["properties"]["name"], "v2", "{body}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CQL2 Spatial & Injection Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// POINT(1 2) and POINT(50 50) as little-endian WKB hex.
+const WKB_POINT_1_2: &str = "0101000000000000000000F03F0000000000000040";
+const WKB_POINT_50_50: &str = "010100000000000000000049400000000000004940";
+
+/// Box covering 0..10 on both axes, so it holds POINT(1 2) but not POINT(50 50).
+fn box_0_10() -> Value {
+    json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]]})
+}
+
+/// Fails if the table was dropped or the rows were altered by injected SQL.
+async fn feature_version_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM feature_versions")
+        .fetch_one(pool)
+        .await
+        .expect("feature_versions must still be queryable")
+}
+
+#[tokio::test]
+async fn test_cql2_spatial_filter_matches_features() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let inside = Uuid::now_v7();
+    let outside = Uuid::now_v7();
+
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": inside.to_string(), "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"name": "inside"}},
+        {"type": "insert", "feature_id": outside.to_string(), "geometry_wkb_hex": WKB_POINT_50_50, "properties": {"name": "outside"}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    // s_intersects keeps only the point inside the box
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "s_intersects", "args": [{"property": "geometry"}, box_0_10()]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "s_intersects: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["id"], inside.to_string(), "{body}");
+
+    // s_within agrees, and "geom" is accepted as the geometry column reference
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "s_within", "args": [{"property": "geom"}, box_0_10()]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "s_within: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["id"], inside.to_string(), "{body}");
+
+    // a point cannot contain the box
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "s_contains", "args": [{"property": "geometry"}, box_0_10()]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "s_contains: {body}");
+    assert_eq!(body["numberReturned"], 0, "{body}");
+
+    // a "crs" member must not push the literal into another SRID (mixed-SRID error)
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "s_intersects", "args": [{"property": "geometry"}, {
+            "type": "Polygon",
+            "coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]],
+            "crs": {"type": "name", "properties": {"name": "EPSG:3857"}}
+        }]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "crs member: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+
+    // a geometry collection round-trips through validation
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "s_intersects", "args": [{"property": "geometry"}, {
+            "type": "GeometryCollection",
+            "geometries": [{"type": "Point", "coordinates": [1, 2]}]
+        }]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "geometry collection: {body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+
+    assert_eq!(feature_version_count(state.pool()).await, 2);
+}
+
+#[tokio::test]
+async fn test_cql2_spatial_geojson_injection_is_rejected() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"name": "inside"}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": WKB_POINT_50_50, "properties": {"name": "outside"}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+    let before = feature_version_count(state.pool()).await;
+
+    // each payload tries to close the GeoJSON string literal and append SQL;
+    // "OR (true)" would widen the result to both features if it ever ran
+    let payloads = [
+        json!({"type": "Point'); DROP TABLE feature_versions; --", "coordinates": [1, 2]}),
+        json!({"type": "Point", "coordinates": [1, 2], "extra": "')) OR (true) --"}),
+        json!("{\"type\":\"Point\",\"coordinates\":[1,2]}')) OR (true) --"),
+        json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]],
+               "id": "x'); UPDATE feature_versions SET properties = '{}'; --"}),
+        json!({"type": "Point", "coordinates": [1, 2], "x": "\\') OR (true) --"}),
+        json!({"coordinates": [1, 2]}),
+        json!({"type": "Point"}),
+        json!([1, 2]),
+    ];
+
+    for payload in payloads {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "s_intersects", "args": [{"property": "geometry"}, payload.clone()]}}),
+        )
+        .await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::OK,
+            "payload {payload} gave {status}: {body}"
+        );
+        if status == StatusCode::OK {
+            assert_ne!(
+                body["numberReturned"], 2,
+                "injected predicate ran for {payload}: {body}"
+            );
+        }
+        assert_eq!(
+            feature_version_count(state.pool()).await,
+            before,
+            "rows changed by {payload}"
+        );
+    }
+
+    // properties survived the UPDATE payload
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "=", "args": [{"property": "name"}, "inside"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["numberReturned"], 1,
+        "properties must be intact: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_cql2_spatial_rejects_non_geometry_property() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for prop in ["pop", "geometry) OR (true", ""] {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "s_intersects", "args": [{"property": prop}, box_0_10()]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "property {prop:?}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("geometry"),
+            "property {prop:?}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_cql2_property_name_injection_is_neutralized() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"pop": 1000}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    // control: the clean property name matches
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "=", "args": [{"property": "pop"}, "1000"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "control must match: {body}");
+
+    // hostile names are looked up as literal jsonb keys: they neither escape the
+    // query nor get stripped down into a different (matching) key
+    for name in [
+        "pop') = '1000' OR (1=1",
+        "pop'; DROP TABLE feature_versions; --",
+        "p'op",
+        "po\u{0301}p",
+        "",
+    ] {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "=", "args": [{"property": name}, "1000"]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "property {name:?}: {body}");
+        assert_eq!(
+            body["numberReturned"], 0,
+            "property {name:?} must match nothing: {body}"
+        );
+        assert_eq!(
+            feature_version_count(state.pool()).await,
+            1,
+            "property {name:?} changed data"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_cql2_value_injection_is_neutralized() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"pop": 1000, "name": "alpha"}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for value in [
+        "alpha' OR '1'='1",
+        "alpha'; DROP TABLE feature_versions; --",
+        "alpha')) OR (true) --",
+        "alpha\\') OR (true) --",
+    ] {
+        for op in ["=", "like", "in"] {
+            let filter = json!({"op": op, "args": [{"property": "name"}, value]});
+            let (status, body) = post_json(&app, &uri, json!({"filter": filter})).await;
+            assert_eq!(status, StatusCode::OK, "{op} {value:?}: {body}");
+            assert_eq!(
+                body["numberReturned"], 0,
+                "{op} {value:?} must match nothing: {body}"
+            );
+            assert_eq!(
+                feature_version_count(state.pool()).await,
+                1,
+                "{op} {value:?} changed data"
+            );
+        }
+    }
+
+    // between bounds are numeric, so a string payload is refused outright
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "between", "args": [{"property": "pop"}, "1' OR '1'='1", 5000]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn test_cql2_text_ops_still_match() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"pop": 1000, "name": "alpha"}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for (label, filter) in [
+        (
+            "like",
+            json!({"op": "like", "args": [{"property": "name"}, "alp%"]}),
+        ),
+        (
+            "in",
+            json!({"op": "in", "args": [{"property": "name"}, "alpha", "beta"]}),
+        ),
+        (
+            "isNull",
+            json!({"op": "isNull", "args": [{"property": "missing"}]}),
+        ),
+        (
+            "and",
+            json!({"op": "and", "args": [
+                {"op": "=", "args": [{"property": "name"}, "alpha"]},
+                {"op": ">", "args": [{"property": "pop"}, 500]}
+            ]}),
+        ),
+        (
+            "not",
+            json!({"op": "not", "args": [{"op": "=", "args": [{"property": "name"}, "beta"]}]}),
+        ),
+    ] {
+        let (status, body) = post_json(&app, &uri, json!({"filter": filter})).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        assert_eq!(body["numberReturned"], 1, "{label}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_cql2_short_args_return_400_not_panic() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for filter in [
+        json!({"op": "not", "args": []}),
+        json!({"op": "and", "args": []}),
+        json!({"op": "or", "args": []}),
+        json!({"op": "=", "args": [{"property": "pop"}]}),
+        json!({"op": "in", "args": [{"property": "pop"}]}),
+        json!({"op": "between", "args": [{"property": "pop"}, 1]}),
+        json!({"op": "like", "args": [{"property": "pop"}]}),
+        json!({"op": "isNull", "args": []}),
+        json!({"op": "s_intersects", "args": []}),
+        json!({"op": "s_within", "args": [{"property": "geometry"}]}),
+        json!({"op": "=", "args": ["pop"]}),
+    ] {
+        let (status, body) = post_json(&app, &uri, json!({"filter": filter.clone()})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "filter {filter}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_qgis_layer_definition_scopes_to_branch() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+    let f3 = Uuid::now_v7();
+
+    let p1 = "0101000000000000000000F03F0000000000000040"; // POINT(1 2)
+    let p2 = "010100000000000000000008400000000000001040"; // POINT(3 4)
+    let far = "010100000000000000000049400000000000004E40"; // POINT(50 60)
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "one"}},
+            {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": p2, "properties": {"name": "two"}}
+        ]),
+    )
+    .await;
+
+    // A far-away feature on a fork must not inflate main's count or extent
+    let other_id = create_fork(&app, ds_id, "other", main_id).await;
+    commit_features(&app, other_id, json!([
+        {"type": "insert", "feature_id": f3.to_string(), "geometry_wkb_hex": far, "properties": {"name": "three"}}
+    ])).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/qgis/branches/{main_id}/layer")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["feature_count"], 2, "{body}");
+    assert_eq!(body["extent"]["min_x"], 1.0, "{body}");
+    assert_eq!(body["extent"]["min_y"], 2.0, "{body}");
+    assert_eq!(body["extent"]["max_x"], 3.0, "{body}");
+    assert_eq!(body["extent"]["max_y"], 4.0, "{body}");
+    let fields: Vec<&str> = body["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(fields, vec!["name"], "{body}");
+
+    // The fork sees its own feature plus the two it inherited
+    let (status, fork_body) =
+        get_json(&app, &format!("/api/v1/qgis/branches/{other_id}/layer")).await;
+    assert_eq!(status, StatusCode::OK, "{fork_body}");
+    assert_eq!(fork_body["feature_count"], 3, "{fork_body}");
+    assert_eq!(fork_body["extent"]["max_x"], 50.0, "{fork_body}");
+
+    // Deleting on main drops it from the count
+    commit_features(
+        &app,
+        main_id,
+        json!([{"type": "delete", "feature_id": f2.to_string()}]),
+    )
+    .await;
+    let (status, after) = get_json(&app, &format!("/api/v1/qgis/branches/{main_id}/layer")).await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(after["feature_count"], 1, "{after}");
+}
+
+#[tokio::test]
+async fn test_qgis_push_updates_live_features_and_inserts_the_rest() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+    let f3 = Uuid::now_v7();
+
+    let p1 = "0101000000000000000000F03F0000000000000040"; // POINT(1 2)
+    let head = commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "one"}}
+    ])).await;
+
+    // f3 exists only on an unrelated branch, so pushing it to main must insert,
+    // not update (an update would look for a base version main never had)
+    let other_id = create_fork(&app, ds_id, "other", main_id).await;
+    commit_features(&app, other_id, json!([
+        {"type": "insert", "feature_id": f3.to_string(), "geometry_wkb_hex": p1, "properties": {"name": "three-on-other"}}
+    ])).await;
+
+    let point = |x: f64, y: f64| json!({"type": "Point", "coordinates": [x, y]});
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/qgis/branches/{main_id}/sync"),
+        json!({
+            "base_changeset": head.to_string(),
+            "author": "qgis",
+            "message": "push from qgis",
+            "geojson": {
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "id": f1.to_string(), "geometry": point(9.0, 9.0), "properties": {"name": "one-edited"}},
+                    {"type": "Feature", "id": f2.to_string(), "geometry": point(5.0, 6.0), "properties": {"name": "two-new"}},
+                    {"type": "Feature", "id": f3.to_string(), "geometry": point(7.0, 8.0), "properties": {"name": "three-pushed"}}
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["status"], "success", "{body}");
+
+    let (status, pulled) = qgis_pull(&app, main_id).await;
+    assert_eq!(status, StatusCode::OK, "{pulled}");
+    let mut expected = vec![f1.to_string(), f2.to_string(), f3.to_string()];
+    expected.sort();
+    assert_eq!(pulled_ids(&pulled), expected, "{pulled}");
+    let feats = pulled["geojson"]["features"].as_array().unwrap();
+    let by_id = |id: Uuid| {
+        feats
+            .iter()
+            .find(|f| f["id"] == id.to_string())
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(f1)["properties"]["name"], "one-edited", "{pulled}");
+    let coords: Vec<f64> = by_id(f1)["geometry"]["coordinates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_f64().unwrap())
+        .collect();
+    assert_eq!(coords, vec![9.0, 9.0], "{pulled}");
+    assert_eq!(by_id(f2)["properties"]["name"], "two-new", "{pulled}");
+    assert_eq!(by_id(f3)["properties"]["name"], "three-pushed", "{pulled}");
+}

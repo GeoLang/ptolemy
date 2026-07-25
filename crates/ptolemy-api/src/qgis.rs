@@ -202,16 +202,16 @@ async fn layer_definition(
     let srid: i32 = row.get("srid");
     let geometry_type: String = row.get("geometry_type");
 
-    // Count features and compute extent
+    // Count features and compute extent. The "features" view already resolves the
+    // latest live version per feature from the branch head's ancestor chain.
     let stats = sqlx::query(
         "SELECT count(*) as cnt,
                 ST_XMin(ST_Extent(geometry)) as min_x,
                 ST_YMin(ST_Extent(geometry)) as min_y,
                 ST_XMax(ST_Extent(geometry)) as max_x,
                 ST_YMax(ST_Extent(geometry)) as max_y
-         FROM feature_versions fv
-         WHERE fv.branch_id = $1
-           AND fv.is_deleted = false",
+         FROM features
+         WHERE branch_id = $1",
     )
     .bind(branch_id)
     .fetch_one(store.pool())
@@ -228,7 +228,7 @@ async fn layer_definition(
     // Get field names from properties of first feature
     let fields = sqlx::query(
         "SELECT DISTINCT jsonb_object_keys(properties) as key
-         FROM feature_versions WHERE branch_id = $1 AND is_deleted = false
+         FROM features WHERE branch_id = $1
          LIMIT 100",
     )
     .bind(branch_id)
@@ -444,12 +444,31 @@ async fn qgis_pull(
 
     // Fetch features as GeoJSON
     let limit = params.limit.clamp(1, 50000);
+    // resolve versions from the branch head's changeset ancestor chain, so forks
+    // see inherited features; a feature whose latest version is a delete drops out
     let rows = sqlx::query(
-        "SELECT fv.feature_id, ST_AsGeoJSON(fv.geometry)::jsonb as geojson, fv.properties
-         FROM feature_versions fv
-         WHERE fv.branch_id = $1 AND fv.is_deleted = false
-         ORDER BY fv.created_at DESC, fv.id DESC
-         LIMIT $2",
+        "WITH RECURSIVE chain AS (
+            SELECT c.id, c.parent_id
+            FROM changesets c
+            JOIN branches b ON b.head = c.id
+            WHERE b.id = $1
+          UNION ALL
+            SELECT c.id, c.parent_id
+            FROM changesets c
+            JOIN chain ch ON ch.parent_id = c.id
+        ),
+        latest AS (
+            SELECT DISTINCT ON (fv.feature_id)
+                fv.id, fv.feature_id, fv.operation, fv.geometry, fv.properties, fv.created_at
+            FROM feature_versions fv
+            JOIN chain ch ON fv.changeset_id = ch.id
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
+        )
+        SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
+        FROM latest
+        WHERE operation != 'delete'
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2",
     )
     .bind(branch_id)
     .bind(limit)
@@ -546,14 +565,13 @@ async fn qgis_push(
 
         let properties = feat["properties"].clone();
 
-        // Check if feature exists (update) or is new (insert)
-        let exists = sqlx::query(
-            "SELECT 1 FROM feature_versions WHERE feature_id = $1 AND branch_id = $2 LIMIT 1",
-        )
-        .bind(fid)
-        .bind(branch_id)
-        .fetch_optional(store.pool())
-        .await?;
+        // Check if the feature is live on this branch (update) or is new (insert).
+        // A feature whose latest version is a delete counts as new again.
+        let exists = sqlx::query("SELECT 1 FROM features WHERE id = $1 AND branch_id = $2 LIMIT 1")
+            .bind(fid)
+            .bind(branch_id)
+            .fetch_optional(store.pool())
+            .await?;
 
         if exists.is_some() {
             ops.push(ptolemy_core::diff::DiffOp::Update {
