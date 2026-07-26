@@ -98,6 +98,27 @@ Three-way merge using the common ancestor changeset:
 3. Conflicting changes (same feature, same attribute modified differently) are surfaced for manual resolution.
 4. Geometry conflicts use spatial comparison (tolerance-based equality).
 
+### Your data is just PostGIS
+
+Ptolemy stores features in plain PostGIS tables, not a proprietary format. Every
+feature version is a row in `feature_versions` with a PostGIS `geometry` column
+(GIST-indexed) and a JSONB `properties` column; the `features` view resolves each
+branch to its current feature set. Anything that speaks PostgreSQL can read it
+directly, with or without any Ptolemy service running:
+
+```sql
+-- current features on a branch, plain SQL
+SELECT id, geometry, properties
+FROM features
+WHERE branch_id = '...'
+  AND ST_DWithin(geometry, ST_Point(7.42, 43.73)::geography, 500);
+```
+
+psql, GDAL/OGR (`ogr2ogr -f GPKG out.gpkg PG:"dbname=ptolemy" -sql "..."`), and
+QGIS's native PostGIS connector all work against the database as-is. Backup and
+restore is standard `pg_dump`/`pg_restore`. If you stop using Ptolemy, your data
+is already in the most widely supported spatial database there is.
+
 ## Quick Start
 
 ```bash
