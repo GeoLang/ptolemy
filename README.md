@@ -424,7 +424,7 @@ client but any JSON structure will work.
 | POST | `/api/v1/trajectories/{id}/simplify` | Simplify trajectory |
 | POST | `/api/v1/datasets/{id}/trajectories/nearest` | Nearest approach |
 | **CQL2 + OGC Tiles** | | |
-| POST | `/api/v1/branches/{id}/features/filter` | CQL2 filter query |
+| POST | `/api/v1/branches/{id}/features/filter` | CQL2-JSON filter query, `limit` max 10000 |
 | GET | `/api/v1/tiles/tileMatrixSets` | List tile matrix sets |
 | GET | `/api/v1/tiles/tileMatrixSets/{tms}` | Get tile matrix set |
 | GET | `/api/v1/datasets/{id}/tiles/{tms}/{z}/{x}/{y}` | OGC vector tile |

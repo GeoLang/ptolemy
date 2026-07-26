@@ -27,13 +27,16 @@ pub fn cql2_routes() -> Router<AppState> {
 
 // ─── CQL2 Filter ────────────────────────────────────────────────────
 
-/// CQL2 filter request — accepts a CQL2-JSON or CQL2-Text filter expression.
+/// Most rows one filter call will return. A caller that wants more has to page
+/// with `offset`; without a ceiling a single request can pull the whole branch.
+const MAX_LIMIT: i64 = 10_000;
+
+/// CQL2 filter request. Only CQL2-JSON is parsed, see [`check_filter_lang`].
 #[derive(Deserialize)]
 struct Cql2FilterRequest {
     /// CQL2-JSON filter object
     filter: serde_json::Value,
     #[serde(default = "default_filter_lang")]
-    #[allow(dead_code)]
     filter_lang: String,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -42,16 +45,47 @@ fn default_filter_lang() -> String {
     "cql2-json".into()
 }
 
+/// The body is parsed as JSON, so a cql2-text filter would fail somewhere deep
+/// in the parser with a confusing message. Say so up front instead.
+fn check_filter_lang(lang: &str) -> Result<(), Cql2Error> {
+    if lang.eq_ignore_ascii_case("cql2-json") {
+        Ok(())
+    } else {
+        Err(Cql2Error::Bad(format!(
+            "filter_lang '{lang}' is not supported, only cql2-json is"
+        )))
+    }
+}
+
+/// Reject out-of-range paging before it reaches PostgreSQL, which rejects a
+/// negative LIMIT with a query error that would surface as a 500.
+fn check_paging(limit: i64, offset: i64) -> Result<(), Cql2Error> {
+    if limit < 0 || offset < 0 {
+        return Err(Cql2Error::Bad(
+            "limit and offset must not be negative".into(),
+        ));
+    }
+    if limit > MAX_LIMIT {
+        return Err(Cql2Error::Bad(format!(
+            "limit {limit} exceeds the maximum of {MAX_LIMIT}, page with offset instead"
+        )));
+    }
+    Ok(())
+}
+
 async fn cql2_filter(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
     Json(req): Json<Cql2FilterRequest>,
 ) -> Result<Json<serde_json::Value>, Cql2Error> {
+    check_filter_lang(&req.filter_lang)?;
+    let limit = req.limit.unwrap_or(100);
+    let offset = req.offset.unwrap_or(0);
+    check_paging(limit, offset)?;
+
     // Parse CQL2-JSON filter into SQL WHERE clause. branch_id is $1, so the
     // filter's own values start at $2 and limit/offset come after them.
     let (where_clause, binds) = cql2_to_sql(&req.filter, 1)?;
-    let limit = req.limit.unwrap_or(100);
-    let offset = req.offset.unwrap_or(0);
     let limit_param = binds.len() + 2;
     let offset_param = binds.len() + 3;
 
@@ -174,8 +208,20 @@ fn filter_to_sql(filter: &serde_json::Value, binds: &mut Binds) -> Result<String
         }
         Some("in") => {
             let args = get_args(filter, "in", 2)?;
-            let prop = binds.add(extract_property(&args[0])?);
-            let values: Vec<String> = args[1..]
+            let property = extract_property(&args[0])?;
+            // the spec form is args: [prop, [a, b]]; the flat form
+            // args: [prop, a, b] is what this endpoint accepted first
+            let items: Vec<serde_json::Value> = match args[1].as_array() {
+                Some(list) if args.len() == 2 => list.clone(),
+                _ => args[1..].to_vec(),
+            };
+            // nothing is in an empty set, and IN () is a syntax error. Return
+            // before binding anything, so the bind list still matches the SQL.
+            if items.is_empty() {
+                return Ok("FALSE".into());
+            }
+            let prop = binds.add(property);
+            let values: Vec<String> = items
                 .iter()
                 .map(|v| extract_literal(v).map(|s| binds.add(s)))
                 .collect::<Result<_, _>>()?;
@@ -296,7 +342,8 @@ fn geojson_geometry(v: &serde_json::Value, op: &str) -> Result<serde_json::Value
         .and_then(|t| t.as_str())
         .ok_or_else(|| Cql2Error::Bad(format!("'{op}' geometry has no 'type' member")))?;
     // PostGIS matches the type case-insensitively, so accept the client's spelling
-    match geom_type.to_ascii_lowercase().as_str() {
+    let lower = geom_type.to_ascii_lowercase();
+    match lower.as_str() {
         "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon" => {
             let coords = obj
                 .get("coordinates")
@@ -304,6 +351,8 @@ fn geojson_geometry(v: &serde_json::Value, op: &str) -> Result<serde_json::Value
                 .ok_or_else(|| {
                     Cql2Error::Bad(format!("'{op}' geometry has no 'coordinates' array"))
                 })?;
+            check_coords(coords, coord_depth(&lower), op)?;
+            check_rings(coords, &lower, op)?;
             Ok(serde_json::json!({"type": geom_type, "coordinates": coords}))
         }
         "geometrycollection" => {
@@ -321,6 +370,69 @@ fn geojson_geometry(v: &serde_json::Value, op: &str) -> Result<serde_json::Value
             "'{op}' unsupported GeoJSON geometry type"
         ))),
     }
+}
+
+/// How deeply a type nests its positions: 0 is a bare position, 1 an array of
+/// positions, and so on.
+fn coord_depth(lower_type: &str) -> usize {
+    match lower_type {
+        "point" => 0,
+        "linestring" | "multipoint" => 1,
+        "polygon" | "multilinestring" => 2,
+        _ => 3, // multipolygon
+    }
+}
+
+/// Check the coordinate nesting before PostGIS sees it. `ST_GeomFromGeoJSON`
+/// reports a malformed array as a query error, which would surface as a 500
+/// for what is a bad request.
+fn check_coords(v: &serde_json::Value, depth: usize, op: &str) -> Result<(), Cql2Error> {
+    let bad = |what: &str| Cql2Error::Bad(format!("'{op}' geometry has {what}"));
+    let arr = v
+        .as_array()
+        .ok_or_else(|| bad("a coordinates entry that is not an array"))?;
+    if depth == 0 {
+        if !(2..=3).contains(&arr.len()) {
+            return Err(bad("a position that is not 2 or 3 numbers"));
+        }
+        if !arr.iter().all(|n| n.as_f64().is_some_and(f64::is_finite)) {
+            return Err(bad("a position with a non-numeric ordinate"));
+        }
+        return Ok(());
+    }
+    if arr.is_empty() {
+        return Err(bad("an empty coordinates array"));
+    }
+    for inner in arr {
+        check_coords(inner, depth - 1, op)?;
+    }
+    Ok(())
+}
+
+/// Polygon rings must be closed and hold at least four positions. Runs after
+/// [`check_coords`], so every level is known to be an array by now.
+fn check_rings(coords: &serde_json::Value, lower_type: &str, op: &str) -> Result<(), Cql2Error> {
+    let rings: Vec<&serde_json::Value> = match lower_type {
+        "polygon" => coords.as_array().into_iter().flatten().collect(),
+        "multipolygon" => coords
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_array())
+            .flatten()
+            .collect(),
+        _ => return Ok(()),
+    };
+    for ring in rings {
+        let positions = ring.as_array().map_or(0, Vec::len);
+        let closed = ring.as_array().is_some_and(|r| r.first() == r.last());
+        if positions < 4 || !closed {
+            return Err(Cql2Error::Bad(format!(
+                "'{op}' polygon ring must be closed and have at least 4 positions"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn extract_property(v: &serde_json::Value) -> Result<String, Cql2Error> {

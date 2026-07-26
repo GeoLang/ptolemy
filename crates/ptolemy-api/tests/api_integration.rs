@@ -2841,3 +2841,208 @@ async fn test_no_auth_keeps_body_author() {
     assert_eq!(status, StatusCode::CREATED, "{commit}");
     assert_eq!(commit["author"], "field-surveyor", "{commit}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// CQL2 filter input validation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Each of these used to reach PostGIS or PostgreSQL and come back as a 500,
+// or (for the spec `in` form) be rejected as an unparseable literal.
+
+/// Branch with two features, "small" (pop 100, at 1 2) and "big" (pop 5000).
+async fn cql2_branch(app: &axum::Router) -> Uuid {
+    let ds_id = create_dataset(app).await;
+    let branch_id = create_branch(app, ds_id, "main").await;
+    commit_features(
+        app,
+        branch_id,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": WKB_POINT_1_2, "properties": {"name": "small", "pop": 100}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": WKB_POINT_50_50, "properties": {"name": "big", "pop": 5000}}
+        ]),
+    )
+    .await;
+    branch_id
+}
+
+#[tokio::test]
+async fn test_cql2_malformed_coordinates_are_400() {
+    let (app, _) = setup_app().await;
+    let branch_id = cql2_branch(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for geometry in [
+        // wrong nesting depth for the declared type
+        json!({"type": "Point", "coordinates": [[1, 2]]}),
+        json!({"type": "Polygon", "coordinates": [[0, 0], [0, 1], [1, 1], [0, 0]]}),
+        json!({"type": "LineString", "coordinates": [1, 2]}),
+        json!({"type": "MultiPolygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}),
+        // positions that are not 2 or 3 finite numbers
+        json!({"type": "Point", "coordinates": [1]}),
+        json!({"type": "Point", "coordinates": [1, 2, 3, 4]}),
+        json!({"type": "Point", "coordinates": ["a", "b"]}),
+        json!({"type": "Point", "coordinates": [null, 2]}),
+        json!({"type": "LineString", "coordinates": [[1, 2], [3]]}),
+        // empty arrays
+        json!({"type": "LineString", "coordinates": []}),
+        json!({"type": "Polygon", "coordinates": []}),
+        // rings that are too short or not closed
+        json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1]]]}),
+        json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0]]]}),
+        json!({"type": "GeometryCollection",
+               "geometries": [{"type": "Point", "coordinates": [1]}]}),
+    ] {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "s_intersects",
+                              "args": [{"property": "geometry"}, geometry.clone()]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{geometry}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("geometry") || e.contains("ring")),
+            "{geometry} needs a message naming the problem: {body}"
+        );
+    }
+
+    // the well-formed equivalents still work
+    for geometry in [
+        json!({"type": "Point", "coordinates": [1, 2]}),
+        json!({"type": "Point", "coordinates": [1, 2, 0]}),
+        json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]]]}),
+    ] {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "s_intersects",
+                              "args": [{"property": "geometry"}, geometry.clone()]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{geometry}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_cql2_paging_bounds_are_400() {
+    let (app, _) = setup_app().await;
+    let branch_id = cql2_branch(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+    let filter = json!({"op": "=", "args": [{"property": "name"}, "small"]});
+
+    for (paging, needle) in [
+        (json!({"limit": -1}), "negative"),
+        (json!({"offset": -1}), "negative"),
+        (json!({"limit": 10001}), "10000"),
+    ] {
+        let mut body = json!({"filter": filter.clone()});
+        for (k, v) in paging.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, response) = post_json(&app, &uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{paging}: {response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(needle)),
+            "{paging} error must mention '{needle}': {response}"
+        );
+    }
+
+    // the boundary value is accepted
+    let (status, response) = post_json(
+        &app,
+        &uri,
+        json!({"filter": filter, "limit": 10000, "offset": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["numberReturned"], 1, "{response}");
+}
+
+#[tokio::test]
+async fn test_cql2_in_accepts_spec_array_form() {
+    let (app, _) = setup_app().await;
+    let branch_id = cql2_branch(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    // spec form: args: [prop, [a, b]]
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "in", "args": [{"property": "name"}, ["small", "nobody"]]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["properties"]["name"], "small", "{body}");
+
+    // both entries match
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "in", "args": [{"property": "name"}, ["small", "big"]]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 2, "{body}");
+
+    // the flat form this endpoint took first still works
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "in", "args": [{"property": "name"}, "small", "big"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 2, "{body}");
+
+    // an empty list matches nothing rather than producing invalid SQL
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"filter": {"op": "in", "args": [{"property": "name"}, []]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 0, "{body}");
+}
+
+#[tokio::test]
+async fn test_cql2_rejects_non_json_filter_lang() {
+    let (app, _) = setup_app().await;
+    let branch_id = cql2_branch(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+
+    for lang in ["cql2-text", "CQL-Text", "sql"] {
+        let (status, body) = post_json(
+            &app,
+            &uri,
+            json!({"filter": {"op": "=", "args": [{"property": "name"}, "small"]},
+                   "filter_lang": lang}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{lang}: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("cql2-json")),
+            "{lang} error must name the supported language: {body}"
+        );
+    }
+
+    // the supported value, and its default when omitted, still pass
+    for body in [
+        json!({"filter": {"op": "=", "args": [{"property": "name"}, "small"]},
+               "filter_lang": "cql2-json"}),
+        json!({"filter": {"op": "=", "args": [{"property": "name"}, "small"]}}),
+    ] {
+        let (status, response) = post_json(&app, &uri, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {response}");
+        assert_eq!(response["numberReturned"], 1, "{response}");
+    }
+}
