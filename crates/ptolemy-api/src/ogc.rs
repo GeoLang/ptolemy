@@ -196,23 +196,31 @@ struct FeatureCollection {
     number_returned: usize,
 }
 
+/// The branch a collection request reads: the one asked for, else `main`. Shared
+/// so the item and the listing can never disagree about which branch they serve.
+async fn collection_branch(
+    store: &AppState,
+    dataset_id: Uuid,
+    requested: Option<Uuid>,
+) -> Result<Uuid, OgcError> {
+    if let Some(b) = requested {
+        return Ok(b);
+    }
+    let row =
+        sqlx::query("SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1")
+            .bind(dataset_id)
+            .fetch_optional(store.pool())
+            .await?
+            .ok_or_else(|| OgcError::NotFound("no main branch".into()))?;
+    Ok(row.get("id"))
+}
+
 async fn items(
     State(store): State<AppState>,
     Path(dataset_id): Path<Uuid>,
     Query(q): Query<ItemsQuery>,
 ) -> Result<Json<FeatureCollection>, OgcError> {
-    // Find branch (main or specified)
-    let branch_id = if let Some(b) = q.branch {
-        b
-    } else {
-        let row =
-            sqlx::query("SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1")
-                .bind(dataset_id)
-                .fetch_optional(store.pool())
-                .await?
-                .ok_or_else(|| OgcError::NotFound("no main branch".into()))?;
-        row.get("id")
-    };
+    let branch_id = collection_branch(&store, dataset_id, q.branch).await?;
 
     // an external dataset swaps in a derived table over the team's relation;
     // the ordinary changeset-chain query is untouched
@@ -285,33 +293,22 @@ async fn items(
 async fn item(
     State(store): State<AppState>,
     Path((dataset_id, feature_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<ItemsQuery>,
 ) -> Result<Json<serde_json::Value>, OgcError> {
-    let external = store.external_for_dataset(dataset_id).await?;
-    let row = match &external {
-        None => {
-            sqlx::query(
-                "SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
-                 FROM feature_versions
-                 WHERE feature_id = $1
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            )
-            .bind(feature_id)
-            .fetch_optional(store.pool())
-            .await?
-        }
-        Some(ext) => {
-            // the id is the hash of the row's own key, so this matches the id
-            // the listing handed out
-            sqlx::query(&format!(
-                "SELECT id as feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
-                 FROM {} f WHERE f.id = $1",
-                ext.features_subquery("NULL")
-            ))
-            .bind(feature_id)
-            .fetch_optional(store.read_pool(external.as_ref()).await?)
-            .await?
-        }
-    }
+    // this read used to take the newest feature_versions row for the id in the
+    // whole database, ignoring branch and dataset, so two branches holding
+    // different values both answered with whichever was written last. It now
+    // resolves through the branch's ancestor chain like the listing does.
+    let branch_id = collection_branch(&store, dataset_id, q.branch).await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
+        "SELECT f.id as feature_id, ST_AsGeoJSON(f.geometry)::jsonb as geojson, f.properties
+         FROM {source} f WHERE f.id = $1"
+    ))
+    .bind(feature_id)
+    .bind(branch_id)
+    .fetch_optional(store.read_pool(external.as_ref()).await?)
+    .await?
     .ok_or_else(|| OgcError::NotFound("feature not found".into()))?;
 
     let geom: Option<serde_json::Value> = row.get("geojson");

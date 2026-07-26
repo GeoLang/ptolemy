@@ -66,6 +66,43 @@ fn latest_cte(columns: &str) -> String {
     )
 }
 
+/// The `features` view's rows for one branch, as a derived table to put after
+/// FROM (the caller supplies the alias).
+///
+/// The view itself cannot do this: it walks the changeset chain of *every* branch
+/// in the database and only then does its consumer's `WHERE branch_id = …` throw
+/// the other branches away, so a read's cost is set by total instance history
+/// rather than by the dataset being queried. A view takes no parameters, so the
+/// scoped form has to be built per query — the same ancestor-chain walk the bbox
+/// reads already use through `latest_cte`.
+///
+/// Columns match the view: `id, branch_id, dataset_id, geometry, properties,
+/// created_at`, deletes excluded. `branch_expr` is SQL for the branch id, so a
+/// query that binds the branch somewhere other than `$1` passes its own
+/// placeholder; it is a caller-side constant, never request data.
+pub fn branch_features_subquery(branch_expr: &str) -> String {
+    format!(
+        "(WITH RECURSIVE chain AS (
+              SELECT c.id, c.parent_id FROM changesets c
+                JOIN branches b ON b.head = c.id
+               WHERE b.id = {branch_expr}
+            UNION ALL
+              SELECT c.id, c.parent_id FROM changesets c
+                JOIN chain ch ON ch.parent_id = c.id
+          ),
+          live AS (
+              SELECT DISTINCT ON (fv.feature_id)
+                     fv.feature_id AS id, fv.dataset_id, fv.operation,
+                     fv.geometry, fv.properties, fv.created_at
+                FROM feature_versions fv JOIN chain ch ON fv.changeset_id = ch.id
+               ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
+          )
+          SELECT id, {branch_expr}::uuid AS branch_id, dataset_id, geometry,
+                 properties, created_at
+            FROM live WHERE operation <> 'delete')"
+    )
+}
+
 /// Rejection message for every mutation aimed at an external dataset.
 pub const EXTERNAL_READ_ONLY: &str =
     "dataset is external (read-only): it is a view over a PostGIS relation ptolemy does not own";
@@ -276,7 +313,22 @@ impl PgStore {
             .await
             .map_err(|e| StoreError::Conflict(format!("cannot read {}: {e}", table.table())))?;
 
-        Ok(srid.unwrap_or(4326))
+        let srid = srid.unwrap_or(4326);
+        if srid != 4326 && srid != 0 {
+            // reads compare 4326 envelopes against the exposed geometry, so the
+            // predicate lands on ST_Transform(geom, 4326) and an index on the
+            // raw column cannot serve it: every bbox read becomes a seq scan
+            tracing::warn!(
+                "external dataset {} is SRID {srid}, so spatial reads cannot use an index on \
+                 {} directly. Add the matching functional index or bbox and tile reads will \
+                 sequentially scan the relation: CREATE INDEX ON {} USING GIST (ST_Transform({}, 4326));",
+                table.table(),
+                table.geometry_column(),
+                table.quoted_relation(),
+                quoted_geometry_column(table),
+            );
+        }
+        Ok(srid)
     }
 
     /// The external read source for a branch, or `None` for an ordinary
@@ -832,17 +884,28 @@ impl PgStore {
         }
     }
 
-    /// What a query should put after FROM where it would say `features`: the
-    /// view itself, or a derived table over the external relation with the same
-    /// columns. The branch id must be bound as `$1`.
+    /// What a query should put after FROM where it would say `features`: this
+    /// branch's rows from the versioned tables, or a derived table over the
+    /// external relation with the same columns. Either way the caller supplies
+    /// the alias and binds the branch id as `$1`.
     pub async fn features_source(
         &self,
         branch_id: Uuid,
     ) -> Result<(Option<ExternalSource>, String), StoreError> {
+        self.features_source_at(branch_id, "$1").await
+    }
+
+    /// [`Self::features_source`] for a query that binds the branch id somewhere
+    /// other than `$1`.
+    pub async fn features_source_at(
+        &self,
+        branch_id: Uuid,
+        branch_expr: &str,
+    ) -> Result<(Option<ExternalSource>, String), StoreError> {
         let external = self.external_for_branch(branch_id).await?;
         let source = match &external {
-            None => "features".to_string(),
-            Some(ext) => ext.features_subquery("$1"),
+            None => branch_features_subquery(branch_expr),
+            Some(ext) => ext.features_subquery(branch_expr),
         };
         Ok((external, source))
     }
@@ -3359,6 +3422,12 @@ where
         enforced: row.get::<i64, _>("total") > 0,
         mine: row.get("mine"),
     })
+}
+
+/// The geometry column quoted for the index hint. Safe because the name passed
+/// [`ExternalTable::parse`] and so cannot contain a quote.
+fn quoted_geometry_column(table: &ExternalTable) -> String {
+    format!("\"{}\"", table.geometry_column())
 }
 
 fn denied_branch(branch_id: Uuid) -> StoreError {

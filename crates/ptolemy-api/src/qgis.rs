@@ -565,6 +565,8 @@ async fn qgis_push(
         .ok_or_else(|| QgisError::Bad("geojson.features must be an array".into()))?;
 
     let mut ops: Vec<ptolemy_core::diff::DiffOp> = Vec::new();
+    // built once: the same branch for every feature in the push
+    let (_, live) = store.features_source_at(branch_id, "$2").await?;
 
     for feat in features {
         let fid_str = feat["id"]
@@ -589,7 +591,7 @@ async fn qgis_push(
 
         // Check if the feature is live on this branch (update) or is new (insert).
         // A feature whose latest version is a delete counts as new again.
-        let exists = sqlx::query("SELECT 1 FROM features WHERE id = $1 AND branch_id = $2 LIMIT 1")
+        let exists = sqlx::query(&format!("SELECT 1 FROM {live} f WHERE f.id = $1 LIMIT 1"))
             .bind(fid)
             .bind(branch_id)
             .fetch_optional(store.pool())

@@ -42,10 +42,11 @@ async fn extrude_3d(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ExtrudeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Extrude(ST_Force3D(geometry), 0, 0, $3))::jsonb as geojson
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(req.height)
@@ -65,10 +66,11 @@ async fn compute_volume(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<VolumeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_3DArea(geometry) as surface_area, ST_Volume(geometry) as volume
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .fetch_optional(store.pool())
@@ -91,11 +93,13 @@ async fn intersection_3d(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<Intersection3DRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    // both sides are the same branch, so the same scoped source twice
+    let (_, source) = store.features_source_at(branch_id, "$3").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_3DIntersection(a.geometry, b.geometry))::jsonb as geojson
-         FROM features a, features b
-         WHERE a.id = $1 AND b.id = $2 AND a.branch_id = $3 AND b.branch_id = $3",
-    )
+         FROM {source} a, {source} b
+         WHERE a.id = $1 AND b.id = $2"
+    ))
     .bind(req.feature_a)
     .bind(req.feature_b)
     .bind(branch_id)
@@ -115,10 +119,11 @@ async fn straight_skeleton(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<SkeletonRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_StraightSkeleton(geometry))::jsonb as geojson
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .fetch_optional(store.pool())
@@ -140,10 +145,11 @@ async fn minkowski_sum(
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     let wkb = hex::decode(&req.buffer_geometry_wkb_hex)
         .map_err(|_| SfcgalError::Bad("invalid hex".into()))?;
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_MinkowskiSum(geometry, ST_GeomFromWKB($3, 4326)))::jsonb as geojson
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(&wkb)
@@ -163,10 +169,11 @@ async fn tesselate(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<TesselateRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Tesselate(geometry))::jsonb as geojson
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .fetch_optional(store.pool())
@@ -188,7 +195,8 @@ async fn visibility(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<VisibilityRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
-    let row = sqlx::query(
+    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let row = sqlx::query(&format!(
         "SELECT ST_3DDistance(
             geometry,
             ST_SetSRID(ST_MakePoint($3, $4, $5), 4326)
@@ -200,8 +208,8 @@ async fn visibility(
                 ST_Centroid(geometry)
             )
          ) as line_of_sight
-         FROM features WHERE id = $1 AND branch_id = $2",
-    )
+         FROM {source} f WHERE f.id = $1"
+    ))
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(req.observer_x)
@@ -218,12 +226,18 @@ async fn visibility(
 
 enum SfcgalError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
 }
 impl From<sqlx::Error> for SfcgalError {
     fn from(e: sqlx::Error) -> Self {
         SfcgalError::Db(e)
+    }
+}
+impl From<ptolemy_storage::StoreError> for SfcgalError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        SfcgalError::Store(e)
     }
 }
 impl IntoResponse for SfcgalError {
@@ -235,6 +249,7 @@ impl IntoResponse for SfcgalError {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
+            SfcgalError::Store(e) => crate::errors::store_error_status(&e),
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
     }

@@ -119,6 +119,14 @@ QGIS's native PostGIS connector all work against the database as-is. Backup and
 restore is standard `pg_dump`/`pg_restore`. If you stop using Ptolemy, your data
 is already in the most widely supported spatial database there is.
 
+One caveat for ad-hoc SQL: the `features` view walks the changeset chain of every
+branch in the database before your `WHERE branch_id = …` filters it, so its cost
+is set by total instance history, not by the branch you asked for. That is fine
+for interactive queries and wrong for a hot path — the API does not use the view,
+it builds the same rows from the one branch's ancestor chain per query. On an
+instance with 89k changesets, reading a 100-feature branch was 115 ms through the
+view and 8.9 ms branch-scoped.
+
 #### Browse your existing PostGIS read-only
 
 The reverse also works: point Ptolemy at tables you already have and browse them
@@ -154,6 +162,19 @@ public, not a table with columns you don't. If the relation has columns that
 must stay internal, register it with `"visibility": "private"` as well — an
 external dataset is gated on read exactly like a versioned one (see
 [Access control](#access-control)).
+
+**Index the geometry the way reads query it.** Ptolemy exposes external geometry
+in EPSG:4326, so if the relation is in another SRID every spatial predicate lands
+on `ST_Transform(geom, 4326)` and a GiST index on the raw column cannot serve it:
+bbox and tile reads sequentially scan the whole relation. On a 50k-row polygon
+table in EPSG:3857 that was 164 ms instead of 7 ms. Add the functional index that
+matches (registration logs a warning naming it):
+
+```sql
+CREATE INDEX ON parcels USING GIST (ST_Transform(geom, 4326));
+```
+
+A relation already in 4326 needs nothing beyond an ordinary GiST index.
 
 Set `PTOLEMY_EXTERNAL_DATABASE_URL` to read external datasets from a different
 database than Ptolemy's own. Use a role with `SELECT` and nothing else:

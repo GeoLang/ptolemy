@@ -4530,3 +4530,285 @@ async fn test_auth_disabled_lists_private_datasets() {
         "dev mode hid a dataset: {body}"
     );
 }
+
+// ─── Branch-scoped reads ────────────────────────────────────────────
+
+/// Two branches of one dataset holding different values for the same feature,
+/// plus a feature only the fork has. Returns (dataset, main, fork, feature id).
+async fn seed_two_branches(app: &axum::Router) -> (Uuid, Uuid, Uuid, Uuid) {
+    let ds_id = create_dataset(app).await;
+    let main = create_branch(app, ds_id, "main").await;
+    let shared = Uuid::now_v7();
+    let point = "0101000000000000000000f03f000000000000f03f";
+
+    commit_features(
+        app,
+        main,
+        json!([{
+            "type": "insert",
+            "feature_id": shared,
+            "geometry_wkb_hex": point,
+            "properties": {"name": "on-main", "kind": "parcel"}
+        }]),
+    )
+    .await;
+
+    let (status, fork) = post_json(
+        app,
+        &format!("/api/v1/datasets/{ds_id}/branches"),
+        json!({"name": "fork", "created_by": "test", "fork_from_branch": main}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    let fork_id = Uuid::parse_str(fork["id"].as_str().unwrap()).unwrap();
+
+    // the fork moves the feature and renames it, then main is committed again so
+    // the newest row in the table belongs to main
+    commit_features(
+        app,
+        fork_id,
+        json!([{
+            "type": "update",
+            "feature_id": shared,
+            "geometry_wkb_hex": "0101000000000000000000004000000000000000 40".replace(' ', ""),
+            "properties": {"name": "on-fork", "kind": "parcel"}
+        }]),
+    )
+    .await;
+    commit_features(
+        app,
+        main,
+        json!([{
+            "type": "update",
+            "feature_id": shared,
+            "geometry_wkb_hex": point,
+            "properties": {"name": "on-main-again", "kind": "parcel"}
+        }]),
+    )
+    .await;
+
+    (ds_id, main, fork_id, shared)
+}
+
+/// The bug: `/ogc/collections/{id}/items/{fid}` took the newest
+/// `feature_versions` row for the id anywhere in the database, so both branches
+/// answered with whichever was written last.
+#[tokio::test]
+async fn test_ogc_single_item_is_scoped_to_its_branch() {
+    let (app, _) = setup_app().await;
+    let (ds_id, main, fork, fid) = seed_two_branches(&app).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{ds_id}/items/{fid}?branch={fork}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["properties"]["name"], "on-fork", "{body}");
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{ds_id}/items/{fid}?branch={main}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["properties"]["name"], "on-main-again", "{body}");
+
+    // no branch means main, the same rule the listing uses
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{ds_id}/items/{fid}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["properties"]["name"], "on-main-again", "{body}");
+
+    // a feature id from another dataset is not served here
+    let other = create_dataset(&app).await;
+    let other_branch = create_branch(&app, other, "main").await;
+    let other_fid = Uuid::now_v7();
+    commit_features(
+        &app,
+        other_branch,
+        json!([{
+            "type": "insert",
+            "feature_id": other_fid,
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {"name": "elsewhere"}
+        }]),
+    )
+    .await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{ds_id}/items/{other_fid}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// A deleted feature is gone from the single-item read too, not served as an
+/// empty geometry.
+#[tokio::test]
+async fn test_ogc_single_item_honours_deletes() {
+    let (app, _) = setup_app().await;
+    let (ds_id, main, _, fid) = seed_two_branches(&app).await;
+
+    commit_features(&app, main, json!([{"type": "delete", "feature_id": fid}])).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{ds_id}/items/{fid}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// The branch-scoped source has to see inherited features, not just the ones
+/// committed on the branch itself. This is what the `features` view was fixed
+/// for in migration 020, so the scoped form must keep it.
+#[tokio::test]
+async fn test_scoped_reads_see_inherited_and_own_values() {
+    let (app, _) = setup_app().await;
+    let (_, main, fork, _) = seed_two_branches(&app).await;
+    let inherited = Uuid::now_v7();
+
+    // a feature committed on main before the fork existed is already inherited;
+    // add one more only main has, to prove the fork does not see it
+    commit_features(
+        &app,
+        main,
+        json!([{
+            "type": "insert",
+            "feature_id": inherited,
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {"name": "main-only", "kind": "parcel"}
+        }]),
+    )
+    .await;
+
+    // the CQL2 filter path, the export paths and the QGIS layer definition all
+    // read through the same scoped source
+    let filter = json!({"filter": {"op": "=", "args": [{"property": "kind"}, "parcel"]}});
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{fork}/features/filter"),
+        filter.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["on-fork"], "fork filter: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main}/features/filter"),
+        filter,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names: Vec<&str> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"]["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["main-only", "on-main-again"],
+        "main filter: {body}"
+    );
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{fork}/export/geojson")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let exported: Vec<&str> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(exported, vec!["on-fork"], "fork export: {body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/qgis/branches/{main}/layer")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["feature_count"], 2, "main layer definition: {body}");
+    let (status, body) = get_json(&app, &format!("/api/v1/qgis/branches/{fork}/layer")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["feature_count"], 1, "fork layer definition: {body}");
+}
+
+/// A deleted feature must not come back through the scoped source, and the CSV
+/// and FlatGeobuf exports share it.
+#[tokio::test]
+async fn test_scoped_reads_exclude_deletes() {
+    let (app, _) = setup_app().await;
+    let (_, main, _, fid) = seed_two_branches(&app).await;
+
+    commit_features(&app, main, json!([{"type": "delete", "feature_id": fid}])).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{main}/export/geojson")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["features"].as_array().unwrap().is_empty(),
+        "deleted feature came back: {body}"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main}/features/filter"),
+        json!({"filter": {"op": "=", "args": [{"property": "kind"}, "parcel"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 0, "{body}");
+}
+
+/// The 3D endpoints resolved features through the same view, so they are
+/// branch-scoped now too: a feature live only on the fork is not found on main.
+#[tokio::test]
+async fn test_sfcgal_resolves_features_per_branch() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main = create_branch(&app, ds_id, "main").await;
+    let (status, fork) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/branches"),
+        json!({"name": "fork", "created_by": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    let fork_id = Uuid::parse_str(fork["id"].as_str().unwrap()).unwrap();
+
+    let fid = Uuid::now_v7();
+    commit_features(
+        &app,
+        main,
+        json!([{
+            "type": "insert",
+            "feature_id": fid,
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {"name": "main-only"}
+        }]),
+    )
+    .await;
+
+    let body = json!({"feature_id": fid});
+    let (status, resp) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main}/3d/volume"),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "on its own branch: {resp}");
+
+    // the fork was created empty, so it never had this feature
+    let (status, resp) =
+        post_json(&app, &format!("/api/v1/branches/{fork_id}/3d/volume"), body).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "on another branch: {resp}");
+}

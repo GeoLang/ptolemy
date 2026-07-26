@@ -12,5 +12,5 @@ pub use postgres::{
     Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry, CompactionResult,
     CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeResult, PgStore,
     ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult, TopologyRepair,
-    TopologyViolation,
+    TopologyViolation, branch_features_subquery,
 };

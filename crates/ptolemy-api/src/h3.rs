@@ -75,13 +75,14 @@ async fn get_hexagons(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
-    let rows = sqlx::query(
+    let (_, source) = store.features_source(branch_id).await?;
+    let rows = sqlx::query(&format!(
         "SELECT DISTINCT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
                 ST_AsGeoJSON(h3_cell_to_boundary(h3_lat_lng_to_cell(ST_Centroid(geometry), $2))::geometry)::jsonb as boundary
-         FROM features
-         WHERE branch_id = $1 AND geometry IS NOT NULL
-         LIMIT $3",
-    ).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(1000))
+         FROM {source} f
+         WHERE geometry IS NOT NULL
+         LIMIT $3"
+    )).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(1000))
     .fetch_all(store.pool()).await?;
 
     let hexagons: Vec<serde_json::Value> = rows
@@ -105,15 +106,16 @@ async fn aggregate_by_hex(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
-    let rows = sqlx::query(
+    let (_, source) = store.features_source(branch_id).await?;
+    let rows = sqlx::query(&format!(
         "SELECT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
                 COUNT(*) as feature_count
-         FROM features
-         WHERE branch_id = $1 AND geometry IS NOT NULL
+         FROM {source} f
+         WHERE geometry IS NOT NULL
          GROUP BY cell
          ORDER BY feature_count DESC
-         LIMIT $3",
-    )
+         LIMIT $3"
+    ))
     .bind(branch_id)
     .bind(q.resolution)
     .bind(q.limit.unwrap_or(500))
@@ -229,20 +231,30 @@ async fn cell_boundary(
 
 enum H3Error {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
 }
 impl From<sqlx::Error> for H3Error {
     fn from(e: sqlx::Error) -> Self {
         H3Error::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for H3Error {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        H3Error::Store(e)
+    }
+}
 impl IntoResponse for H3Error {
     fn into_response(self) -> axum::response::Response {
-        let H3Error::Db(e) = self;
-        tracing::error!("DB: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
+        let (status, message) = match self {
+            H3Error::Db(e) => {
+                tracing::error!("DB: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
+            H3Error::Store(e) => crate::errors::store_error_status(&e),
+        };
+        (status, Json(serde_json::json!({"error": message}))).into_response()
     }
 }
