@@ -8,6 +8,7 @@ pub mod dataset;
 pub mod datastore;
 pub mod diff;
 pub mod event;
+pub mod external;
 pub mod feature;
 pub mod geoconvert;
 pub mod review;
@@ -21,6 +22,7 @@ pub use datastore::{
     StoreResult,
 };
 pub use event::{Event, EventType, Webhook};
+pub use external::{ExternalError, ExternalSource, ExternalTable};
 pub use feature::Feature;
 pub use review::{MergeRequest, MergeRequestStatus, ReviewComment};
 pub use schema::{

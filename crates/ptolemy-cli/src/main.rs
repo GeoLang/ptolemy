@@ -296,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                     geometry_type: parse_geom_type(&geometry_type),
                     created_at: OffsetDateTime::now_utc(),
                     created_by,
+                    external: None,
                 };
                 store.create_dataset(&ds).await?;
                 println!("Created dataset '{}' ({})", name, ds.id);

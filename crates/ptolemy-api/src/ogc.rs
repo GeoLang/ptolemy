@@ -205,34 +205,26 @@ async fn items(
         row.get("id")
     };
 
+    // an external dataset swaps in a derived table over the team's relation;
+    // the ordinary changeset-chain query is untouched
+    let (external, prelude, source) = store.latest_source(branch_id).await?;
+    let pool = store.read_pool(external.as_ref()).await?;
+
     let features = if let Some(bbox_str) = &q.bbox {
         // Parse bbox
         let parts: Vec<f64> = bbox_str.split(',').filter_map(|s| s.parse().ok()).collect();
         if parts.len() != 4 {
             return Err(OgcError::NotFound("invalid bbox format".into()));
         }
-        sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id FROM changesets c
-                JOIN branches b ON b.head = c.id WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.operation, fv.geometry, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
+        sqlx::query(&format!(
+            "{prelude}
             SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
-            FROM latest
+            FROM {source}
             WHERE operation != 'delete'
               AND geometry IS NOT NULL
               AND geometry && ST_MakeEnvelope($2, $3, $4, $5, 4326)
-            LIMIT $6 OFFSET $7",
-        )
+            LIMIT $6 OFFSET $7"
+        ))
         .bind(branch_id)
         .bind(parts[0])
         .bind(parts[1])
@@ -240,33 +232,20 @@ async fn items(
         .bind(parts[3])
         .bind(q.limit)
         .bind(q.offset)
-        .fetch_all(store.pool())
+        .fetch_all(pool)
         .await?
     } else {
-        sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id FROM changesets c
-                JOIN branches b ON b.head = c.id WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.operation, fv.geometry, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
+        sqlx::query(&format!(
+            "{prelude}
             SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
-            FROM latest
+            FROM {source}
             WHERE operation != 'delete'
-            LIMIT $2 OFFSET $3",
-        )
+            LIMIT $2 OFFSET $3"
+        ))
         .bind(branch_id)
         .bind(q.limit)
         .bind(q.offset)
-        .fetch_all(store.pool())
+        .fetch_all(pool)
         .await?
     };
 
@@ -296,17 +275,34 @@ async fn items(
 
 async fn item(
     State(store): State<AppState>,
-    Path((_dataset_id, feature_id)): Path<(Uuid, Uuid)>,
+    Path((dataset_id, feature_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, OgcError> {
-    let row = sqlx::query(
-        "SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
-         FROM feature_versions
-         WHERE feature_id = $1
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(feature_id)
-    .fetch_optional(store.pool())
-    .await?
+    let external = store.external_for_dataset(dataset_id).await?;
+    let row = match &external {
+        None => {
+            sqlx::query(
+                "SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
+                 FROM feature_versions
+                 WHERE feature_id = $1
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(feature_id)
+            .fetch_optional(store.pool())
+            .await?
+        }
+        Some(ext) => {
+            // the id is the hash of the row's own key, so this matches the id
+            // the listing handed out
+            sqlx::query(&format!(
+                "SELECT id as feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties
+                 FROM {} f WHERE f.id = $1",
+                ext.features_subquery("NULL")
+            ))
+            .bind(feature_id)
+            .fetch_optional(store.read_pool(external.as_ref()).await?)
+            .await?
+        }
+    }
     .ok_or_else(|| OgcError::NotFound("feature not found".into()))?;
 
     let geom: Option<serde_json::Value> = row.get("geojson");

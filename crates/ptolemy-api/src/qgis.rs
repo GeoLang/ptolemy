@@ -204,17 +204,19 @@ async fn layer_definition(
 
     // Count features and compute extent. The "features" view already resolves the
     // latest live version per feature from the branch head's ancestor chain.
-    let stats = sqlx::query(
+    let (external, source) = store.features_source(branch_id).await?;
+    let pool = store.read_pool(external.as_ref()).await?;
+    let stats = sqlx::query(&format!(
         "SELECT count(*) as cnt,
                 ST_XMin(ST_Extent(geometry)) as min_x,
                 ST_YMin(ST_Extent(geometry)) as min_y,
                 ST_XMax(ST_Extent(geometry)) as max_x,
                 ST_YMax(ST_Extent(geometry)) as max_y
-         FROM features
-         WHERE branch_id = $1",
-    )
+         FROM {source} f
+         WHERE branch_id = $1"
+    ))
     .bind(branch_id)
-    .fetch_one(store.pool())
+    .fetch_one(pool)
     .await?;
 
     let feature_count: i64 = stats.get("cnt");
@@ -226,13 +228,13 @@ async fn layer_definition(
     });
 
     // Get field names from properties of first feature
-    let fields = sqlx::query(
+    let fields = sqlx::query(&format!(
         "SELECT DISTINCT jsonb_object_keys(properties) as key
-         FROM features WHERE branch_id = $1
-         LIMIT 100",
-    )
+         FROM {source} f WHERE branch_id = $1
+         LIMIT 100"
+    ))
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(pool)
     .await?
     .into_iter()
     .map(|r| LayerField {
@@ -316,6 +318,7 @@ async fn wfs_transaction(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<WfsTransaction>,
 ) -> Result<Json<WfsTransactionResponse>, QgisError> {
+    store.ensure_branch_writable(branch_id).await?;
     let mut diff_ops: Vec<ptolemy_core::diff::DiffOp> = Vec::new();
     let mut inserted = 0usize;
     let mut updated = 0usize;
@@ -522,6 +525,7 @@ async fn qgis_push(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<QgisPushRequest>,
 ) -> Result<(StatusCode, Json<QgisPushResponse>), QgisError> {
+    store.ensure_branch_writable(branch_id).await?;
     let branch = store.get_branch(branch_id).await?;
 
     // Check if behind
@@ -735,8 +739,20 @@ impl From<sqlx::Error> for QgisError {
 impl IntoResponse for QgisError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
-            QgisError::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            QgisError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            QgisError::Store(ptolemy_storage::StoreError::Conflict(m)) => (StatusCode::CONFLICT, m),
+            QgisError::Store(ptolemy_storage::StoreError::NotFound(m)) => {
+                (StatusCode::NOT_FOUND, m)
+            }
+            // database errors are logged, never echoed: they can carry
+            // connection details and schema internals
+            QgisError::Store(e) => {
+                tracing::error!("Store error: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
+            QgisError::Db(e) => {
+                tracing::error!("Database error: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
             QgisError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             QgisError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
         };

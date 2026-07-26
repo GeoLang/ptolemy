@@ -10,6 +10,7 @@ use ptolemy_core::changeset::Changeset;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::{Diff, DiffOp};
 use ptolemy_core::event::{Event, Webhook};
+use ptolemy_core::external::{ExternalSource, ExternalTable};
 use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
 use ptolemy_core::schema::{
     DatasetSchema, FieldDef, GeometryRules, QualityReport, QualityStatistics, TopologyRule,
@@ -29,13 +30,58 @@ pub enum StoreError {
     Conflict(String),
 }
 
+/// Columns every read query needs from `latest`.
+const LATEST_COLUMNS: &str =
+    "fv.feature_id, fv.dataset_id, fv.operation, fv.geometry, fv.properties";
+
+/// Latest live version of each feature on the branch bound to `$1`, resolved by
+/// walking the branch head's ancestor chain. Shared by the read queries so the
+/// external variant only has to swap the FROM clause. `columns` is the
+/// projection: the DISTINCT ON sorts every version in the chain, so a query
+/// that only counts should not drag geometry through it.
+fn latest_cte(columns: &str) -> String {
+    format!(
+        "WITH RECURSIVE chain AS (
+        SELECT c.id, c.parent_id
+        FROM changesets c
+        JOIN branches b ON b.head = c.id
+        WHERE b.id = $1
+      UNION ALL
+        SELECT c.id, c.parent_id
+        FROM changesets c
+        JOIN chain ch ON ch.parent_id = c.id
+    ),
+    latest AS (
+        SELECT DISTINCT ON (fv.feature_id)
+            {columns}
+        FROM feature_versions fv
+        JOIN chain ch ON fv.changeset_id = ch.id
+        ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
+    )"
+    )
+}
+
+/// Rejection message for every mutation aimed at an external dataset.
+pub const EXTERNAL_READ_ONLY: &str =
+    "dataset is external (read-only): it is a view over a PostGIS relation ptolemy does not own";
+
+/// Optional second database for external reads. Point it at a read-only role so
+/// the guarantee holds at the database, not only in this process.
+pub const EXTERNAL_DATABASE_URL: &str = "PTOLEMY_EXTERNAL_DATABASE_URL";
+
 pub struct PgStore {
     pool: PgPool,
+    /// Built on first external read, so an unset env var costs nothing and a
+    /// bad URL fails the request rather than startup.
+    external_pool: tokio::sync::OnceCell<PgPool>,
 }
 
 impl PgStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            external_pool: tokio::sync::OnceCell::new(),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -58,8 +104,9 @@ impl PgStore {
     pub async fn create_dataset(&self, ds: &Dataset) -> Result<(), StoreError> {
         let geom_type = format!("{:?}", ds.geometry_type).to_lowercase();
         sqlx::query(
-            "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by,
+                                   external_table, external_id_column, external_geometry_column)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(ds.id)
         .bind(&ds.name)
@@ -67,53 +114,267 @@ impl PgStore {
         .bind(&geom_type)
         .bind(ds.created_at)
         .bind(&ds.created_by)
+        .bind(ds.external.as_ref().map(|e| e.table()))
+        .bind(ds.external.as_ref().map(|e| e.id_column()))
+        .bind(ds.external.as_ref().map(|e| e.geometry_column()))
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    /// Register an external dataset: probe the relation, then insert the
+    /// dataset and its `main` branch together so list/branch endpoints work
+    /// like they do for a versioned dataset. `srid` is taken from the relation
+    /// itself, not from the request, because the relation is the truth.
+    pub async fn register_external_dataset(&self, ds: &Dataset) -> Result<Dataset, StoreError> {
+        let table = ds
+            .external
+            .as_ref()
+            .ok_or_else(|| StoreError::Conflict("dataset has no external table".into()))?;
+        let srid = self.probe_external(table).await?;
+
+        let mut ds = ds.clone();
+        ds.srid = srid;
+        let geom_type = format!("{:?}", ds.geometry_type).to_lowercase();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by,
+                                   external_table, external_id_column, external_geometry_column)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(ds.id)
+        .bind(&ds.name)
+        .bind(ds.srid)
+        .bind(&geom_type)
+        .bind(ds.created_at)
+        .bind(&ds.created_by)
+        .bind(table.table())
+        .bind(table.id_column())
+        .bind(table.geometry_column())
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO branches (id, dataset_id, name, head, created_at, created_by)
+             VALUES ($1, $2, 'main', NULL, $3, $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(ds.id)
+        .bind(ds.created_at)
+        .bind(&ds.created_by)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(ds)
+    }
+
+    /// Check that the relation and its two columns exist, that the geometry
+    /// column really is PostGIS geometry, and that the pool external reads use
+    /// can actually select from it. Returns the relation's SRID.
+    ///
+    /// The catalog lookup binds the relation name, so it never builds SQL from
+    /// it; the `LIMIT 1` select must interpolate the identifiers, which is why
+    /// they went through `ExternalTable::parse` first.
+    pub async fn probe_external(&self, table: &ExternalTable) -> Result<i32, StoreError> {
+        let pool = self.external_pool().await?;
+        let relation = table.quoted_relation();
+
+        let oid: i64 = sqlx::query_scalar("SELECT $1::regclass::oid::int8")
+            .bind(&relation)
+            .fetch_one(pool)
+            .await
+            .map_err(|_| {
+                StoreError::Conflict(format!(
+                    "relation {} does not exist or is not readable",
+                    table.table()
+                ))
+            })?;
+
+        let columns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod)
+             FROM pg_attribute a
+             WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped
+               AND a.attname = ANY($2)",
+        )
+        .bind(oid)
+        .bind(vec![
+            table.id_column().to_string(),
+            table.geometry_column().to_string(),
+        ])
+        .fetch_all(pool)
+        .await?;
+
+        let column_type = |name: &str| columns.iter().find(|(n, _)| n == name).map(|(_, t)| t);
+        if column_type(table.id_column()).is_none() {
+            return Err(StoreError::Conflict(format!(
+                "column {} does not exist on {}",
+                table.id_column(),
+                table.table()
+            )));
+        }
+        let geom_type = column_type(table.geometry_column()).ok_or_else(|| {
+            StoreError::Conflict(format!(
+                "column {} does not exist on {}",
+                table.geometry_column(),
+                table.table()
+            ))
+        })?;
+        if geom_type != "geometry" && !geom_type.starts_with("geometry(") {
+            return Err(StoreError::Conflict(format!(
+                "column {} on {} is {geom_type}, not PostGIS geometry",
+                table.geometry_column(),
+                table.table()
+            )));
+        }
+
+        // reading one row proves SELECT is granted and gives the SRID actually
+        // stored, which a plain `geometry` column does not declare
+        let id = format!("\"{}\"", table.id_column());
+        let geom = format!("\"{}\"", table.geometry_column());
+        let srid: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT ST_SRID(t.{geom}) FROM {relation} t WHERE t.{geom} IS NOT NULL LIMIT 1"
+        ))
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StoreError::Conflict(format!("cannot read {}: {e}", table.table())))?
+        .flatten();
+
+        sqlx::query(&format!("SELECT t.{id} FROM {relation} t LIMIT 1"))
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| StoreError::Conflict(format!("cannot read {}: {e}", table.table())))?;
+
+        Ok(srid.unwrap_or(4326))
+    }
+
+    /// The external read source for a branch, or `None` for an ordinary
+    /// versioned dataset. Every read path that supports external datasets
+    /// starts here.
+    pub async fn external_for_branch(
+        &self,
+        branch_id: Uuid,
+    ) -> Result<Option<ExternalSource>, StoreError> {
+        let row = sqlx::query(
+            "SELECT d.id, d.srid, d.external_table, d.external_id_column,
+                    d.external_geometry_column
+             FROM branches b JOIN datasets d ON d.id = b.dataset_id
+             WHERE b.id = $1",
+        )
+        .bind(branch_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(external_source_from_row)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Same, resolved through the dataset's `main` branch.
+    pub async fn external_for_dataset(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Option<ExternalSource>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, srid, external_table, external_id_column, external_geometry_column
+             FROM datasets WHERE id = $1",
+        )
+        .bind(dataset_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(external_source_from_row)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Reject any mutation aimed at an external dataset. One place, so a write
+    /// path is read-only by being routed through it rather than by remembering
+    /// to check.
+    pub async fn ensure_dataset_writable(&self, dataset_id: Uuid) -> Result<(), StoreError> {
+        let external: Option<String> =
+            sqlx::query_scalar("SELECT external_table FROM datasets WHERE id = $1")
+                .bind(dataset_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        match external {
+            Some(_) => Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into())),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn ensure_branch_writable(&self, branch_id: Uuid) -> Result<(), StoreError> {
+        let external: Option<String> = sqlx::query_scalar(
+            "SELECT d.external_table FROM branches b JOIN datasets d ON d.id = b.dataset_id
+             WHERE b.id = $1",
+        )
+        .bind(branch_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        match external {
+            Some(_) => Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into())),
+            None => Ok(()),
+        }
+    }
+
+    /// Pool that external reads and probes run on: a second database when
+    /// `PTOLEMY_EXTERNAL_DATABASE_URL` is set (meant to hold a read-only role),
+    /// otherwise the primary pool for tables in the same database.
+    pub async fn external_pool(&self) -> Result<&PgPool, StoreError> {
+        let Ok(url) = std::env::var(EXTERNAL_DATABASE_URL) else {
+            return Ok(&self.pool);
+        };
+        if url.is_empty() {
+            return Ok(&self.pool);
+        }
+        self.external_pool
+            .get_or_try_init(|| async { PgPool::connect(&url).await })
+            .await
+            .map_err(StoreError::Db)
+    }
+
+    /// The pool a read should use, given whether it targets an external dataset.
+    pub async fn read_pool(
+        &self,
+        external: Option<&ExternalSource>,
+    ) -> Result<&PgPool, StoreError> {
+        match external {
+            Some(_) => self.external_pool().await,
+            None => Ok(&self.pool),
+        }
+    }
+
     pub async fn get_dataset(&self, id: Uuid) -> Result<Dataset, StoreError> {
         let row = sqlx::query(
-            "SELECT id, name, srid, geometry_type, created_at, created_by FROM datasets WHERE id = $1",
+            "SELECT id, name, srid, geometry_type, created_at, created_by,
+                    external_table, external_id_column, external_geometry_column
+             FROM datasets WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("dataset {id}")))?;
 
-        Ok(Dataset {
-            id: row.get("id"),
-            name: row.get("name"),
-            srid: row.get("srid"),
-            geometry_type: parse_geometry_type(row.get::<String, _>("geometry_type")),
-            created_at: row.get("created_at"),
-            created_by: row.get("created_by"),
-        })
+        dataset_from_row(row)
     }
 
     pub async fn list_datasets(&self) -> Result<Vec<Dataset>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, name, srid, geometry_type, created_at, created_by FROM datasets ORDER BY name",
+            "SELECT id, name, srid, geometry_type, created_at, created_by,
+                    external_table, external_id_column, external_geometry_column
+             FROM datasets ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| Dataset {
-                id: row.get("id"),
-                name: row.get("name"),
-                srid: row.get("srid"),
-                geometry_type: parse_geometry_type(row.get::<String, _>("geometry_type")),
-                created_at: row.get("created_at"),
-                created_by: row.get("created_by"),
-            })
-            .collect())
+        rows.into_iter().map(dataset_from_row).collect()
     }
 
     // ─── Branch CRUD ────────────────────────────────────────────────
 
     pub async fn create_branch(&self, branch: &Branch) -> Result<(), StoreError> {
+        self.ensure_dataset_writable(branch.dataset_id).await?;
         sqlx::query(
             "INSERT INTO branches (id, dataset_id, name, head, created_at, created_by)
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -215,12 +476,22 @@ impl PgStore {
     ) -> Result<Changeset, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        // Get current branch head
-        let branch_row =
-            sqlx::query("SELECT head, dataset_id FROM branches WHERE id = $1 FOR UPDATE")
-                .bind(branch_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        // Get current branch head. The external check rides along on the row
+        // lock, so no commit can slip past it.
+        let branch_row = sqlx::query(
+            "SELECT b.head, b.dataset_id, d.external_table
+             FROM branches b JOIN datasets d ON d.id = b.dataset_id
+             WHERE b.id = $1 FOR UPDATE OF b",
+        )
+        .bind(branch_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if branch_row
+            .get::<Option<String>, _>("external_table")
+            .is_some()
+        {
+            return Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into()));
+        }
         let parent_id: Option<Uuid> = branch_row.get("head");
         let dataset_id: Uuid = branch_row.get("dataset_id");
 
@@ -353,33 +624,65 @@ impl PgStore {
 
     // ─── Feature Queries ────────────────────────────────────────────
 
+    /// Live features on a branch, as SQL every read query can build on: the
+    /// prelude declares a `latest` CTE for an ordinary dataset, or is empty and
+    /// the source is a derived table over the team's relation for an external
+    /// one. Either way the source exposes feature_id, dataset_id, operation,
+    /// geometry and properties, and the branch id is `$1`.
+    ///
+    /// Returns (external source if any, prelude, FROM expression). Handlers that
+    /// build their own SQL use this so there is one definition of what a live
+    /// feature is.
+    pub async fn latest_source(
+        &self,
+        branch_id: Uuid,
+    ) -> Result<(Option<ExternalSource>, String, String), StoreError> {
+        self.latest_source_of(branch_id, LATEST_COLUMNS).await
+    }
+
+    /// [`Self::latest_source`] with a narrower projection, for queries that do
+    /// not need the geometry or properties.
+    pub async fn latest_source_of(
+        &self,
+        branch_id: Uuid,
+        columns: &str,
+    ) -> Result<(Option<ExternalSource>, String, String), StoreError> {
+        let external = self.external_for_branch(branch_id).await?;
+        match &external {
+            None => Ok((None, latest_cte(columns), "latest".to_string())),
+            Some(ext) => {
+                let source = format!("{} latest", ext.latest_subquery("$1"));
+                Ok((external.clone(), String::new(), source))
+            }
+        }
+    }
+
+    /// What a query should put after FROM where it would say `features`: the
+    /// view itself, or a derived table over the external relation with the same
+    /// columns. The branch id must be bound as `$1`.
+    pub async fn features_source(
+        &self,
+        branch_id: Uuid,
+    ) -> Result<(Option<ExternalSource>, String), StoreError> {
+        let external = self.external_for_branch(branch_id).await?;
+        let source = match &external {
+            None => "features".to_string(),
+            Some(ext) => ext.features_subquery("$1"),
+        };
+        Ok((external, source))
+    }
+
     /// Get the current state of all features on a branch (at its head).
     pub async fn list_features_at_head(&self, branch_id: Uuid) -> Result<Vec<Feature>, StoreError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.dataset_id, fv.operation,
-                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
-            SELECT feature_id, dataset_id, geometry_wkb, properties
-            FROM latest
-            WHERE operation != 'delete'",
-        )
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let rows = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            FROM {source}
+            WHERE operation != 'delete'"
+        ))
         .bind(branch_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -553,6 +856,7 @@ impl PgStore {
         target_branch_id: Uuid,
         author: &str,
     ) -> Result<MergeResult, StoreError> {
+        self.ensure_branch_writable(target_branch_id).await?;
         let source = self.get_branch(source_branch_id).await?;
         let target = self.get_branch(target_branch_id).await?;
 
@@ -963,66 +1267,34 @@ impl PgStore {
         cursor: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let pool = self.read_pool(external.as_ref()).await?;
         let query = if let Some(cursor_id) = cursor {
-            sqlx::query(
-                "WITH RECURSIVE chain AS (
-                    SELECT c.id, c.parent_id
-                    FROM changesets c
-                    JOIN branches b ON b.head = c.id
-                    WHERE b.id = $1
-                  UNION ALL
-                    SELECT c.id, c.parent_id
-                    FROM changesets c
-                    JOIN chain ch ON ch.parent_id = c.id
-                ),
-                latest AS (
-                    SELECT DISTINCT ON (fv.feature_id)
-                        fv.feature_id, fv.dataset_id, fv.operation,
-                        ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                    FROM feature_versions fv
-                    JOIN chain ch ON fv.changeset_id = ch.id
-                    ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-                )
-                SELECT feature_id, dataset_id, geometry_wkb, properties
-                FROM latest
+            sqlx::query(&format!(
+                "{prelude}
+                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+                FROM {source}
                 WHERE operation != 'delete' AND feature_id > $2
                 ORDER BY feature_id
-                LIMIT $3",
-            )
+                LIMIT $3"
+            ))
             .bind(branch_id)
             .bind(cursor_id)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(pool)
             .await?
         } else {
-            sqlx::query(
-                "WITH RECURSIVE chain AS (
-                    SELECT c.id, c.parent_id
-                    FROM changesets c
-                    JOIN branches b ON b.head = c.id
-                    WHERE b.id = $1
-                  UNION ALL
-                    SELECT c.id, c.parent_id
-                    FROM changesets c
-                    JOIN chain ch ON ch.parent_id = c.id
-                ),
-                latest AS (
-                    SELECT DISTINCT ON (fv.feature_id)
-                        fv.feature_id, fv.dataset_id, fv.operation,
-                        ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                    FROM feature_versions fv
-                    JOIN chain ch ON fv.changeset_id = ch.id
-                    ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-                )
-                SELECT feature_id, dataset_id, geometry_wkb, properties
-                FROM latest
+            sqlx::query(&format!(
+                "{prelude}
+                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+                FROM {source}
                 WHERE operation != 'delete'
                 ORDER BY feature_id
-                LIMIT $2",
-            )
+                LIMIT $2"
+            ))
             .bind(branch_id)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(pool)
             .await?
         };
 
@@ -1051,37 +1323,21 @@ impl PgStore {
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.dataset_id, fv.operation,
-                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
-            SELECT feature_id, dataset_id, geometry_wkb, properties
-            FROM latest
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let rows = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            FROM {source}
             WHERE operation != 'delete'
               AND properties->>$2 ILIKE '%' || $3 || '%'
             ORDER BY feature_id
-            LIMIT $4",
-        )
+            LIMIT $4"
+        ))
         .bind(branch_id)
         .bind(key)
         .bind(escaped)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1107,38 +1363,22 @@ impl PgStore {
         max_y: f64,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.dataset_id, fv.operation,
-                    fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
-            SELECT feature_id, dataset_id, geometry_wkb, properties
-            FROM latest
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let rows = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            FROM {source}
             WHERE operation != 'delete'
               AND geometry && ST_MakeEnvelope($2, $3, $4, $5, 4326)
-            LIMIT $6",
-        )
+            LIMIT $6"
+        ))
         .bind(branch_id)
         .bind(min_x)
         .bind(min_y)
         .bind(max_x)
         .bind(max_y)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1159,35 +1399,19 @@ impl PgStore {
         geojson_geometry: &str,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.dataset_id, fv.operation,
-                    fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
-            SELECT feature_id, dataset_id, geometry_wkb, properties
-            FROM latest
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let rows = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            FROM {source}
             WHERE operation != 'delete'
               AND ST_Intersects(geometry, ST_GeomFromGeoJSON($2))
-            LIMIT $3",
-        )
+            LIMIT $3"
+        ))
         .bind(branch_id)
         .bind(geojson_geometry)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1208,35 +1432,19 @@ impl PgStore {
         geojson_geometry: &str,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.dataset_id, fv.operation,
-                    fv.geometry, ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
-            SELECT feature_id, dataset_id, geometry_wkb, properties
-            FROM latest
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let rows = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            FROM {source}
             WHERE operation != 'delete'
               AND ST_Within(geometry, ST_GeomFromGeoJSON($2))
-            LIMIT $3",
-        )
+            LIMIT $3"
+        ))
         .bind(branch_id)
         .bind(geojson_geometry)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1252,30 +1460,17 @@ impl PgStore {
 
     /// Count features at branch head.
     pub async fn count_features_at_head(&self, branch_id: Uuid) -> Result<i64, StoreError> {
-        let row = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.operation
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            )
+        let (external, prelude, source) = self
+            .latest_source_of(branch_id, "fv.feature_id, fv.operation")
+            .await?;
+        let row = sqlx::query(&format!(
+            "{prelude}
             SELECT COUNT(*) as cnt
-            FROM latest
-            WHERE operation != 'delete'",
-        )
+            FROM {source}
+            WHERE operation != 'delete'"
+        ))
         .bind(branch_id)
-        .fetch_one(&self.pool)
+        .fetch_one(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(row.get::<i64, _>("cnt"))
@@ -1291,24 +1486,14 @@ impl PgStore {
         x: u32,
         y: u32,
     ) -> Result<Vec<u8>, StoreError> {
-        let row = sqlx::query(
-            "WITH RECURSIVE chain AS (
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN branches b ON b.head = c.id
-                WHERE b.id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id
-                FROM changesets c
-                JOIN chain ch ON ch.parent_id = c.id
-            ),
-            latest AS (
-                SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.operation, fv.geometry, fv.properties
-                FROM feature_versions fv
-                JOIN chain ch ON fv.changeset_id = ch.id
-                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-            ),
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let latest_cte = if prelude.is_empty() {
+            format!("WITH latest AS (SELECT * FROM {source}),")
+        } else {
+            format!("{prelude},")
+        };
+        let row = sqlx::query(&format!(
+            "{latest_cte}
             bounds AS (
                 SELECT ST_TileEnvelope($2::integer, $3::integer, $4::integer) AS geom
             ),
@@ -1326,13 +1511,13 @@ impl PgStore {
                   AND ST_Intersects(l.geometry, ST_Transform(b.geom, 4326))
             )
             SELECT COALESCE(ST_AsMVT(mvtgeom.*, 'features', 4096, 'geom'), ''::bytea) AS tile
-            FROM mvtgeom",
-        )
+            FROM mvtgeom"
+        ))
         .bind(branch_id)
         .bind(z as i32)
         .bind(x as i32)
         .bind(y as i32)
-        .fetch_one(&self.pool)
+        .fetch_one(self.read_pool(external.as_ref()).await?)
         .await?;
 
         Ok(row.get::<Vec<u8>, _>("tile"))
@@ -2547,6 +2732,7 @@ impl PgStore {
         branch_id: Uuid,
         keep_latest: i32,
     ) -> Result<CompactionResult, StoreError> {
+        self.ensure_branch_writable(branch_id).await?;
         let run_id = Uuid::now_v7();
         let branch = self.get_branch(branch_id).await?;
 
@@ -2928,6 +3114,49 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
         (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
         _ => false,
     }
+}
+
+/// Rebuild the validated [`ExternalTable`] from a `datasets` row. Names in the
+/// table passed validation when they were written, so a row that fails it now
+/// was tampered with outside the API and must not reach a query.
+fn external_table_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<ExternalTable>, StoreError> {
+    let Some(table) = row.get::<Option<String>, _>("external_table") else {
+        return Ok(None);
+    };
+    let id_column: Option<String> = row.get("external_id_column");
+    let geometry_column: Option<String> = row.get("external_geometry_column");
+    let (Some(id_column), Some(geometry_column)) = (id_column, geometry_column) else {
+        return Err(StoreError::Conflict(
+            "external dataset row is missing its column names".into(),
+        ));
+    };
+    ExternalTable::parse(&table, &id_column, &geometry_column)
+        .map(Some)
+        .map_err(|e| StoreError::Conflict(e.to_string()))
+}
+
+fn external_source_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<Option<ExternalSource>, StoreError> {
+    Ok(external_table_from_row(&row)?.map(|table| ExternalSource {
+        dataset_id: row.get("id"),
+        srid: row.get("srid"),
+        table,
+    }))
+}
+
+fn dataset_from_row(row: sqlx::postgres::PgRow) -> Result<Dataset, StoreError> {
+    Ok(Dataset {
+        external: external_table_from_row(&row)?,
+        id: row.get("id"),
+        name: row.get("name"),
+        srid: row.get("srid"),
+        geometry_type: parse_geometry_type(row.get::<String, _>("geometry_type")),
+        created_at: row.get("created_at"),
+        created_by: row.get("created_by"),
+    })
 }
 
 fn parse_geometry_type(s: String) -> GeometryType {

@@ -2,6 +2,7 @@
 // License, v. 3.0. If a copy of the AGPL was not distributed with this
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
+use crate::external::ExternalTable;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -16,6 +17,10 @@ pub struct Dataset {
     pub geometry_type: GeometryType,
     pub created_at: OffsetDateTime,
     pub created_by: String,
+    /// Set when the dataset is a read-only view over a PostGIS relation
+    /// ptolemy does not own. Omitted from JSON for ordinary datasets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalTable>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

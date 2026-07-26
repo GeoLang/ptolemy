@@ -12,6 +12,7 @@ use axum::{
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
+use ptolemy_core::external::ExternalTable;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -97,6 +98,34 @@ struct CreateDatasetRequest {
     #[serde(default)]
     geometry_type: Option<String>,
     created_by: String,
+    /// Set all three to register a read-only view over an existing PostGIS
+    /// relation instead of an empty versioned dataset.
+    #[serde(default)]
+    external_table: Option<String>,
+    #[serde(default)]
+    external_id_column: Option<String>,
+    #[serde(default)]
+    external_geometry_column: Option<String>,
+}
+
+impl CreateDatasetRequest {
+    /// The three external fields only mean anything together, so a partial set
+    /// is a request error rather than a silently ordinary dataset.
+    fn external(&self) -> Result<Option<ExternalTable>, AppError> {
+        match (
+            &self.external_table,
+            &self.external_id_column,
+            &self.external_geometry_column,
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(table), Some(id), Some(geom)) => ExternalTable::parse(table, id, geom)
+                .map(Some)
+                .map_err(|e| AppError::BadRequest(e.to_string())),
+            _ => Err(AppError::BadRequest(
+                "external_table, external_id_column and external_geometry_column must be set together".into(),
+            )),
+        }
+    }
 }
 
 fn default_srid() -> i32 {
@@ -107,6 +136,7 @@ async fn create_dataset(
     State(store): State<AppState>,
     Json(req): Json<CreateDatasetRequest>,
 ) -> Result<(StatusCode, Json<Dataset>), AppError> {
+    let external = req.external()?;
     let geom_type = req.geometry_type.as_deref().unwrap_or("point");
     let ds = Dataset {
         id: Uuid::now_v7(),
@@ -115,8 +145,24 @@ async fn create_dataset(
         geometry_type: parse_geometry_type(geom_type),
         created_at: OffsetDateTime::now_utc(),
         created_by: req.created_by,
+        external,
     };
-    store.create_dataset(&ds).await?;
+    // registering probes the relation and creates the main branch, so the
+    // dataset is browsable the moment the call returns
+    let ds = if ds.external.is_some() {
+        // at registration every rejection is about the request, so report 400
+        // rather than the 409 the read-only guard uses
+        store
+            .register_external_dataset(&ds)
+            .await
+            .map_err(|e| match e {
+                ptolemy_storage::StoreError::Conflict(msg) => AppError::BadRequest(msg),
+                other => AppError::Store(other),
+            })?
+    } else {
+        store.create_dataset(&ds).await?;
+        ds
+    };
     Ok((StatusCode::CREATED, Json(ds)))
 }
 

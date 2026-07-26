@@ -246,6 +246,7 @@ impl DataStore for MongoStore {
                     geometry_type,
                     created_at: OffsetDateTime::now_utc(),
                     created_by: "mongodb".into(),
+                    external: None,
                 });
             }
             Ok(out)

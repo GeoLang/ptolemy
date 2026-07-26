@@ -49,19 +49,20 @@ async fn export_geojson(
     let limit = q.limit.unwrap_or(10000);
     let offset = q.offset.unwrap_or(0);
 
-    let rows = sqlx::query(
+    let (external, source) = store.features_source(branch_id).await?;
+    let rows = sqlx::query(&format!(
         "SELECT id, properties,
                 ST_AsGeoJSON(ST_Transform(geometry, $4))::jsonb as geojson
-         FROM features
+         FROM {source} f
          WHERE branch_id = $1
          ORDER BY id
-         LIMIT $2 OFFSET $3",
-    )
+         LIMIT $2 OFFSET $3"
+    ))
     .bind(branch_id)
     .bind(limit)
     .bind(offset)
     .bind(target_srid)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool(external.as_ref()).await?)
     .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -107,15 +108,16 @@ async fn export_csv(
     let limit = q.limit.unwrap_or(10000);
     let offset = q.offset.unwrap_or(0);
 
-    let rows = sqlx::query(
+    let (external, source) = store.features_source(branch_id).await?;
+    let rows = sqlx::query(&format!(
         "SELECT id, ST_X(ST_Centroid(geometry)) as lng, ST_Y(ST_Centroid(geometry)) as lat,
                 properties::text as props
-         FROM features WHERE branch_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
-    )
+         FROM {source} f WHERE branch_id = $1 ORDER BY id LIMIT $2 OFFSET $3"
+    ))
     .bind(branch_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool(external.as_ref()).await?)
     .await?;
 
     let mut csv = String::from("id,longitude,latitude,properties\n");
@@ -152,17 +154,18 @@ async fn export_flatgeobuf(
     Query(q): Query<ExportQuery>,
 ) -> Result<axum::response::Response, FormatError> {
     let limit = q.limit.unwrap_or(10000);
-    let rows = sqlx::query(
+    let (external, source) = store.features_source(branch_id).await?;
+    let rows = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(geometry)::text as geojson_geom,
                 properties
-         FROM features
+         FROM {source} f
          WHERE branch_id = $1 AND geometry IS NOT NULL
          ORDER BY id
-         LIMIT $2",
-    )
+         LIMIT $2"
+    ))
     .bind(branch_id)
     .bind(limit)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool(external.as_ref()).await?)
     .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -218,6 +221,7 @@ async fn import_geojson(
     Path(branch_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ImportResult>, FormatError> {
+    store.ensure_branch_writable(branch_id).await?;
     let features = body
         .get("features")
         .and_then(|f| f.as_array())
@@ -334,6 +338,7 @@ async fn import_csv(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ImportCsvRequest>,
 ) -> Result<Json<ImportResult>, FormatError> {
+    store.ensure_branch_writable(branch_id).await?;
     let lines: Vec<&str> = req.csv.lines().collect();
     if lines.is_empty() {
         return Err(FormatError::Bad("empty CSV".into()));
@@ -529,6 +534,7 @@ async fn reproject_features(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ReprojectRequest>,
 ) -> Result<Json<serde_json::Value>, FormatError> {
+    store.ensure_branch_writable(branch_id).await?;
     let result = sqlx::query(
         "UPDATE features SET geometry = ST_Transform(geometry, $2)
          WHERE branch_id = $1 AND geometry IS NOT NULL",
@@ -607,6 +613,7 @@ async fn get_crs_info(
 
 enum FormatError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
 }
@@ -615,11 +622,26 @@ impl From<sqlx::Error> for FormatError {
         FormatError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for FormatError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        FormatError::Store(e)
+    }
+}
 impl IntoResponse for FormatError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             FormatError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             FormatError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
+            FormatError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
+                (StatusCode::NOT_FOUND, msg)
+            }
+            FormatError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
+                (StatusCode::CONFLICT, msg)
+            }
+            FormatError::Store(e) => {
+                tracing::error!("Store: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
             FormatError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

@@ -299,6 +299,7 @@ impl DataStore for ElasticsearchStore {
                     geometry_type,
                     created_at: OffsetDateTime::now_utc(),
                     created_by: "elasticsearch".into(),
+                    external: None,
                 });
             }
             Ok(out)

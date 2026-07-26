@@ -55,9 +55,13 @@ async fn cql2_filter(
     let limit_param = binds.len() + 2;
     let offset_param = binds.len() + 3;
 
+    // an external dataset swaps the view for a derived table in the same shape,
+    // so the filter SQL built above needs no special case
+    let (external, source) = store.features_source(branch_id).await?;
+
     let query = format!(
         "SELECT id, dataset_id, properties, ST_AsGeoJSON(geometry)::jsonb as geojson
-         FROM features
+         FROM {source} f
          WHERE branch_id = $1 AND ({where_clause})
          LIMIT ${limit_param} OFFSET ${offset_param}"
     );
@@ -66,7 +70,11 @@ async fn cql2_filter(
     for value in &binds {
         q = q.bind(value.as_str());
     }
-    let rows = q.bind(limit).bind(offset).fetch_all(store.pool()).await?;
+    let rows = q
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(store.read_pool(external.as_ref()).await?)
+        .await?;
 
     let features: Vec<serde_json::Value> = rows
         .iter()
@@ -402,7 +410,19 @@ async fn ogc_tile(
     State(store): State<AppState>,
     Path((dataset_id, _tms, z, x, y)): Path<(Uuid, String, i32, i32, i32)>,
 ) -> Result<axum::response::Response, Cql2Error> {
-    let row = sqlx::query(
+    // the branch join lives in ptolemy's own database, so an external dataset
+    // gets a query that only touches the team's relation
+    let external = store.external_for_dataset(dataset_id).await?;
+    let from_clause = match &external {
+        None => {
+            "features f JOIN branches b ON f.branch_id = b.id WHERE b.dataset_id = $1".to_string()
+        }
+        Some(ext) => format!(
+            "{} f WHERE f.dataset_id = $1",
+            ext.features_subquery("NULL")
+        ),
+    };
+    let sql = format!(
         "SELECT ST_AsMVT(tile, 'default', 4096, 'geom') as mvt
          FROM (
             SELECT ST_AsMVTGeom(
@@ -410,18 +430,17 @@ async fn ogc_tile(
                 ST_TileEnvelope($2, $3, $4),
                 4096, 64, true
             ) as geom, f.properties
-            FROM features f
-            JOIN branches b ON f.branch_id = b.id
-            WHERE b.dataset_id = $1
+            FROM {from_clause}
               AND ST_Intersects(f.geometry, ST_TileEnvelope($2, $3, $4))
-         ) tile",
-    )
-    .bind(dataset_id)
-    .bind(z)
-    .bind(x)
-    .bind(y)
-    .fetch_one(store.pool())
-    .await?;
+         ) tile"
+    );
+    let row = sqlx::query(&sql)
+        .bind(dataset_id)
+        .bind(z)
+        .bind(x)
+        .bind(y)
+        .fetch_one(store.read_pool(external.as_ref()).await?)
+        .await?;
 
     let mvt: Vec<u8> = row.get("mvt");
     Ok((
@@ -437,6 +456,7 @@ async fn ogc_tile(
 
 enum Cql2Error {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     Bad(String),
 }
 impl From<sqlx::Error> for Cql2Error {
@@ -444,10 +464,25 @@ impl From<sqlx::Error> for Cql2Error {
         Cql2Error::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for Cql2Error {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        Cql2Error::Store(e)
+    }
+}
 impl IntoResponse for Cql2Error {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             Cql2Error::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
+            Cql2Error::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
+                (StatusCode::NOT_FOUND, msg)
+            }
+            Cql2Error::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
+                (StatusCode::CONFLICT, msg)
+            }
+            Cql2Error::Store(e) => {
+                tracing::error!("Store: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
             Cql2Error::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
