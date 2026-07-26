@@ -222,17 +222,32 @@ async fn items(
 ) -> Result<Json<FeatureCollection>, OgcError> {
     let branch_id = collection_branch(&store, dataset_id, q.branch).await?;
 
+    // Parse the bbox first: an external source pushes it down onto the relation's
+    // own geometry column, so the source depends on whether there is one.
+    let bbox = match &q.bbox {
+        None => None,
+        Some(bbox_str) => {
+            let parts: Vec<f64> = bbox_str.split(',').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() != 4 {
+                return Err(OgcError::NotFound("invalid bbox format".into()));
+            }
+            Some(parts)
+        }
+    };
+
     // an external dataset swaps in a derived table over the team's relation;
     // the ordinary changeset-chain query is untouched
-    let (external, prelude, source) = store.latest_source(branch_id).await?;
+    let (external, prelude, source) = store
+        .latest_source_overlapping(
+            branch_id,
+            ptolemy_storage::LATEST_COLUMNS,
+            bbox.as_ref()
+                .map(|_| "ST_MakeEnvelope($2, $3, $4, $5, 4326)"),
+        )
+        .await?;
     let pool = store.read_pool(external.as_ref()).await?;
 
-    let features = if let Some(bbox_str) = &q.bbox {
-        // Parse bbox
-        let parts: Vec<f64> = bbox_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if parts.len() != 4 {
-            return Err(OgcError::NotFound("invalid bbox format".into()));
-        }
+    let features = if let Some(parts) = &bbox {
         sqlx::query(&format!(
             "{prelude}
             SELECT feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson, properties

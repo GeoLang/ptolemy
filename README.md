@@ -163,18 +163,22 @@ must stay internal, register it with `"visibility": "private"` as well — an
 external dataset is gated on read exactly like a versioned one (see
 [Access control](#access-control)).
 
-**Index the geometry the way reads query it.** Ptolemy exposes external geometry
-in EPSG:4326, so if the relation is in another SRID every spatial predicate lands
-on `ST_Transform(geom, 4326)` and a GiST index on the raw column cannot serve it:
-bbox and tile reads sequentially scan the whole relation. On a 50k-row polygon
-table in EPSG:3857 that was 164 ms instead of 7 ms. Add the functional index that
-matches (registration logs a warning naming it):
+**An ordinary GiST index on the geometry column is all you need**, whatever the
+relation's SRID. Ptolemy exposes external geometry in EPSG:4326, so on a projected
+relation the read's own predicate sits on `ST_Transform(geom, 4326)`, which no
+index covers. Spatial reads therefore also push a second, index-served predicate
+onto the relation's own column in its own SRID: the query window is reprojected
+into that SRID and widened slightly, so it can only admit extra candidate rows,
+never drop one — the exact 4326 predicate still decides the result. On a 60k-row
+polygon table in EPSG:3857 that took bbox from 213 ms (sequential scan) to 63 ms
+(index scan), and a z6 tile from 268 ms to 18 ms. Covers bbox, intersects, within,
+vector tiles, OGC items and CQL2 spatial filters.
 
-```sql
-CREATE INDEX ON parcels USING GIST (ST_Transform(geom, 4326));
-```
-
-A relation already in 4326 needs nothing beyond an ordinary GiST index.
+Two things it deliberately does not do. A window wider than 45° or reaching past
+±85° latitude is not reprojected at all (PROJ may reject it), so those near-global
+reads scan as before — they return most of the relation anyway. And a CQL2 spatial
+op under `or` or `not` is not pushed down, because a matching row need not satisfy
+it.
 
 Set `PTOLEMY_EXTERNAL_DATABASE_URL` to read external datasets from a different
 database than Ptolemy's own. Use a role with `SELECT` and nothing else:

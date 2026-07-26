@@ -85,13 +85,20 @@ async fn cql2_filter(
 
     // Parse CQL2-JSON filter into SQL WHERE clause. branch_id is $1, so the
     // filter's own values start at $2 and limit/offset come after them.
-    let (where_clause, binds) = cql2_to_sql(&req.filter, 1)?;
+    let CompiledFilter {
+        sql: where_clause,
+        binds,
+        overlaps_4326,
+    } = cql2_to_sql(&req.filter, 1)?;
     let limit_param = binds.len() + 2;
     let offset_param = binds.len() + 3;
 
     // an external dataset swaps the view for a derived table in the same shape,
-    // so the filter SQL built above needs no special case
-    let (external, source) = store.features_source(branch_id).await?;
+    // so the filter SQL built above needs no special case; a spatial op the filter
+    // requires of every row is pushed onto the relation's own geometry column
+    let (external, source) = store
+        .features_source_overlapping(branch_id, "$1", overlaps_4326.as_deref())
+        .await?;
 
     let query = format!(
         "SELECT id, dataset_id, properties, ST_AsGeoJSON(geometry)::jsonb as geojson
@@ -134,6 +141,14 @@ async fn cql2_filter(
 struct Binds {
     values: Vec<String>,
     offset: usize,
+    /// Placeholders of spatial-op geometries every returned row must overlap, so
+    /// an external source can pre-filter on them. Only ops reached from the root
+    /// through `and` qualify: under `or` a row need not satisfy the op at all, and
+    /// under `not` it must not, so either would drop rows that belong in the
+    /// result. See [`Binds::conjunctive`].
+    conjunctive_geoms: Vec<String>,
+    /// Whether the node being compiled is still reached through `and` only.
+    conjunctive: bool,
 }
 
 impl Binds {
@@ -141,6 +156,8 @@ impl Binds {
         Binds {
             values: Vec::new(),
             offset,
+            conjunctive_geoms: Vec::new(),
+            conjunctive: true,
         }
     }
 
@@ -148,6 +165,15 @@ impl Binds {
     fn add(&mut self, value: impl Into<String>) -> String {
         self.values.push(value.into());
         format!("${}", self.offset + self.values.len())
+    }
+
+    /// Compile a subtree that is no longer a plain conjunction of the root.
+    fn non_conjunctive<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.conjunctive;
+        self.conjunctive = false;
+        let out = f(self);
+        self.conjunctive = outer;
+        out
     }
 }
 
@@ -160,27 +186,55 @@ const NUMERIC_TEXT_RE: &str = r"^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$";
 /// Nothing from the request is interpolated into the SQL: property names,
 /// literals and GeoJSON all travel as text bind parameters, numbered from
 /// `params_bound` + 1.
+/// A compiled CQL2 filter: the WHERE fragment, the values its placeholders stand
+/// for, and a window an external source may pre-filter on.
+struct CompiledFilter {
+    sql: String,
+    binds: Vec<String>,
+    /// SQL for a geometry in EPSG:4326 that every matching row must overlap, or
+    /// `None` when the filter has no spatial op that all rows must satisfy. It
+    /// reuses the geometry's existing placeholder, so it adds no bind.
+    overlaps_4326: Option<String>,
+}
+
 fn cql2_to_sql(
     filter: &serde_json::Value,
     params_bound: usize,
-) -> Result<(String, Vec<String>), Cql2Error> {
+) -> Result<CompiledFilter, Cql2Error> {
     let mut binds = Binds::new(params_bound);
     let sql = filter_to_sql(filter, &mut binds)?;
-    Ok((sql, binds.values))
+    // any one necessary condition is a sound pre-filter, so take the first rather
+    // than intersecting them; filters with more than one spatial op are rare
+    let overlaps_4326 = binds
+        .conjunctive_geoms
+        .first()
+        .map(|placeholder| format!("ST_GeomFromGeoJSON({placeholder})"));
+    Ok(CompiledFilter {
+        sql,
+        binds: binds.values,
+        overlaps_4326,
+    })
 }
 
 fn filter_to_sql(filter: &serde_json::Value, binds: &mut Binds) -> Result<String, Cql2Error> {
     match filter.get("op").and_then(|v| v.as_str()) {
         Some(op @ ("and" | "or")) => {
             let args = get_args(filter, op, 1)?;
-            let clauses: Result<Vec<String>, _> =
-                args.iter().map(|a| filter_to_sql(a, binds)).collect();
+            let compile = |binds: &mut Binds| -> Result<Vec<String>, Cql2Error> {
+                args.iter().map(|a| filter_to_sql(a, binds)).collect()
+            };
+            // an `and` child is still a necessary condition; an `or` child is not
+            let clauses = if op == "and" {
+                compile(binds)?
+            } else {
+                binds.non_conjunctive(compile)?
+            };
             let sep = if op == "and" { " AND " } else { " OR " };
-            Ok(format!("({})", clauses?.join(sep)))
+            Ok(format!("({})", clauses.join(sep)))
         }
         Some("not") => {
             let args = get_args(filter, "not", 1)?;
-            let inner = filter_to_sql(&args[0], binds)?;
+            let inner = binds.non_conjunctive(|binds| filter_to_sql(&args[0], binds))?;
             Ok(format!("NOT ({})", inner))
         }
         Some(op @ ("=" | "eq")) => binary_op(filter, op, "=", binds),
@@ -231,6 +285,11 @@ fn filter_to_sql(filter: &serde_json::Value, binds: &mut Binds) -> Result<String
             let args = get_args(filter, op, 2)?;
             require_geometry_column(&args[0], op)?;
             let geom = binds.add(geojson_geometry(&args[1], op)?.to_string());
+            // all three imply the row's geometry overlaps the argument, so the
+            // argument is a sound pre-filter window wherever the op is required
+            if binds.conjunctive {
+                binds.conjunctive_geoms.push(geom.clone());
+            }
             let func = match op {
                 "s_intersects" => "ST_Intersects",
                 "s_within" => "ST_Within",
@@ -525,25 +584,29 @@ async fn ogc_tile(
     // the branch join lives in ptolemy's own database, so an external dataset
     // gets a query that only touches the team's relation
     let external = store.external_for_dataset(dataset_id).await?;
+    // the tile envelope is in 3857 and the exposed geometry in 4326, so the
+    // comparison happens in 4326 and only the MVT projection uses 3857. Passing
+    // the envelope straight to ST_Intersects made every call fail on mixed SRIDs.
+    const TILE_4326: &str = "ST_Transform(ST_TileEnvelope($2, $3, $4), 4326)";
     let from_clause = match &external {
         None => {
             "features f JOIN branches b ON f.branch_id = b.id WHERE b.dataset_id = $1".to_string()
         }
         Some(ext) => format!(
             "{} f WHERE f.dataset_id = $1",
-            ext.features_subquery("NULL")
+            ext.features_subquery("NULL", Some(TILE_4326))
         ),
     };
     let sql = format!(
         "SELECT ST_AsMVT(tile, 'default', 4096, 'geom') as mvt
          FROM (
             SELECT ST_AsMVTGeom(
-                f.geometry,
+                ST_Transform(f.geometry, 3857),
                 ST_TileEnvelope($2, $3, $4),
                 4096, 64, true
             ) as geom, f.properties
             FROM {from_clause}
-              AND ST_Intersects(f.geometry, ST_TileEnvelope($2, $3, $4))
+              AND ST_Intersects(f.geometry, {TILE_4326})
          ) tile"
     );
     let row = sqlx::query(&sql)
@@ -592,5 +655,120 @@ impl IntoResponse for Cql2Error {
             }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn poly() -> serde_json::Value {
+        serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+        })
+    }
+
+    fn spatial(op: &str) -> serde_json::Value {
+        serde_json::json!({"op": op, "args": [{"property": "geometry"}, poly()]})
+    }
+
+    fn compile(filter: &serde_json::Value) -> CompiledFilter {
+        match cql2_to_sql(filter, 1) {
+            Ok(compiled) => compiled,
+            Err(_) => panic!("filter should compile: {filter}"),
+        }
+    }
+
+    /// A lone spatial op is required of every row, so it is a sound window.
+    #[test]
+    fn a_single_spatial_op_yields_a_window() {
+        for op in ["s_intersects", "s_within", "s_contains"] {
+            let compiled = compile(&spatial(op));
+            assert_eq!(
+                compiled.overlaps_4326.as_deref(),
+                Some("ST_GeomFromGeoJSON($2)"),
+                "{op}"
+            );
+        }
+    }
+
+    /// So is one under an `and`, at any depth, and the placeholder must be the
+    /// one the filter itself bound.
+    #[test]
+    fn a_conjunctive_spatial_op_yields_a_window() {
+        let filter = serde_json::json!({"op": "and", "args": [
+            {"op": "=", "args": [{"property": "kind"}, "parcel"]},
+            {"op": "and", "args": [
+                {"op": "like", "args": [{"property": "owner"}, "a%"]},
+                spatial("s_intersects"),
+            ]},
+        ]});
+        let compiled = compile(&filter);
+        // kind, parcel, owner, a% are $2..$5, so the geometry is $6
+        assert_eq!(
+            compiled.overlaps_4326.as_deref(),
+            Some("ST_GeomFromGeoJSON($6)")
+        );
+        assert_eq!(compiled.binds.len(), 5);
+        assert!(
+            compiled
+                .sql
+                .contains("ST_Intersects(geometry, ST_GeomFromGeoJSON($6))")
+        );
+    }
+
+    /// Under `or` a matching row need not satisfy the spatial op at all, so
+    /// pre-filtering on it would drop rows that belong in the result.
+    #[test]
+    fn a_disjunctive_spatial_op_yields_no_window() {
+        let filter = serde_json::json!({"op": "or", "args": [
+            {"op": "=", "args": [{"property": "kind"}, "parcel"]},
+            spatial("s_intersects"),
+        ]});
+        assert_eq!(compile(&filter).overlaps_4326, None);
+    }
+
+    /// Same for a negated one, where the row must *not* satisfy it.
+    #[test]
+    fn a_negated_spatial_op_yields_no_window() {
+        let filter = serde_json::json!({"op": "not", "args": [spatial("s_intersects")]});
+        assert_eq!(compile(&filter).overlaps_4326, None);
+
+        // and an `or` or `not` anywhere above it disqualifies it, however deep
+        let nested = serde_json::json!({"op": "and", "args": [
+            {"op": "=", "args": [{"property": "kind"}, "parcel"]},
+            {"op": "or", "args": [
+                {"op": "and", "args": [spatial("s_within")]},
+                {"op": "isNull", "args": [{"property": "owner"}]},
+            ]},
+        ]});
+        assert_eq!(compile(&nested).overlaps_4326, None);
+    }
+
+    /// A conjunctive op stays usable even when a disjunctive one sits beside it:
+    /// the conjunctive one alone is still a necessary condition.
+    #[test]
+    fn a_mixed_filter_uses_only_the_conjunctive_op() {
+        let filter = serde_json::json!({"op": "and", "args": [
+            spatial("s_intersects"),
+            {"op": "or", "args": [
+                spatial("s_within"),
+                {"op": "isNull", "args": [{"property": "owner"}]},
+            ]},
+        ]});
+        let compiled = compile(&filter);
+        // the conjunctive geometry is bound first, so it is $2
+        assert_eq!(
+            compiled.overlaps_4326.as_deref(),
+            Some("ST_GeomFromGeoJSON($2)")
+        );
+    }
+
+    /// A filter with no spatial op restricts nothing spatially.
+    #[test]
+    fn a_non_spatial_filter_yields_no_window() {
+        let filter = serde_json::json!({"op": "=", "args": [{"property": "kind"}, "parcel"]});
+        assert_eq!(compile(&filter).overlaps_4326, None);
     }
 }

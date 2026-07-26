@@ -35,8 +35,9 @@ pub enum StoreError {
     Forbidden(String),
 }
 
-/// Columns every read query needs from `latest`.
-const LATEST_COLUMNS: &str =
+/// Columns every read query needs from `latest`. Public so a handler that builds
+/// its own query can ask for the same projection.
+pub const LATEST_COLUMNS: &str =
     "fv.feature_id, fv.dataset_id, fv.operation, fv.geometry, fv.properties";
 
 /// Latest live version of each feature on the branch bound to `$1`, resolved by
@@ -313,22 +314,7 @@ impl PgStore {
             .await
             .map_err(|e| StoreError::Conflict(format!("cannot read {}: {e}", table.table())))?;
 
-        let srid = srid.unwrap_or(4326);
-        if srid != 4326 && srid != 0 {
-            // reads compare 4326 envelopes against the exposed geometry, so the
-            // predicate lands on ST_Transform(geom, 4326) and an index on the
-            // raw column cannot serve it: every bbox read becomes a seq scan
-            tracing::warn!(
-                "external dataset {} is SRID {srid}, so spatial reads cannot use an index on \
-                 {} directly. Add the matching functional index or bbox and tile reads will \
-                 sequentially scan the relation: CREATE INDEX ON {} USING GIST (ST_Transform({}, 4326));",
-                table.table(),
-                table.geometry_column(),
-                table.quoted_relation(),
-                quoted_geometry_column(table),
-            );
-        }
-        Ok(srid)
+        Ok(srid.unwrap_or(4326))
     }
 
     /// The external read source for a branch, or `None` for an ordinary
@@ -874,11 +860,28 @@ impl PgStore {
         branch_id: Uuid,
         columns: &str,
     ) -> Result<(Option<ExternalSource>, String, String), StoreError> {
+        self.latest_source_overlapping(branch_id, columns, None)
+            .await
+    }
+
+    /// [`Self::latest_source_of`] for a read with a spatial restriction.
+    ///
+    /// `overlaps_4326` is SQL for a geometry in EPSG:4326 that returned rows must
+    /// overlap, built by the calling query from its own bind placeholders. An
+    /// external source turns it into an index-served pre-filter on the relation's
+    /// own geometry column; a versioned dataset ignores it, since its geometry is
+    /// already indexed in 4326. The caller keeps its exact predicate either way.
+    pub async fn latest_source_overlapping(
+        &self,
+        branch_id: Uuid,
+        columns: &str,
+        overlaps_4326: Option<&str>,
+    ) -> Result<(Option<ExternalSource>, String, String), StoreError> {
         let external = self.external_for_branch(branch_id).await?;
         match &external {
             None => Ok((None, latest_cte(columns), "latest".to_string())),
             Some(ext) => {
-                let source = format!("{} latest", ext.latest_subquery("$1"));
+                let source = format!("{} latest", ext.latest_subquery("$1", overlaps_4326));
                 Ok((external.clone(), String::new(), source))
             }
         }
@@ -902,10 +905,22 @@ impl PgStore {
         branch_id: Uuid,
         branch_expr: &str,
     ) -> Result<(Option<ExternalSource>, String), StoreError> {
+        self.features_source_overlapping(branch_id, branch_expr, None)
+            .await
+    }
+
+    /// [`Self::features_source_at`] for a read with a spatial restriction; see
+    /// [`Self::latest_source_overlapping`] for what `overlaps_4326` must be.
+    pub async fn features_source_overlapping(
+        &self,
+        branch_id: Uuid,
+        branch_expr: &str,
+        overlaps_4326: Option<&str>,
+    ) -> Result<(Option<ExternalSource>, String), StoreError> {
         let external = self.external_for_branch(branch_id).await?;
         let source = match &external {
             None => branch_features_subquery(branch_expr),
-            Some(ext) => ext.features_subquery(branch_expr),
+            Some(ext) => ext.features_subquery(branch_expr, overlaps_4326),
         };
         Ok((external, source))
     }
@@ -1607,7 +1622,13 @@ impl PgStore {
         max_y: f64,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let (external, prelude, source) = self
+            .latest_source_overlapping(
+                branch_id,
+                LATEST_COLUMNS,
+                Some("ST_MakeEnvelope($2, $3, $4, $5, 4326)"),
+            )
+            .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
             SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
@@ -1643,7 +1664,9 @@ impl PgStore {
         geojson_geometry: &str,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let (external, prelude, source) = self
+            .latest_source_overlapping(branch_id, LATEST_COLUMNS, Some("ST_GeomFromGeoJSON($2)"))
+            .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
             SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
@@ -1676,7 +1699,11 @@ impl PgStore {
         geojson_geometry: &str,
         limit: i64,
     ) -> Result<Vec<Feature>, StoreError> {
-        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        // ST_Within(geometry, w) implies the row overlaps w, so w is a sound
+        // window for the pre-filter here too
+        let (external, prelude, source) = self
+            .latest_source_overlapping(branch_id, LATEST_COLUMNS, Some("ST_GeomFromGeoJSON($2)"))
+            .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
             SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
@@ -1730,7 +1757,13 @@ impl PgStore {
         x: u32,
         y: u32,
     ) -> Result<Vec<u8>, StoreError> {
-        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let (external, prelude, source) = self
+            .latest_source_overlapping(
+                branch_id,
+                LATEST_COLUMNS,
+                Some("ST_Transform(ST_TileEnvelope($2::integer, $3::integer, $4::integer), 4326)"),
+            )
+            .await?;
         let latest_cte = if prelude.is_empty() {
             format!("WITH latest AS (SELECT * FROM {source}),")
         } else {
@@ -3422,12 +3455,6 @@ where
         enforced: row.get::<i64, _>("total") > 0,
         mine: row.get("mine"),
     })
-}
-
-/// The geometry column quoted for the index hint. Safe because the name passed
-/// [`ExternalTable::parse`] and so cannot contain a quote.
-fn quoted_geometry_column(table: &ExternalTable) -> String {
-    format!("\"{}\"", table.geometry_column())
 }
 
 fn denied_branch(branch_id: Uuid) -> StoreError {

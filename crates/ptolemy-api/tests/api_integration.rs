@@ -4812,3 +4812,276 @@ async fn test_sfcgal_resolves_features_per_branch() {
         post_json(&app, &format!("/api/v1/branches/{fork_id}/3d/volume"), body).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "on another branch: {resp}");
 }
+
+// ─── External spatial pushdown ──────────────────────────────────────
+
+/// The same three parcels twice: once in EPSG:4326 and once reprojected to
+/// EPSG:3857, each with a GiST index on the raw column only. A read of the 3857
+/// relation must return exactly what the 4326 one returns.
+async fn create_projected_fixture(state: &AppState) {
+    let pool = state.external_pool().await.unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS ext_proj_4326 CASCADE;
+         DROP TABLE IF EXISTS ext_proj_3857 CASCADE;
+         CREATE TABLE ext_proj_4326 (
+             pid integer PRIMARY KEY,
+             owner text NOT NULL,
+             geom geometry(Geometry, 4326) NOT NULL
+         );
+         INSERT INTO ext_proj_4326 (pid, owner, geom) VALUES
+           (1, 'alice', ST_GeomFromText('POLYGON((10 20,10.01 20,10.01 20.01,10 20.01,10 20))', 4326)),
+           (2, 'bob',   ST_GeomFromText('POLYGON((11 21,11.01 21,11.01 21.01,11 21.01,11 21))', 4326)),
+           (3, 'carol', ST_GeomFromText('POLYGON((30 40,30.01 40,30.01 40.01,30 40.01,30 40))', 4326));
+         CREATE INDEX ext_proj_4326_geom_idx ON ext_proj_4326 USING GIST (geom);
+
+         CREATE TABLE ext_proj_3857 (
+             pid integer PRIMARY KEY,
+             owner text NOT NULL,
+             geom geometry(Geometry, 3857) NOT NULL
+         );
+         INSERT INTO ext_proj_3857 (pid, owner, geom)
+           SELECT pid, owner, ST_Transform(geom, 3857) FROM ext_proj_4326;
+         CREATE INDEX ext_proj_3857_geom_idx ON ext_proj_3857 USING GIST (geom);",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Register both relations and return (4326 branch, 3857 branch).
+async fn setup_projected(app: &axum::Router, state: &AppState) -> (Uuid, Uuid) {
+    create_projected_fixture(state).await;
+    let mut branches = Vec::new();
+    for table in ["ext_proj_4326", "ext_proj_3857"] {
+        let (status, body) = register_external(app, table, "pid", "geom").await;
+        assert_eq!(status, StatusCode::CREATED, "register {table}: {body}");
+        let dataset_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+        let (status, list) =
+            get_json(app, &format!("/api/v1/datasets/{dataset_id}/branches")).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        branches
+            .push(Uuid::parse_str(list.as_array().unwrap()[0]["id"].as_str().unwrap()).unwrap());
+    }
+    (branches[0], branches[1])
+}
+
+fn owners_of(body: &Value, key: &str) -> Vec<String> {
+    let mut owners: Vec<String> = body[key]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|f| {
+            f["properties"]["owner"]
+                .as_str()
+                .or_else(|| f["owner"].as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    owners.sort();
+    owners
+}
+
+/// A projected source must answer every spatial read exactly as the 4326 one
+/// does: the pushed-down pre-filter may only widen the candidate set.
+#[tokio::test]
+async fn test_projected_external_matches_the_4326_source() {
+    let (app, state) = setup_app().await;
+    let (b4326, b3857) = setup_projected(&app, &state).await;
+
+    // a window covering parcels 1 and 2 but not 3
+    let bbox = "min_x=9.5&min_y=19.5&max_x=11.5&max_y=21.5";
+    for (label, branch) in [("4326", b4326), ("3857", b3857)] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/branches/{branch}/features/bbox?{bbox}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label} bbox: {body}");
+        let mut owners: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["properties"]["owner"].as_str().map(str::to_owned))
+            .collect();
+        owners.sort();
+        assert_eq!(owners, vec!["alice", "bob"], "{label} bbox owners: {body}");
+    }
+
+    let window = json!({
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[9.5, 19.5], [11.5, 19.5], [11.5, 21.5], [9.5, 21.5], [9.5, 19.5]]]
+        }
+    });
+    for (label, branch) in [("4326", b4326), ("3857", b3857)] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/branches/{branch}/features/intersects"),
+            window.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label} intersects: {body}");
+        let mut owners: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["properties"]["owner"].as_str().map(str::to_owned))
+            .collect();
+        owners.sort();
+        assert_eq!(owners, vec!["alice", "bob"], "{label} intersects: {body}");
+
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/branches/{branch}/features/within"),
+            window.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label} within: {body}");
+        let mut owners: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["properties"]["owner"].as_str().map(str::to_owned))
+            .collect();
+        owners.sort();
+        assert_eq!(owners, vec!["alice", "bob"], "{label} within: {body}");
+    }
+
+    // the CQL2 spatial op, which carries its own geometry bind
+    let filter = json!({
+        "filter": {
+            "op": "s_intersects",
+            "args": [
+                {"property": "geometry"},
+                {"type": "Polygon",
+                 "coordinates": [[[9.5, 19.5], [11.5, 19.5], [11.5, 21.5], [9.5, 21.5], [9.5, 19.5]]]}
+            ]
+        }
+    });
+    for (label, branch) in [("4326", b4326), ("3857", b3857)] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/branches/{branch}/features/filter"),
+            filter.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label} cql2: {body}");
+        assert_eq!(
+            owners_of(&body, "features"),
+            vec!["alice", "bob"],
+            "{label} cql2: {body}"
+        );
+    }
+}
+
+/// A window that no projection can be asked to reproject must fall back to no
+/// pre-filter rather than aborting the read.
+#[tokio::test]
+async fn test_projected_external_survives_a_global_window() {
+    let (app, state) = setup_app().await;
+    let (_, b3857) = setup_projected(&app, &state).await;
+
+    for bbox in [
+        "min_x=-180&min_y=-90&max_x=180&max_y=90",
+        "min_x=-179&min_y=-89&max_x=179&max_y=89",
+    ] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/branches/{b3857}/features/bbox?{bbox}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bbox}: {body}");
+        assert_eq!(body.as_array().unwrap().len(), 3, "{bbox}: {body}");
+    }
+}
+
+/// Tiles work on a projected source, and the dataset-level tile route works at
+/// all: it used to compare a 3857 tile envelope against 4326 geometry and fail
+/// on mixed SRIDs for every dataset, external or not.
+#[tokio::test]
+async fn test_tiles_work_on_projected_and_versioned_sources() {
+    let (app, state) = setup_app().await;
+    let (_, b3857) = setup_projected(&app, &state).await;
+
+    // z7 tile containing lon 10, lat 20
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{b3857}/tiles/7/67/57")).await;
+    assert!(
+        status == StatusCode::OK,
+        "external branch tile: {status} {body}"
+    );
+
+    // the dataset-level OGC tile route, on an ordinary versioned dataset
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {"name": "one"}
+        }]),
+    )
+    .await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/tiles/WebMercatorQuad/0/0/0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "versioned dataset tile: {body}");
+}
+
+/// Visibility still governs a projected external dataset: the pushdown changes
+/// the plan, not who may read.
+#[tokio::test]
+async fn test_projected_external_still_obeys_visibility() {
+    let (app, state) = setup_app_authed_with_state().await;
+    create_projected_fixture(&state).await;
+    let carol = token_for_user("carol", Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(json!({
+            "name": format!("proj_{}", Uuid::now_v7()),
+            "created_by": "carol",
+            "visibility": "private",
+            "external_table": "ext_proj_3857",
+            "external_id_column": "pid",
+            "external_geometry_column": "geom",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+    let (status, list) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let branch = Uuid::parse_str(list.as_array().unwrap()[0]["id"].as_str().unwrap()).unwrap();
+
+    let bbox =
+        format!("/api/v1/branches/{branch}/features/bbox?min_x=9&min_y=19&max_x=12&max_y=22");
+    let (status, body) = request_as(&app, "GET", &bbox, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "anonymous: {body}");
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &bbox,
+        Some(&token_for_user("eve", Role::Editor)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-granted editor: {body}");
+    let (status, body) = request_as(&app, "GET", &bbox, Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "owner: {body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "owner: {body}");
+}

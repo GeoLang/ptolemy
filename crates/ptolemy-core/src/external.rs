@@ -123,6 +123,24 @@ impl ExternalTable {
     }
 }
 
+/// Bounds a projected CRS can be expected to accept a window within, and the
+/// largest window side we will reproject. A window outside these gets no
+/// pre-filter rather than risking a PROJ domain error, which would abort the read.
+const SAFE_LON_DEG: f64 = 180.0;
+const SAFE_LAT_DEG: f64 = 85.0;
+const MAX_WINDOW_DEG: f64 = 45.0;
+
+/// Margin added to the window before reprojecting it: this fraction of its longer
+/// side, plus a floor for a degenerate (point) window.
+///
+/// Reprojecting a window and taking the window of a reprojection are not the same
+/// operation for a projected CRS — only the vertices move, so straight edges stay
+/// straight where the true image curves. The margin covers that gap. It can only
+/// ever admit extra candidate rows, never drop one, because the caller keeps its
+/// exact predicate.
+const MARGIN_FRACTION: f64 = 0.05;
+const MARGIN_FLOOR_DEG: f64 = 0.001;
+
 /// Everything needed to read an external dataset: the relation and the ids the
 /// derived table has to report so it looks like the `features` view.
 #[derive(Debug, Clone)]
@@ -142,19 +160,29 @@ impl ExternalSource {
     /// `branch_expr` is SQL for the branch id: pass `"$1"` where the caller
     /// already binds the branch, otherwise a literal cast.
     ///
+    /// `overlaps_4326` is SQL for a geometry in EPSG:4326 that returned rows must
+    /// overlap, so the read can be pushed down; see [`Self::prefilter`]. Pass
+    /// `None` for a read with no spatial restriction.
+    ///
     /// Nothing interpolated here is caller text. Identifiers passed
-    /// [`ExternalTable::parse`], and a [`Uuid`] renders only as hex and dashes.
-    pub fn features_subquery(&self, branch_expr: &str) -> String {
+    /// [`ExternalTable::parse`], a [`Uuid`] renders only as hex and dashes, and
+    /// both SQL fragments are built by the calling query out of bind
+    /// placeholders — no request bytes reach this string.
+    pub fn features_subquery(&self, branch_expr: &str, overlaps_4326: Option<&str>) -> String {
         let relation = self.table.quoted_relation();
         let id = quote_ident(&self.table.id_column);
         let geom = quote_ident(&self.table.geometry_column);
         let geom_key = literal(&self.table.geometry_column);
         let dataset_id = self.dataset_id;
-        let geometry = if self.srid == 4326 || self.srid == 0 {
+        let geometry = if self.is_4326() {
             format!("t.{geom}")
         } else {
             format!("ST_Transform(t.{geom}, 4326)")
         };
+        let prefilter = overlaps_4326
+            .and_then(|w| self.prefilter(w))
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
         // ptolemy identifies features by uuid; a foreign key of any type is
         // hashed into one. Stable across queries, so paging and single-feature
         // get agree. The original key stays visible in properties.
@@ -164,18 +192,59 @@ impl ExternalSource {
              '{dataset_id}'::uuid AS dataset_id, \
              {geometry} AS geometry, \
              to_jsonb(t) - {geom_key} AS properties \
-             FROM {relation} t WHERE t.{id} IS NOT NULL)"
+             FROM {relation} t WHERE t.{id} IS NOT NULL{prefilter})"
         )
     }
 
     /// The same rows in the column shape the storage read queries use for their
     /// `latest` CTE, so those queries only swap their FROM clause.
-    pub fn latest_subquery(&self, branch_expr: &str) -> String {
-        let inner = self.features_subquery(branch_expr);
+    pub fn latest_subquery(&self, branch_expr: &str, overlaps_4326: Option<&str>) -> String {
+        let inner = self.features_subquery(branch_expr, overlaps_4326);
         format!(
             "(SELECT id AS feature_id, branch_id, dataset_id, 'insert' AS operation, \
              geometry, properties FROM {inner} ext)"
         )
+    }
+
+    /// Whether the relation's geometry is already in the SRID reads are served in.
+    pub fn is_4326(&self) -> bool {
+        self.srid == 4326 || self.srid == 0
+    }
+
+    /// A predicate on the relation's *own* geometry column, in its own SRID, that
+    /// every row satisfying `overlaps_4326` must also satisfy. A plain GiST index
+    /// on that column serves it; without it a spatial read on a projected relation
+    /// can only sequentially scan, because the caller's predicate sits on
+    /// `ST_Transform(geom, 4326)` and no index covers that expression.
+    ///
+    /// `None` when the relation is already in 4326: there the exposed geometry *is*
+    /// the column, so the caller's own predicate already reaches the index and
+    /// nothing needs adding.
+    ///
+    /// Deliberately conservative in two ways, because the caller keeps its exact
+    /// 4326 predicate and so extra candidates cost time but cannot change results:
+    /// the window is widened by `MARGIN_FRACTION` before reprojection, and a
+    /// window outside the safe lon/lat range or wider than `MAX_WINDOW_DEG`
+    /// yields an all-covering box — no restriction — rather than a reprojection
+    /// that PROJ might reject. A window that is NULL or empty lands in the same
+    /// fallback.
+    pub fn prefilter(&self, overlaps_4326: &str) -> Option<String> {
+        if self.is_4326() {
+            return None;
+        }
+        let geom = quote_ident(&self.table.geometry_column);
+        let srid = self.srid;
+        Some(format!(
+            "t.{geom} && (SELECT CASE \
+               WHEN ST_XMin(w.g) >= -{SAFE_LON_DEG} AND ST_XMax(w.g) <= {SAFE_LON_DEG} \
+                AND ST_YMin(w.g) >= -{SAFE_LAT_DEG} AND ST_YMax(w.g) <= {SAFE_LAT_DEG} \
+                AND ST_XMax(w.g) - ST_XMin(w.g) <= {MAX_WINDOW_DEG} \
+                AND ST_YMax(w.g) - ST_YMin(w.g) <= {MAX_WINDOW_DEG} \
+               THEN ST_Transform(ST_Expand(w.g, greatest(ST_XMax(w.g) - ST_XMin(w.g), \
+                    ST_YMax(w.g) - ST_YMin(w.g)) * {MARGIN_FRACTION} + {MARGIN_FLOOR_DEG}), {srid}) \
+               ELSE ST_SetSRID(ST_MakeEnvelope(-1e15, -1e15, 1e15, 1e15), {srid}) \
+             END FROM (SELECT ST_Envelope({overlaps_4326}) AS g) w)"
+        ))
     }
 }
 
@@ -250,13 +319,87 @@ mod tests {
             srid: 4326,
             table: ExternalTable::parse("public.parcels", "gid", "geom").unwrap(),
         };
-        let sql = src.features_subquery("$1");
+        let sql = src.features_subquery("$1", None);
         assert!(sql.contains("md5(t.\"gid\"::text)::uuid AS id"));
         assert!(sql.contains("$1::uuid AS branch_id"));
         assert!(sql.contains("'00000000-0000-0000-0000-000000000000'::uuid AS dataset_id"));
         assert!(sql.contains("t.\"geom\" AS geometry"));
         assert!(sql.contains("to_jsonb(t) - 'geom' AS properties"));
         assert!(sql.contains("FROM \"public\".\"parcels\" t"));
+    }
+
+    fn projected() -> ExternalSource {
+        ExternalSource {
+            dataset_id: Uuid::nil(),
+            srid: 3857,
+            table: ExternalTable::parse("parcels", "gid", "geom").unwrap(),
+        }
+    }
+
+    /// A 4326 relation needs no pre-filter: the exposed geometry *is* the column,
+    /// so the caller's own predicate already reaches an ordinary GiST index.
+    #[test]
+    fn a_4326_source_gets_no_prefilter() {
+        let src = ExternalSource {
+            dataset_id: Uuid::nil(),
+            srid: 4326,
+            table: ExternalTable::parse("parcels", "gid", "geom").unwrap(),
+        };
+        assert_eq!(src.prefilter("$2"), None);
+        assert!(src.is_4326());
+        // srid 0 means "unset", which the read stack treats as 4326
+        let unset = ExternalSource { srid: 0, ..src };
+        assert_eq!(unset.prefilter("$2"), None);
+        // and the subquery is byte-identical with or without a window
+        assert_eq!(
+            unset.features_subquery("$1", None),
+            unset.features_subquery("$1", Some("$2"))
+        );
+    }
+
+    /// The pre-filter must restrict the relation's own column, in its own SRID,
+    /// so a plain GiST index applies.
+    #[test]
+    fn a_projected_source_prefilters_on_the_raw_column() {
+        let sql = projected().prefilter("$2").unwrap();
+        assert!(sql.starts_with("t.\"geom\" && "), "{sql}");
+        assert!(sql.contains("ST_Transform(ST_Expand("), "{sql}");
+        assert!(sql.contains(", 3857)"), "{sql}");
+        // the window reaches the SQL only through the caller's placeholder
+        assert!(sql.contains("ST_Envelope($2)"), "{sql}");
+        // and it never wraps the column in a transform, which is what defeated
+        // the index before
+        assert!(!sql.contains("ST_Transform(t."), "{sql}");
+    }
+
+    /// A window outside the reprojectable range must become an all-covering box,
+    /// not a reprojection PROJ could reject, and never a narrower restriction.
+    #[test]
+    fn an_unreprojectable_window_falls_back_to_no_restriction() {
+        let sql = projected().prefilter("$2").unwrap();
+        assert!(sql.contains("ELSE ST_SetSRID(ST_MakeEnvelope(-1e15, -1e15, 1e15, 1e15), 3857)"));
+        // the guard covers both the lon/lat range and the window size
+        for bound in ["-180", "85", "<= 45"] {
+            assert!(sql.contains(bound), "guard missing {bound}: {sql}");
+        }
+    }
+
+    /// The pre-filter goes inside the derived table's WHERE, next to the id check.
+    #[test]
+    fn the_window_lands_in_the_subquery() {
+        let src = projected();
+        let plain = src.features_subquery("$1", None);
+        assert!(plain.ends_with("WHERE t.\"gid\" IS NOT NULL)"), "{plain}");
+        let filtered = src.features_subquery("$1", Some("$2"));
+        assert!(
+            filtered.contains("WHERE t.\"gid\" IS NOT NULL AND t.\"geom\" && "),
+            "{filtered}"
+        );
+        // latest_subquery carries it through unchanged
+        assert!(
+            src.latest_subquery("$1", Some("$2"))
+                .contains("t.\"geom\" && ")
+        );
     }
 
     #[test]
@@ -267,7 +410,7 @@ mod tests {
             table: ExternalTable::parse("parcels", "gid", "geom").unwrap(),
         };
         assert!(
-            src.features_subquery("$1")
+            src.features_subquery("$1", None)
                 .contains("ST_Transform(t.\"geom\", 4326) AS geometry")
         );
     }
