@@ -427,7 +427,7 @@ mod tests {
             (Method::POST, "/api/v1/datasets"),
             (Method::POST, "/api/v1/qgis/branches/x/sync"),
             (Method::POST, "/api/v1/branches/x/merge/y"),
-            (Method::POST, "/api/v1/conflicts/x/resolve"),
+            (Method::POST, "/api/v1/branches/x/merge/y/resolve"),
             (Method::POST, "/api/v1/branches/x/geoprocessing/split"),
             (Method::DELETE, "/api/v1/attachments/x"),
             (Method::PUT, "/api/v1/reviews/x/approve"),

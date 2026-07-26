@@ -309,7 +309,8 @@ client but any JSON structure will work.
 | POST | `/api/v1/orgs/{id}/members` | Add member |
 | GET | `/api/v1/orgs/{id}/datasets` | Org datasets |
 | GET | `/api/v1/conflicts/{id}` | List merge conflicts |
-| POST | `/api/v1/conflicts/{id}/resolve` | Resolve conflicts |
+| GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
+| POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
 | GET | `/api/v1/events/stream` | SSE real-time event stream |
 | WS | `/ws/branches/{id}` | Real-time branch events |
 | WS | `/ws/rooms/{room_id}` | Ephemeral collaboration relay (presence, view sync, chat) |

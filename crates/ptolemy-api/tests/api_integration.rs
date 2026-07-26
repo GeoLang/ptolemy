@@ -665,23 +665,32 @@ async fn create_fork(app: &axum::Router, dataset_id: Uuid, name: &str, from: Uui
     Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
 }
 
-async fn resolve_theirs(app: &axum::Router, source_id: Uuid, feature_id: Uuid) -> Value {
+/// Helper: resolve a conflicting merge of `source_id` into `target_id` by
+/// keeping the target's version. `resolve_and_merge` names the target side
+/// "ours", the opposite of the branch-relative naming callers may expect.
+async fn resolve_keeping_target(
+    app: &axum::Router,
+    target_id: Uuid,
+    source_id: Uuid,
+    feature_id: Uuid,
+) -> Value {
     let (status, body) = post_json(
         app,
-        &format!("/api/v1/conflicts/{source_id}/resolve"),
+        &format!("/api/v1/branches/{target_id}/merge/{source_id}/resolve"),
         json!({
-            "resolutions": [{"feature_id": feature_id.to_string(), "strategy": "theirs"}],
-            "message": "take theirs",
+            "resolutions": [{"feature_id": feature_id.to_string(), "strategy": "ours"}],
+            "message": "keep target",
             "author": "test",
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "resolve theirs: {body}");
+    assert_eq!(status, StatusCode::OK, "resolve: {body}");
+    assert_eq!(body["success"], true, "resolve: {body}");
     body
 }
 
 #[tokio::test]
-async fn test_resolve_theirs_uses_target_branch_not_newest_write() {
+async fn test_resolve_target_side_uses_target_chain_not_newest_write() {
     let (app, _) = setup_app().await;
     let ds_id = create_dataset(&app).await;
     let main_id = create_branch(&app, ds_id, "main").await;
@@ -703,7 +712,17 @@ async fn test_resolve_theirs_uses_target_branch_not_newest_write() {
     )
     .await;
 
-    // An unrelated branch writes a newer version of the same feature
+    // Target moves on too, so the merge actually conflicts
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "main-v2"}}
+        ]),
+    )
+    .await;
+
+    // An unrelated branch writes the newest version of the same feature
     let other_id = create_fork(&app, ds_id, "other", main_id).await;
     commit_features(
         &app,
@@ -714,20 +733,20 @@ async fn test_resolve_theirs_uses_target_branch_not_newest_write() {
     )
     .await;
 
-    resolve_theirs(&app, dev_id, f1).await;
+    resolve_keeping_target(&app, main_id, dev_id, f1).await;
 
-    let (status, body) = get_json(&app, &format!("/api/v1/branches/{dev_id}/features")).await;
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{main_id}/features")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let features = body["features"].as_array().unwrap();
     assert_eq!(features.len(), 1, "{body}");
     assert_eq!(
-        features[0]["properties"]["name"], "main-v1",
-        "theirs must come from the merge target, not another branch: {body}"
+        features[0]["properties"]["name"], "main-v2",
+        "the target side must come from the target's own chain, not another branch: {body}"
     );
 }
 
 #[tokio::test]
-async fn test_resolve_theirs_deletes_when_target_deleted() {
+async fn test_resolve_target_side_delete_propagates_as_delete() {
     let (app, _) = setup_app().await;
     let ds_id = create_dataset(&app).await;
     let main_id = create_branch(&app, ds_id, "main").await;
@@ -756,14 +775,14 @@ async fn test_resolve_theirs_deletes_when_target_deleted() {
     )
     .await;
 
-    resolve_theirs(&app, dev_id, f1).await;
+    resolve_keeping_target(&app, main_id, dev_id, f1).await;
 
-    let (status, body) = get_json(&app, &format!("/api/v1/branches/{dev_id}/features")).await;
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{main_id}/features")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["features"].as_array().unwrap().len(),
         0,
-        "taking theirs after target deleted must delete the feature: {body}"
+        "keeping a target-side delete must delete the feature: {body}"
     );
 }
 

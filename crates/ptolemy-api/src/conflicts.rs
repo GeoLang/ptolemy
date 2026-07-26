@@ -27,7 +27,6 @@ use crate::{AppState, auth::Actor};
 pub fn conflict_routes() -> Router<AppState> {
     Router::new()
         .route("/conflicts/{merge_id}", get(list_conflicts))
-        .route("/conflicts/{merge_id}/resolve", post(resolve_conflicts))
         // Visual merge preview: returns GeoJSON with ours/theirs/base for rendering
         .route(
             "/branches/{target_id}/merge/{source_id}/preview",
@@ -47,30 +46,6 @@ struct ConflictDetail {
     ours: Option<serde_json::Value>,
     theirs: Option<serde_json::Value>,
     base: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct Resolution {
-    feature_id: Uuid,
-    strategy: ResolutionStrategy,
-    /// Custom value if strategy is Custom
-    custom_properties: Option<serde_json::Value>,
-    custom_geometry_wkb_hex: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "snake_case")]
-enum ResolutionStrategy {
-    Ours,
-    Theirs,
-    Custom,
-}
-
-#[derive(Deserialize)]
-struct ResolveRequest {
-    resolutions: Vec<Resolution>,
-    message: String,
-    author: String,
 }
 
 async fn list_conflicts(
@@ -124,128 +99,6 @@ async fn list_conflicts(
             })
             .collect(),
     ))
-}
-
-async fn resolve_conflicts(
-    State(store): State<AppState>,
-    Path(merge_id): Path<Uuid>,
-    actor: Actor,
-    Json(req): Json<ResolveRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ConflictError> {
-    let mut ops = Vec::new();
-    // resolved on first 'theirs' resolution, then reused
-    let mut target_head: Option<Uuid> = None;
-
-    for res in &req.resolutions {
-        match res.strategy {
-            ResolutionStrategy::Ours => {
-                // Keep source version — no-op (already in source branch)
-            }
-            ResolutionStrategy::Theirs => {
-                // Take target version — read it from the target's own ancestor
-                // chain, never from whatever branch wrote last
-                let head = match target_head {
-                    Some(h) => h,
-                    None => {
-                        let h = resolve_target_head(&store, merge_id).await?;
-                        target_head = Some(h);
-                        h
-                    }
-                };
-                let row = sqlx::query(
-                    "WITH RECURSIVE chain AS (
-                        SELECT id, parent_id FROM changesets WHERE id = $2
-                      UNION ALL
-                        SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
-                    )
-                    SELECT ST_AsBinary(fv.geometry) as geom, fv.properties, fv.operation
-                    FROM feature_versions fv
-                    JOIN chain ch ON fv.changeset_id = ch.id
-                    WHERE fv.feature_id = $1
-                    ORDER BY fv.id DESC LIMIT 1",
-                )
-                .bind(res.feature_id)
-                .bind(head)
-                .fetch_optional(store.pool())
-                .await?;
-
-                if let Some(r) = row {
-                    if r.get::<String, _>("operation") == "delete" {
-                        // theirs deleted it, so taking theirs means deleting it
-                        ops.push(DiffOp::Delete {
-                            feature_id: res.feature_id,
-                        });
-                    } else {
-                        ops.push(DiffOp::Update {
-                            feature_id: res.feature_id,
-                            geometry_wkb: r.get::<Option<Vec<u8>>, _>("geom"),
-                            properties: r.get::<Option<serde_json::Value>, _>("properties"),
-                        });
-                    }
-                }
-            }
-            ResolutionStrategy::Custom => {
-                let geom = res
-                    .custom_geometry_wkb_hex
-                    .as_ref()
-                    .and_then(|h| hex::decode(h).ok());
-                ops.push(DiffOp::Update {
-                    feature_id: res.feature_id,
-                    geometry_wkb: geom,
-                    properties: res.custom_properties.clone(),
-                });
-            }
-        }
-    }
-
-    if !ops.is_empty() {
-        let changeset = store
-            .commit(merge_id, &req.message, actor.or_body(&req.author), &ops)
-            .await?;
-        Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "resolved": req.resolutions.len(),
-                "changeset_id": changeset.id,
-            })),
-        ))
-    } else {
-        Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "resolved": req.resolutions.len(),
-                "changeset_id": null,
-            })),
-        ))
-    }
-}
-
-/// Head changeset of the merge target for a source branch: the 'main' branch of
-/// the same dataset, resolved the same way list_conflicts does.
-async fn resolve_target_head(
-    store: &AppState,
-    source_branch_id: Uuid,
-) -> Result<Uuid, ConflictError> {
-    let row = sqlx::query(
-        "SELECT b.head FROM branches b
-         WHERE b.dataset_id = (SELECT dataset_id FROM branches WHERE id = $1)
-           AND b.name = 'main'
-         LIMIT 1",
-    )
-    .bind(source_branch_id)
-    .fetch_optional(store.pool())
-    .await?
-    .ok_or_else(|| {
-        ConflictError::Store(ptolemy_storage::StoreError::NotFound(
-            "no 'main' branch to merge into".into(),
-        ))
-    })?;
-
-    row.get::<Option<Uuid>, _>("head").ok_or_else(|| {
-        ConflictError::Store(ptolemy_storage::StoreError::NotFound(
-            "target has no commits".into(),
-        ))
-    })
 }
 
 // ─── Visual Merge Preview ───────────────────────────────────────────
