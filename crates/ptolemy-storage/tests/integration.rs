@@ -7,7 +7,7 @@
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
-use ptolemy_storage::permission::Writer;
+use ptolemy_storage::permission::{Reader, Writer};
 use ptolemy_storage::postgres::{MergeResult, PgStore};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -17,6 +17,12 @@ use uuid::Uuid;
 /// These tests exercise storage, not permissions, so every write is unenforced.
 /// The permission ladder has its own tests in the api integration suite.
 const W: Writer = Writer::Unenforced;
+
+/// A reader that sees every dataset, matching this suite's unenforced writes.
+const ALL: Reader = Reader {
+    bypass: true,
+    id: None,
+};
 
 /// WKB for POINT(0 0) in SRID 4326 (little-endian)
 fn point_wkb(x: f64, y: f64) -> Vec<u8> {
@@ -102,7 +108,7 @@ async fn test_list_datasets() {
     create_test_dataset(&store).await;
     create_test_dataset(&store).await;
 
-    let datasets = store.list_datasets().await.unwrap();
+    let datasets = store.list_datasets(&ALL).await.unwrap();
     assert!(datasets.len() >= 2);
 }
 

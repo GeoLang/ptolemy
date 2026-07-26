@@ -4,7 +4,9 @@
 
 //! PostgreSQL/PostGIS backend for the versioned feature store.
 
-use crate::permission::{Check, Scope, Writer, permission_level, write_allowed};
+use crate::permission::{
+    Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
+};
 use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
@@ -430,12 +432,18 @@ impl PgStore {
         dataset_from_row(row)
     }
 
-    pub async fn list_datasets(&self) -> Result<Vec<Dataset>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, name, srid, geometry_type, created_at, created_by,
-                    external_table, external_id_column, external_geometry_column, visibility
-             FROM datasets ORDER BY name",
-        )
+    /// Datasets this reader may see. A private dataset the reader holds no grant
+    /// on is simply absent, as it is from every other listing.
+    pub async fn list_datasets(&self, reader: &Reader) -> Result<Vec<Dataset>, StoreError> {
+        let visible = visible_datasets_sql("d", 1, 2);
+        let rows = sqlx::query(&format!(
+            "SELECT d.id, d.name, d.srid, d.geometry_type, d.created_at, d.created_by,
+                    d.external_table, d.external_id_column, d.external_geometry_column,
+                    d.visibility
+             FROM datasets d WHERE {visible} ORDER BY d.name"
+        ))
+        .bind(reader.bypass)
+        .bind(reader.id.as_deref())
         .fetch_all(&self.pool)
         .await?;
 

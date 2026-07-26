@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
-use ptolemy_storage::Writer;
+use ptolemy_storage::{Reader, Writer};
 use serde::{Deserialize, Serialize};
 
 /// Shortest HS256 secret we accept, matching collecta.
@@ -376,6 +376,14 @@ impl Actor {
     /// there is no verified identity to check them against.
     pub fn enforces(&self) -> bool {
         self.auth_enabled
+    }
+
+    /// The identity a dataset listing is filtered by.
+    pub fn reader(&self) -> Reader {
+        Reader {
+            bypass: !self.auth_enabled || self.is_instance_admin(),
+            id: self.id().map(str::to_owned),
+        }
     }
 
     /// The identity a write is checked against.

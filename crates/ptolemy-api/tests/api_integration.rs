@@ -4336,3 +4336,197 @@ async fn test_auth_disabled_skips_delegation_checks() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+// ─── Enumeration gating ─────────────────────────────────────────────
+
+/// Every listing that names a dataset. Each returns JSON somewhere in which the
+/// dataset's id or name appears, so a substring check over the whole body is the
+/// honest test: it catches a leak in a description as well as in an id field.
+const DATASET_LISTINGS: [&str; 5] = [
+    "/api/v1/datasets",
+    "/api/v1/catalog/search",
+    "/api/v1/ogc/collections",
+    "/api/v1/stac/collections",
+    "/api/v1/qgis/datasets",
+];
+
+async fn listing_mentions(
+    app: &axum::Router,
+    uri: &str,
+    token: Option<&str>,
+    needle: &str,
+) -> bool {
+    let (status, body) = request_as(app, "GET", uri, token, None).await;
+    assert_eq!(status, StatusCode::OK, "GET {uri}: {body}");
+    body.to_string().contains(needle)
+}
+
+#[tokio::test]
+async fn test_private_dataset_is_absent_from_every_listing() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, carol) = seed_private_dataset(&app).await;
+    let id = dataset_id.to_string();
+    let eve = token_for_user("eve", Role::Editor);
+    let root = token_for_user("root", Role::Admin);
+
+    for uri in DATASET_LISTINGS {
+        assert!(
+            !listing_mentions(&app, uri, None, &id).await,
+            "anonymous GET {uri} leaked the private dataset"
+        );
+        assert!(
+            !listing_mentions(&app, uri, Some(&eve), &id).await,
+            "non-granted editor GET {uri} leaked the private dataset"
+        );
+    }
+
+    // the owner and the instance admin see it in the listings that cover
+    // versioned datasets (stac collections list raster catalogs, of which this
+    // dataset has none)
+    for uri in [
+        "/api/v1/datasets",
+        "/api/v1/ogc/collections",
+        "/api/v1/qgis/datasets",
+    ] {
+        assert!(
+            listing_mentions(&app, uri, Some(&carol), &id).await,
+            "owner GET {uri} hid their own dataset"
+        );
+        assert!(
+            listing_mentions(&app, uri, Some(&root), &id).await,
+            "instance admin GET {uri} hid the dataset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_a_grant_puts_a_private_dataset_back_in_the_listings() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_private_dataset(&app).await;
+    let id = dataset_id.to_string();
+    let vic = token_for_user("vic", Role::Viewer);
+    let bob = token_for_user("bob", Role::Viewer);
+
+    assert!(!listing_mentions(&app, "/api/v1/datasets", Some(&vic), &id).await);
+
+    grant_as(&app, &carol, "datasets", dataset_id, "vic", "read").await;
+    assert!(
+        listing_mentions(&app, "/api/v1/datasets", Some(&vic), &id).await,
+        "a dataset read grant did not surface the dataset"
+    );
+
+    // a grant on one of its branches counts too
+    assert!(!listing_mentions(&app, "/api/v1/datasets", Some(&bob), &id).await);
+    grant_as(&app, &carol, "branches", branch_id, "bob", "read").await;
+    assert!(
+        listing_mentions(&app, "/api/v1/datasets", Some(&bob), &id).await,
+        "a branch read grant did not surface the dataset"
+    );
+}
+
+#[tokio::test]
+async fn test_public_datasets_stay_in_every_listing() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let id = dataset["id"].as_str().unwrap().to_string();
+    let name = dataset["name"].as_str().unwrap().to_string();
+
+    // tagged so the tag branch of catalog search is exercised too
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{id}/tags"),
+        Some(&carol),
+        Some(json!({"tag": "demo"})),
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "tag: {body}"
+    );
+
+    for uri in [
+        "/api/v1/datasets",
+        "/api/v1/ogc/collections",
+        "/api/v1/qgis/datasets",
+    ] {
+        assert!(
+            listing_mentions(&app, uri, None, &id).await,
+            "anonymous GET {uri} lost a public dataset"
+        );
+    }
+    for uri in [
+        format!("/api/v1/catalog/search?q={name}"),
+        format!("/api/v1/catalog/search?tag=demo&q={name}"),
+    ] {
+        assert!(
+            listing_mentions(&app, &uri, None, &id).await,
+            "anonymous GET {uri} lost a public dataset"
+        );
+    }
+}
+
+/// The private dataset must not eat the limit window either: a filtered-out row
+/// cannot consume a slot a visible dataset needed.
+#[tokio::test]
+async fn test_catalog_search_limit_counts_only_visible_rows() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let tag = format!("t{}", Uuid::now_v7().simple());
+
+    let mut public_id = String::new();
+    for visibility in ["private", "public"] {
+        let mut body = new_dataset_body();
+        body["visibility"] = json!(visibility);
+        let (status, ds) =
+            request_as(&app, "POST", "/api/v1/datasets", Some(&carol), Some(body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{ds}");
+        let id = ds["id"].as_str().unwrap().to_string();
+        request_as(
+            &app,
+            "POST",
+            &format!("/api/v1/datasets/{id}/tags"),
+            Some(&carol),
+            Some(json!({"tag": tag})),
+        )
+        .await;
+        if visibility == "public" {
+            public_id = id;
+        }
+    }
+
+    // limit 1 with the private dataset sorted first would return nothing if the
+    // filter ran after the limit
+    let uri = format!("/api/v1/catalog/search?tag={tag}&limit=1");
+    assert!(
+        listing_mentions(&app, &uri, None, &public_id).await,
+        "the private row consumed the limit window"
+    );
+}
+
+/// Dev mode lists everything, as the rest of it does.
+#[tokio::test]
+async fn test_auth_disabled_lists_private_datasets() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, _) = seed_unowned_dataset(&state).await;
+    state
+        .set_dataset_visibility(dataset_id, ptolemy_core::dataset::Visibility::Private)
+        .await
+        .unwrap();
+
+    let (status, body) = get_json(&app, "/api/v1/datasets").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string().contains(&dataset_id.to_string()),
+        "dev mode hid a dataset: {body}"
+    );
+}

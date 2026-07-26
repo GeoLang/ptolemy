@@ -284,10 +284,15 @@ datasets are covered the same way.
 Unauthorized private reads answer `404`, not `403`, so a dataset id cannot be
 confirmed by probing.
 
-Dataset *enumeration* is not gated: `GET /api/v1/datasets`,
-`/api/v1/catalog/search`, `/api/v1/ogc/collections`, `/api/v1/stac/collections`
-and `/api/v1/qgis/datasets` still list a private dataset's name and id. Its
-content is not readable, but treat names as public.
+Enumeration is gated by the same rule, so a private dataset is simply absent
+from `GET /api/v1/datasets`, `/api/v1/catalog/search`, `/api/v1/ogc/collections`,
+`/api/v1/stac/collections`, `/api/v1/qgis/datasets` and `/api/v1/orgs/{id}/datasets`
+for a caller with no grant. The filter is a SQL predicate applied inside each
+query, so a paged search's `limit` counts only rows the caller may see.
+
+Raster tiles are not covered: `GET /api/v1/stac/search` returns tile ids and
+bounds from `raster_tiles` without naming a dataset, and raster catalogs have no
+visibility of their own yet.
 
 ## API Endpoints
 

@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn stac_routes() -> Router<AppState> {
     Router::new()
@@ -50,16 +50,24 @@ async fn stac_root() -> Json<serde_json::Value> {
 
 async fn stac_collections(
     State(store): State<AppState>,
+    actor: Actor,
 ) -> Result<Json<serde_json::Value>, StacError> {
-    let rows = sqlx::query(
+    let reader = actor.reader();
+    // the description names the dataset, so the collection list is a dataset
+    // listing as far as visibility is concerned
+    let visible = ptolemy_storage::visible_datasets_sql("d", 1, 2);
+    let rows = sqlx::query(&format!(
         "SELECT rc.id, rc.name, rc.srid, rc.pixel_type, rc.num_bands,
                 d.name as dataset_name,
                 ST_AsGeoJSON(ST_Extent(rt.bounds))::jsonb as extent
          FROM raster_catalogs rc
          JOIN datasets d ON d.id = rc.dataset_id
          LEFT JOIN raster_tiles rt ON rt.catalog_id = rc.id
-         GROUP BY rc.id, rc.name, rc.srid, rc.pixel_type, rc.num_bands, d.name",
-    )
+         WHERE {visible}
+         GROUP BY rc.id, rc.name, rc.srid, rc.pixel_type, rc.num_bands, d.name"
+    ))
+    .bind(reader.bypass)
+    .bind(reader.id.as_deref())
     .fetch_all(store.pool())
     .await?;
 

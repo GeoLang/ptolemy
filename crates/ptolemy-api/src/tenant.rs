@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn tenant_routes() -> Router<AppState> {
     Router::new()
@@ -165,11 +165,17 @@ async fn remove_member(
 async fn org_datasets(
     State(store): State<AppState>,
     Path(org_id): Path<Uuid>,
+    actor: Actor,
 ) -> Result<Json<Vec<serde_json::Value>>, TenantError> {
-    let rows = sqlx::query(
-        "SELECT id, name, srid, geometry_type FROM datasets WHERE org_id = $1 ORDER BY name",
-    )
+    let reader = actor.reader();
+    let visible = ptolemy_storage::visible_datasets_sql("d", 2, 3);
+    let rows = sqlx::query(&format!(
+        "SELECT d.id, d.name, d.srid, d.geometry_type FROM datasets d
+          WHERE d.org_id = $1 AND {visible} ORDER BY d.name"
+    ))
     .bind(org_id)
+    .bind(reader.bypass)
+    .bind(reader.id.as_deref())
     .fetch_all(store.pool())
     .await?;
 

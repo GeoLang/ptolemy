@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn catalog_routes() -> Router<AppState> {
     Router::new()
@@ -57,34 +57,46 @@ struct SearchResult {
 
 async fn search_datasets(
     State(store): State<AppState>,
+    actor: Actor,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Vec<SearchResult>>, CatalogError> {
+    let reader = actor.reader();
+    // filtered in SQL rather than after the fact, so LIMIT counts only rows the
+    // caller may actually see
     let rows = if let Some(tag) = &q.tag {
-        sqlx::query(
+        let visible = ptolemy_storage::visible_datasets_sql("d", 4, 5);
+        sqlx::query(&format!(
             "SELECT d.id, d.name, COALESCE(m.description, '') as description,
                     ARRAY(SELECT tag FROM dataset_tags WHERE dataset_id = d.id) as tags
              FROM datasets d
              LEFT JOIN dataset_metadata m ON m.dataset_id = d.id
              JOIN dataset_tags t ON t.dataset_id = d.id AND t.tag = $1
              WHERE ($2 = '' OR d.name ILIKE '%' || $2 || '%' OR COALESCE(m.description, '') ILIKE '%' || $2 || '%')
-             LIMIT $3",
-        )
+               AND {visible}
+             LIMIT $3"
+        ))
         .bind(tag)
         .bind(&q.q)
         .bind(q.limit)
+        .bind(reader.bypass)
+        .bind(reader.id.as_deref())
         .fetch_all(store.pool())
         .await?
     } else {
-        sqlx::query(
+        let visible = ptolemy_storage::visible_datasets_sql("d", 3, 4);
+        sqlx::query(&format!(
             "SELECT d.id, d.name, COALESCE(m.description, '') as description,
                     ARRAY(SELECT tag FROM dataset_tags WHERE dataset_id = d.id) as tags
              FROM datasets d
              LEFT JOIN dataset_metadata m ON m.dataset_id = d.id
              WHERE ($1 = '' OR d.name ILIKE '%' || $1 || '%' OR COALESCE(m.description, '') ILIKE '%' || $1 || '%')
-             LIMIT $2",
-        )
+               AND {visible}
+             LIMIT $2"
+        ))
         .bind(&q.q)
         .bind(q.limit)
+        .bind(reader.bypass)
+        .bind(reader.id.as_deref())
         .fetch_all(store.pool())
         .await?
     };

@@ -88,8 +88,11 @@ async fn readiness(State(state): State<AppState>) -> (axum::http::StatusCode, &'
 
 // ─── Datasets ───────────────────────────────────────────────────────
 
-async fn list_datasets(State(store): State<AppState>) -> Result<Json<Vec<Dataset>>, AppError> {
-    let datasets = store.list_datasets().await?;
+async fn list_datasets(
+    State(store): State<AppState>,
+    actor: Actor,
+) -> Result<Json<Vec<Dataset>>, AppError> {
+    let datasets = store.list_datasets(&actor.reader()).await?;
     Ok(Json(datasets))
 }
 

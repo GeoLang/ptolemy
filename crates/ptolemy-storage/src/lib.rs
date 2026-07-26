@@ -5,7 +5,9 @@
 pub mod permission;
 pub mod postgres;
 
-pub use permission::{Check, Scope, Writer, permission_level, write_allowed};
+pub use permission::{
+    Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
+};
 pub use postgres::{
     Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry, CompactionResult,
     CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeResult, PgStore,

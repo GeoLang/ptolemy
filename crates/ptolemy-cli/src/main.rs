@@ -305,7 +305,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("Created dataset '{}' ({})", name, ds.id);
             }
             DatasetCmd::List => {
-                let datasets = store.list_datasets().await?;
+                // the CLI holds database credentials, not a token, so it lists everything
+                let datasets = store
+                    .list_datasets(&ptolemy_storage::Reader {
+                        bypass: true,
+                        id: None,
+                    })
+                    .await?;
                 for ds in datasets {
                     println!(
                         "{} | {} | srid={} | {}",

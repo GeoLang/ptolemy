@@ -66,6 +66,37 @@ impl Writer {
     }
 }
 
+/// Who a dataset listing is built for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reader {
+    /// Sees every dataset whatever its visibility: auth is off, or the caller
+    /// holds the instance admin role.
+    pub bypass: bool,
+    /// The caller id grants are matched against, `None` when anonymous.
+    pub id: Option<String>,
+}
+
+/// SQL keeping only the datasets a [`Reader`] may see: public ones, plus private
+/// ones the caller holds a grant on, directly or on one of their branches. `AND`
+/// it into every listing that names datasets — the per-request visibility layer
+/// only covers requests that name an id, so a listing has to filter itself.
+///
+/// `alias` is the datasets table's alias in the calling query, and the two
+/// numbers are the 1-based positions of the binds carrying [`Reader::bypass`]
+/// (bool) then [`Reader::id`] (text, NULL when anonymous). All three come from
+/// the calling query, never from request data, so nothing a caller sends is
+/// interpolated here.
+pub fn visible_datasets_sql(alias: &str, bypass_param: usize, caller_param: usize) -> String {
+    format!(
+        "({alias}.visibility = 'public' OR ${bypass_param} OR EXISTS (
+             SELECT 1 FROM dataset_permissions dp
+              WHERE dp.dataset_id = {alias}.id AND dp.user_id = ${caller_param}
+            UNION ALL
+             SELECT 1 FROM branch_permissions bp JOIN branches b ON b.id = bp.branch_id
+              WHERE b.dataset_id = {alias}.id AND bp.user_id = ${caller_param}))"
+    )
+}
+
 /// One permission table's view of a writer, for a single dataset or branch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scope {

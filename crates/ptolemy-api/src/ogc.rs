@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn ogc_routes() -> Router<AppState> {
     Router::new()
@@ -107,10 +107,19 @@ struct Collections {
     collections: Vec<Collection>,
 }
 
-async fn collections(State(store): State<AppState>) -> Result<Json<Collections>, OgcError> {
-    let rows = sqlx::query("SELECT id, name FROM datasets ORDER BY name")
-        .fetch_all(store.pool())
-        .await?;
+async fn collections(
+    State(store): State<AppState>,
+    actor: Actor,
+) -> Result<Json<Collections>, OgcError> {
+    let reader = actor.reader();
+    let visible = ptolemy_storage::visible_datasets_sql("d", 1, 2);
+    let rows = sqlx::query(&format!(
+        "SELECT d.id, d.name FROM datasets d WHERE {visible} ORDER BY d.name"
+    ))
+    .bind(reader.bypass)
+    .bind(reader.id.as_deref())
+    .fetch_all(store.pool())
+    .await?;
 
     let cols: Vec<Collection> = rows
         .into_iter()

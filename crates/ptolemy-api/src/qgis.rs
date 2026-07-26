@@ -115,14 +115,20 @@ struct QgisBranch {
 
 async fn list_datasets_for_qgis(
     State(store): State<AppState>,
+    actor: Actor,
 ) -> Result<Json<Vec<QgisDataset>>, QgisError> {
-    let rows = sqlx::query(
+    let reader = actor.reader();
+    let visible = ptolemy_storage::visible_datasets_sql("d", 1, 2);
+    let rows = sqlx::query(&format!(
         "SELECT d.id, d.name, d.srid, d.geometry_type,
                 b.id as branch_id, b.name as branch_name, b.head
          FROM datasets d
          LEFT JOIN branches b ON b.dataset_id = d.id
-         ORDER BY d.name, b.name",
-    )
+         WHERE {visible}
+         ORDER BY d.name, b.name"
+    ))
+    .bind(reader.bypass)
+    .bind(reader.id.as_deref())
     .fetch_all(store.pool())
     .await?;
 
