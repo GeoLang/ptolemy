@@ -119,6 +119,51 @@ QGIS's native PostGIS connector all work against the database as-is. Backup and
 restore is standard `pg_dump`/`pg_restore`. If you stop using Ptolemy, your data
 is already in the most widely supported spatial database there is.
 
+#### Browse your existing PostGIS read-only
+
+The reverse also works: point Ptolemy at tables you already have and browse them
+through the normal API and the viewer, without importing or copying anything.
+Register the relation as an *external dataset*:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/datasets \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{
+    "name": "parcels",
+    "created_by": "you",
+    "external_table": "public.parcels",
+    "external_id_column": "gid",
+    "external_geometry_column": "geom"
+  }'
+```
+
+Registration checks the relation exists, that the geometry column really is
+PostGIS geometry, and that Ptolemy can select from it, then creates the dataset
+and its `main` branch. From there the ordinary read endpoints work: feature
+listing and paging, bbox, CQL2 filters, OGC API - Features collections and
+items, GeoJSON/CSV export, vector tiles.
+
+The dataset is read-only. Commits, merges, imports, QGIS push and branch
+creation all return 409. Non-geometry columns become the feature `properties`;
+each row's id is hashed into a stable UUID, and the original key stays in
+`properties`. Geometry not in EPSG:4326 is reprojected on read.
+
+Every non-geometry column is published, and Ptolemy serves reads to anonymous
+callers by default. Register a view that selects only the columns you want
+public, not a table with columns you don't.
+
+Set `PTOLEMY_EXTERNAL_DATABASE_URL` to read external datasets from a different
+database than Ptolemy's own. Use a role with `SELECT` and nothing else:
+
+```sql
+CREATE ROLE ptolemy_ro LOGIN PASSWORD '...';
+GRANT CONNECT ON DATABASE yourdb TO ptolemy_ro;
+GRANT USAGE ON SCHEMA public TO ptolemy_ro;
+GRANT SELECT ON public.parcels TO ptolemy_ro;
+```
+
+Then the read-only guarantee is enforced by PostgreSQL, not only by Ptolemy.
+
 ## Quick Start
 
 ```bash
@@ -147,6 +192,7 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |
 | `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | — |
 | `PTOLEMY_OIDC_REDIRECT_URL` | Callback URL for OIDC flow | — |
+| `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets; use a read-only role | (primary pool) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
 
