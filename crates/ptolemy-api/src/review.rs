@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn review_routes() -> Router<AppState> {
     Router::new()
@@ -70,6 +70,7 @@ struct CreateReviewRequest {
 
 async fn create_review(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<MergeRequest>), ReviewError> {
     let now = OffsetDateTime::now_utc();
@@ -80,7 +81,7 @@ async fn create_review(
         target_branch_id: req.target_branch_id,
         title: req.title,
         description: req.description,
-        author: req.author,
+        author: actor.or_body(&req.author).to_string(),
         status: MergeRequestStatus::Open,
         created_at: now,
         updated_at: now,
@@ -133,6 +134,7 @@ struct MergeReviewResponse {
 async fn merge_review(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<MergeReviewRequest>,
 ) -> Result<Json<MergeReviewResponse>, ReviewError> {
     let mr = store.get_merge_request(id).await?;
@@ -145,7 +147,11 @@ async fn merge_review(
     }
 
     let result = store
-        .merge(mr.source_branch_id, mr.target_branch_id, &req.author)
+        .merge(
+            mr.source_branch_id,
+            mr.target_branch_id,
+            actor.or_body(&req.author),
+        )
         .await?;
 
     match result {
@@ -208,13 +214,14 @@ struct AddCommentRequest {
 async fn add_comment(
     State(store): State<AppState>,
     Path(mr_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<AddCommentRequest>,
 ) -> Result<(StatusCode, Json<ReviewComment>), ReviewError> {
     let comment = ReviewComment {
         id: Uuid::now_v7(),
         merge_request_id: mr_id,
         feature_id: req.feature_id,
-        author: req.author,
+        author: actor.or_body(&req.author).to_string(),
         body: req.body,
         created_at: OffsetDateTime::now_utc(),
     };

@@ -15,7 +15,7 @@ use ptolemy_storage::FeatureLock;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn lock_routes() -> Router<AppState> {
     Router::new()
@@ -50,13 +50,14 @@ fn default_duration() -> i64 {
 async fn lock_feature(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<LockRequest>,
 ) -> Result<StatusCode, LockError> {
     store
         .lock_feature(
             req.feature_id,
             branch_id,
-            &req.locked_by,
+            actor.or_body(&req.locked_by),
             req.duration_minutes,
             req.reason.as_deref(),
         )

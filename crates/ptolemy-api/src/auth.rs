@@ -14,8 +14,8 @@
 
 use axum::{
     Json,
-    extract::{Request, State},
-    http::{Method, StatusCode, header},
+    extract::{FromRequestParts, Request, State},
+    http::{Method, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -286,6 +286,31 @@ pub async fn auth_middleware(
     let mut request = request;
     request.extensions_mut().insert(claims);
     next.run(request).await
+}
+
+/// Who to record in an audit field (`author`, `created_by`, `granted_by`, …).
+/// Holds the token subject, or `None` when auth is disabled and there is no
+/// token to trust.
+#[derive(Debug, Clone)]
+pub struct Actor(Option<String>);
+
+impl Actor {
+    /// The token subject wins over whatever the body says, so a caller cannot
+    /// attribute a write to someone else. With auth off the body value stands,
+    /// which keeps dev and CLI flows working.
+    pub fn or_body<'a>(&'a self, body: &'a str) -> &'a str {
+        self.0.as_deref().unwrap_or(body)
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Actor {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Actor(
+            parts.extensions.get::<Claims>().map(|c| c.sub.clone()),
+        ))
+    }
 }
 
 /// Generate a JWT token (for testing/admin use).

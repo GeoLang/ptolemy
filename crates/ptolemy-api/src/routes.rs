@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn v1_routes() -> Router<AppState> {
     Router::new()
@@ -134,6 +134,7 @@ fn default_srid() -> i32 {
 
 async fn create_dataset(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<CreateDatasetRequest>,
 ) -> Result<(StatusCode, Json<Dataset>), AppError> {
     let external = req.external()?;
@@ -144,7 +145,7 @@ async fn create_dataset(
         srid: req.srid,
         geometry_type: parse_geometry_type(geom_type),
         created_at: OffsetDateTime::now_utc(),
-        created_by: req.created_by,
+        created_by: actor.or_body(&req.created_by).to_string(),
         external,
     };
     // registering probes the relation and creates the main branch, so the
@@ -195,6 +196,7 @@ struct CreateBranchRequest {
 async fn create_branch(
     State(store): State<AppState>,
     Path(dataset_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<CreateBranchRequest>,
 ) -> Result<(StatusCode, Json<Branch>), AppError> {
     // If forking, copy the head from the source branch
@@ -211,7 +213,7 @@ async fn create_branch(
         name: req.name,
         head,
         created_at: OffsetDateTime::now_utc(),
-        created_by: req.created_by,
+        created_by: actor.or_body(&req.created_by).to_string(),
     };
     store.create_branch(&branch).await?;
     Ok((StatusCode::CREATED, Json(branch)))
@@ -414,6 +416,7 @@ struct BatchCommitRequest {
 async fn batch_commit(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<BatchCommitRequest>,
 ) -> Result<(StatusCode, Json<BatchCommitResponse>), AppError> {
     let ops: Result<Vec<DiffOp>, AppError> = req
@@ -455,7 +458,7 @@ async fn batch_commit(
     let ops = ops?;
     let op_count = ops.len();
     let changeset = store
-        .commit(branch_id, &req.message, &req.author, &ops)
+        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -504,6 +507,7 @@ enum DiffOpRequest {
 async fn commit(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<CommitRequest>,
 ) -> Result<(StatusCode, Json<ptolemy_core::changeset::Changeset>), AppError> {
     let ops: Result<Vec<DiffOp>, AppError> = req
@@ -561,7 +565,7 @@ async fn commit(
     }
 
     let changeset = store
-        .commit(branch_id, &req.message, &req.author, &ops)
+        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
         .await?;
     Ok((StatusCode::CREATED, Json(changeset)))
 }

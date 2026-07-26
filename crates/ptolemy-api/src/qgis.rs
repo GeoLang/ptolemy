@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn qgis_routes() -> Router<AppState> {
     Router::new()
@@ -316,6 +316,7 @@ struct WfsTransactionResponse {
 async fn wfs_transaction(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<WfsTransaction>,
 ) -> Result<Json<WfsTransactionResponse>, QgisError> {
     store.ensure_branch_writable(branch_id).await?;
@@ -388,7 +389,12 @@ async fn wfs_transaction(
     }
 
     let changeset = store
-        .commit(branch_id, &req.message, &req.author, &diff_ops)
+        .commit(
+            branch_id,
+            &req.message,
+            actor.or_body(&req.author),
+            &diff_ops,
+        )
         .await?;
 
     Ok(Json(WfsTransactionResponse {
@@ -523,6 +529,7 @@ enum QgisPushResponse {
 async fn qgis_push(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<QgisPushRequest>,
 ) -> Result<(StatusCode, Json<QgisPushResponse>), QgisError> {
     store.ensure_branch_writable(branch_id).await?;
@@ -593,7 +600,7 @@ async fn qgis_push(
     }
 
     let changeset = store
-        .commit(branch_id, &req.message, &req.author, &ops)
+        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
         .await?;
 
     Ok((

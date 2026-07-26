@@ -20,7 +20,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn attachment_routes() -> Router<AppState> {
     Router::new()
@@ -44,6 +44,7 @@ async fn list_attachments(
 async fn upload_attachment(
     State(store): State<AppState>,
     Path((branch_id, feature_id)): Path<(Uuid, Uuid)>,
+    actor: Actor,
     Json(req): Json<UploadAttachmentRequest>,
 ) -> Result<(StatusCode, Json<AttachmentMeta>), AttachmentError> {
     let data = base64_decode(&req.data)?;
@@ -62,7 +63,7 @@ async fn upload_attachment(
         data,
         thumbnail: None,
         metadata: req.metadata.unwrap_or(serde_json::json!({})),
-        created_by: req.created_by.clone(),
+        created_by: actor.or_body(&req.created_by).to_string(),
         created_at: now,
     };
 

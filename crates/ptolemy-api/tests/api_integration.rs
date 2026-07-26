@@ -2595,3 +2595,249 @@ async fn test_external_fields_are_all_or_none() {
         "expected the CHECK constraint to fire: {err}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audit identity comes from the token, not the body
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Before this, any caller could set `author` / `created_by` / `granted_by` to
+// someone else's name and the audit trail would believe it. With auth on the
+// token subject wins; with auth off there is no token, so the body stands.
+
+/// Token for a specific subject, so a test can tell "who the token says" from
+/// "who the body says".
+fn token_for_sub(sub: &str, role: Role) -> String {
+    generate_token(TEST_SECRET, sub, role, 3600)
+}
+
+#[tokio::test]
+async fn test_authed_commit_author_is_token_subject() {
+    let app = setup_app_authed().await;
+    let editor = token_for_sub("real-editor", Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(json!({
+            "name": format!("audit_{}", Uuid::now_v7()),
+            "geometry_type": "point",
+            "srid": 4326,
+            "created_by": "someone-else"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    assert_eq!(dataset["created_by"], "real-editor", "{dataset}");
+    let dataset_id = dataset["id"].as_str().unwrap();
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&editor),
+        Some(json!({"name": "main", "created_by": "someone-else"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    assert_eq!(branch["created_by"], "real-editor", "{branch}");
+    let branch_id = branch["id"].as_str().unwrap();
+
+    let (status, commit) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&editor),
+        Some(json!({
+            "message": "spoof attempt",
+            "author": "someone-else",
+            "operations": [{
+                "type": "insert",
+                "feature_id": Uuid::now_v7(),
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {"name": "one"}
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{commit}");
+    assert_eq!(commit["author"], "real-editor", "{commit}");
+
+    // and it is what was persisted, not just what the response echoed
+    let (status, history) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/history"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history[0]["author"], "real-editor", "{history}");
+}
+
+#[tokio::test]
+async fn test_authed_batch_and_review_author_is_token_subject() {
+    let app = setup_app_authed().await;
+    let editor = token_for_sub("real-editor", Role::Editor);
+
+    let (_, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    let dataset_id = dataset["id"].as_str().unwrap();
+    let (_, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&editor),
+        Some(json!({"name": "main", "created_by": "x"})),
+    )
+    .await;
+    let branch_id = branch["id"].as_str().unwrap();
+    let (_, target) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&editor),
+        Some(json!({"name": "target", "created_by": "x"})),
+    )
+    .await;
+    let target_id = target["id"].as_str().unwrap();
+
+    let (status, batch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/batch"),
+        Some(&editor),
+        Some(json!({
+            "message": "batch spoof attempt",
+            "author": "someone-else",
+            "operations": [{
+                "type": "insert",
+                "feature_id": Uuid::now_v7(),
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {"name": "b"}
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{batch}");
+    assert_eq!(batch["changeset"]["author"], "real-editor", "{batch}");
+
+    let (status, review) = request_as(
+        &app,
+        "POST",
+        "/api/v1/reviews",
+        Some(&editor),
+        Some(json!({
+            "dataset_id": dataset_id,
+            "source_branch_id": branch_id,
+            "target_branch_id": target_id,
+            "title": "review spoof attempt",
+            "author": "someone-else"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{review}");
+    assert_eq!(review["author"], "real-editor", "{review}");
+    let review_id = review["id"].as_str().unwrap();
+
+    let (status, comment) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/reviews/{review_id}/comments"),
+        Some(&editor),
+        Some(json!({"author": "someone-else", "body": "looks fine"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+    assert_eq!(comment["author"], "real-editor", "{comment}");
+}
+
+#[tokio::test]
+async fn test_authed_granted_by_is_token_subject() {
+    let app = setup_app_authed().await;
+    let admin = token_for_sub("real-admin", Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+
+    let (status, perm) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        Some(&admin),
+        Some(json!({
+            "user_id": "bob",
+            "permission": "write",
+            "granted_by": "someone-else"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{perm}");
+    assert_eq!(perm["granted_by"], "real-admin", "{perm}");
+
+    let (_, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&admin),
+        Some(json!({"name": "main", "created_by": "x"})),
+    )
+    .await;
+    let branch_id = branch["id"].as_str().unwrap();
+
+    let (status, perm) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/permissions"),
+        Some(&admin),
+        Some(json!({
+            "user_id": "bob",
+            "permission": "read",
+            "granted_by": "someone-else"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{perm}");
+    assert_eq!(perm["granted_by"], "real-admin", "{perm}");
+}
+
+#[tokio::test]
+async fn test_no_auth_keeps_body_author() {
+    // dev mode has no token, so the body value is all there is
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+
+    let (status, branch) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        json!({"name": "main", "created_by": "field-surveyor"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    assert_eq!(branch["created_by"], "field-surveyor", "{branch}");
+    let branch_id = branch["id"].as_str().unwrap();
+
+    let (status, commit) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        json!({
+            "message": "offline edit",
+            "author": "field-surveyor",
+            "operations": [{
+                "type": "insert",
+                "feature_id": Uuid::now_v7(),
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {"name": "one"}
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{commit}");
+    assert_eq!(commit["author"], "field-surveyor", "{commit}");
+}

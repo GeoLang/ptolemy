@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn vertical_routes() -> Router<AppState> {
     Router::new()
@@ -676,6 +676,7 @@ struct CreateIncidentRequest {
 
 async fn create_incident(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<CreateIncidentRequest>,
 ) -> Result<(StatusCode, Json<IncidentInfo>), VerticalError> {
     use ptolemy_core::diff::DiffOp;
@@ -705,7 +706,12 @@ async fn create_incident(
     }];
 
     store
-        .commit(req.branch_id, "new incident", &req.author, &ops)
+        .commit(
+            req.branch_id,
+            "new incident",
+            actor.or_body(&req.author),
+            &ops,
+        )
         .await
         .map_err(VerticalError::Store)?;
 

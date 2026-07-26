@@ -196,6 +196,11 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
 
+With auth on, audit fields (`author`, `created_by`, `granted_by`, `locked_by`)
+are taken from the token subject and the value in the request body is ignored.
+With `PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is
+recorded as-is.
+
 ## API Endpoints
 
 ### Real-Time Collaboration Relay

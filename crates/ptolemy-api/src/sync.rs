@@ -22,7 +22,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn sync_routes() -> Router<AppState> {
     Router::new()
@@ -187,6 +187,7 @@ enum PushResponse {
 
 async fn sync_push(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<PushRequest>,
 ) -> Result<(StatusCode, Json<PushResponse>), SyncError> {
     let branch = store.get_branch(req.branch_id).await?;
@@ -244,7 +245,12 @@ async fn sync_push(
         .collect();
 
     let changeset = store
-        .commit(req.branch_id, &req.message, &req.author, &ops?)
+        .commit(
+            req.branch_id,
+            &req.message,
+            actor.or_body(&req.author),
+            &ops?,
+        )
         .await?;
 
     Ok((

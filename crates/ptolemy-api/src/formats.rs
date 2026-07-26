@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn format_routes() -> Router<AppState> {
     Router::new()
@@ -219,6 +219,7 @@ struct ImportResult {
 async fn import_geojson(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ImportResult>, FormatError> {
     store.ensure_branch_writable(branch_id).await?;
@@ -233,10 +234,11 @@ async fn import_geojson(
         .get("message")
         .and_then(|m| m.as_str())
         .unwrap_or("GeoJSON import");
-    let author = body
-        .get("author")
-        .and_then(|a| a.as_str())
-        .unwrap_or("import");
+    let author = actor.or_body(
+        body.get("author")
+            .and_then(|a| a.as_str())
+            .unwrap_or("import"),
+    );
 
     if features.len() > 50_000 {
         return Err(FormatError::Bad(
@@ -336,6 +338,7 @@ struct ImportCsvRequest {
 async fn import_csv(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<ImportCsvRequest>,
 ) -> Result<Json<ImportResult>, FormatError> {
     store.ensure_branch_writable(branch_id).await?;
@@ -394,7 +397,7 @@ async fn import_csv(
     .bind(changeset_id)
     .bind(branch_id)
     .bind(&req.message)
-    .bind(&req.author)
+    .bind(actor.or_body(&req.author))
     .execute(store.pool())
     .await?;
 

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn conflict_routes() -> Router<AppState> {
     Router::new()
@@ -129,6 +129,7 @@ async fn list_conflicts(
 async fn resolve_conflicts(
     State(store): State<AppState>,
     Path(merge_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<ResolveRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ConflictError> {
     let mut ops = Vec::new();
@@ -199,7 +200,7 @@ async fn resolve_conflicts(
 
     if !ops.is_empty() {
         let changeset = store
-            .commit(merge_id, &req.message, &req.author, &ops)
+            .commit(merge_id, &req.message, actor.or_body(&req.author), &ops)
             .await?;
         Ok((
             StatusCode::OK,
@@ -455,6 +456,7 @@ struct VisualResolution {
 async fn resolve_and_merge(
     State(store): State<AppState>,
     Path((target_id, source_id)): Path<(Uuid, Uuid)>,
+    actor: Actor,
     Json(req): Json<VisualResolveRequest>,
 ) -> Result<Json<serde_json::Value>, ConflictError> {
     let source = store.get_branch(source_id).await?;
@@ -561,7 +563,7 @@ async fn resolve_and_merge(
     });
 
     let changeset = store
-        .commit(target_id, &message, &req.author, &final_ops)
+        .commit(target_id, &message, actor.or_body(&req.author), &final_ops)
         .await?;
 
     Ok(Json(serde_json::json!({

@@ -18,7 +18,7 @@ use ptolemy_storage::{BranchPermission, DatasetPermission};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn rbac_routes() -> Router<AppState> {
     Router::new()
@@ -70,11 +70,17 @@ struct GrantRequest {
 async fn grant_dataset_permission(
     State(store): State<AppState>,
     Path(dataset_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<GrantRequest>,
 ) -> Result<(StatusCode, Json<DatasetPermission>), RbacError> {
     validate_permission(&req.permission)?;
     let perm = store
-        .grant_dataset_permission(dataset_id, &req.user_id, &req.permission, &req.granted_by)
+        .grant_dataset_permission(
+            dataset_id,
+            &req.user_id,
+            &req.permission,
+            actor.or_body(&req.granted_by),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(perm)))
 }
@@ -148,11 +154,17 @@ async fn list_branch_permissions(
 async fn grant_branch_permission(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<GrantRequest>,
 ) -> Result<(StatusCode, Json<BranchPermission>), RbacError> {
     validate_permission(&req.permission)?;
     let perm = store
-        .grant_branch_permission(branch_id, &req.user_id, &req.permission, &req.granted_by)
+        .grant_branch_permission(
+            branch_id,
+            &req.user_id,
+            &req.permission,
+            actor.or_body(&req.granted_by),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(perm)))
 }
