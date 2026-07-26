@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn real_estate_routes() -> Router<AppState> {
     Router::new()
@@ -317,8 +317,13 @@ struct ParcelSplitRequest {
 
 async fn parcel_split(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<ParcelSplitRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RealEstateError> {
+    // the branch comes from the body, so the visibility layer cannot see it
+    crate::visibility::ensure_readable(&store, &actor, &[req.branch_id])
+        .await
+        .map_err(RealEstateError::Store)?;
     // Get the feature
     let features = store
         .list_features_paginated(req.branch_id, None, 10000)
@@ -356,8 +361,13 @@ struct ParcelMergeRequest {
 
 async fn parcel_merge(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<ParcelMergeRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RealEstateError> {
+    // the branch comes from the body, so the visibility layer cannot see it
+    crate::visibility::ensure_readable(&store, &actor, &[req.branch_id])
+        .await
+        .map_err(RealEstateError::Store)?;
     if req.feature_ids.len() < 2 {
         return Err(RealEstateError::BadRequest(
             "need at least 2 parcels to merge".into(),

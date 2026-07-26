@@ -355,6 +355,16 @@ impl Actor {
         self.claims.as_ref().is_some_and(Claims::can_admin)
     }
 
+    pub fn claims(&self) -> Option<&Claims> {
+        self.claims.as_ref()
+    }
+
+    /// Whether per-dataset permissions apply at all. False in dev mode, where
+    /// there is no verified identity to check them against.
+    pub fn enforces(&self) -> bool {
+        self.auth_enabled
+    }
+
     /// The identity a write is checked against.
     pub fn writer(&self) -> Writer {
         if !self.auth_enabled {

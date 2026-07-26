@@ -148,9 +148,12 @@ creation all return 409. Non-geometry columns become the feature `properties`;
 each row's id is hashed into a stable UUID, and the original key stays in
 `properties`. Geometry not in EPSG:4326 is reprojected on read.
 
-Every non-geometry column is published, and Ptolemy serves reads to anonymous
-callers by default. Register a view that selects only the columns you want
-public, not a table with columns you don't.
+Every non-geometry column is published, and a `public` dataset serves reads to
+anonymous callers. Register a view that selects only the columns you want
+public, not a table with columns you don't. If the relation has columns that
+must stay internal, register it with `"visibility": "private"` as well — an
+external dataset is gated on read exactly like a versioned one (see
+[Access control](#access-control)).
 
 Set `PTOLEMY_EXTERNAL_DATABASE_URL` to read external datasets from a different
 database than Ptolemy's own. Use a role with `SELECT` and nothing else:
@@ -201,6 +204,68 @@ are taken from the token subject and the value in the request body is ignored.
 With `PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is
 recorded as-is.
 
+## Access control
+
+Two layers. The token's `role` claim decides what kind of request you may make
+at all: `viewer` reads, `editor` writes, `admin` also reaches config, ACL,
+membership, audit and `/metrics`. Per-dataset grants then decide *which* data
+you may touch. Both are off entirely with `PTOLEMY_AUTH_DISABLED=true`, which is
+why that mode is for development only.
+
+Grants are rows in `dataset_permissions` and `branch_permissions`, one per user
+per scope, with permission `read`, `write` or `admin` (admin > write > read).
+Grant and revoke through the `/permissions` endpoints, which need an `admin`
+token.
+
+### Writes
+
+On commit, batch commit, merge (plain, topology-aware, review and
+conflict-resolving), GeoJSON/CSV import, QGIS push, WFS transaction, sync push,
+branch creation, reproject, repair and compaction:
+
+1. An `admin` role token bypasses per-dataset grants.
+2. Otherwise, if the target **branch** has any permission rows, the caller needs
+   `write` or `admin` **on that branch**. A dataset-level grant does not reach
+   into a branch that has its own rows.
+3. Otherwise, if the **dataset** has any permission rows, the caller needs
+   `write` or `admin` on the dataset.
+4. Otherwise the dataset has no rows anywhere and any editor may write, so
+   datasets that predate enforcement keep working.
+
+Denial is `403`. The first grant on a dataset flips it from step 4 to step 3, so
+granting is what turns enforcement on. Creating a dataset with auth on inserts an
+`admin` row for the creator, which means a new dataset is enforced immediately and
+its creator owns it.
+
+Organization membership (`org_members`) is deliberately *not* part of this
+ladder: only an explicit grant lets you write. The `/permissions/{user}/check`
+endpoints still report the older cascading rule and are informational.
+
+### Reads: dataset visibility
+
+Each dataset has `visibility`, `public` (the default) or `private`. Set it on
+create, or later with `PATCH /api/v1/datasets/{id}` (instance admin, or an
+`admin` grant on that dataset).
+
+`public` keeps today's behavior: reads are anonymous, no token needed.
+
+For `private`, every read that serves the dataset's content needs an instance
+admin token or a caller holding *any* grant (`read`, `write` or `admin`) on the
+dataset or on one of its branches. That covers feature listing and get, spatial
+and CQL2 queries, OGC items, GeoJSON/CSV/FlatGeobuf export, MVT tiles, history,
+diff, temporal queries, H3, similarity search, QGIS pull and layer definition,
+geoprocessing and analytics reads, sync pull, and the vertical listings — the
+check runs before the handler, keyed on every id the request names. External
+datasets are covered the same way.
+
+Unauthorized private reads answer `404`, not `403`, so a dataset id cannot be
+confirmed by probing.
+
+Dataset *enumeration* is not gated: `GET /api/v1/datasets`,
+`/api/v1/catalog/search`, `/api/v1/ogc/collections`, `/api/v1/stac/collections`
+and `/api/v1/qgis/datasets` still list a private dataset's name and id. Its
+content is not readable, but treat names as public.
+
 ## API Endpoints
 
 ### Real-Time Collaboration Relay
@@ -240,6 +305,7 @@ client but any JSON structure will work.
 | GET | `/api/v1/datasets` | List datasets |
 | POST | `/api/v1/datasets` | Create dataset |
 | GET | `/api/v1/datasets/{id}` | Get dataset |
+| PATCH | `/api/v1/datasets/{id}` | Set dataset visibility (dataset admin) |
 | GET | `/api/v1/datasets/{id}/branches` | List branches |
 | POST | `/api/v1/datasets/{id}/branches` | Create branch |
 | GET | `/api/v1/branches/{id}` | Get branch |
@@ -303,6 +369,12 @@ client but any JSON structure will work.
 | DELETE | `/api/v1/datasets/{id}/tags/{tag}` | Remove tag |
 | GET | `/api/v1/datasets/{id}/metadata` | Get dataset metadata |
 | PUT | `/api/v1/datasets/{id}/metadata` | Set dataset metadata |
+| GET | `/api/v1/datasets/{id}/permissions` | List dataset grants (admin) |
+| POST | `/api/v1/datasets/{id}/permissions` | Grant on a dataset (admin) |
+| DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (admin) |
+| GET | `/api/v1/branches/{id}/permissions` | List branch grants (admin) |
+| POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (admin) |
+| DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (admin) |
 | GET | `/api/v1/orgs` | List organizations |
 | POST | `/api/v1/orgs` | Create organization |
 | GET | `/api/v1/orgs/{id}/members` | List members |

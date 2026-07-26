@@ -25,9 +25,10 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use ptolemy_storage::StoreError;
 use uuid::Uuid;
 
-use crate::{AppState, auth::AuthEnabled, errors::store_error_status};
+use crate::{AppState, Claims, auth::AuthEnabled, errors::store_error_status};
 
 /// Every uuid the request names, in the path or in a query value.
 fn referenced_ids(uri: &axum::http::Uri) -> Vec<Uuid> {
@@ -55,6 +56,30 @@ fn not_found() -> Response {
         .into_response()
 }
 
+/// The rule itself: may this caller read the datasets these ids name?
+async fn allowed(
+    store: &AppState,
+    claims: Option<&Claims>,
+    ids: &[Uuid],
+) -> Result<bool, StoreError> {
+    if ids.is_empty() {
+        return Ok(true);
+    }
+    if claims.is_some_and(Claims::can_admin) {
+        return Ok(true);
+    }
+    let private = store.private_datasets_for_ids(ids).await?;
+    if private.is_empty() {
+        return Ok(true);
+    }
+    let Some(user_id) = claims.map(|c| c.sub.as_str()) else {
+        return Ok(false);
+    };
+    let readable = store.readable_datasets(&private, user_id).await?;
+    // every private dataset the request touches has to be granted, not just one
+    Ok(private.iter().all(|id| readable.contains(id)))
+}
+
 pub async fn visibility_middleware(
     State(store): State<AppState>,
     request: Request,
@@ -67,42 +92,31 @@ pub async fn visibility_middleware(
     }
 
     let ids = referenced_ids(request.uri());
-    if ids.is_empty() {
-        return next.run(request).await;
-    }
-
-    let private = match store.private_datasets_for_ids(&ids).await {
-        Ok(private) => private,
-        Err(e) => {
-            let (status, message) = store_error_status(&e);
-            return (status, axum::Json(serde_json::json!({"error": message}))).into_response();
-        }
-    };
-    if private.is_empty() {
-        return next.run(request).await;
-    }
-
-    let claims = request.extensions().get::<crate::Claims>();
-    if claims.is_some_and(crate::Claims::can_admin) {
-        return next.run(request).await;
-    }
-    let Some(user_id) = claims.map(|c| c.sub.clone()) else {
-        return not_found();
-    };
-
-    // every private dataset the request touches has to be granted, not just one
-    match store.readable_datasets(&private, &user_id).await {
-        Ok(readable) => {
-            if private.iter().all(|id| readable.contains(id)) {
-                next.run(request).await
-            } else {
-                not_found()
-            }
-        }
+    match allowed(&store, request.extensions().get::<Claims>(), &ids).await {
+        Ok(true) => next.run(request).await,
+        Ok(false) => not_found(),
         Err(e) => {
             let (status, message) = store_error_status(&e);
             (status, axum::Json(serde_json::json!({"error": message}))).into_response()
         }
+    }
+}
+
+/// The same rule for a handler whose dataset scope arrives in the request body,
+/// where [`visibility_middleware`] cannot see it. Denial is a `NotFound`, so the
+/// handler's own error mapping answers 404 exactly like the layer does.
+pub async fn ensure_readable(
+    store: &AppState,
+    actor: &crate::Actor,
+    ids: &[Uuid],
+) -> Result<(), StoreError> {
+    if !actor.enforces() {
+        return Ok(());
+    }
+    if allowed(store, actor.claims(), ids).await? {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound("not found".into()))
     }
 }
 

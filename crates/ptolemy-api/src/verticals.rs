@@ -185,8 +185,13 @@ struct ElevationStats {
 
 async fn survey_compare(
     State(store): State<AppState>,
+    actor: Actor,
     Json(req): Json<SurveyCompareRequest>,
 ) -> Result<Json<SurveyCompareResponse>, VerticalError> {
+    // the branch comes from the body, so the visibility layer cannot see it
+    crate::visibility::ensure_readable(&store, &actor, &[req.branch_id])
+        .await
+        .map_err(VerticalError::Store)?;
     // Fetch both surveys
     let features = store
         .list_features_paginated(req.branch_id, None, 10000)

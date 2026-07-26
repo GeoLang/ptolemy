@@ -3964,3 +3964,55 @@ async fn test_auth_disabled_ignores_visibility() {
     let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// Three read handlers take the branch id in the request body, where the
+/// visibility layer cannot see it, so they check it themselves.
+#[tokio::test]
+async fn test_body_scoped_reads_respect_visibility() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, carol) = seed_private_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let feature = Uuid::now_v7();
+
+    let calls: Vec<(&str, Value)> = vec![
+        (
+            "/api/v1/parcels/split",
+            json!({
+                "branch_id": branch_id,
+                "feature_id": feature,
+                "line": [[0.0, 0.0], [1.0, 1.0]],
+                "author": "eve"
+            }),
+        ),
+        (
+            "/api/v1/parcels/merge",
+            json!({
+                "branch_id": branch_id,
+                "feature_ids": [feature, Uuid::now_v7()],
+                "author": "eve"
+            }),
+        ),
+        (
+            "/api/v1/surveys/compare",
+            json!({
+                "branch_id": branch_id,
+                "survey_a": feature,
+                "survey_b": Uuid::now_v7()
+            }),
+        ),
+    ];
+
+    for (uri, body) in calls {
+        let (status, resp) = request_as(&app, "POST", uri, Some(&eve), Some(body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor POST {uri}: {resp}"
+        );
+
+        // the owner gets past the visibility check and into the handler, which
+        // then complains about the made-up feature ids rather than hiding the branch
+        let (status, resp) = request_as(&app, "POST", uri, Some(&carol), Some(body)).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "owner POST {uri}: {resp}");
+    }
+}
