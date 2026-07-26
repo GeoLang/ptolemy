@@ -47,6 +47,7 @@ pub mod topology;
 pub mod trajectory;
 pub mod vector_search;
 pub mod verticals;
+pub mod visibility;
 pub mod webhook;
 pub mod ws;
 
@@ -135,6 +136,12 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
         .layer(middleware::from_fn(metrics::metrics_middleware))
+        // inside the auth layer, so the token is already decoded and a bad one
+        // is a 401 before visibility ever runs
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            visibility::visibility_middleware,
+        ))
         .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

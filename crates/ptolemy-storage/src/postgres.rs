@@ -2231,10 +2231,12 @@ impl PgStore {
     ) -> Result<Vec<Feature>, StoreError> {
         let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
-                -- Find the changeset that was head at the given time
-                SELECT c.id, c.parent_id FROM changesets c
-                WHERE c.branch_id = $1 AND c.created_at <= $2
-                ORDER BY c.created_at DESC LIMIT 1
+                -- Find the changeset that was head at the given time. The
+                -- parentheses are required: postgres rejects ORDER BY / LIMIT in
+                -- a bare non-recursive term.
+                (SELECT c.id, c.parent_id FROM changesets c
+                 WHERE c.branch_id = $1 AND c.created_at <= $2
+                 ORDER BY c.created_at DESC LIMIT 1)
               UNION ALL
                 SELECT c.id, c.parent_id FROM changesets c
                 JOIN chain ch ON ch.parent_id = c.id

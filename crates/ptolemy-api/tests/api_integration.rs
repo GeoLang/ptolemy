@@ -3599,3 +3599,368 @@ async fn test_auth_disabled_ignores_permission_rows() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+// ─── Per-dataset read visibility ────────────────────────────────────
+
+/// A private dataset owned by "carol", with one feature committed and the branch
+/// id of that content. Returns (dataset id, branch id, carol's token).
+async fn seed_private_dataset(app: &axum::Router) -> (Uuid, Uuid, String) {
+    let carol = token_for_user("carol", Role::Editor);
+    let mut body = new_dataset_body();
+    body["visibility"] = json!("private");
+    let (status, dataset) =
+        request_as(app, "POST", "/api/v1/datasets", Some(&carol), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    assert_eq!(dataset["visibility"], "private", "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = commit_as(app, branch_id, &carol).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    (dataset_id, branch_id, carol)
+}
+
+/// Reads whose handler needs an optional postgres extension the test database
+/// may not have (h3-pg, pgvector). Visibility still has to gate them, so they
+/// stay in the list, but an authorized caller may legitimately get a 500.
+fn needs_optional_extension(uri: &str) -> bool {
+    uri.contains("/h3/") || uri.contains("/similarity/")
+}
+
+/// Every read path that serves content of a private dataset, so one test covers
+/// the handlers that resolve a dataset in their own way.
+fn content_read_uris(dataset_id: Uuid, branch_id: Uuid) -> Vec<String> {
+    vec![
+        format!("/api/v1/datasets/{dataset_id}"),
+        format!("/api/v1/datasets/{dataset_id}/branches"),
+        format!("/api/v1/branches/{branch_id}"),
+        format!("/api/v1/branches/{branch_id}/features"),
+        format!("/api/v1/branches/{branch_id}/features/count"),
+        format!(
+            "/api/v1/branches/{branch_id}/features/bbox?min_x=-180&min_y=-90&max_x=180&max_y=90"
+        ),
+        format!("/api/v1/branches/{branch_id}/features/at?at=2030-01-01T00:00:00Z"),
+        format!("/api/v1/branches/{branch_id}/history"),
+        format!("/api/v1/branches/{branch_id}/tiles/0/0/0"),
+        format!("/api/v1/branches/{branch_id}/export/geojson"),
+        format!("/api/v1/branches/{branch_id}/export/csv"),
+        format!("/api/v1/branches/{branch_id}/export/flatgeobuf"),
+        format!("/api/v1/branches/{branch_id}/h3/hexagons?resolution=7"),
+        format!("/api/v1/branches/{branch_id}/similarity/duplicates"),
+        format!("/api/v1/branches/{branch_id}/quality"),
+        format!("/api/v1/qgis/branches/{branch_id}/layer"),
+        format!("/api/v1/ogc/collections/{dataset_id}"),
+        format!("/api/v1/ogc/collections/{dataset_id}/items"),
+        format!("/api/v1/sync/pull?branch_id={branch_id}"),
+        format!("/api/v1/sensors?branch_id={branch_id}"),
+    ]
+}
+
+#[tokio::test]
+async fn test_private_dataset_content_is_404_for_outsiders() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_private_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    for uri in content_read_uris(dataset_id, branch_id) {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor GET {uri}: {body}"
+        );
+
+        if needs_optional_extension(&uri) {
+            continue;
+        }
+
+        // the owner and the instance admin both get real answers
+        let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+
+        let (status, body) = request_as(
+            &app,
+            "GET",
+            &uri,
+            Some(&token_for_user("root", Role::Admin)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+    }
+}
+
+/// A query-shaped POST is a read, and it is covered too.
+#[tokio::test]
+async fn test_private_dataset_query_posts_are_404_for_outsiders() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, carol) = seed_private_dataset(&app).await;
+
+    let bodies: Vec<(String, Value)> = vec![
+        (
+            format!("/api/v1/branches/{branch_id}/features/intersects"),
+            json!({"geometry": {"type": "Point", "coordinates": [1.0, 1.0]}}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/features/filter"),
+            json!({"filter": {"op": "=", "args": [{"property": "name"}, "one"]}}),
+        ),
+    ];
+
+    for (uri, body) in bodies {
+        let (status, resp) = request_as(&app, "POST", &uri, None, Some(body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "anonymous POST {uri}: {resp}"
+        );
+
+        let (status, resp) = request_as(&app, "POST", &uri, Some(&carol), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "owner POST {uri}: {resp}");
+    }
+}
+
+/// A plain read grant is enough to see a private dataset.
+#[tokio::test]
+async fn test_read_grant_opens_a_private_dataset() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _) = seed_private_dataset(&app).await;
+    let vic = token_for_user("vic", Role::Viewer);
+
+    let uri = format!("/api/v1/branches/{branch_id}/features");
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["features"].as_array().unwrap().len(), 1, "{body}");
+}
+
+/// A grant on one branch is enough for the dataset's content.
+#[tokio::test]
+async fn test_branch_grant_opens_a_private_dataset() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, _) = seed_private_dataset(&app).await;
+    let bob = token_for_user("bob", Role::Viewer);
+
+    grant(&app, "branches", branch_id, "bob", "read").await;
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/features"),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Public datasets keep serving anonymous reads, which is what the viewer's
+/// golden path depends on.
+#[tokio::test]
+async fn test_public_dataset_reads_stay_anonymous() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    assert_eq!(dataset["visibility"], "public", "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+    let (status, body) = commit_as(&app, branch_id, &carol).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for uri in content_read_uris(dataset_id, branch_id) {
+        if needs_optional_extension(&uri) {
+            continue;
+        }
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "anonymous GET {uri}: {body}");
+    }
+}
+
+/// External datasets get the same treatment: the read substitutes a derived
+/// table for the features view, but visibility is decided before that.
+#[tokio::test]
+async fn test_private_external_dataset_is_covered() {
+    let (app, state) = setup_app_authed_with_state().await;
+    create_external_fixture(&state).await;
+    let carol = token_for_user("carol", Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(json!({
+            "name": format!("ext_{}", Uuid::now_v7()),
+            "created_by": "carol",
+            "visibility": "private",
+            "external_table": "ext_parcels",
+            "external_id_column": "parcel_id",
+            "external_geometry_column": "geom",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, branches) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{branches}");
+    let branch_id =
+        Uuid::parse_str(branches.as_array().unwrap()[0]["id"].as_str().unwrap()).unwrap();
+
+    for uri in [
+        format!("/api/v1/branches/{branch_id}/features"),
+        format!("/api/v1/branches/{branch_id}/export/geojson"),
+        format!("/api/v1/ogc/collections/{dataset_id}/items"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+    }
+}
+
+/// Flipping visibility is a dataset-admin operation, and it takes effect at once.
+#[tokio::test]
+async fn test_visibility_patch_needs_a_dataset_admin_grant() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+    let uri = format!("/api/v1/datasets/{dataset_id}");
+
+    // a write grant is not enough to publish or hide someone else's dataset
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &uri,
+        Some(&token_for_user("eve", Role::Editor)),
+        Some(json!({"visibility": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &uri,
+        Some(&carol),
+        Some(json!({"visibility": "nonsense"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &uri,
+        Some(&carol),
+        Some(json!({"visibility": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["visibility"], "private", "{body}");
+
+    let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &uri,
+        Some(&carol),
+        Some(json!({"visibility": "public"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The auth layer sits outside visibility: a token that does not verify is a 401
+/// on a write, and is treated as anonymous on a read.
+#[tokio::test]
+async fn test_bad_token_does_not_reach_visibility() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, _) = seed_private_dataset(&app).await;
+
+    let (status, body) = commit_as(&app, branch_id, "not-a-jwt").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/features"),
+        Some("not-a-jwt"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// With auth off there is no identity, so visibility is not enforced either.
+#[tokio::test]
+async fn test_auth_disabled_ignores_visibility() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    state
+        .set_dataset_visibility(dataset_id, ptolemy_core::dataset::Visibility::Private)
+        .await
+        .unwrap();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
