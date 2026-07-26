@@ -736,6 +736,7 @@ fn test_dataset_creation() {
         geometry_type: GeometryType::Polygon,
         created_at: OffsetDateTime::now_utc(),
         created_by: "admin".into(),
+        external: None,
     };
     let json = serde_json::to_string(&ds).unwrap();
     let back: Dataset = serde_json::from_str(&json).unwrap();

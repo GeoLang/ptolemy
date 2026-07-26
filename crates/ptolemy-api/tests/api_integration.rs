@@ -2149,3 +2149,449 @@ async fn test_data_read_stays_public_without_token() {
         "anonymous data read must stay open: {body}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// External datasets: read-only over a PostGIS table ptolemy does not own
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A plain PostGIS table of the kind a team already has: an integer key, its
+/// own column names, no ptolemy metadata. `fresh_state` does not know about
+/// these, so each run recreates them.
+///
+/// It goes into whichever pool external reads use, so setting
+/// `PTOLEMY_EXTERNAL_DATABASE_URL` runs this whole group against a second
+/// database instead of the primary one.
+async fn create_external_fixture(state: &AppState) {
+    let pool = state.external_pool().await.unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE IF EXISTS ext_parcels CASCADE;
+         CREATE TABLE ext_parcels (
+             parcel_id integer PRIMARY KEY,
+             owner text NOT NULL,
+             assessed integer NOT NULL,
+             geom geometry(Geometry, 4326) NOT NULL
+         );
+         INSERT INTO ext_parcels (parcel_id, owner, assessed, geom) VALUES
+           (1, 'alice', 100, ST_SetSRID(ST_MakePoint(10.0, 20.0), 4326)),
+           (2, 'bob', 200, ST_SetSRID(ST_MakePoint(-30.0, -40.0), 4326)),
+           (3, 'carol', 300, ST_GeomFromText('POLYGON((0 0,0 1,1 1,1 0,0 0))', 4326));
+         DROP TABLE IF EXISTS ext_no_geom CASCADE;
+         CREATE TABLE ext_no_geom (id integer PRIMARY KEY, label text);",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn register_external(
+    app: &axum::Router,
+    table: &str,
+    id_column: &str,
+    geometry_column: &str,
+) -> (StatusCode, Value) {
+    post_json(
+        app,
+        "/api/v1/datasets",
+        json!({
+            "name": format!("ext_{}", Uuid::now_v7()),
+            "created_by": "test",
+            "external_table": table,
+            "external_id_column": id_column,
+            "external_geometry_column": geometry_column,
+        }),
+    )
+    .await
+}
+
+/// Register the fixture and return (dataset id, main branch id).
+async fn setup_external(app: &axum::Router, state: &AppState) -> (Uuid, Uuid) {
+    create_external_fixture(state).await;
+    let (status, body) = register_external(app, "ext_parcels", "parcel_id", "geom").await;
+    assert_eq!(status, StatusCode::CREATED, "register external: {body}");
+    let dataset_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let (status, branches) =
+        get_json(app, &format!("/api/v1/datasets/{dataset_id}/branches")).await;
+    assert_eq!(status, StatusCode::OK);
+    let branches = branches.as_array().unwrap();
+    assert_eq!(
+        branches.len(),
+        1,
+        "registration must create main: {branches:?}"
+    );
+    assert_eq!(branches[0]["name"], "main");
+    let branch_id = Uuid::parse_str(branches[0]["id"].as_str().unwrap()).unwrap();
+    (dataset_id, branch_id)
+}
+
+#[tokio::test]
+async fn test_external_registration_reports_the_relation() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, _) = setup_external(&app, &state).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{dataset_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["external"]["table"], "ext_parcels");
+    assert_eq!(body["external"]["id_column"], "parcel_id");
+    assert_eq!(body["external"]["geometry_column"], "geom");
+    // srid comes from the relation, not the request
+    assert_eq!(body["srid"], 4326);
+}
+
+/// An ordinary dataset must look exactly as it did before this feature.
+#[tokio::test]
+async fn test_normal_dataset_has_no_external_field() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.get("external").is_none(),
+        "external key leaked into an ordinary dataset: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_external_feature_listing_and_paging() {
+    let (app, state) = setup_app().await;
+    let (_, branch_id) = setup_external(&app, &state).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 3, "{body}");
+    // the row's own key stays visible; the geometry column does not duplicate
+    let owners: Vec<&str> = features
+        .iter()
+        .map(|f| f["properties"]["owner"].as_str().unwrap())
+        .collect();
+    assert!(
+        owners.contains(&"alice") && owners.contains(&"carol"),
+        "{owners:?}"
+    );
+    assert!(features[0]["properties"]["parcel_id"].is_number(), "{body}");
+    assert!(features[0]["properties"].get("geom").is_none(), "{body}");
+
+    // paging: one at a time, following the cursor, sees every feature once
+    let mut seen = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..3 {
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/branches/{branch_id}/features?limit=1&cursor={c}"),
+            None => format!("/api/v1/branches/{branch_id}/features?limit=1"),
+        };
+        let (status, page) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let page_features = page["features"].as_array().unwrap();
+        assert_eq!(page_features.len(), 1, "{page}");
+        seen.insert(page_features[0]["id"].as_str().unwrap().to_string());
+        cursor = page["next_cursor"].as_str().map(|s| s.to_string());
+    }
+    assert_eq!(seen.len(), 3, "paging repeated or skipped features");
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/count"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 3);
+}
+
+#[tokio::test]
+async fn test_external_bbox_filter() {
+    let (app, state) = setup_app().await;
+    let (_, branch_id) = setup_external(&app, &state).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/bbox?min_x=9&min_y=19&max_x=11&max_y=21"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let features = body.as_array().unwrap();
+    assert_eq!(features.len(), 1, "{body}");
+    assert_eq!(features[0]["properties"]["owner"], "alice");
+}
+
+#[tokio::test]
+async fn test_external_cql2_filter() {
+    let (app, state) = setup_app().await;
+    let (_, branch_id) = setup_external(&app, &state).await;
+
+    // attribute equality
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": "eq", "args": [{"property": "owner"}, "bob"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["properties"]["owner"], "bob");
+
+    // numeric comparison over the same jsonb properties
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": "gte", "args": [{"property": "assessed"}, 200]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 2, "{body}");
+
+    // spatial operator against the geometry column
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/filter"),
+        json!({"filter": {"op": "s_intersects", "args": [
+            {"property": "geometry"},
+            {"type": "Polygon", "coordinates": [[[-1.0, -1.0], [-1.0, 2.0], [2.0, 2.0], [2.0, -1.0], [-1.0, -1.0]]]}
+        ]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+    assert_eq!(body["features"][0]["properties"]["owner"], "carol");
+}
+
+#[tokio::test]
+async fn test_external_ogc_items_and_single_feature() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, _) = setup_external(&app, &state).await;
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/ogc/collections/{dataset_id}/items")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], "FeatureCollection");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 3, "{body}");
+    assert!(features[0]["geometry"]["type"].is_string(), "{body}");
+
+    // bbox variant
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items?bbox=9,19,11,21"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["features"].as_array().unwrap().len(), 1, "{body}");
+    let feature_id = body["features"][0]["id"].as_str().unwrap().to_string();
+
+    // single feature get resolves the same id the listing handed out
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items/{feature_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], feature_id);
+    assert_eq!(body["properties"]["owner"], "alice");
+
+    // an id that is not in the relation is a 404, not a 500
+    let (status, _) = get_json(
+        &app,
+        &format!(
+            "/api/v1/ogc/collections/{dataset_id}/items/{}",
+            Uuid::now_v7()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_external_geojson_export() {
+    let (app, state) = setup_app().await;
+    let (_, branch_id) = setup_external(&app, &state).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/export/geojson"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["features"].as_array().unwrap().len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn test_external_dataset_rejects_every_write() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, branch_id) = setup_external(&app, &state).await;
+
+    let insert = json!([{
+        "type": "insert",
+        "geometry_wkb_hex": "0101000000000000000000f03f0000000000000040",
+        "properties": {"owner": "mallory"}
+    }]);
+
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "commit",
+            format!("/api/v1/branches/{branch_id}/commit"),
+            json!({"message": "m", "author": "a", "operations": insert}),
+        ),
+        (
+            "batch commit",
+            format!("/api/v1/branches/{branch_id}/batch"),
+            json!({"message": "m", "author": "a", "operations": insert}),
+        ),
+        (
+            "merge",
+            format!("/api/v1/branches/{branch_id}/merge/{}", Uuid::now_v7()),
+            json!({"author": "a"}),
+        ),
+        (
+            "qgis push",
+            format!("/api/v1/qgis/branches/{branch_id}/sync"),
+            json!({
+                "message": "m",
+                "author": "a",
+                "geojson": {"type": "FeatureCollection", "features": []}
+            }),
+        ),
+        (
+            "wfs transaction",
+            format!("/api/v1/qgis/branches/{branch_id}/transaction"),
+            json!({"message": "m", "author": "a", "operations": []}),
+        ),
+        (
+            "geojson import",
+            format!("/api/v1/branches/{branch_id}/import/geojson"),
+            json!({"features": []}),
+        ),
+        (
+            "branch create",
+            format!("/api/v1/datasets/{dataset_id}/branches"),
+            json!({"name": "feature-x", "created_by": "test"}),
+        ),
+    ];
+
+    for (label, uri, body) in cases {
+        let (status, response) = post_json(&app, &uri, body).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{label} must be rejected, got {status}: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("read-only"),
+            "{label} rejection must say why: {response}"
+        );
+    }
+
+    // and nothing was written behind the rejection
+    let (_, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/count"),
+    )
+    .await;
+    assert_eq!(body["count"], 3);
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM feature_versions WHERE dataset_id = $1")
+            .bind(dataset_id)
+            .fetch_one(state.pool())
+            .await
+            .unwrap();
+    assert_eq!(versions, 0, "a write reached ptolemy's version table");
+}
+
+#[tokio::test]
+async fn test_external_registration_rejects_hostile_identifiers() {
+    let (app, state) = setup_app().await;
+    create_external_fixture(&state).await;
+
+    let hostile = [
+        "ext_parcels\"; drop table ext_parcels;--",
+        "ext_parcels'; drop table ext_parcels;--",
+        "ext_parcels; DROP TABLE ext_parcels",
+        "pg_catalog.pg_authid; --",
+        "a.b.c",
+    ];
+    for name in hostile {
+        let (status, body) = register_external(&app, name, "parcel_id", "geom").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "table {name}: {body}");
+        let (status, body) = register_external(&app, "ext_parcels", name, "geom").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "id column {name}: {body}");
+        let (status, body) = register_external(&app, "ext_parcels", "parcel_id", name).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "geometry column {name}: {body}"
+        );
+    }
+
+    // the fixture survived every attempt
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ext_parcels")
+        .fetch_one(state.external_pool().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(rows, 3);
+}
+
+#[tokio::test]
+async fn test_external_registration_probes_the_relation() {
+    let (app, state) = setup_app().await;
+    create_external_fixture(&state).await;
+
+    let (status, body) = register_external(&app, "no_such_relation", "id", "geom").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("does not exist"),
+        "{body}"
+    );
+
+    let (status, body) =
+        register_external(&app, "ext_parcels", "parcel_id", "no_such_column").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = register_external(&app, "ext_parcels", "parcel_id", "owner").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("not PostGIS geometry"),
+        "{body}"
+    );
+
+    let (status, body) = register_external(&app, "ext_no_geom", "id", "label").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn test_external_fields_are_all_or_none() {
+    let (app, state) = setup_app().await;
+    create_external_fixture(&state).await;
+
+    for partial in [
+        json!({"external_table": "ext_parcels"}),
+        json!({"external_id_column": "parcel_id"}),
+        json!({"external_table": "ext_parcels", "external_id_column": "parcel_id"}),
+        json!({"external_table": "ext_parcels", "external_geometry_column": "geom"}),
+    ] {
+        let mut body = json!({"name": format!("ext_{}", Uuid::now_v7()), "created_by": "test"});
+        for (k, v) in partial.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, response) = post_json(&app, "/api/v1/datasets", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{partial}: {response}");
+    }
+
+    // the database refuses a partial row too, in case something bypasses the API
+    let err = sqlx::query(
+        "INSERT INTO datasets (id, name, srid, geometry_type, created_by, external_table)
+         VALUES ($1, 'partial', 4326, 'point', 'test', 'ext_parcels')",
+    )
+    .bind(Uuid::now_v7())
+    .execute(state.pool())
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("datasets_external_all_or_none"),
+        "expected the CHECK constraint to fire: {err}"
+    );
+}

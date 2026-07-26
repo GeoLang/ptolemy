@@ -56,6 +56,7 @@ async fn create_test_dataset(store: &PgStore) -> Dataset {
         geometry_type: GeometryType::Point,
         created_at: OffsetDateTime::now_utc(),
         created_by: "test".to_string(),
+        external: None,
     };
     store.create_dataset(&ds).await.unwrap();
     ds
