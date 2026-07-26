@@ -2136,22 +2136,41 @@ async fn test_webhooks_read_is_admin_only() {
     assert_read_is_admin_only(&app, &uri, &admin).await;
 }
 
+/// Grant reads are not public and not for outsiders, but they are no longer
+/// role-gated: the dataset's own admin reads them too, which
+/// `test_dataset_admin_manages_only_its_own_dataset` covers.
+async fn assert_read_needs_dataset_admin(app: &axum::Router, uri: &str, admin: &str) {
+    let (status, body) = request_as(app, "GET", uri, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no-token GET {uri}: {body}"
+    );
+
+    let outsider = token_for_user("outsider", Role::Editor);
+    let (status, body) = request_as(app, "GET", uri, Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "outsider GET {uri}: {body}");
+
+    let (status, body) = request_as(app, "GET", uri, Some(admin), None).await;
+    assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+}
+
 #[tokio::test]
-async fn test_dataset_permissions_read_is_admin_only() {
+async fn test_dataset_permissions_read_needs_dataset_admin() {
     let app = setup_app_authed().await;
     let admin = token_for(Role::Admin);
     let dataset_id = create_dataset_authed(&app, &admin).await;
     let uri = format!("/api/v1/datasets/{dataset_id}/permissions");
-    assert_read_is_admin_only(&app, &uri, &admin).await;
+    assert_read_needs_dataset_admin(&app, &uri, &admin).await;
 }
 
 #[tokio::test]
-async fn test_permission_check_read_is_admin_only() {
+async fn test_permission_check_read_needs_dataset_admin() {
     let app = setup_app_authed().await;
     let admin = token_for(Role::Admin);
     let dataset_id = create_dataset_authed(&app, &admin).await;
     let uri = format!("/api/v1/datasets/{dataset_id}/permissions/some-user/check");
-    assert_read_is_admin_only(&app, &uri, &admin).await;
+    assert_read_needs_dataset_admin(&app, &uri, &admin).await;
 }
 
 #[tokio::test]
@@ -4015,4 +4034,305 @@ async fn test_body_scoped_reads_respect_visibility() {
         let (status, resp) = request_as(&app, "POST", uri, Some(&carol), Some(body)).await;
         assert_ne!(status, StatusCode::NOT_FOUND, "owner POST {uri}: {resp}");
     }
+}
+
+// ─── Dataset-admin delegation ───────────────────────────────────────
+
+/// Grant as a given caller, returning the raw status so a test can assert denial.
+async fn grant_as(
+    app: &axum::Router,
+    token: &str,
+    scope: &str,
+    id: Uuid,
+    user: &str,
+    permission: &str,
+) -> (StatusCode, Value) {
+    request_as(
+        app,
+        "POST",
+        &format!("/api/v1/{scope}/{id}/permissions"),
+        Some(token),
+        Some(json!({
+            "user_id": user,
+            "permission": permission,
+            "granted_by": "ignored",
+        })),
+    )
+    .await
+}
+
+/// The creator holds an admin grant, so it manages its own dataset's grants and
+/// its branches' grants without an instance admin token.
+#[tokio::test]
+async fn test_dataset_admin_delegates_on_its_own_dataset() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_private_dataset(&app).await;
+
+    let (status, body) = grant_as(&app, &carol, "datasets", dataset_id, "dave", "write").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "dataset grant by owner: {body}"
+    );
+
+    let (status, body) = grant_as(&app, &carol, "branches", branch_id, "dave", "admin").await;
+    assert_eq!(status, StatusCode::CREATED, "branch grant by owner: {body}");
+
+    // and reads the ACL, and the check endpoints
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/permissions"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/permissions/dave/check?required=write"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["allowed"], true, "{body}");
+
+    // the granted write user is not an admin, so it cannot delegate further
+    let (status, body) = grant_as(
+        &app,
+        &token_for_user("dave", Role::Editor),
+        "datasets",
+        dataset_id,
+        "eve",
+        "write",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "write grantee delegating: {body}"
+    );
+}
+
+/// A dataset admin's reach stops at its own dataset.
+#[tokio::test]
+async fn test_dataset_admin_cannot_touch_another_dataset() {
+    let app = setup_app_authed().await;
+    let (mine, _, carol) = seed_private_dataset(&app).await;
+
+    // a second, public dataset owned by someone else
+    let frank = token_for_user("frank", Role::Editor);
+    let (status, other) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&frank),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{other}");
+    let others = Uuid::parse_str(other["id"].as_str().unwrap()).unwrap();
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{others}/branches"),
+        Some(&frank),
+        Some(json!({"name": "main", "created_by": "frank"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let other_branch = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    // public dataset, so carol reaches the handler and is refused there
+    let (status, body) = grant_as(&app, &carol, "datasets", others, "carol", "admin").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-dataset grant: {body}");
+    let (status, body) = grant_as(&app, &carol, "branches", other_branch, "carol", "admin").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-branch grant: {body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{others}/permissions"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-dataset acl read: {body}"
+    );
+
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/datasets/{others}/permissions/frank"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-dataset revoke: {body}"
+    );
+
+    // frank's own dataset is untouched, and carol still owns hers
+    let (status, body) = grant_as(&app, &carol, "datasets", mine, "dave", "read").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // a private dataset answers 404 instead, so its id is not confirmed
+    let (_, hidden, _) = seed_private_dataset(&app).await;
+    let hidden_ds = Uuid::parse_str(
+        request_as(
+            &app,
+            "GET",
+            &format!("/api/v1/branches/{hidden}"),
+            Some(&token_for_user("root", Role::Admin)),
+            None,
+        )
+        .await
+        .1["dataset_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let (status, body) = grant_as(&app, &frank, "datasets", hidden_ds, "frank", "admin").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "private cross-dataset: {body}"
+    );
+}
+
+/// The instance admin role keeps working everywhere, including on a dataset with
+/// no rows at all, which has no dataset admin to delegate to.
+#[tokio::test]
+async fn test_instance_admin_still_grants_anywhere() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    let root = token_for_user("root", Role::Admin);
+
+    // nobody holds an admin grant here, so an ordinary editor cannot start one
+    let (status, body) = grant_as(
+        &app,
+        &token_for_user("eve", Role::Editor),
+        "datasets",
+        dataset_id,
+        "eve",
+        "admin",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "self-grant on unowned: {body}"
+    );
+
+    let (status, body) = grant_as(&app, &root, "datasets", dataset_id, "alice", "admin").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = grant_as(&app, &root, "branches", branch_id, "alice", "write").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Revoking may not strand a dataset: not its last admin row, and not its last
+/// row of any kind, which would drop it back to any-editor-writable.
+#[tokio::test]
+async fn test_revoke_cannot_strand_a_dataset() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, carol) = seed_private_dataset(&app).await;
+    let root = token_for_user("root", Role::Admin);
+    let revoke = |token: String, user: &str| {
+        let uri = format!("/api/v1/datasets/{dataset_id}/permissions/{user}");
+        let app = app.clone();
+        async move { request_as(&app, "DELETE", &uri, Some(&token), None).await }
+    };
+
+    // carol is the only row and the only admin: refused, for her and for root
+    let (status, body) = revoke(carol.clone(), "carol").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "self-revoke: {body}");
+    let (status, body) = revoke(root.clone(), "carol").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "root revoking last admin: {body}"
+    );
+
+    // a second, non-admin row does not make the admin removable
+    grant_as(&app, &carol, "datasets", dataset_id, "dave", "write").await;
+    let (status, body) = revoke(carol.clone(), "carol").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "last admin with a write row: {body}"
+    );
+
+    // dave is removable, but then he is the last row again once carol goes
+    let (status, body) = revoke(carol.clone(), "dave").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // promote dave, and now carol can step down
+    grant_as(&app, &carol, "datasets", dataset_id, "dave", "admin").await;
+    let (status, body) = revoke(carol.clone(), "carol").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "step down: {body}");
+
+    // and carol has really lost the dataset
+    let (status, body) = grant_as(&app, &carol, "datasets", dataset_id, "carol", "admin").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "after stepping down: {body}");
+
+    // dave, the remaining admin, cannot remove himself either
+    let (status, body) = revoke(token_for_user("dave", Role::Editor), "dave").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // revoking a user who has no row is a no-op, not a lockout error
+    let (status, body) = revoke(token_for_user("dave", Role::Editor), "nobody").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Branch rows carry no such rule: removing them all falls back to the dataset
+/// scope, which is still enforced.
+#[tokio::test]
+async fn test_branch_revoke_has_no_lockout_rule() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, carol) = seed_private_dataset(&app).await;
+
+    grant_as(&app, &carol, "branches", branch_id, "dave", "admin").await;
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/branches/{branch_id}/permissions/dave"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// With auth off the endpoints stay open, as the rest of dev mode does.
+#[tokio::test]
+async fn test_auth_disabled_skips_delegation_checks() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, _) = seed_unowned_dataset(&state).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        json!({"user_id": "alice", "permission": "admin", "granted_by": "dev"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }

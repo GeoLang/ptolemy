@@ -94,6 +94,9 @@ impl Role {
 pub enum Access {
     /// No token needed.
     Public,
+    /// Any valid token. For routes whose authorization is per-dataset and so
+    /// cannot be decided from the path: the handler does it.
+    Authenticated,
     /// Valid token with role `editor` or `admin`.
     Write,
     /// Valid token with role `admin`.
@@ -112,12 +115,19 @@ const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
 /// POSTs are public; privilege and delivery-config changes are admin-only;
 /// everything else that mutates needs write access.
 pub fn classify(method: &Method, path: &str) -> Access {
-    // permissions, org membership, webhook config and audit are ACL/config that
-    // both hand out access and exfiltrate data, so they are admin-only for every
-    // method. This must sit above the read-is-public rule below, or an anonymous
-    // GET would leak the ACL, hook list, or membership.
-    if path.contains("/permissions")
-        || path.contains("/webhooks")
+    // Grant management is authorized per dataset, not per role: the holder of an
+    // `admin` grant manages their own dataset. The path alone cannot decide that,
+    // so any valid token gets through to the handler, which enforces
+    // instance-admin-or-dataset-admin and answers 403 otherwise. This still has
+    // to sit above the read-is-public rule, or an anonymous GET would leak the ACL.
+    if path.contains("/permissions") {
+        return Access::Authenticated;
+    }
+
+    // webhook config, org membership and audit are ACL/config that both hand out
+    // access and exfiltrate data, and have no per-dataset owner to delegate to,
+    // so they stay admin-only for every method.
+    if path.contains("/webhooks")
         || path.starts_with("/api/v1/orgs")
         || path.starts_with("/api/v1/audit")
     {
@@ -300,6 +310,8 @@ pub async fn auth_middleware(
 
     let allowed = match access {
         Access::Public => true,
+        // an unknown role string is still not a role, so it gets nothing
+        Access::Authenticated => claims.parsed_role().is_some(),
         Access::Write => claims.can_write(),
         Access::Admin => claims.can_admin(),
     };
@@ -308,6 +320,7 @@ pub async fn auth_middleware(
             StatusCode::FORBIDDEN,
             match access {
                 Access::Admin => "admin role required",
+                Access::Authenticated => "unknown role",
                 _ => "editor or admin role required",
             },
         );
@@ -501,8 +514,6 @@ mod tests {
         for (method, path) in [
             (Method::POST, "/api/v1/datasets/x/webhooks"),
             (Method::DELETE, "/api/v1/webhooks/x"),
-            (Method::POST, "/api/v1/datasets/x/permissions"),
-            (Method::DELETE, "/api/v1/branches/x/permissions/u"),
             (Method::POST, "/api/v1/orgs"),
             (Method::DELETE, "/api/v1/orgs/x/members/u"),
             (Method::POST, "/api/v1/replication/peers"),
@@ -517,9 +528,6 @@ mod tests {
     fn classify_sensitive_reads_are_admin() {
         for path in [
             "/api/v1/datasets/x/webhooks",
-            "/api/v1/datasets/x/permissions",
-            "/api/v1/datasets/x/permissions/u/check",
-            "/api/v1/branches/x/permissions",
             "/api/v1/orgs",
             "/api/v1/orgs/x/members",
             "/api/v1/audit",
@@ -547,6 +555,29 @@ mod tests {
             classify(&Method::POST, "/api/v1/datasets/x/events"),
             Access::Write
         );
+    }
+
+    /// Grant management cannot be decided from the path: a dataset admin manages
+    /// their own dataset, so the handler authorizes and any valid token gets in.
+    /// It must still never be Public, or an anonymous GET would dump the ACL.
+    #[test]
+    fn classify_permission_routes_need_a_token_not_a_role() {
+        for (method, path) in [
+            (Method::GET, "/api/v1/datasets/x/permissions"),
+            (Method::POST, "/api/v1/datasets/x/permissions"),
+            (Method::DELETE, "/api/v1/datasets/x/permissions/u"),
+            (Method::GET, "/api/v1/datasets/x/permissions/u/check"),
+            (Method::GET, "/api/v1/branches/x/permissions"),
+            (Method::POST, "/api/v1/branches/x/permissions"),
+            (Method::DELETE, "/api/v1/branches/x/permissions/u"),
+            (Method::GET, "/api/v1/branches/x/permissions/u/check"),
+        ] {
+            assert_eq!(
+                classify(&method, path),
+                Access::Authenticated,
+                "{method} {path}"
+            );
+        }
     }
 
     #[test]

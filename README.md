@@ -214,8 +214,31 @@ why that mode is for development only.
 
 Grants are rows in `dataset_permissions` and `branch_permissions`, one per user
 per scope, with permission `read`, `write` or `admin` (admin > write > read).
-Grant and revoke through the `/permissions` endpoints, which need an `admin`
-token.
+
+### Who manages grants
+
+The `/permissions` endpoints need a valid token but not the `admin` role, because
+delegation is per dataset. A caller gets in if it holds the instance `admin` role,
+or an `admin` grant on the dataset in question — which also covers grants on that
+dataset's branches. Anything else is `403` (or `404` if the dataset is private and
+the caller has no grant on it, so ids are not confirmed).
+
+A branch-level `admin` grant does **not** carry delegation: it would let a branch
+grantee widen their own scope.
+
+A dataset with no rows has no dataset admin, so only an instance admin can make
+the first grant. Normally the creator auto-grant supplies one.
+
+Revoking is refused in two cases, for everyone including instance admins:
+
+- removing the dataset's last `admin` row, which would leave nobody able to
+  manage its grants;
+- removing its last row of any kind, which would drop the dataset back to "no
+  rows means open" and quietly hand write access to every editor.
+
+Grant a replacement first, then revoke. Stepping down as owner is
+grant-then-revoke, in that order. Branch rows have no such rule: removing them
+all just falls back to the dataset scope, which is still enforced.
 
 ### Writes
 
@@ -369,12 +392,12 @@ client but any JSON structure will work.
 | DELETE | `/api/v1/datasets/{id}/tags/{tag}` | Remove tag |
 | GET | `/api/v1/datasets/{id}/metadata` | Get dataset metadata |
 | PUT | `/api/v1/datasets/{id}/metadata` | Set dataset metadata |
-| GET | `/api/v1/datasets/{id}/permissions` | List dataset grants (admin) |
-| POST | `/api/v1/datasets/{id}/permissions` | Grant on a dataset (admin) |
-| DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (admin) |
-| GET | `/api/v1/branches/{id}/permissions` | List branch grants (admin) |
-| POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (admin) |
-| DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (admin) |
+| GET | `/api/v1/datasets/{id}/permissions` | List dataset grants (dataset admin) |
+| POST | `/api/v1/datasets/{id}/permissions` | Grant on a dataset (dataset admin) |
+| DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (dataset admin) |
+| GET | `/api/v1/branches/{id}/permissions` | List branch grants (dataset admin) |
+| POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (dataset admin) |
+| DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (dataset admin) |
 | GET | `/api/v1/orgs` | List organizations |
 | POST | `/api/v1/orgs` | Create organization |
 | GET | `/api/v1/orgs/{id}/members` | List members |

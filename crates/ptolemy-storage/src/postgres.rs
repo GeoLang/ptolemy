@@ -2723,16 +2723,52 @@ impl PgStore {
         })
     }
 
+    /// Revoking is refused when it would strand the dataset: removing its last
+    /// `admin` row leaves nobody able to manage grants, and removing its last row
+    /// of any kind drops it back to "no rows means open", quietly handing write
+    /// access to every editor. Grant a replacement first. The rule binds instance
+    /// admins too, because the second case is a downgrade of the dataset's
+    /// protection rather than a question of who is asking.
     pub async fn revoke_dataset_permission(
         &self,
         dataset_id: Uuid,
         user_id: &str,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // locked, so two concurrent revokes cannot each see the other's row and
+        // both conclude a second admin remains
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT user_id, permission FROM dataset_permissions
+              WHERE dataset_id = $1 FOR UPDATE",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let target_exists = rows.iter().any(|(u, _)| u == user_id);
+        if target_exists {
+            if rows.len() == 1 {
+                return Err(StoreError::Forbidden(format!(
+                    "{user_id} holds the only permission row on dataset {dataset_id}: revoking it \
+                     would reopen the dataset to every editor. Grant someone else first."
+                )));
+            }
+            let admins = rows.iter().filter(|(_, p)| p == "admin").count();
+            let target_is_admin = rows.iter().any(|(u, p)| u == user_id && p == "admin");
+            if target_is_admin && admins == 1 {
+                return Err(StoreError::Forbidden(format!(
+                    "{user_id} is the only admin of dataset {dataset_id}: revoking it would leave \
+                     nobody able to manage its permissions. Grant another admin first."
+                )));
+            }
+        }
+
         sqlx::query("DELETE FROM dataset_permissions WHERE dataset_id = $1 AND user_id = $2")
             .bind(dataset_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

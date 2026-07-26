@@ -12,7 +12,7 @@
 //! itself, so the layer resolves every uuid the request names.
 //!
 //! An id may name a dataset, a branch, a changeset, a merge request or a
-//! feature: [`PgStore::private_datasets_for_ids`] resolves all five to a
+//! feature: the store's `private_datasets_for_ids` resolves all five to a
 //! dataset. A request that names none of them has no dataset in scope and
 //! passes, and so does a request that names only public ones.
 //!
