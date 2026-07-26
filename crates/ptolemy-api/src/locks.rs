@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get},
@@ -65,13 +65,24 @@ async fn lock_feature(
     Ok(StatusCode::CREATED)
 }
 
+/// A DELETE carries no body, so this is the stand-in for `locked_by`: it only
+/// matters with auth off, since the token subject wins when there is one.
+#[derive(Deserialize)]
+struct UnlockQuery {
+    #[serde(default)]
+    actor: String,
+}
+
+/// The storage layer only unlocks when the actor matches `locked_by`, so this
+/// must resolve the same identity [`lock_feature`] recorded.
 async fn unlock_feature(
     State(store): State<AppState>,
     Path((branch_id, feature_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<UnlockQuery>,
+    actor: Actor,
 ) -> Result<StatusCode, LockError> {
-    // In production, actor would come from auth token
     store
-        .unlock_feature(feature_id, branch_id, "system")
+        .unlock_feature(feature_id, branch_id, actor.or_body(&q.actor))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

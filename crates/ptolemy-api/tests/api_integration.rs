@@ -1140,19 +1140,29 @@ async fn test_feature_locking() {
     let (status, body) = post_json(
         &app,
         &format!("/api/v1/branches/{branch_id}/locks"),
-        json!({"feature_id": f1.to_string(), "owner": "alice"}),
+        json!({"feature_id": f1.to_string(), "locked_by": "alice"}),
     )
     .await;
-    assert!(
-        status == StatusCode::CREATED
-            || status == StatusCode::OK
-            || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "lock: {status} {body}"
-    );
+    assert_eq!(status, StatusCode::CREATED, "lock: {body}");
 
     // List locks
     let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/locks")).await;
     assert_eq!(status, StatusCode::OK, "list locks: {body}");
+    assert_eq!(body[0]["locked_by"], "alice", "{body}");
+
+    // With auth off the query param is the actor, so alice can release her lock
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/branches/{branch_id}/locks/{f1}?actor=alice"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "unlock: {body}");
+
+    let (_, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/locks")).await;
+    assert_eq!(body.as_array().unwrap().len(), 0, "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2903,6 +2913,148 @@ async fn test_no_auth_keeps_body_author() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{commit}");
     assert_eq!(commit["author"], "field-surveyor", "{commit}");
+}
+
+// ─── Feature locks are owned by the token subject ────────────────────
+//
+// unlock_feature used to send a hardcoded "system" actor, and the storage layer
+// refuses to unlock when it does not match `locked_by`, so nobody could release
+// their own lock over HTTP.
+
+/// Dataset, branch and one committed feature in an auth-enabled app.
+async fn locked_branch(app: &axum::Router, token: &str) -> (Uuid, Uuid) {
+    let (_, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(token),
+        Some(new_dataset_body()),
+    )
+    .await;
+    let dataset_id = dataset["id"].as_str().unwrap();
+    let (_, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(token),
+        Some(json!({"name": "main", "created_by": "x"})),
+    )
+    .await;
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let feature_id = Uuid::now_v7();
+    let (status, commit) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(token),
+        Some(json!({
+            "message": "seed",
+            "author": "x",
+            "operations": [{
+                "type": "insert",
+                "feature_id": feature_id,
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {"name": "one"}
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{commit}");
+
+    (branch_id, feature_id)
+}
+
+/// Take a lock as `token`'s subject. The body `locked_by` is deliberately wrong,
+/// to prove the token subject is what gets recorded.
+async fn take_lock(app: &axum::Router, branch_id: Uuid, feature_id: Uuid, token: &str) {
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/locks"),
+        Some(token),
+        Some(json!({"feature_id": feature_id, "locked_by": "someone-else"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "lock: {body}");
+}
+
+#[tokio::test]
+async fn test_lock_owner_can_unlock_own_lock() {
+    let app = setup_app_authed().await;
+    let owner = token_for_sub("lock-owner", Role::Editor);
+    let (branch_id, feature_id) = locked_branch(&app, &owner).await;
+    take_lock(&app, branch_id, feature_id, &owner).await;
+
+    let (status, locks) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/locks"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{locks}");
+    assert_eq!(locks[0]["locked_by"], "lock-owner", "{locks}");
+
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/branches/{branch_id}/locks/{feature_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "unlock: {body}");
+
+    let (_, locks) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/locks"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(locks.as_array().unwrap().len(), 0, "{locks}");
+}
+
+#[tokio::test]
+async fn test_lock_cannot_be_released_by_another_user() {
+    let app = setup_app_authed().await;
+    let owner = token_for_sub("lock-owner", Role::Editor);
+    let intruder = token_for_sub("intruder", Role::Editor);
+    let (branch_id, feature_id) = locked_branch(&app, &owner).await;
+    take_lock(&app, branch_id, feature_id, &owner).await;
+
+    let uri = format!("/api/v1/branches/{branch_id}/locks/{feature_id}");
+
+    let (status, body) = request_as(&app, "DELETE", &uri, Some(&intruder), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "intruder unlock: {body}");
+
+    // and the query param cannot be used to claim the owner's name
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("{uri}?actor=lock-owner"),
+        Some(&intruder),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "spoofed actor unlock: {body}");
+
+    let (_, locks) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/locks"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        locks.as_array().unwrap().len(),
+        1,
+        "lock must survive: {locks}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

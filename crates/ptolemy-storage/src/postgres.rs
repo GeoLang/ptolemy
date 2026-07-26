@@ -2111,6 +2111,10 @@ impl PgStore {
         duration_minutes: i64,
         reason: Option<&str>,
     ) -> Result<(), StoreError> {
+        // make_interval's mins is int4, and a lock is short-lived by design, so
+        // clamp rather than let a caller's duration overflow the interval
+        let mins = duration_minutes.clamp(1, 60 * 24 * 30) as i32;
+
         // Clean up expired locks first
         sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
             .execute(&self.pool)
@@ -2140,7 +2144,7 @@ impl PgStore {
             )
             .bind(feature_id)
             .bind(branch_id)
-            .bind(duration_minutes as f64)
+            .bind(mins)
             .bind(reason)
             .execute(&self.pool)
             .await?;
@@ -2152,7 +2156,7 @@ impl PgStore {
             .bind(feature_id)
             .bind(branch_id)
             .bind(locked_by)
-            .bind(duration_minutes as f64)
+            .bind(mins)
             .bind(reason)
             .execute(&self.pool)
             .await?;
