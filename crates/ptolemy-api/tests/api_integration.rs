@@ -2140,6 +2140,50 @@ async fn test_metrics_read_is_admin_only() {
 }
 
 #[tokio::test]
+async fn test_dataset_events_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/events");
+    assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+#[tokio::test]
+async fn test_replication_feed_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&admin),
+        Some(json!({"name": "main", "created_by": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = branch["id"].as_str().unwrap();
+    let uri = format!("/api/v1/replication/feed/{branch_id}");
+    assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+/// The lrs endpoint that shares the `/events` suffix is map data and stays open.
+#[tokio::test]
+async fn test_route_events_read_stays_public() {
+    let app = setup_app_authed().await;
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/routes/{}/events", Uuid::now_v7()),
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
 async fn test_data_read_stays_public_without_token() {
     let app = setup_app_authed().await;
     let (status, body) = request_as(&app, "GET", "/api/v1/datasets", None, None).await;

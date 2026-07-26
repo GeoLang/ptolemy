@@ -131,6 +131,21 @@ pub fn classify(method: &Method, path: &str) -> Access {
     }
 
     if *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS {
+        // Two reads that are diagnostics and bulk replication, not map data, so
+        // the anonymous-viewer decision does not cover them.
+
+        // dataset event history is webhook delivery diagnostics: it carries the
+        // payloads that were sent and the traffic shape. lrs has
+        // /routes/{id}/events, map data with the same suffix, so the dataset
+        // prefix is part of the match. Emitting an event stays a normal write.
+        if path.starts_with("/api/v1/datasets/") && path.ends_with("/events") {
+            return Access::Admin;
+        }
+        // the change feed dumps every change on a branch for a replication peer,
+        // and registering a peer is already admin-only
+        if path.starts_with("/api/v1/replication/feed") {
+            return Access::Admin;
+        }
         return Access::Public;
     }
 
@@ -451,6 +466,27 @@ mod tests {
         ] {
             assert_eq!(classify(&Method::GET, path), Access::Admin, "GET {path}");
         }
+    }
+
+    /// Delivery history and the replication feed are reads, but diagnostics and
+    /// bulk change data rather than map data.
+    #[test]
+    fn classify_diagnostic_reads_are_admin() {
+        for path in ["/api/v1/datasets/x/events", "/api/v1/replication/feed/x"] {
+            assert_eq!(classify(&Method::GET, path), Access::Admin, "GET {path}");
+            assert_eq!(classify(&Method::HEAD, path), Access::Admin, "HEAD {path}");
+        }
+
+        // lrs route events share the suffix but are map data
+        assert_eq!(
+            classify(&Method::GET, "/api/v1/routes/x/events"),
+            Access::Public
+        );
+        // emitting an event is still an ordinary write, not admin
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/datasets/x/events"),
+            Access::Write
+        );
     }
 
     #[test]
