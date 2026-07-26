@@ -10,7 +10,6 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -18,7 +17,7 @@ use ptolemy_storage::{CompactionResult, CompactionRun};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn compaction_routes() -> Router<AppState> {
     Router::new()
@@ -40,10 +39,13 @@ fn default_keep() -> i32 {
 async fn compact_branch(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactionResult>, CompactionError> {
     let keep = req.keep_latest.max(1); // never keep less than 1
-    let result = store.compact_versions(branch_id, keep).await?;
+    let result = store
+        .compact_versions(branch_id, keep, &actor.writer())
+        .await?;
     Ok(Json(result))
 }
 
@@ -71,10 +73,10 @@ impl From<ptolemy_storage::StoreError> for CompactionError {
 impl IntoResponse for CompactionError {
     fn into_response(self) -> Response {
         match self {
-            Self::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg).into_response()
+            Self::Store(e) => {
+                let (status, message) = crate::errors::store_error_status(&e);
+                (status, message).into_response()
             }
-            Self::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     }
 }

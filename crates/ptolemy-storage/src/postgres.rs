@@ -4,10 +4,11 @@
 
 //! PostgreSQL/PostGIS backend for the versioned feature store.
 
+use crate::permission::{Check, Scope, Writer, permission_level, write_allowed};
 use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
-use ptolemy_core::dataset::{Dataset, GeometryType};
+use ptolemy_core::dataset::{Dataset, GeometryType, Visibility};
 use ptolemy_core::diff::{Diff, DiffOp};
 use ptolemy_core::event::{Event, Webhook};
 use ptolemy_core::external::{ExternalSource, ExternalTable};
@@ -28,6 +29,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 /// Columns every read query needs from `latest`.
@@ -101,12 +104,22 @@ impl PgStore {
 
     // ─── Dataset CRUD ───────────────────────────────────────────────
 
-    pub async fn create_dataset(&self, ds: &Dataset) -> Result<(), StoreError> {
+    /// Create a dataset. `grant_admin_to` is the verified creator identity when
+    /// auth is on: it gets an admin permission row in the same transaction, so a
+    /// dataset is never left with content but no owner. `None` (auth off) leaves
+    /// the dataset with no rows, which keeps it open to any editor.
+    pub async fn create_dataset(
+        &self,
+        ds: &Dataset,
+        grant_admin_to: Option<&str>,
+    ) -> Result<(), StoreError> {
         let geom_type = format!("{:?}", ds.geometry_type).to_lowercase();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by,
-                                   external_table, external_id_column, external_geometry_column)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                   external_table, external_id_column, external_geometry_column,
+                                   visibility)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(ds.id)
         .bind(&ds.name)
@@ -117,8 +130,13 @@ impl PgStore {
         .bind(ds.external.as_ref().map(|e| e.table()))
         .bind(ds.external.as_ref().map(|e| e.id_column()))
         .bind(ds.external.as_ref().map(|e| e.geometry_column()))
-        .execute(&self.pool)
+        .bind(ds.visibility.as_str())
+        .execute(&mut *tx)
         .await?;
+        if let Some(creator) = grant_admin_to {
+            insert_creator_admin_grant(&mut tx, ds.id, creator).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -126,7 +144,11 @@ impl PgStore {
     /// dataset and its `main` branch together so list/branch endpoints work
     /// like they do for a versioned dataset. `srid` is taken from the relation
     /// itself, not from the request, because the relation is the truth.
-    pub async fn register_external_dataset(&self, ds: &Dataset) -> Result<Dataset, StoreError> {
+    pub async fn register_external_dataset(
+        &self,
+        ds: &Dataset,
+        grant_admin_to: Option<&str>,
+    ) -> Result<Dataset, StoreError> {
         let table = ds
             .external
             .as_ref()
@@ -140,8 +162,9 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by,
-                                   external_table, external_id_column, external_geometry_column)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                                   external_table, external_id_column, external_geometry_column,
+                                   visibility)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(ds.id)
         .bind(&ds.name)
@@ -152,6 +175,7 @@ impl PgStore {
         .bind(table.table())
         .bind(table.id_column())
         .bind(table.geometry_column())
+        .bind(ds.visibility.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -165,6 +189,10 @@ impl PgStore {
         .bind(&ds.created_by)
         .execute(&mut *tx)
         .await?;
+
+        if let Some(creator) = grant_admin_to {
+            insert_creator_admin_grant(&mut tx, ds.id, creator).await?;
+        }
 
         tx.commit().await?;
         Ok(ds)
@@ -287,34 +315,77 @@ impl PgStore {
             .map(Option::flatten)
     }
 
-    /// Reject any mutation aimed at an external dataset. One place, so a write
-    /// path is read-only by being routed through it rather than by remembering
-    /// to check.
-    pub async fn ensure_dataset_writable(&self, dataset_id: Uuid) -> Result<(), StoreError> {
+    /// Reject any mutation aimed at an external dataset, and any writer the
+    /// dataset's permission rows do not allow. One place, so a write path is
+    /// guarded by being routed through it rather than by remembering to check.
+    pub async fn ensure_dataset_writable(
+        &self,
+        dataset_id: Uuid,
+        writer: &Writer,
+    ) -> Result<(), StoreError> {
         let external: Option<String> =
             sqlx::query_scalar("SELECT external_table FROM datasets WHERE id = $1")
                 .bind(dataset_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten();
-        match external {
-            Some(_) => Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into())),
-            None => Ok(()),
+        if external.is_some() {
+            return Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into()));
+        }
+
+        let user_id = match writer.check() {
+            Check::Skip => return Ok(()),
+            Check::Deny => return Err(denied_dataset(dataset_id)),
+            Check::Ladder(id) => id,
+        };
+        let dataset = dataset_scope(&self.pool, dataset_id, user_id).await?;
+        if write_allowed(&Scope::open(), &dataset) {
+            Ok(())
+        } else {
+            Err(denied_dataset(dataset_id))
         }
     }
 
-    pub async fn ensure_branch_writable(&self, branch_id: Uuid) -> Result<(), StoreError> {
-        let external: Option<String> = sqlx::query_scalar(
-            "SELECT d.external_table FROM branches b JOIN datasets d ON d.id = b.dataset_id
+    pub async fn ensure_branch_writable(
+        &self,
+        branch_id: Uuid,
+        writer: &Writer,
+    ) -> Result<(), StoreError> {
+        let row = sqlx::query(
+            "SELECT d.id AS dataset_id, d.external_table
+             FROM branches b JOIN datasets d ON d.id = b.dataset_id
              WHERE b.id = $1",
         )
         .bind(branch_id)
         .fetch_optional(&self.pool)
         .await?
-        .flatten();
-        match external {
-            Some(_) => Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into())),
-            None => Ok(()),
+        .ok_or_else(|| StoreError::NotFound(format!("branch {branch_id}")))?;
+
+        if row.get::<Option<String>, _>("external_table").is_some() {
+            return Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into()));
+        }
+        self.ensure_branch_write_allowed(branch_id, row.get("dataset_id"), writer)
+            .await
+    }
+
+    /// The write ladder on its own, for callers that already proved the target
+    /// is not external.
+    async fn ensure_branch_write_allowed(
+        &self,
+        branch_id: Uuid,
+        dataset_id: Uuid,
+        writer: &Writer,
+    ) -> Result<(), StoreError> {
+        let user_id = match writer.check() {
+            Check::Skip => return Ok(()),
+            Check::Deny => return Err(denied_branch(branch_id)),
+            Check::Ladder(id) => id,
+        };
+        let (branch, dataset) = write_scopes(&self.pool, branch_id, dataset_id, user_id).await?;
+        if write_allowed(&branch, &dataset) {
+            Ok(())
+        } else {
+            Err(denied_branch(branch_id))
         }
     }
 
@@ -348,7 +419,7 @@ impl PgStore {
     pub async fn get_dataset(&self, id: Uuid) -> Result<Dataset, StoreError> {
         let row = sqlx::query(
             "SELECT id, name, srid, geometry_type, created_at, created_by,
-                    external_table, external_id_column, external_geometry_column
+                    external_table, external_id_column, external_geometry_column, visibility
              FROM datasets WHERE id = $1",
         )
         .bind(id)
@@ -362,7 +433,7 @@ impl PgStore {
     pub async fn list_datasets(&self) -> Result<Vec<Dataset>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, name, srid, geometry_type, created_at, created_by,
-                    external_table, external_id_column, external_geometry_column
+                    external_table, external_id_column, external_geometry_column, visibility
              FROM datasets ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -371,10 +442,93 @@ impl PgStore {
         rows.into_iter().map(dataset_from_row).collect()
     }
 
+    /// Set a dataset's visibility. Only an instance admin or a holder of an
+    /// `admin` permission row on the dataset may call this; the caller enforces
+    /// that, this is the write itself.
+    pub async fn set_dataset_visibility(
+        &self,
+        id: Uuid,
+        visibility: Visibility,
+    ) -> Result<Dataset, StoreError> {
+        let affected = sqlx::query("UPDATE datasets SET visibility = $2 WHERE id = $1")
+            .bind(id)
+            .bind(visibility.as_str())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::NotFound(format!("dataset {id}")));
+        }
+        self.get_dataset(id).await
+    }
+
+    /// Whether the caller holds an `admin` permission row on a dataset. Used to
+    /// decide who may change its visibility.
+    pub async fn is_dataset_admin(&self, id: Uuid, user_id: &str) -> Result<bool, StoreError> {
+        let perm: Option<String> = sqlx::query_scalar(
+            "SELECT permission FROM dataset_permissions WHERE dataset_id = $1 AND user_id = $2",
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(perm.as_deref().map(permission_level).unwrap_or(0) >= permission_level("admin"))
+    }
+
+    // ─── Visibility enforcement (read paths) ────────────────────────
+
+    /// The private datasets any of `ids` refers to. An id may name a dataset, a
+    /// branch, a changeset, a merge request or a feature, because that is the
+    /// full set of ways a request identifies dataset content. Public datasets are
+    /// left out, so an empty result means nothing to enforce.
+    pub async fn private_datasets_for_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT d.id FROM datasets d WHERE d.visibility = 'private' AND (
+                 d.id = ANY($1)
+                 OR EXISTS (SELECT 1 FROM branches b
+                             WHERE b.dataset_id = d.id AND b.id = ANY($1))
+                 OR EXISTS (SELECT 1 FROM changesets c JOIN branches b ON b.id = c.branch_id
+                             WHERE b.dataset_id = d.id AND c.id = ANY($1))
+                 OR EXISTS (SELECT 1 FROM merge_requests m
+                             WHERE m.dataset_id = d.id AND m.id = ANY($1))
+                 OR EXISTS (SELECT 1 FROM feature_versions fv
+                             WHERE fv.dataset_id = d.id AND fv.feature_id = ANY($1))
+             )",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("id")).collect())
+    }
+
+    /// Which of `dataset_ids` this user holds any permission row on, counting a
+    /// row on one of the dataset's branches. Org membership does not count: only
+    /// an explicit grant opens a private dataset.
+    pub async fn readable_datasets(
+        &self,
+        dataset_ids: &[Uuid],
+        user_id: &str,
+    ) -> Result<Vec<Uuid>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT dataset_id FROM dataset_permissions
+              WHERE dataset_id = ANY($1) AND user_id = $2
+             UNION
+             SELECT b.dataset_id FROM branch_permissions bp
+               JOIN branches b ON b.id = bp.branch_id
+              WHERE b.dataset_id = ANY($1) AND bp.user_id = $2",
+        )
+        .bind(dataset_ids)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("dataset_id")).collect())
+    }
+
     // ─── Branch CRUD ────────────────────────────────────────────────
 
-    pub async fn create_branch(&self, branch: &Branch) -> Result<(), StoreError> {
-        self.ensure_dataset_writable(branch.dataset_id).await?;
+    pub async fn create_branch(&self, branch: &Branch, writer: &Writer) -> Result<(), StoreError> {
+        self.ensure_dataset_writable(branch.dataset_id, writer)
+            .await?;
         sqlx::query(
             "INSERT INTO branches (id, dataset_id, name, head, created_at, created_by)
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -473,11 +627,12 @@ impl PgStore {
         message: &str,
         author: &str,
         operations: &[DiffOp],
+        writer: &Writer,
     ) -> Result<Changeset, StoreError> {
         let mut tx = self.pool.begin().await?;
 
-        // Get current branch head. The external check rides along on the row
-        // lock, so no commit can slip past it.
+        // Get current branch head. The external and permission checks ride along
+        // on the row lock, so no commit can slip past them.
         let branch_row = sqlx::query(
             "SELECT b.head, b.dataset_id, d.external_table
              FROM branches b JOIN datasets d ON d.id = b.dataset_id
@@ -494,6 +649,18 @@ impl PgStore {
         }
         let parent_id: Option<Uuid> = branch_row.get("head");
         let dataset_id: Uuid = branch_row.get("dataset_id");
+
+        match writer.check() {
+            Check::Skip => {}
+            Check::Deny => return Err(denied_branch(branch_id)),
+            Check::Ladder(user_id) => {
+                let (branch, dataset) =
+                    write_scopes(&mut *tx, branch_id, dataset_id, user_id).await?;
+                if !write_allowed(&branch, &dataset) {
+                    return Err(denied_branch(branch_id));
+                }
+            }
+        }
 
         // Create changeset
         let changeset_id = Uuid::now_v7();
@@ -855,8 +1022,10 @@ impl PgStore {
         source_branch_id: Uuid,
         target_branch_id: Uuid,
         author: &str,
+        writer: &Writer,
     ) -> Result<MergeResult, StoreError> {
-        self.ensure_branch_writable(target_branch_id).await?;
+        self.ensure_branch_writable(target_branch_id, writer)
+            .await?;
         let source = self.get_branch(source_branch_id).await?;
         let target = self.get_branch(target_branch_id).await?;
 
@@ -927,6 +1096,7 @@ impl PgStore {
                 &format!("Merge branch '{}' into '{}'", source.name, target.name),
                 author,
                 &merged_ops,
+                writer,
             )
             .await?;
 
@@ -944,10 +1114,11 @@ impl PgStore {
         target_branch_id: Uuid,
         author: &str,
         auto_repair: bool,
+        writer: &Writer,
     ) -> Result<TopologyMergeResult, StoreError> {
         // First, do the normal merge
         let result = self
-            .merge(source_branch_id, target_branch_id, author)
+            .merge(source_branch_id, target_branch_id, author, writer)
             .await?;
 
         match result {
@@ -970,7 +1141,7 @@ impl PgStore {
                 if auto_repair {
                     // Attempt to auto-repair topology violations
                     let (repaired, remaining) = self
-                        .auto_repair_topology(target_branch_id, &violations, author)
+                        .auto_repair_topology(target_branch_id, &violations, author, writer)
                         .await?;
 
                     if remaining.is_empty() {
@@ -1114,6 +1285,7 @@ impl PgStore {
         branch_id: Uuid,
         violations: &[TopologyViolation],
         author: &str,
+        writer: &Writer,
     ) -> Result<(Vec<TopologyRepair>, Vec<TopologyViolation>), StoreError> {
         let mut repaired: Vec<TopologyRepair> = Vec::new();
         let mut remaining: Vec<TopologyViolation> = Vec::new();
@@ -1213,6 +1385,7 @@ impl PgStore {
                 "auto-repair topology violations",
                 author,
                 &repair_ops,
+                writer,
             )
             .await?;
         }
@@ -1816,6 +1989,7 @@ impl PgStore {
         &self,
         branch_id: Uuid,
         author: &str,
+        writer: &Writer,
     ) -> Result<Option<Changeset>, StoreError> {
         // Find features with invalid geometries
         let rows = sqlx::query(
@@ -1863,6 +2037,7 @@ impl PgStore {
                 &format!("Auto-repair: fixed {} invalid geometries", count),
                 author,
                 &ops,
+                writer,
             )
             .await?;
 
@@ -2735,8 +2910,9 @@ impl PgStore {
         &self,
         branch_id: Uuid,
         keep_latest: i32,
+        writer: &Writer,
     ) -> Result<CompactionResult, StoreError> {
-        self.ensure_branch_writable(branch_id).await?;
+        self.ensure_branch_writable(branch_id, writer).await?;
         let run_id = Uuid::now_v7();
         let branch = self.get_branch(branch_id).await?;
 
@@ -3062,13 +3238,95 @@ pub struct CompactionRun {
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /// Permission level: higher = more access.
-fn permission_level(perm: &str) -> u8 {
-    match perm {
-        "admin" => 3,
-        "write" => 2,
-        "read" => 1,
-        _ => 0,
-    }
+/// Give the creator an admin row so a dataset created with auth on always has an
+/// owner who can grant to others.
+async fn insert_creator_admin_grant(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dataset_id: Uuid,
+    creator: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO dataset_permissions (id, dataset_id, user_id, permission, granted_by)
+         VALUES ($1, $2, $3, 'admin', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(dataset_id)
+    .bind(creator)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The branch and dataset permission scopes for one writer, in one round trip.
+async fn write_scopes<'e, E>(
+    exec: E,
+    branch_id: Uuid,
+    dataset_id: Uuid,
+    user_id: &str,
+) -> Result<(Scope, Scope), StoreError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query(
+        "SELECT
+            (SELECT count(*) FROM branch_permissions WHERE branch_id = $1) AS branch_total,
+            (SELECT permission FROM branch_permissions
+              WHERE branch_id = $1 AND user_id = $3) AS branch_mine,
+            (SELECT count(*) FROM dataset_permissions WHERE dataset_id = $2) AS dataset_total,
+            (SELECT permission FROM dataset_permissions
+              WHERE dataset_id = $2 AND user_id = $3) AS dataset_mine",
+    )
+    .bind(branch_id)
+    .bind(dataset_id)
+    .bind(user_id)
+    .fetch_one(exec)
+    .await?;
+
+    Ok((
+        Scope {
+            enforced: row.get::<i64, _>("branch_total") > 0,
+            mine: row.get("branch_mine"),
+        },
+        Scope {
+            enforced: row.get::<i64, _>("dataset_total") > 0,
+            mine: row.get("dataset_mine"),
+        },
+    ))
+}
+
+async fn dataset_scope<'e, E>(exec: E, dataset_id: Uuid, user_id: &str) -> Result<Scope, StoreError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row = sqlx::query(
+        "SELECT
+            (SELECT count(*) FROM dataset_permissions WHERE dataset_id = $1) AS total,
+            (SELECT permission FROM dataset_permissions
+              WHERE dataset_id = $1 AND user_id = $2) AS mine",
+    )
+    .bind(dataset_id)
+    .bind(user_id)
+    .fetch_one(exec)
+    .await?;
+
+    Ok(Scope {
+        enforced: row.get::<i64, _>("total") > 0,
+        mine: row.get("mine"),
+    })
+}
+
+fn denied_branch(branch_id: Uuid) -> StoreError {
+    StoreError::Forbidden(format!(
+        "no write permission on branch {branch_id}: ask an admin of the dataset for a write or \
+         admin grant"
+    ))
+}
+
+fn denied_dataset(dataset_id: Uuid) -> StoreError {
+    StoreError::Forbidden(format!(
+        "no write permission on dataset {dataset_id}: ask an admin of the dataset for a write or \
+         admin grant"
+    ))
 }
 
 /// Map org role to permission level.
@@ -3152,6 +3410,7 @@ fn external_source_from_row(
 }
 
 fn dataset_from_row(row: sqlx::postgres::PgRow) -> Result<Dataset, StoreError> {
+    let visibility = row.get::<String, _>("visibility");
     Ok(Dataset {
         external: external_table_from_row(&row)?,
         id: row.get("id"),
@@ -3160,6 +3419,8 @@ fn dataset_from_row(row: sqlx::postgres::PgRow) -> Result<Dataset, StoreError> {
         geometry_type: parse_geometry_type(row.get::<String, _>("geometry_type")),
         created_at: row.get("created_at"),
         created_by: row.get("created_by"),
+        // the column has a CHECK constraint, so an unknown value cannot be stored
+        visibility: Visibility::parse(&visibility).unwrap_or_default(),
     })
 }
 

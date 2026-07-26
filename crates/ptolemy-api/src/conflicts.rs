@@ -416,7 +416,13 @@ async fn resolve_and_merge(
     });
 
     let changeset = store
-        .commit(target_id, &message, actor.or_body(&req.author), &final_ops)
+        .commit(
+            target_id,
+            &message,
+            actor.or_body(&req.author),
+            &final_ops,
+            &actor.writer(),
+        )
         .await?;
 
     Ok(Json(serde_json::json!({
@@ -535,16 +541,7 @@ impl IntoResponse for ConflictError {
                     "internal error".to_string(),
                 )
             }
-            ConflictError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            ConflictError::Store(e) => {
-                tracing::error!("Store error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            ConflictError::Store(e) => crate::errors::store_error_status(&e),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
     }

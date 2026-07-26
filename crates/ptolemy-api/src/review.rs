@@ -151,6 +151,7 @@ async fn merge_review(
             mr.source_branch_id,
             mr.target_branch_id,
             actor.or_body(&req.author),
+            &actor.writer(),
         )
         .await?;
 
@@ -245,19 +246,7 @@ impl From<ptolemy_storage::StoreError> for ReviewError {
 impl IntoResponse for ReviewError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            ReviewError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            ReviewError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            ReviewError::Store(ptolemy_storage::StoreError::Db(e)) => {
-                tracing::error!("Database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            ReviewError::Store(e) => crate::errors::store_error_status(&e),
             ReviewError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

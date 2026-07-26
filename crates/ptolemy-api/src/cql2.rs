@@ -585,16 +585,7 @@ impl IntoResponse for Cql2Error {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             Cql2Error::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
-            Cql2Error::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            Cql2Error::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            Cql2Error::Store(e) => {
-                tracing::error!("Store: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-            }
+            Cql2Error::Store(e) => crate::errors::store_error_status(&e),
             Cql2Error::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

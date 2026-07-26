@@ -406,19 +406,7 @@ enum RealEstateError {
 impl IntoResponse for RealEstateError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            RealEstateError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            RealEstateError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            RealEstateError::Store(ptolemy_storage::StoreError::Db(e)) => {
-                tracing::error!("Database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            RealEstateError::Store(e) => crate::errors::store_error_status(&e),
             RealEstateError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

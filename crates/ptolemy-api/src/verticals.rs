@@ -711,6 +711,7 @@ async fn create_incident(
             "new incident",
             actor.or_body(&req.author),
             &ops,
+            &actor.writer(),
         )
         .await
         .map_err(VerticalError::Store)?;
@@ -834,19 +835,7 @@ enum VerticalError {
 impl IntoResponse for VerticalError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            VerticalError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            VerticalError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            VerticalError::Store(ptolemy_storage::StoreError::Db(e)) => {
-                tracing::error!("Database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            VerticalError::Store(e) => crate::errors::store_error_status(&e),
             VerticalError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()

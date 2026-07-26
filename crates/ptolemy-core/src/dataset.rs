@@ -21,6 +21,37 @@ pub struct Dataset {
     /// ptolemy does not own. Omitted from JSON for ordinary datasets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<ExternalTable>,
+    #[serde(default)]
+    pub visibility: Visibility,
+}
+
+/// Who may read a dataset's content. `Private` is enforced only when auth is
+/// on: reads then need a permission row on the dataset or one of its branches.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    #[default]
+    Public,
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        }
+    }
+
+    /// Unknown strings are rejected rather than defaulted, so a typo cannot
+    /// silently publish a dataset that was meant to be private.
+    pub fn parse(s: &str) -> Option<Visibility> {
+        match s {
+            "public" => Some(Visibility::Public),
+            "private" => Some(Visibility::Private),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

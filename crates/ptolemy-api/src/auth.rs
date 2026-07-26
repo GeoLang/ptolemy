@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use jsonwebtoken::{DecodingKey, Validation, decode};
+use ptolemy_storage::Writer;
 use serde::{Deserialize, Serialize};
 
 /// Shortest HS256 secret we accept, matching collecta.
@@ -260,28 +261,42 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let access = classify(request.method(), request.uri().path());
-    if access == Access::Public {
-        return next.run(request).await;
-    }
+    let mut request = request;
+    // per-dataset enforcement is off in dev mode, so downstream needs to know
+    // auth ran at all, not just whether this request carried a token
+    request.extensions_mut().insert(AuthEnabled);
 
+    let access = classify(request.method(), request.uri().path());
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let key = DecodingKey::from_secret(config.secret.as_bytes());
+    let claims = token
+        .as_deref()
+        .and_then(|t| decode::<Claims>(t, &key, &Validation::default()).ok())
+        .map(|data| data.claims);
 
-    let Some(token) = token else {
+    if access == Access::Public {
+        // a public route ignores a bad token rather than rejecting it, keeping
+        // anonymous reads working; a good one still identifies the caller so
+        // private-dataset reads can be allowed
+        if let Some(claims) = claims {
+            request.extensions_mut().insert(claims);
+        }
+        return next.run(request).await;
+    }
+
+    if token.is_none() {
         return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
-    };
-
+    }
     // the decode error is not echoed back: it distinguishes "expired" from
     // "bad signature", which helps an attacker more than a caller
-    let key = DecodingKey::from_secret(config.secret.as_bytes());
-    let Ok(data) = decode::<Claims>(token, &key, &Validation::default()) else {
+    let Some(claims) = claims else {
         return deny(StatusCode::UNAUTHORIZED, "invalid or expired token");
     };
-    let claims = data.claims;
 
     let allowed = match access {
         Access::Public => true,
@@ -298,23 +313,57 @@ pub async fn auth_middleware(
         );
     }
 
-    let mut request = request;
     request.extensions_mut().insert(claims);
     next.run(request).await
 }
 
-/// Who to record in an audit field (`author`, `created_by`, `granted_by`, …).
-/// Holds the token subject, or `None` when auth is disabled and there is no
-/// token to trust.
+/// Marker put in the request extensions when auth is enabled. Absent means dev
+/// mode, where per-dataset permissions and visibility are not enforced at all.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthEnabled;
+
+/// The caller: who to record in an audit field (`author`, `created_by`,
+/// `granted_by`, …) and who to check permission rows against. Claims are absent
+/// when auth is off, and on a public route when the request carried no usable
+/// token.
 #[derive(Debug, Clone)]
-pub struct Actor(Option<String>);
+pub struct Actor {
+    claims: Option<Claims>,
+    auth_enabled: bool,
+}
 
 impl Actor {
     /// The token subject wins over whatever the body says, so a caller cannot
     /// attribute a write to someone else. With auth off the body value stands,
     /// which keeps dev and CLI flows working.
     pub fn or_body<'a>(&'a self, body: &'a str) -> &'a str {
-        self.0.as_deref().unwrap_or(body)
+        self.id().unwrap_or(body)
+    }
+
+    /// The verified caller id, or `None` when there is no token to trust.
+    pub fn id(&self) -> Option<&str> {
+        self.claims.as_ref().map(|c| c.sub.as_str())
+    }
+
+    /// The verified caller id only when auth is on, which is when a permission
+    /// row means anything. Used for the dataset creator auto-grant.
+    pub fn enforced_id(&self) -> Option<&str> {
+        if self.auth_enabled { self.id() } else { None }
+    }
+
+    pub fn is_instance_admin(&self) -> bool {
+        self.claims.as_ref().is_some_and(Claims::can_admin)
+    }
+
+    /// The identity a write is checked against.
+    pub fn writer(&self) -> Writer {
+        if !self.auth_enabled {
+            return Writer::Unenforced;
+        }
+        match &self.claims {
+            None => Writer::Anonymous,
+            Some(claims) => Writer::user(claims.sub.clone(), claims.can_admin()),
+        }
     }
 }
 
@@ -322,9 +371,10 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Actor(
-            parts.extensions.get::<Claims>().map(|c| c.sub.clone()),
-        ))
+        Ok(Actor {
+            claims: parts.extensions.get::<Claims>().cloned(),
+            auth_enabled: parts.extensions.get::<AuthEnabled>().is_some(),
+        })
     }
 }
 

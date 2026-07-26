@@ -119,10 +119,10 @@ impl From<ptolemy_storage::StoreError> for SchemaError {
 impl IntoResponse for SchemaError {
     fn into_response(self) -> Response {
         match self {
-            Self::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg).into_response()
+            Self::Store(e) => {
+                let (status, message) = crate::errors::store_error_status(&e);
+                (status, message).into_response()
             }
-            Self::Store(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
         }
     }

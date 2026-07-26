@@ -12,6 +12,7 @@ pub mod conflicts;
 pub mod cql2;
 pub mod delivery;
 pub mod domains;
+pub mod errors;
 pub mod formats;
 pub mod geoprocessing;
 pub mod grpc;
@@ -57,7 +58,8 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
 pub use auth::{
-    Access, Actor, AuthConfig, Claims, Role, classify, generate_token, generate_token_from_env,
+    Access, Actor, AuthConfig, AuthEnabled, Claims, Role, classify, generate_token,
+    generate_token_from_env,
 };
 pub use delivery::{DeliveryJob, DeliverySender, spawn_delivery_worker};
 pub use jobs::BackgroundJobs;

@@ -102,9 +102,17 @@ impl GrpcService {
             .collect();
 
         let count = ops.len() as u64;
+        // this service is not mounted and carries no request identity, so it
+        // writes unenforced; wire an Actor through before mounting it
         let changeset = self
             .store
-            .commit(branch_id, &request.message, &request.author, &ops)
+            .commit(
+                branch_id,
+                &request.message,
+                &request.author,
+                &ops,
+                &ptolemy_storage::Writer::Unenforced,
+            )
             .await
             .map_err(|e| format!("commit failed: {e}"))?;
 

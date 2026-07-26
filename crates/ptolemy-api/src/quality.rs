@@ -17,7 +17,7 @@ use ptolemy_core::schema::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn quality_routes() -> Router<AppState> {
     Router::new()
@@ -129,8 +129,11 @@ struct RepairResponse {
 async fn repair_geometries(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
 ) -> Result<Json<RepairResponse>, QualityError> {
-    let result = store.repair_geometries(branch_id, "system").await?;
+    let result = store
+        .repair_geometries(branch_id, actor.or_body("system"), &actor.writer())
+        .await?;
     match result {
         Some(cs) => Ok(Json(RepairResponse {
             repaired: true,
@@ -160,19 +163,7 @@ impl From<ptolemy_storage::StoreError> for QualityError {
 impl IntoResponse for QualityError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            QualityError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            QualityError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            QualityError::Store(ptolemy_storage::StoreError::Db(e)) => {
-                tracing::error!("Database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            QualityError::Store(e) => crate::errors::store_error_status(&e),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
     }

@@ -247,6 +247,7 @@ impl DataStore for MongoStore {
                     created_at: OffsetDateTime::now_utc(),
                     created_by: "mongodb".into(),
                     external: None,
+                    visibility: Default::default(),
                 });
             }
             Ok(out)

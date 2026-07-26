@@ -16,7 +16,7 @@ pub mod schema;
 
 pub use branch::Branch;
 pub use changeset::Changeset;
-pub use dataset::{Dataset, GeometryType};
+pub use dataset::{Dataset, GeometryType, Visibility};
 pub use datastore::{
     Bbox, BoxFuture, DataStore, DataStoreError, DataStoreRegistry, FeatureQuery, StoreCapabilities,
     StoreResult,

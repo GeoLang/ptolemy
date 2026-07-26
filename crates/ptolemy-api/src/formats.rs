@@ -222,7 +222,9 @@ async fn import_geojson(
     actor: Actor,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ImportResult>, FormatError> {
-    store.ensure_branch_writable(branch_id).await?;
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let features = body
         .get("features")
         .and_then(|f| f.as_array())
@@ -341,7 +343,9 @@ async fn import_csv(
     actor: Actor,
     Json(req): Json<ImportCsvRequest>,
 ) -> Result<Json<ImportResult>, FormatError> {
-    store.ensure_branch_writable(branch_id).await?;
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let lines: Vec<&str> = req.csv.lines().collect();
     if lines.is_empty() {
         return Err(FormatError::Bad("empty CSV".into()));
@@ -535,9 +539,12 @@ struct ReprojectRequest {
 async fn reproject_features(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<ReprojectRequest>,
 ) -> Result<Json<serde_json::Value>, FormatError> {
-    store.ensure_branch_writable(branch_id).await?;
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let result = sqlx::query(
         "UPDATE features SET geometry = ST_Transform(geometry, $2)
          WHERE branch_id = $1 AND geometry IS NOT NULL",
@@ -635,16 +642,7 @@ impl IntoResponse for FormatError {
         let (s, m) = match self {
             FormatError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             FormatError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
-            FormatError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            FormatError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            FormatError::Store(e) => {
-                tracing::error!("Store: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-            }
+            FormatError::Store(e) => crate::errors::store_error_status(&e),
             FormatError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

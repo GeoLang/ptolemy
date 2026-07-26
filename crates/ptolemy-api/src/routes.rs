@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use ptolemy_core::branch::Branch;
-use ptolemy_core::dataset::{Dataset, GeometryType};
+use ptolemy_core::dataset::{Dataset, GeometryType, Visibility};
 use ptolemy_core::diff::DiffOp;
 use ptolemy_core::external::ExternalTable;
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,10 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/readyz", get(readiness))
         // Datasets
         .route("/datasets", get(list_datasets).post(create_dataset))
-        .route("/datasets/{id}", get(get_dataset))
+        .route(
+            "/datasets/{id}",
+            get(get_dataset).patch(update_dataset_visibility),
+        )
         // Branches
         .route(
             "/datasets/{dataset_id}/branches",
@@ -106,6 +109,10 @@ struct CreateDatasetRequest {
     external_id_column: Option<String>,
     #[serde(default)]
     external_geometry_column: Option<String>,
+    /// `public` (default) keeps anonymous reads; `private` limits reads to
+    /// callers holding a permission row on the dataset or one of its branches.
+    #[serde(default)]
+    visibility: Option<String>,
 }
 
 impl CreateDatasetRequest {
@@ -139,6 +146,7 @@ async fn create_dataset(
 ) -> Result<(StatusCode, Json<Dataset>), AppError> {
     let external = req.external()?;
     let geom_type = req.geometry_type.as_deref().unwrap_or("point");
+    let visibility = parse_visibility(req.visibility.as_deref())?;
     let ds = Dataset {
         id: Uuid::now_v7(),
         name: req.name,
@@ -147,21 +155,25 @@ async fn create_dataset(
         created_at: OffsetDateTime::now_utc(),
         created_by: actor.or_body(&req.created_by).to_string(),
         external,
+        visibility,
     };
+    // with auth on the creator gets an admin permission row, which also flips
+    // the dataset to enforced: from here on only granted users may write to it
+    let creator = actor.enforced_id();
     // registering probes the relation and creates the main branch, so the
     // dataset is browsable the moment the call returns
     let ds = if ds.external.is_some() {
         // at registration every rejection is about the request, so report 400
         // rather than the 409 the read-only guard uses
         store
-            .register_external_dataset(&ds)
+            .register_external_dataset(&ds, creator)
             .await
             .map_err(|e| match e {
                 ptolemy_storage::StoreError::Conflict(msg) => AppError::BadRequest(msg),
                 other => AppError::Store(other),
             })?
     } else {
-        store.create_dataset(&ds).await?;
+        store.create_dataset(&ds, creator).await?;
         ds
     };
     Ok((StatusCode::CREATED, Json(ds)))
@@ -172,6 +184,35 @@ async fn get_dataset(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Dataset>, AppError> {
     let ds = store.get_dataset(id).await?;
+    Ok(Json(ds))
+}
+
+#[derive(Deserialize)]
+struct UpdateDatasetRequest {
+    visibility: String,
+}
+
+/// Flipping a dataset between public and private is a dataset-admin operation,
+/// not an ordinary write: an editor with a write grant must not be able to
+/// publish data someone else marked private.
+async fn update_dataset_visibility(
+    State(store): State<AppState>,
+    Path(id): Path<Uuid>,
+    actor: Actor,
+    Json(req): Json<UpdateDatasetRequest>,
+) -> Result<Json<Dataset>, AppError> {
+    let visibility = parse_visibility(Some(&req.visibility))?;
+
+    if let Some(user_id) = actor.enforced_id()
+        && !actor.is_instance_admin()
+        && !store.is_dataset_admin(id, user_id).await?
+    {
+        return Err(AppError::Store(ptolemy_storage::StoreError::Forbidden(
+            format!("changing visibility of dataset {id} needs an admin grant on it"),
+        )));
+    }
+
+    let ds = store.set_dataset_visibility(id, visibility).await?;
     Ok(Json(ds))
 }
 
@@ -215,7 +256,7 @@ async fn create_branch(
         created_at: OffsetDateTime::now_utc(),
         created_by: actor.or_body(&req.created_by).to_string(),
     };
-    store.create_branch(&branch).await?;
+    store.create_branch(&branch, &actor.writer()).await?;
     Ok((StatusCode::CREATED, Json(branch)))
 }
 
@@ -458,7 +499,13 @@ async fn batch_commit(
     let ops = ops?;
     let op_count = ops.len();
     let changeset = store
-        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
+        .commit(
+            branch_id,
+            &req.message,
+            actor.or_body(&req.author),
+            &ops,
+            &actor.writer(),
+        )
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -565,7 +612,13 @@ async fn commit(
     }
 
     let changeset = store
-        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
+        .commit(
+            branch_id,
+            &req.message,
+            actor.or_body(&req.author),
+            &ops,
+            &actor.writer(),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(changeset)))
 }
@@ -593,8 +646,11 @@ struct ConflictResponse {
 async fn merge_branches(
     State(store): State<AppState>,
     Path((target_id, source_id)): Path<(Uuid, Uuid)>,
+    actor: Actor,
 ) -> Result<Json<MergeResponse>, AppError> {
-    let result = store.merge(source_id, target_id, "api").await?;
+    let result = store
+        .merge(source_id, target_id, actor.or_body("api"), &actor.writer())
+        .await?;
     match result {
         ptolemy_storage::MergeResult::Success(changeset) => {
             Ok(Json(MergeResponse::Success { changeset }))
@@ -646,9 +702,16 @@ async fn merge_with_topology(
     State(store): State<AppState>,
     Path((target_id, source_id)): Path<(Uuid, Uuid)>,
     Query(params): Query<TopologyMergeParams>,
+    actor: Actor,
 ) -> Result<Json<TopologyMergeResponse>, AppError> {
     let result = store
-        .merge_with_topology(source_id, target_id, "api", params.auto_repair)
+        .merge_with_topology(
+            source_id,
+            target_id,
+            actor.or_body("api"),
+            params.auto_repair,
+            &actor.writer(),
+        )
         .await?;
 
     match result {
@@ -711,19 +774,7 @@ impl From<ptolemy_storage::StoreError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            AppError::Store(ptolemy_storage::StoreError::NotFound(msg)) => {
-                (StatusCode::NOT_FOUND, msg)
-            }
-            AppError::Store(ptolemy_storage::StoreError::Conflict(msg)) => {
-                (StatusCode::CONFLICT, msg)
-            }
-            AppError::Store(ptolemy_storage::StoreError::Db(e)) => {
-                tracing::error!("Database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal error".to_string(),
-                )
-            }
+            AppError::Store(e) => crate::errors::store_error_status(&e),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
@@ -731,6 +782,18 @@ impl IntoResponse for AppError {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
+
+/// Absent means public, matching the column default.
+fn parse_visibility(s: Option<&str>) -> Result<Visibility, AppError> {
+    match s {
+        None => Ok(Visibility::Public),
+        Some(v) => Visibility::parse(v).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "invalid visibility: '{v}'. Must be 'public' or 'private'"
+            ))
+        }),
+    }
+}
 
 fn parse_geometry_type(s: &str) -> GeometryType {
     match s {

@@ -297,8 +297,11 @@ async fn main() -> anyhow::Result<()> {
                     created_at: OffsetDateTime::now_utc(),
                     created_by,
                     external: None,
+                    visibility: Default::default(),
                 };
-                store.create_dataset(&ds).await?;
+                // the CLI runs with database credentials, not a token: it is
+                // always unenforced and grants no creator row
+                store.create_dataset(&ds, None).await?;
                 println!("Created dataset '{}' ({})", name, ds.id);
             }
             DatasetCmd::List => {
@@ -337,7 +340,9 @@ async fn main() -> anyhow::Result<()> {
                     created_at: OffsetDateTime::now_utc(),
                     created_by,
                 };
-                store.create_branch(&branch).await?;
+                store
+                    .create_branch(&branch, &ptolemy_storage::Writer::Unenforced)
+                    .await?;
                 println!("Created branch '{}' ({})", name, branch.id);
             }
             BranchCmd::List { dataset } => {
@@ -367,7 +372,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 vec![]
             };
-            let changeset = store.commit(branch, &message, &author, &ops).await?;
+            let changeset = store
+                .commit(
+                    branch,
+                    &message,
+                    &author,
+                    &ops,
+                    &ptolemy_storage::Writer::Unenforced,
+                )
+                .await?;
             println!("Committed {} ({} operations)", changeset.id, ops.len());
         }
 
@@ -376,7 +389,14 @@ async fn main() -> anyhow::Result<()> {
             target,
             author,
         } => {
-            let result = store.merge(source, target, &author).await?;
+            let result = store
+                .merge(
+                    source,
+                    target,
+                    &author,
+                    &ptolemy_storage::Writer::Unenforced,
+                )
+                .await?;
             match result {
                 ptolemy_storage::MergeResult::Success(cs) => {
                     println!("Merge successful: {}", cs.id);
@@ -440,7 +460,15 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let count = ops.len();
-            let changeset = store.commit(branch, &message, &author, &ops).await?;
+            let changeset = store
+                .commit(
+                    branch,
+                    &message,
+                    &author,
+                    &ops,
+                    &ptolemy_storage::Writer::Unenforced,
+                )
+                .await?;
             println!("Imported {} features as changeset {}", count, changeset.id);
         }
 

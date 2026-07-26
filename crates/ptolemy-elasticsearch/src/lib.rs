@@ -300,6 +300,7 @@ impl DataStore for ElasticsearchStore {
                     created_at: OffsetDateTime::now_utc(),
                     created_by: "elasticsearch".into(),
                     external: None,
+                    visibility: Default::default(),
                 });
             }
             Ok(out)

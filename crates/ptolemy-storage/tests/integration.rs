@@ -7,11 +7,16 @@
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
+use ptolemy_storage::permission::Writer;
 use ptolemy_storage::postgres::{MergeResult, PgStore};
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+/// These tests exercise storage, not permissions, so every write is unenforced.
+/// The permission ladder has its own tests in the api integration suite.
+const W: Writer = Writer::Unenforced;
 
 /// WKB for POINT(0 0) in SRID 4326 (little-endian)
 fn point_wkb(x: f64, y: f64) -> Vec<u8> {
@@ -57,8 +62,9 @@ async fn create_test_dataset(store: &PgStore) -> Dataset {
         created_at: OffsetDateTime::now_utc(),
         created_by: "test".to_string(),
         external: None,
+        visibility: Default::default(),
     };
-    store.create_dataset(&ds).await.unwrap();
+    store.create_dataset(&ds, None).await.unwrap();
     ds
 }
 
@@ -71,7 +77,7 @@ async fn create_test_branch(store: &PgStore, dataset_id: Uuid, name: &str) -> Br
         created_at: OffsetDateTime::now_utc(),
         created_by: "test".to_string(),
     };
-    store.create_branch(&branch).await.unwrap();
+    store.create_branch(&branch, &W).await.unwrap();
     branch
 }
 
@@ -164,6 +170,7 @@ async fn test_commit_insert_features() {
                     properties: json!({"name": "School"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -200,6 +207,7 @@ async fn test_commit_update_feature() {
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -215,6 +223,7 @@ async fn test_commit_update_feature() {
                 geometry_wkb: None, // keep geometry
                 properties: Some(json!({"name": "Central Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -244,6 +253,7 @@ async fn test_commit_delete_feature() {
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -254,6 +264,7 @@ async fn test_commit_delete_feature() {
             "Delete",
             "alice",
             &[DiffOp::Delete { feature_id: f1 }],
+            &W,
         )
         .await
         .unwrap();
@@ -280,6 +291,7 @@ async fn test_feature_at_specific_changeset() {
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"version": 1}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -294,6 +306,7 @@ async fn test_feature_at_specific_changeset() {
                 geometry_wkb: None,
                 properties: Some(json!({"version": 2})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -325,6 +338,7 @@ async fn test_branch_history() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -339,6 +353,7 @@ async fn test_branch_history() {
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"updated": true})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -379,6 +394,7 @@ async fn test_diff_from_root() {
                     properties: json!({"b": 2}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -406,6 +422,7 @@ async fn test_diff_between_changesets() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -420,6 +437,7 @@ async fn test_diff_between_changesets() {
                 geometry_wkb: point_wkb(1.0, 1.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -451,6 +469,7 @@ async fn test_merge_no_conflicts() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Origin"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -465,7 +484,7 @@ async fn test_merge_no_conflicts() {
         created_at: OffsetDateTime::now_utc(),
         created_by: "bob".to_string(),
     };
-    store.create_branch(&feature_branch).await.unwrap();
+    store.create_branch(&feature_branch, &W).await.unwrap();
 
     // Add a new feature on the feature branch
     let f2 = Uuid::now_v7();
@@ -479,6 +498,7 @@ async fn test_merge_no_conflicts() {
                 geometry_wkb: point_wkb(5.0, 5.0),
                 properties: json!({"name": "School"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -494,13 +514,14 @@ async fn test_merge_no_conflicts() {
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Town Center"})),
             }],
+            &W,
         )
         .await
         .unwrap();
 
     // Merge feature -> main (no conflicts: different features modified)
     let result = store
-        .merge(feature_branch.id, main.id, "alice")
+        .merge(feature_branch.id, main.id, "alice", &W)
         .await
         .unwrap();
     match result {
@@ -534,6 +555,7 @@ async fn test_merge_with_conflicts() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -548,7 +570,7 @@ async fn test_merge_with_conflicts() {
         created_at: OffsetDateTime::now_utc(),
         created_by: "bob".to_string(),
     };
-    store.create_branch(&feature_branch).await.unwrap();
+    store.create_branch(&feature_branch, &W).await.unwrap();
 
     // Both sides modify the SAME feature differently
     store
@@ -561,6 +583,7 @@ async fn test_merge_with_conflicts() {
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Central Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -575,13 +598,14 @@ async fn test_merge_with_conflicts() {
                 geometry_wkb: Some(point_wkb(10.0, 10.0)),
                 properties: Some(json!({"name": "Park", "moved": true})),
             }],
+            &W,
         )
         .await
         .unwrap();
 
     // Merge should detect conflict
     let result = store
-        .merge(feature_branch.id, main.id, "alice")
+        .merge(feature_branch.id, main.id, "alice", &W)
         .await
         .unwrap();
     match result {
@@ -611,6 +635,7 @@ async fn test_merge_same_change_no_conflict() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -624,7 +649,7 @@ async fn test_merge_same_change_no_conflict() {
         created_at: OffsetDateTime::now_utc(),
         created_by: "bob".to_string(),
     };
-    store.create_branch(&feature_branch).await.unwrap();
+    store.create_branch(&feature_branch, &W).await.unwrap();
 
     // Both sides delete the same feature — should NOT conflict
     store
@@ -633,6 +658,7 @@ async fn test_merge_same_change_no_conflict() {
             "Alice deletes",
             "alice",
             &[DiffOp::Delete { feature_id: f1 }],
+            &W,
         )
         .await
         .unwrap();
@@ -643,12 +669,13 @@ async fn test_merge_same_change_no_conflict() {
             "Bob also deletes",
             "bob",
             &[DiffOp::Delete { feature_id: f1 }],
+            &W,
         )
         .await
         .unwrap();
 
     let result = store
-        .merge(feature_branch.id, main.id, "alice")
+        .merge(feature_branch.id, main.id, "alice", &W)
         .await
         .unwrap();
     match result {
@@ -675,6 +702,7 @@ async fn test_merge_base_finding() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -688,7 +716,7 @@ async fn test_merge_base_finding() {
         created_at: OffsetDateTime::now_utc(),
         created_by: "bob".to_string(),
     };
-    store.create_branch(&feature_branch).await.unwrap();
+    store.create_branch(&feature_branch, &W).await.unwrap();
 
     // Advance both
     let c2 = store
@@ -701,6 +729,7 @@ async fn test_merge_base_finding() {
                 geometry_wkb: point_wkb(1.0, 0.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -715,6 +744,7 @@ async fn test_merge_base_finding() {
                 geometry_wkb: point_wkb(0.0, 1.0),
                 properties: json!({}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -735,7 +765,7 @@ async fn fork_branch(store: &PgStore, dataset_id: Uuid, from_branch: Uuid, name:
         created_at: OffsetDateTime::now_utc(),
         created_by: "test".to_string(),
     };
-    store.create_branch(&branch).await.unwrap();
+    store.create_branch(&branch, &W).await.unwrap();
     branch
 }
 
@@ -774,6 +804,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -791,6 +822,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"name": "Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -804,11 +836,12 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 geometry_wkb: Some(point_wkb(2.0, 2.0)),
                 properties: Some(json!({"name": "Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     match result {
         MergeResult::Conflicts(conflicts) => {
             assert_eq!(conflicts.len(), 1);
@@ -837,6 +870,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -854,6 +888,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "North Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -867,11 +902,12 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "South Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     match result {
         MergeResult::Conflicts(conflicts) => {
             assert_eq!(conflicts.len(), 1);
@@ -906,6 +942,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     properties: json!({"name": "B"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -926,6 +963,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     properties: Some(json!({"name": "B"})),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -942,11 +980,12 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                 },
                 DiffOp::Delete { feature_id: f2 },
             ],
+            &W,
         )
         .await
         .unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     match result {
         MergeResult::Conflicts(mut conflicts) => {
             conflicts.sort_by_key(|c| c.feature_id);
@@ -984,6 +1023,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park", "capacity": 100}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1000,6 +1040,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Central Park", "capacity": 100})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1013,11 +1054,12 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Park", "capacity": 250})),
             }],
+            &W,
         )
         .await
         .unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     match result {
         MergeResult::Conflicts(conflicts) => {
             assert_eq!(conflicts.len(), 1);
@@ -1046,6 +1088,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1073,6 +1116,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     properties: Some(json!({"name": "Base v2"})),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -1093,11 +1137,12 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     properties: json!({"name": "Feat4"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     let MergeResult::Success(_) = result else {
         panic!("Expected clean merge of disjoint feature sets");
     };
@@ -1129,6 +1174,7 @@ async fn test_diff_round_trip_after_merge() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1155,6 +1201,7 @@ async fn test_diff_round_trip_after_merge() {
                     properties: json!({"name": "Feat2"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -1168,13 +1215,14 @@ async fn test_diff_round_trip_after_merge() {
                 geometry_wkb: point_wkb(3.0, 3.0),
                 properties: json!({"name": "Main3"}),
             }],
+            &W,
         )
         .await
         .unwrap();
 
     let pre_merge_head = store.get_branch(main.id).await.unwrap().head.unwrap();
 
-    let result = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     let MergeResult::Success(merge_cs) = result else {
         panic!("Expected clean merge");
     };
@@ -1189,9 +1237,9 @@ async fn test_diff_round_trip_after_merge() {
         created_at: OffsetDateTime::now_utc(),
         created_by: "test".to_string(),
     };
-    store.create_branch(&replay).await.unwrap();
+    store.create_branch(&replay, &W).await.unwrap();
     store
-        .commit(replay.id, "Replay diff", "test", &diff.operations)
+        .commit(replay.id, "Replay diff", "test", &diff.operations, &W)
         .await
         .unwrap();
 
@@ -1219,6 +1267,7 @@ async fn test_merge_idempotent_remerge() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1243,18 +1292,19 @@ async fn test_merge_idempotent_remerge() {
                     properties: json!({"name": "Feat2"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
 
-    let first = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let first = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     let MergeResult::Success(_) = first else {
         panic!("Expected first merge to succeed");
     };
     let after_first = snapshot(&store, main.id).await;
 
     // Re-merging an already-merged branch must not conflict or change state
-    let second = store.merge(feature.id, main.id, "alice").await.unwrap();
+    let second = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
     let MergeResult::Success(_) = second else {
         panic!("Re-merge of merged branch must not conflict");
     };
@@ -1280,8 +1330,8 @@ async fn test_concurrent_commits_same_branch_no_lost_update() {
         properties: json!({"who": "b"}),
     }];
     let (ra, rb) = tokio::join!(
-        store.commit(branch.id, "A", "alice", &ops_a),
-        store.commit(branch.id, "B", "bob", &ops_b),
+        store.commit(branch.id, "A", "alice", &ops_a, &W),
+        store.commit(branch.id, "B", "bob", &ops_b, &W),
     );
     let ca = ra.unwrap();
     let cb = rb.unwrap();
@@ -1319,6 +1369,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1336,6 +1387,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 geometry_wkb: Some(point_wkb(9.0, 9.0)),
                 properties: Some(json!({"name": "Bob's Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1353,6 +1405,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Alice's Park"})),
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1374,6 +1427,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 geometry_wkb: Some(point_wkb(0.5, 0.5)),
                 properties: None,
             }],
+            &W,
         )
         .await
         .unwrap();
@@ -1412,6 +1466,7 @@ async fn test_insert_then_update_same_feature_in_one_commit() {
                     properties: Some(json!({"v": 2})),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -1451,6 +1506,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     properties: json!({"name": "School"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -1476,6 +1532,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     properties: json!({"name": "Cafe"}),
                 },
             ],
+            &W,
         )
         .await
         .unwrap();
@@ -1541,7 +1598,7 @@ async fn test_multiple_commits_chain() {
             }
         };
         store
-            .commit(branch.id, &format!("Step {i}"), "alice", &[op])
+            .commit(branch.id, &format!("Step {i}"), "alice", &[op], &W)
             .await
             .unwrap();
     }
@@ -1562,7 +1619,7 @@ async fn test_empty_commit() {
 
     // Commit with no operations (allowed, like an empty git commit)
     let c = store
-        .commit(branch.id, "Empty", "alice", &[])
+        .commit(branch.id, "Empty", "alice", &[], &W)
         .await
         .unwrap();
     assert_eq!(c.message, "Empty");
@@ -1586,6 +1643,7 @@ async fn test_delete_nonexistent_feature_at_head() {
             "Ghost delete",
             "alice",
             &[DiffOp::Delete { feature_id: f1 }],
+            &W,
         )
         .await
         .unwrap();
@@ -1609,7 +1667,7 @@ async fn test_insert_many_features() {
         .collect();
 
     store
-        .commit(branch.id, "Bulk insert", "alice", &ops)
+        .commit(branch.id, "Bulk insert", "alice", &ops, &W)
         .await
         .unwrap();
 

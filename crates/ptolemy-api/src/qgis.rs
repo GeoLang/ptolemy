@@ -319,7 +319,9 @@ async fn wfs_transaction(
     actor: Actor,
     Json(req): Json<WfsTransaction>,
 ) -> Result<Json<WfsTransactionResponse>, QgisError> {
-    store.ensure_branch_writable(branch_id).await?;
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let mut diff_ops: Vec<ptolemy_core::diff::DiffOp> = Vec::new();
     let mut inserted = 0usize;
     let mut updated = 0usize;
@@ -394,6 +396,7 @@ async fn wfs_transaction(
             &req.message,
             actor.or_body(&req.author),
             &diff_ops,
+            &actor.writer(),
         )
         .await?;
 
@@ -532,7 +535,9 @@ async fn qgis_push(
     actor: Actor,
     Json(req): Json<QgisPushRequest>,
 ) -> Result<(StatusCode, Json<QgisPushResponse>), QgisError> {
-    store.ensure_branch_writable(branch_id).await?;
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let branch = store.get_branch(branch_id).await?;
 
     // Check if behind
@@ -600,7 +605,13 @@ async fn qgis_push(
     }
 
     let changeset = store
-        .commit(branch_id, &req.message, actor.or_body(&req.author), &ops)
+        .commit(
+            branch_id,
+            &req.message,
+            actor.or_body(&req.author),
+            &ops,
+            &actor.writer(),
+        )
         .await?;
 
     Ok((
@@ -674,6 +685,7 @@ struct ResolveConflictRequest {
 async fn resolve_conflict(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<ResolveConflictRequest>,
 ) -> Result<Json<serde_json::Value>, QgisError> {
     // Mark conflict as resolved
@@ -704,7 +716,13 @@ async fn resolve_conflict(
                     properties: req.custom_properties,
                 }];
                 store
-                    .commit(branch_id, "resolve conflict (custom)", "system", &ops)
+                    .commit(
+                        branch_id,
+                        "resolve conflict (custom)",
+                        actor.or_body("system"),
+                        &ops,
+                        &actor.writer(),
+                    )
                     .await?;
             }
 
