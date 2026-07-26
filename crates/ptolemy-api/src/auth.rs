@@ -123,6 +123,13 @@ pub fn classify(method: &Method, path: &str) -> Access {
         return Access::Admin;
     }
 
+    // /metrics leaks traffic shape and the non-uuid path identifiers the label
+    // normalizer keeps (topology names, room ids). The platform compose publishes
+    // ptolemy's port straight to the host, so a proxy allowlist can't cover it.
+    if path == "/metrics" {
+        return Access::Admin;
+    }
+
     if *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS {
         return Access::Public;
     }
@@ -419,6 +426,17 @@ mod tests {
         ] {
             assert_eq!(classify(&Method::GET, path), Access::Admin, "GET {path}");
         }
+    }
+
+    #[test]
+    fn classify_metrics_is_admin() {
+        assert_eq!(classify(&Method::GET, "/metrics"), Access::Admin);
+        assert_eq!(classify(&Method::HEAD, "/metrics"), Access::Admin);
+        // the gate is the exact scrape path, not any path containing "metrics"
+        assert_eq!(
+            classify(&Method::GET, "/api/v1/branches/x/quality/metrics"),
+            Access::Public
+        );
     }
 
     /// The anonymous-viewer product decision: spatial data reads stay public.

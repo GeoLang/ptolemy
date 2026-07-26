@@ -194,7 +194,7 @@ client but any JSON structure will work.
 | GET | `/api/v1/reviews/{id}/diff` | Review diff |
 | GET | `/api/v1/reviews/{id}/comments` | List comments |
 | POST | `/api/v1/reviews/{id}/comments` | Add comment |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/metrics` | Prometheus metrics (admin token) |
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
 | GET | `/review` | Web review UI |

@@ -2133,6 +2133,13 @@ async fn test_audit_read_is_admin_only() {
 }
 
 #[tokio::test]
+async fn test_metrics_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    assert_read_is_admin_only(&app, "/metrics", &admin).await;
+}
+
+#[tokio::test]
 async fn test_data_read_stays_public_without_token() {
     let app = setup_app_authed().await;
     let (status, body) = request_as(&app, "GET", "/api/v1/datasets", None, None).await;
