@@ -61,8 +61,15 @@ async fn setup_app() -> (axum::Router, AppState) {
 
 /// Helper: create the test app with auth enforced against [`TEST_SECRET`].
 async fn setup_app_authed() -> axum::Router {
+    setup_app_authed_with_state().await.0
+}
+
+/// Same, keeping the store so a test can seed rows the API would not create,
+/// such as a dataset with no permission rows at all.
+async fn setup_app_authed_with_state() -> (axum::Router, AppState) {
     let state = fresh_state().await;
-    app_with_auth(state, AuthConfig::enabled(TEST_SECRET))
+    let router = app_with_auth(state.clone(), AuthConfig::enabled(TEST_SECRET));
+    (router, state)
 }
 
 /// Helper: make a JSON POST request and return status + body.
@@ -3260,4 +3267,335 @@ async fn test_cql2_rejects_non_json_filter_lang() {
         assert_eq!(status, StatusCode::OK, "{body}: {response}");
         assert_eq!(response["numberReturned"], 1, "{response}");
     }
+}
+
+// ─── Per-dataset write permission enforcement ───────────────────────
+
+fn token_for_user(sub: &str, role: Role) -> String {
+    generate_token(TEST_SECRET, sub, role, 3600)
+}
+
+/// A dataset and branch created straight through the store, so they carry no
+/// permission rows: the state every dataset created before enforcement is in.
+async fn seed_unowned_dataset(state: &AppState) -> (Uuid, Uuid) {
+    let ds = ptolemy_core::dataset::Dataset {
+        id: Uuid::now_v7(),
+        name: format!("unowned_{}", Uuid::now_v7()),
+        srid: 4326,
+        geometry_type: ptolemy_core::dataset::GeometryType::Point,
+        created_at: time::OffsetDateTime::now_utc(),
+        created_by: "legacy".into(),
+        external: None,
+        visibility: Default::default(),
+    };
+    state.create_dataset(&ds, None).await.unwrap();
+    let branch = ptolemy_core::branch::Branch {
+        id: Uuid::now_v7(),
+        dataset_id: ds.id,
+        name: "main".into(),
+        head: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        created_by: "legacy".into(),
+    };
+    state
+        .create_branch(&branch, &ptolemy_storage::Writer::Unenforced)
+        .await
+        .unwrap();
+    (ds.id, branch.id)
+}
+
+fn insert_op() -> Value {
+    json!([{
+        "type": "insert",
+        "feature_id": Uuid::now_v7(),
+        "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+        "properties": {"name": "one"}
+    }])
+}
+
+async fn commit_as(app: &axum::Router, branch_id: Uuid, token: &str) -> (StatusCode, Value) {
+    request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(token),
+        Some(json!({
+            "message": "permission probe",
+            "author": "ignored",
+            "operations": insert_op(),
+        })),
+    )
+    .await
+}
+
+async fn grant(
+    app: &axum::Router,
+    scope: &str,
+    id: Uuid,
+    user: &str,
+    permission: &str,
+) -> StatusCode {
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/{scope}/{id}/permissions"),
+        Some(&token_for_user("root", Role::Admin)),
+        Some(json!({
+            "user_id": user,
+            "permission": permission,
+            "granted_by": "ignored",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "grant failed: {body}");
+    status
+}
+
+/// The compatibility rule: a dataset that never had a grant keeps accepting
+/// writes from any editor.
+#[tokio::test]
+async fn test_dataset_without_permission_rows_accepts_any_editor() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (_, branch_id) = seed_unowned_dataset(&state).await;
+
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("eve", Role::Editor)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// ... and the first grant flips it to enforced.
+#[tokio::test]
+async fn test_first_grant_locks_out_other_editors() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+
+    grant(&app, "datasets", dataset_id, "alice", "write").await;
+
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("eve", Role::Editor)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("alice", Role::Editor)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// A read grant is not a write grant.
+#[tokio::test]
+async fn test_read_grant_cannot_write() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+
+    grant(&app, "datasets", dataset_id, "viewer-vic", "read").await;
+
+    let (status, body) =
+        commit_as(&app, branch_id, &token_for_user("viewer-vic", Role::Editor)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Branch rows decide once they exist: a dataset-level write grant does not
+/// reach into an enforced branch.
+#[tokio::test]
+async fn test_branch_permissions_win_over_dataset() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+
+    grant(&app, "datasets", dataset_id, "alice", "write").await;
+    grant(&app, "branches", branch_id, "bob", "write").await;
+
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("alice", Role::Editor)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("bob", Role::Editor)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// The creator of a dataset gets an admin row, which makes the dataset enforced
+/// from the moment it exists.
+#[tokio::test]
+async fn test_creator_owns_the_dataset_and_others_are_denied() {
+    let app = setup_app_authed().await;
+    let creator = token_for_user("carol", Role::Editor);
+    let intruder = token_for_user("eve", Role::Editor);
+
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&creator),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = dataset["id"].as_str().unwrap().to_string();
+
+    // the auto-granted row is what the creator writes with
+    let (status, perms) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        Some(&token_for_user("root", Role::Admin)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{perms}");
+    let rows = perms.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{perms}");
+    assert_eq!(rows[0]["user_id"], "carol", "{perms}");
+    assert_eq!(rows[0]["permission"], "admin", "{perms}");
+    assert_eq!(rows[0]["granted_by"], "carol", "{perms}");
+
+    // creating a branch is a dataset write, so the intruder cannot
+    let branch_uri = format!("/api/v1/datasets/{dataset_id}/branches");
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &branch_uri,
+        Some(&intruder),
+        Some(json!({"name": "intruder", "created_by": "eve"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &branch_uri,
+        Some(&creator),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = commit_as(&app, branch_id, &intruder).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &creator).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // the instance admin role bypasses per-dataset permissions
+    let (status, body) = commit_as(&app, branch_id, &token_for_user("root", Role::Admin)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Import, sync push, merge and compaction go through the same ladder as commit.
+#[tokio::test]
+async fn test_every_write_path_checks_permissions() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    grant(&app, "datasets", dataset_id, "alice", "write").await;
+    let alice = token_for_user("alice", Role::Editor);
+    let eve = token_for_user("eve", Role::Editor);
+
+    // a commit alice is allowed to make, so the branch has a head to merge from
+    let (status, body) = commit_as(&app, branch_id, &alice).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let geojson = json!({
+        "features": [{
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+            "properties": {"name": "imported"}
+        }],
+        "author": "ignored"
+    });
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/import/geojson"),
+        Some(&eve),
+        Some(geojson.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "import as eve: {body}");
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/import/geojson"),
+        Some(&alice),
+        Some(geojson),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "import as alice: {body}");
+
+    let push = json!({
+        "branch_id": branch_id,
+        "message": "offline edits",
+        "author": "ignored",
+        "operations": [{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {"name": "pushed"}
+        }]
+    });
+    let (status, body) =
+        request_as(&app, "POST", "/api/v1/sync/push", Some(&eve), Some(push)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "sync push as eve: {body}");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/compact"),
+        Some(&eve),
+        Some(json!({"keep_latest": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "compact as eve: {body}");
+
+    // merge needs write on the target branch, which is where the commit lands
+    let (status, fork) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&alice),
+        Some(json!({"name": "fork", "created_by": "alice", "fork_from_branch": branch_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{fork}");
+    let fork_id = Uuid::parse_str(fork["id"].as_str().unwrap()).unwrap();
+    let (status, body) = commit_as(&app, fork_id, &alice).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/merge/{fork_id}"),
+        Some(&eve),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "merge as eve: {body}");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/merge/{fork_id}"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "merge as alice: {body}");
+}
+
+/// With auth off there is no identity to check, so permission rows are ignored
+/// and the dev and CLI flows keep working.
+#[tokio::test]
+async fn test_auth_disabled_ignores_permission_rows() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    state
+        .grant_dataset_permission(dataset_id, "alice", "write", "root")
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        json!({
+            "message": "dev mode commit",
+            "author": "whoever",
+            "operations": insert_op(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
