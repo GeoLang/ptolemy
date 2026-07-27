@@ -4223,6 +4223,327 @@ async fn test_public_raster_reads_stay_anonymous() {
     );
 }
 
+/// STAC search takes its collection filter as a query value, so the layer sees
+/// the catalog id too. What this pins is the filter itself: a public tile the
+/// caller asked for comes back, one they did not does not.
+#[tokio::test]
+async fn test_stac_search_collections_filter() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let carol = token_for_user("carol", Role::Editor);
+
+    let mut tiles = Vec::new();
+    for _ in 0..2 {
+        let (status, dataset) = request_as(
+            &app,
+            "POST",
+            "/api/v1/datasets",
+            Some(&carol),
+            Some(new_dataset_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{dataset}");
+        let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            &format!("/api/v1/datasets/{dataset_id}/rasters"),
+            Some(&carol),
+            Some(json!({"name": "imagery"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let catalog_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        let tile_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level)
+             VALUES ($1, $2, ST_MakeEnvelope(0, 0, 1, 1, 4326), 0)",
+        )
+        .bind(tile_id)
+        .bind(catalog_id)
+        .execute(state.pool())
+        .await
+        .unwrap();
+        tiles.push((catalog_id, tile_id));
+    }
+
+    let (wanted_catalog, wanted_tile) = tiles[0];
+    let (_, other_tile) = tiles[1];
+    let uri = format!("/api/v1/stac/search?collections={wanted_catalog}");
+    assert!(
+        listing_mentions(&app, &uri, None, &wanted_tile.to_string()).await,
+        "the filtered collection's tile was missing"
+    );
+    assert!(
+        !listing_mentions(&app, &uri, None, &other_tile.to_string()).await,
+        "the filter let another collection's tile through"
+    );
+
+    // a collection id that is not a uuid matches nothing rather than everything
+    assert!(
+        !listing_mentions(
+            &app,
+            "/api/v1/stac/search?collections=not-a-uuid",
+            None,
+            &wanted_tile.to_string()
+        )
+        .await,
+        "an unparseable collection id disabled the filter"
+    );
+}
+
+/// A point cloud catalog with one patch inside a private dataset. The patch row
+/// goes in through the store: adding one through the API needs real PC binary.
+/// Returns (dataset id, catalog id, patch id, carol's token).
+async fn seed_private_pointcloud(
+    app: &axum::Router,
+    state: &AppState,
+) -> (Uuid, Uuid, Uuid, String) {
+    let (dataset_id, _, carol) = seed_private_dataset(app).await;
+
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/pointclouds"),
+        Some(&carol),
+        Some(json!({"name": "lidar", "srid": 4326})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let catalog_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let patch_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO pointcloud_patches (id, catalog_id, bounds, num_points)
+         VALUES ($1, $2, ST_MakeEnvelope(0, 0, 1, 1, 4326), 3)",
+    )
+    .bind(patch_id)
+    .bind(catalog_id)
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    (dataset_id, catalog_id, patch_id, carol)
+}
+
+/// Point cloud reads name a catalog, never the dataset, so they rely on the
+/// layer resolving that id back to the owning dataset.
+#[tokio::test]
+async fn test_private_dataset_pointclouds_are_404_for_outsiders() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, catalog_id, _, carol) = seed_private_pointcloud(&app, &state).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let root = token_for_user("root", Role::Admin);
+
+    for uri in [
+        format!("/api/v1/datasets/{dataset_id}/pointclouds"),
+        format!("/api/v1/pointclouds/{catalog_id}"),
+        format!("/api/v1/pointclouds/{catalog_id}/patches"),
+        format!("/api/v1/pointclouds/{catalog_id}/stats"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor GET {uri}: {body}"
+        );
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&root), None).await;
+        assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+    }
+
+    // the spatial query and the profile are POST reads, which the role gate
+    // classifies as writes, so anonymous is a 401 there and never reaches the
+    // visibility layer. the profile needs the pointcloud extension the test
+    // database may not have, so it is only checked for denial.
+    let bbox = json!({"min_x": -1.0, "min_y": -1.0, "max_x": 2.0, "max_y": 2.0});
+    let query_uri = format!("/api/v1/pointclouds/{catalog_id}/query");
+    let profile_uri = format!("/api/v1/pointclouds/{catalog_id}/profile");
+    let profile_body = json!({"line_wkb_hex": "00"});
+
+    for (uri, body) in [(&query_uri, bbox.clone()), (&profile_uri, profile_body)] {
+        let (status, resp) = request_as(&app, "POST", uri, None, Some(body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous POST {uri}: {resp}"
+        );
+
+        let (status, resp) = request_as(&app, "POST", uri, Some(&eve), Some(body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor POST {uri}: {resp}"
+        );
+    }
+
+    let (status, resp) = request_as(&app, "POST", &query_uri, Some(&carol), Some(bbox)).await;
+    assert_eq!(status, StatusCode::OK, "owner POST {query_uri}: {resp}");
+    assert_eq!(resp["patch_count"], 1, "{resp}");
+}
+
+/// A read grant opens the point cloud reads exactly as it opens the feature reads.
+#[tokio::test]
+async fn test_read_grant_opens_a_private_pointcloud() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, catalog_id, _, _) = seed_private_pointcloud(&app, &state).await;
+    let vic = token_for_user("vic", Role::Viewer);
+    let uri = format!("/api/v1/pointclouds/{catalog_id}");
+
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A public dataset owned by carol, so a write denial is the ladder talking and
+/// not the visibility layer. Returns (dataset id, carol's token).
+async fn seed_owned_public_dataset(app: &axum::Router) -> (Uuid, String) {
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    (
+        Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap(),
+        carol,
+    )
+}
+
+/// Attaching a raster to a dataset is a dataset write, so it runs the same
+/// permission ladder as a commit.
+#[tokio::test]
+async fn test_raster_writes_need_a_dataset_write_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, carol) = seed_owned_public_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let catalogs_uri = format!("/api/v1/datasets/{dataset_id}/rasters");
+    let body = json!({"name": "imagery"});
+
+    let (status, resp) =
+        request_as(&app, "POST", &catalogs_uri, Some(&eve), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-granted editor: {resp}");
+
+    // the role gate answers the anonymous write before the ladder sees it
+    let (status, resp) = request_as(&app, "POST", &catalogs_uri, None, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous: {resp}");
+
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &catalogs_uri,
+        Some(&carol),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "owner: {resp}");
+    let catalog_id = Uuid::parse_str(resp["id"].as_str().unwrap()).unwrap();
+
+    // the instance admin bypasses per-dataset rows here as everywhere
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &catalogs_uri,
+        Some(&token_for_user("root", Role::Admin)),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "admin: {resp}");
+
+    // a tile is a write on the catalog's dataset, resolved through the catalog
+    let tiles_uri = format!("/api/v1/rasters/{catalog_id}/tiles");
+    let tile = json!({"zoom_level": 0, "bounds_wkb_hex": "zz", "rast_hex": "00"});
+    let (status, resp) = request_as(&app, "POST", &tiles_uri, Some(&eve), Some(tile.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-granted editor: {resp}");
+
+    // the owner gets past the ladder and into the handler, which rejects the
+    // deliberately invalid hex
+    let (status, resp) =
+        request_as(&app, "POST", &tiles_uri, Some(&carol), Some(tile.clone())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "owner: {resp}");
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    let (status, resp) = request_as(&app, "POST", &catalogs_uri, Some(&eve), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "granted editor: {resp}");
+    let (status, resp) = request_as(&app, "POST", &tiles_uri, Some(&eve), Some(tile)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "granted editor: {resp}");
+}
+
+/// Same ladder for point clouds.
+#[tokio::test]
+async fn test_pointcloud_writes_need_a_dataset_write_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, carol) = seed_owned_public_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let catalogs_uri = format!("/api/v1/datasets/{dataset_id}/pointclouds");
+    let body = json!({"name": "lidar"});
+
+    let (status, resp) =
+        request_as(&app, "POST", &catalogs_uri, Some(&eve), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-granted editor: {resp}");
+
+    let (status, resp) = request_as(&app, "POST", &catalogs_uri, None, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "anonymous: {resp}");
+
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &catalogs_uri,
+        Some(&carol),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "owner: {resp}");
+    let catalog_id = Uuid::parse_str(resp["id"].as_str().unwrap()).unwrap();
+
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &catalogs_uri,
+        Some(&token_for_user("root", Role::Admin)),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "admin: {resp}");
+
+    let patches_uri = format!("/api/v1/pointclouds/{catalog_id}/patches");
+    let patch = json!({"bounds_wkb_hex": "zz", "num_points": 1, "patch_hex": "00"});
+    let (status, resp) =
+        request_as(&app, "POST", &patches_uri, Some(&eve), Some(patch.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-granted editor: {resp}");
+
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &patches_uri,
+        Some(&carol),
+        Some(patch.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "owner: {resp}");
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    let (status, resp) = request_as(&app, "POST", &catalogs_uri, Some(&eve), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "granted editor: {resp}");
+    let (status, resp) = request_as(&app, "POST", &patches_uri, Some(&eve), Some(patch)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "granted editor: {resp}");
+}
+
 // ─── Dataset-admin delegation ───────────────────────────────────────
 
 /// Grant as a given caller, returning the raw status so a test can assert denial.

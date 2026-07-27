@@ -257,14 +257,15 @@ async fn stac_search(
         }
     }
 
-    if let Some(colls) = &q.collections {
-        let ids: Vec<&str> = colls.split(',').collect();
-        let in_clause = ids
-            .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        conditions.push(format!("rt.catalog_id::text IN ({})", in_clause));
+    // an unparseable collection id matches nothing rather than filtering nothing
+    let collections: Option<Vec<Uuid>> = q.collections.as_deref().map(|colls| {
+        colls
+            .split(',')
+            .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+            .collect()
+    });
+    if collections.is_some() {
+        conditions.push("rt.catalog_id = ANY($4)".to_string());
     }
 
     let where_clause = conditions.join(" AND ");
@@ -280,12 +281,15 @@ async fn stac_search(
          WHERE {visible} AND {where_clause} LIMIT $1"
     );
 
-    let rows = sqlx::query(&query)
+    let mut search = sqlx::query(&query)
         .bind(limit)
         .bind(reader.bypass)
-        .bind(reader.id.as_deref())
-        .fetch_all(store.pool())
-        .await?;
+        .bind(reader.id.as_deref());
+    // only bound when the condition above referenced it
+    if let Some(ids) = &collections {
+        search = search.bind(ids.as_slice());
+    }
+    let rows = search.fetch_all(store.pool()).await?;
 
     let features: Vec<serde_json::Value> = rows
         .iter()

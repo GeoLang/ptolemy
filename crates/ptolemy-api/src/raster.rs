@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn raster_routes() -> Router<AppState> {
     Router::new()
@@ -92,8 +92,13 @@ fn default_bands() -> i32 {
 async fn create_catalog(
     State(store): State<AppState>,
     Path(dataset_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<CreateCatalogRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RasterError> {
+    // a catalog hangs off the dataset, so creating one is a dataset write
+    store
+        .ensure_dataset_writable(dataset_id, &actor.writer())
+        .await?;
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO raster_catalogs (id, dataset_id, name, srid, pixel_type, num_bands)
@@ -171,11 +176,25 @@ struct UploadTileRequest {
     rast_hex: String,
 }
 
+/// The dataset a catalog hangs off, so a tile write runs the dataset's ladder.
+async fn catalog_dataset(store: &AppState, catalog_id: Uuid) -> Result<Uuid, RasterError> {
+    sqlx::query_scalar("SELECT dataset_id FROM raster_catalogs WHERE id = $1")
+        .bind(catalog_id)
+        .fetch_optional(store.pool())
+        .await?
+        .ok_or(RasterError::NotFound)
+}
+
 async fn upload_tile(
     State(store): State<AppState>,
     Path(catalog_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<UploadTileRequest>,
 ) -> Result<StatusCode, RasterError> {
+    let dataset_id = catalog_dataset(&store, catalog_id).await?;
+    store
+        .ensure_dataset_writable(dataset_id, &actor.writer())
+        .await?;
     let id = Uuid::now_v7();
     let bounds_wkb = hex::decode(&req.bounds_wkb_hex)
         .map_err(|_| RasterError::Bad("invalid bounds hex".into()))?;
@@ -255,6 +274,7 @@ async fn band_stats(
 
 enum RasterError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
 }
@@ -263,11 +283,17 @@ impl From<sqlx::Error> for RasterError {
         RasterError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for RasterError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        RasterError::Store(e)
+    }
+}
 impl IntoResponse for RasterError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             RasterError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             RasterError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
+            RasterError::Store(e) => crate::errors::store_error_status(&e),
             RasterError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

@@ -524,10 +524,10 @@ impl PgStore {
     // ─── Visibility enforcement (read paths) ────────────────────────
 
     /// The private datasets any of `ids` refers to. An id may name a dataset, a
-    /// branch, a changeset, a merge request, a feature, a raster catalog or a
-    /// raster tile, because that is the full set of ways a request identifies
-    /// dataset content. Public datasets are left out, so an empty result means
-    /// nothing to enforce.
+    /// branch, a changeset, a merge request, a feature, a raster catalog or tile,
+    /// or a point cloud catalog or patch, because that is the full set of ways a
+    /// request identifies dataset content. Public datasets are left out, so an
+    /// empty result means nothing to enforce.
     pub async fn private_datasets_for_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, StoreError> {
         let rows = sqlx::query(
             "SELECT DISTINCT d.id FROM datasets d WHERE d.visibility = 'private' AND (
@@ -545,6 +545,11 @@ impl PgStore {
                  OR EXISTS (SELECT 1 FROM raster_tiles rt
                               JOIN raster_catalogs rc ON rc.id = rt.catalog_id
                              WHERE rc.dataset_id = d.id AND rt.id = ANY($1))
+                 OR EXISTS (SELECT 1 FROM pointcloud_catalogs pc
+                             WHERE pc.dataset_id = d.id AND pc.id = ANY($1))
+                 OR EXISTS (SELECT 1 FROM pointcloud_patches pp
+                              JOIN pointcloud_catalogs pc ON pc.id = pp.catalog_id
+                             WHERE pc.dataset_id = d.id AND pp.id = ANY($1))
              )",
         )
         .bind(ids)
