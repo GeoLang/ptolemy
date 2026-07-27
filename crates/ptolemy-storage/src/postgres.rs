@@ -355,20 +355,23 @@ impl PgStore {
             .map(Option::flatten)
     }
 
-    /// Reject any mutation aimed at an external dataset, and any writer the
-    /// dataset's permission rows do not allow. One place, so a write path is
-    /// guarded by being routed through it rather than by remembering to check.
+    /// Reject any mutation aimed at a dataset that does not exist or is external,
+    /// and any writer the dataset's permission rows do not allow. One place, so a
+    /// write path is guarded by being routed through it rather than by
+    /// remembering to check.
     pub async fn ensure_dataset_writable(
         &self,
         dataset_id: Uuid,
         writer: &Writer,
     ) -> Result<(), StoreError> {
+        // a missing dataset has no permission rows, so the ladder below would
+        // read it as unenforced and pass the write on to fail on the foreign key
         let external: Option<String> =
             sqlx::query_scalar("SELECT external_table FROM datasets WHERE id = $1")
                 .bind(dataset_id)
                 .fetch_optional(&self.pool)
                 .await?
-                .flatten();
+                .ok_or_else(|| StoreError::NotFound(format!("dataset {dataset_id}")))?;
         if external.is_some() {
             return Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into()));
         }

@@ -164,6 +164,15 @@ pub fn classify(method: &Method, path: &str) -> Access {
         return Access::Public;
     }
 
+    // the point cloud spatial query and elevation profile only SELECT, so they
+    // are reads that happen to take a POST body. The prefix is part of the match
+    // because /query and /profile are generic enough to catch a future write.
+    if path.starts_with("/api/v1/pointclouds/")
+        && (path.ends_with("/query") || path.ends_with("/profile"))
+    {
+        return Access::Public;
+    }
+
     // registering a replication peer hands out a data feed, so admin only;
     // listing peers (GET) stays public under the read rule above
     if path.starts_with("/api/v1/replication/peers") {
@@ -498,6 +507,27 @@ mod tests {
         assert_eq!(
             classify(&Method::POST, "/api/v1/branches/x/features/filter"),
             Access::Public
+        );
+    }
+
+    #[test]
+    fn classify_pointcloud_queries_are_public() {
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/pointclouds/x/query"),
+            Access::Public
+        );
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/pointclouds/x/profile"),
+            Access::Public
+        );
+        // adding a patch is still a write, and the suffixes do not travel
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/pointclouds/x/patches"),
+            Access::Write
+        );
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/branches/x/query"),
+            Access::Write
         );
     }
 

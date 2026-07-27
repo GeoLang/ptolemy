@@ -4359,10 +4359,8 @@ async fn test_private_dataset_pointclouds_are_404_for_outsiders() {
         assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
     }
 
-    // the spatial query and the profile are POST reads, which the role gate
-    // classifies as writes, so anonymous is a 401 there and never reaches the
-    // visibility layer. the profile needs the pointcloud extension the test
-    // database may not have, so it is only checked for denial.
+    // the spatial query and the profile are POST reads, so the visibility layer
+    // is their only gate: an outsider gets the same 404 as on a GET
     let bbox = json!({"min_x": -1.0, "min_y": -1.0, "max_x": 2.0, "max_y": 2.0});
     let query_uri = format!("/api/v1/pointclouds/{catalog_id}/query");
     let profile_uri = format!("/api/v1/pointclouds/{catalog_id}/profile");
@@ -4372,7 +4370,7 @@ async fn test_private_dataset_pointclouds_are_404_for_outsiders() {
         let (status, resp) = request_as(&app, "POST", uri, None, Some(body.clone())).await;
         assert_eq!(
             status,
-            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
             "anonymous POST {uri}: {resp}"
         );
 
@@ -4404,6 +4402,103 @@ async fn test_read_grant_opens_a_private_pointcloud() {
 
     let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// The point cloud query and profile are reads, so a public dataset serves them
+/// to an anonymous caller like any other read.
+#[tokio::test]
+async fn test_public_pointcloud_queries_stay_anonymous() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let (dataset_id, _) = seed_owned_public_dataset(&app).await;
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/pointclouds"),
+        Some(&carol),
+        Some(json!({"name": "lidar"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let catalog_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    sqlx::query(
+        "INSERT INTO pointcloud_patches (id, catalog_id, bounds, num_points)
+         VALUES ($1, $2, ST_MakeEnvelope(0, 0, 1, 1, 4326), 3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(catalog_id)
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/pointclouds/{catalog_id}/query"),
+        None,
+        Some(json!({"min_x": -1.0, "min_y": -1.0, "max_x": 2.0, "max_y": 2.0})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "anonymous query: {resp}");
+    assert_eq!(resp["patch_count"], 1, "{resp}");
+
+    // the profile handler needs the pointcloud extension the test database may
+    // not have, so what is pinned is that it is not turned away
+    let (status, resp) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/pointclouds/{catalog_id}/profile"),
+        None,
+        Some(json!({"line_wkb_hex": "00"})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "anonymous profile: {resp}"
+    );
+    assert_ne!(status, StatusCode::NOT_FOUND, "anonymous profile: {resp}");
+}
+
+/// A catalog can only hang off a dataset that exists, and saying so is a 404
+/// rather than the foreign key failing as a 500.
+#[tokio::test]
+async fn test_catalog_writes_on_a_missing_dataset_are_404() {
+    let missing = Uuid::now_v7();
+    let bodies = [
+        ("rasters", json!({"name": "imagery"})),
+        ("pointclouds", json!({"name": "lidar"})),
+    ];
+
+    let app = setup_app_authed().await;
+    for (kind, body) in &bodies {
+        let (status, resp) = request_as(
+            &app,
+            "POST",
+            &format!("/api/v1/datasets/{missing}/{kind}"),
+            Some(&token_for_user("root", Role::Admin)),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "admin POST {kind}: {resp}");
+    }
+
+    // dev mode skips the ladder, so the existence check is what answers there
+    let (app, _) = setup_app().await;
+    for (kind, body) in &bodies {
+        let (status, resp) = post_json(
+            &app,
+            &format!("/api/v1/datasets/{missing}/{kind}"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "dev mode POST {kind}: {resp}"
+        );
+    }
 }
 
 /// A public dataset owned by carol, so a write denial is the ladder talking and
