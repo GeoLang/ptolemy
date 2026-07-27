@@ -4036,6 +4036,193 @@ async fn test_body_scoped_reads_respect_visibility() {
     }
 }
 
+/// A raster catalog with one tile inside a private dataset. The tile row goes in
+/// through the store because uploading one through the API needs real raster WKB.
+/// Returns (catalog id, tile id, carol's token).
+async fn seed_private_raster(app: &axum::Router, state: &AppState) -> (Uuid, Uuid, Uuid, String) {
+    let (dataset_id, _, carol) = seed_private_dataset(app).await;
+
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/rasters"),
+        Some(&carol),
+        Some(json!({"name": "imagery", "srid": 4326, "num_bands": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let catalog_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let tile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level)
+         VALUES ($1, $2, ST_MakeEnvelope(0, 0, 1, 1, 4326), 0)",
+    )
+    .bind(tile_id)
+    .bind(catalog_id)
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    (dataset_id, catalog_id, tile_id, carol)
+}
+
+/// Raster and STAC reads name a catalog or a tile, never the dataset, so they
+/// rely on the layer resolving those ids back to the owning dataset.
+#[tokio::test]
+async fn test_private_dataset_rasters_are_404_for_outsiders() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, catalog_id, tile_id, carol) = seed_private_raster(&app, &state).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    let uris = [
+        format!("/api/v1/datasets/{dataset_id}/rasters"),
+        format!("/api/v1/rasters/{catalog_id}"),
+        format!("/api/v1/rasters/{catalog_id}/tiles"),
+        format!("/api/v1/rasters/{catalog_id}/value?lng=0.5&lat=0.5"),
+        format!("/api/v1/rasters/{catalog_id}/stats"),
+        format!("/api/v1/stac/collections/{catalog_id}"),
+        format!("/api/v1/stac/collections/{catalog_id}/items"),
+        format!("/api/v1/stac/collections/{catalog_id}/items/{tile_id}"),
+    ];
+
+    for uri in uris {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor GET {uri}: {body}"
+        );
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+
+        let (status, body) = request_as(
+            &app,
+            "GET",
+            &uri,
+            Some(&token_for_user("root", Role::Admin)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+    }
+}
+
+/// A read grant opens the raster reads exactly as it opens the feature reads.
+#[tokio::test]
+async fn test_read_grant_opens_a_private_raster() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, catalog_id, _, _) = seed_private_raster(&app, &state).await;
+    let vic = token_for_user("vic", Role::Viewer);
+    let uri = format!("/api/v1/rasters/{catalog_id}");
+
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// STAC search names no id, so it filters its own results.
+#[tokio::test]
+async fn test_stac_search_hides_private_tiles() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, _, tile_id, carol) = seed_private_raster(&app, &state).await;
+    let tile = tile_id.to_string();
+    let eve = token_for_user("eve", Role::Editor);
+    let vic = token_for_user("vic", Role::Viewer);
+
+    for (who, token) in [("anonymous", None), ("non-granted editor", Some(&eve))] {
+        assert!(
+            !listing_mentions(
+                &app,
+                "/api/v1/stac/search",
+                token.map(String::as_str),
+                &tile
+            )
+            .await,
+            "{who} STAC search leaked a private tile"
+        );
+    }
+
+    for (who, token) in [
+        ("owner", carol.clone()),
+        ("instance admin", token_for_user("root", Role::Admin)),
+    ] {
+        assert!(
+            listing_mentions(&app, "/api/v1/stac/search", Some(&token), &tile).await,
+            "{who} STAC search hid the tile"
+        );
+    }
+
+    assert!(!listing_mentions(&app, "/api/v1/stac/search", Some(&vic), &tile).await);
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+    assert!(
+        listing_mentions(&app, "/api/v1/stac/search", Some(&vic), &tile).await,
+        "a read grant did not surface the tile in STAC search"
+    );
+}
+
+/// Public rasters keep serving anonymous reads.
+#[tokio::test]
+async fn test_public_raster_reads_stay_anonymous() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/rasters"),
+        Some(&carol),
+        Some(json!({"name": "imagery"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let catalog_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let tile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level)
+         VALUES ($1, $2, ST_MakeEnvelope(0, 0, 1, 1, 4326), 0)",
+    )
+    .bind(tile_id)
+    .bind(catalog_id)
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    for uri in [
+        format!("/api/v1/rasters/{catalog_id}"),
+        format!("/api/v1/rasters/{catalog_id}/tiles"),
+        format!("/api/v1/stac/collections/{catalog_id}"),
+        format!("/api/v1/stac/collections/{catalog_id}/items/{tile_id}"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "anonymous GET {uri}: {body}");
+    }
+
+    assert!(
+        listing_mentions(&app, "/api/v1/stac/search", None, &tile_id.to_string()).await,
+        "anonymous STAC search hid a public tile"
+    );
+}
+
 // ─── Dataset-admin delegation ───────────────────────────────────────
 
 /// Grant as a given caller, returning the raw status so a test can assert denial.

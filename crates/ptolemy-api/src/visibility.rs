@@ -11,10 +11,11 @@
 //! the path, that take one in a query parameter. What they all share is the id
 //! itself, so the layer resolves every uuid the request names.
 //!
-//! An id may name a dataset, a branch, a changeset, a merge request or a
-//! feature: the store's `private_datasets_for_ids` resolves all five to a
-//! dataset. A request that names none of them has no dataset in scope and
-//! passes, and so does a request that names only public ones.
+//! An id may name a dataset, a branch, a changeset, a merge request, a feature,
+//! a raster catalog or a raster tile: the store's `private_datasets_for_ids`
+//! resolves all of them to a dataset. A request that names none of them has no
+//! dataset in scope and passes, and so does a request that names only public
+//! ones.
 //!
 //! Unauthorized reads answer 404, not 403, so a private dataset id cannot be
 //! confirmed by probing.

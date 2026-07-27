@@ -238,6 +238,7 @@ struct StacSearchQuery {
 
 async fn stac_search(
     State(store): State<AppState>,
+    actor: Actor,
     Query(q): Query<StacSearchQuery>,
 ) -> Result<Json<serde_json::Value>, StacError> {
     let limit = q.limit.unwrap_or(10);
@@ -250,7 +251,7 @@ async fn stac_search(
             .collect();
         if coords.len() == 4 {
             conditions.push(format!(
-                "bounds && ST_MakeEnvelope({}, {}, {}, {}, 4326)",
+                "rt.bounds && ST_MakeEnvelope({}, {}, {}, {}, 4326)",
                 coords[0], coords[1], coords[2], coords[3]
             ));
         }
@@ -263,17 +264,26 @@ async fn stac_search(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(",");
-        conditions.push(format!("catalog_id::text IN ({})", in_clause));
+        conditions.push(format!("rt.catalog_id::text IN ({})", in_clause));
     }
 
     let where_clause = conditions.join(" AND ");
+    // search names no id in the path, so the visibility layer cannot cover it:
+    // every tile it returns has to be filtered back to a visible dataset here
+    let reader = actor.reader();
+    let visible = ptolemy_storage::visible_datasets_sql("d", 2, 3);
     let query = format!(
-        "SELECT id, catalog_id, zoom_level, ST_AsGeoJSON(bounds)::jsonb as geometry
-         FROM raster_tiles WHERE {where_clause} LIMIT $1"
+        "SELECT rt.id, rt.catalog_id, rt.zoom_level, ST_AsGeoJSON(rt.bounds)::jsonb as geometry
+         FROM raster_tiles rt
+         JOIN raster_catalogs rc ON rc.id = rt.catalog_id
+         JOIN datasets d ON d.id = rc.dataset_id
+         WHERE {visible} AND {where_clause} LIMIT $1"
     );
 
     let rows = sqlx::query(&query)
         .bind(limit)
+        .bind(reader.bypass)
+        .bind(reader.id.as_deref())
         .fetch_all(store.pool())
         .await?;
 
