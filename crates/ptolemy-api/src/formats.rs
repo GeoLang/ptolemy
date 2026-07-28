@@ -311,6 +311,8 @@ async fn import_geojson(
         .execute(store.pool())
         .await?;
 
+    store.analyzer().after_write(imported);
+
     Ok(Json(ImportResult {
         imported,
         skipped,
@@ -487,6 +489,8 @@ async fn import_csv(
         .bind(branch_id)
         .execute(store.pool())
         .await?;
+
+    store.analyzer().after_write(imported);
 
     Ok(Json(ImportResult {
         imported,

@@ -4,6 +4,7 @@
 
 //! PostgreSQL/PostGIS backend for the versioned feature store.
 
+use crate::analyze::Analyzer;
 use crate::permission::{
     Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
 };
@@ -117,11 +118,19 @@ pub struct PgStore {
     /// Built on first external read, so an unset env var costs nothing and a
     /// bad URL fails the request rather than startup.
     external_pool: tokio::sync::OnceCell<PgPool>,
+    analyzer: Analyzer,
 }
 
 impl PgStore {
     pub fn new(pool: PgPool) -> Self {
+        Self::with_analyze_threshold(pool, Analyzer::threshold_from_env())
+    }
+
+    /// Same, with the bulk-write ANALYZE threshold given directly instead of
+    /// read from the environment.
+    pub fn with_analyze_threshold(pool: PgPool, rows: usize) -> Self {
         Self {
+            analyzer: Analyzer::new(pool.clone(), rows),
             pool,
             external_pool: tokio::sync::OnceCell::new(),
         }
@@ -129,6 +138,12 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Refreshes planner statistics after a bulk write. Handlers that insert
+    /// rows outside [`PgStore::commit`] must report their row count to it.
+    pub fn analyzer(&self) -> &Analyzer {
+        &self.analyzer
     }
 
     /// Run migrations embedded in this crate.
@@ -838,6 +853,7 @@ impl PgStore {
             .await?;
 
         tx.commit().await?;
+        self.analyzer.after_write(operations.len());
 
         Ok(Changeset {
             id: changeset_id,
@@ -3115,6 +3131,7 @@ impl PgStore {
 
         let removed = deleted.rows_affected() as i64;
         let after = before - removed;
+        self.analyzer.after_write(removed as usize);
 
         // Estimate bytes freed (rough: ~200 bytes per version row)
         let bytes_freed = removed * 200;

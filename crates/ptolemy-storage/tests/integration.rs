@@ -35,6 +35,12 @@ fn point_wkb(x: f64, y: f64) -> Vec<u8> {
 }
 
 async fn setup() -> PgStore {
+    setup_with_analyze_threshold(ptolemy_storage::DEFAULT_ANALYZE_ROW_THRESHOLD).await
+}
+
+/// Fresh schema with the bulk-write ANALYZE threshold pinned, so a test does
+/// not depend on the ambient environment.
+async fn setup_with_analyze_threshold(rows: usize) -> PgStore {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url)
@@ -54,7 +60,7 @@ async fn setup() -> PgStore {
     .await
     .unwrap();
 
-    let store = PgStore::new(pool);
+    let store = PgStore::with_analyze_threshold(pool, rows);
     store.migrate().await.unwrap();
     store
 }
@@ -1679,4 +1685,66 @@ async fn test_insert_many_features() {
 
     let features = store.list_features_at_head(branch.id).await.unwrap();
     assert_eq!(features.len(), 100);
+}
+
+/// A bulk import leaves postgres with pre-import statistics, and the recursive
+/// changeset walk every read builds on then gets a plan sized for an empty
+/// table. The write path has to refresh them itself; waiting for autoanalyze
+/// costs minutes of slow reads.
+#[tokio::test]
+async fn test_bulk_commit_refreshes_planner_statistics() {
+    let store = setup_with_analyze_threshold(50).await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let inserts = |n: usize| -> Vec<DiffOp> {
+        (0..n)
+            .map(|i| DiffOp::Insert {
+                feature_id: Uuid::now_v7(),
+                geometry_wkb: point_wkb(i as f64, i as f64),
+                properties: json!({"index": i}),
+            })
+            .collect()
+    };
+
+    store
+        .commit(branch.id, "Small", "alice", &inserts(10), &W)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.analyzer().scheduled(),
+        0,
+        "a commit under the threshold must not analyze"
+    );
+
+    store
+        .commit(branch.id, "Bulk", "alice", &inserts(50), &W)
+        .await
+        .unwrap();
+    assert_eq!(store.analyzer().scheduled(), 1);
+
+    store.analyzer().wait_idle().await;
+
+    // last_analyze counts only explicit ANALYZE, so a background autoanalyze
+    // cannot make this pass on its own.
+    for table in ["feature_versions", "changesets", "branches"] {
+        let row = sqlx::query(
+            "SELECT c.reltuples, s.last_analyze
+               FROM pg_class c JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relname = $1",
+        )
+        .bind(table)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            row.get::<Option<OffsetDateTime>, _>("last_analyze")
+                .is_some(),
+            "{table} was never analyzed"
+        );
+        assert!(
+            row.get::<f32, _>("reltuples") >= 0.0,
+            "{table} still has no row estimate"
+        );
+    }
 }

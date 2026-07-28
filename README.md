@@ -223,6 +223,20 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 | `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets; use a read-only role | (primary pool) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
+| `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger a planner-statistics refresh; `0` leaves it to autoanalyze | 1000 |
+
+### Planner statistics after a bulk import
+
+Every branch read walks the changeset ancestor chain, and postgres picks that
+plan from the statistics it holds for `feature_versions`, `changesets` and
+`branches`. Straight after an import those statistics still describe an empty
+database, so reads get a plan sized for an empty table and cost tens of
+milliseconds each until autoanalyze catches up, minutes later. A write that
+touches at least `PTOLEMY_ANALYZE_ROW_THRESHOLD` rows therefore runs `ANALYZE`
+on those three tables once it has committed, off the request path, and
+concurrent bulk writes share one run. It cannot fail or delay a write: if the
+database refuses the `ANALYZE`, for instance because the connecting role does
+not own the tables, the failure is logged and autoanalyze takes over.
 
 With auth on, audit fields (`author`, `created_by`, `granted_by`, `locked_by`)
 are taken from the token subject and the value in the request body is ignored.

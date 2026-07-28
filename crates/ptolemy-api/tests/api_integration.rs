@@ -21,6 +21,12 @@ const TEST_SECRET: &str = "integration-test-secret-0123456789abcdef";
 
 /// Helper: reset the database and return fresh state.
 async fn fresh_state() -> AppState {
+    fresh_state_with_analyze_threshold(ptolemy_storage::DEFAULT_ANALYZE_ROW_THRESHOLD).await
+}
+
+/// Same, with the bulk-write ANALYZE threshold pinned so a test does not depend
+/// on the ambient environment.
+async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
@@ -44,7 +50,7 @@ async fn fresh_state() -> AppState {
     .await
     .unwrap();
 
-    let store = PgStore::new(pool);
+    let store = PgStore::with_analyze_threshold(pool, rows);
     store.migrate().await.unwrap();
 
     Arc::new(store)
@@ -5826,4 +5832,66 @@ async fn test_subprotocol_token_does_not_authenticate_http_routes() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A bulk write over HTTP must leave the planner fresh statistics for the
+/// recursive changeset walk every read builds on, instead of serving slow reads
+/// until autoanalyze catches up.
+#[tokio::test]
+async fn test_bulk_write_refreshes_planner_statistics() {
+    let state = fresh_state_with_analyze_threshold(3).await;
+    let app = app_with_auth(state.clone(), AuthConfig::disabled());
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+
+    let inserts = |n: usize| -> Value {
+        (0..n)
+            .map(|_| {
+                json!({
+                    "type": "insert",
+                    "feature_id": Uuid::now_v7(),
+                    "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                    "properties": {}
+                })
+            })
+            .collect::<Vec<_>>()
+            .into()
+    };
+
+    let uri = format!("/api/v1/branches/{branch_id}/batch");
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"message": "small", "author": "a", "operations": inserts(2)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        state.analyzer().scheduled(),
+        0,
+        "a write under the threshold must not analyze"
+    );
+
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"message": "bulk", "author": "a", "operations": inserts(3)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(state.analyzer().scheduled(), 1);
+
+    state.analyzer().wait_idle().await;
+    // last_analyze counts only explicit ANALYZE, so a background autoanalyze
+    // cannot make this pass on its own.
+    let last_analyze: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "SELECT last_analyze FROM pg_stat_user_tables WHERE relname = 'feature_versions'",
+    )
+    .fetch_one(state.pool())
+    .await
+    .unwrap();
+    assert!(
+        last_analyze.is_some(),
+        "feature_versions was never analyzed"
+    );
 }
