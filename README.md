@@ -22,7 +22,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 | **SFCGAL** | 3D geometry operations: extrude, volume, Minkowski sum, straight skeleton |
 | **h3-pg** | Uber H3 hexagonal spatial indexing, aggregation, compaction |
 | **pg_partman** | Automatic time-based partitioning (audit logs) |
-| **pgvector** | Vector similarity search, feature deduplication, k-means clustering |
+| **pgvector** | Vector similarity search, feature deduplication, distance-ranked bucketing |
 | **pg_trgm** | Fuzzy text search for data catalog |
 | **pointcloud** | LiDAR/point cloud storage and spatial queries |
 | **MobilityDB** | Moving object trajectories, speed/distance analysis |
@@ -624,10 +624,13 @@ cargo build --release
 
 ```
 crates/
-├── ptolemy-core/      # Domain types, merge logic, diff algorithms
-├── ptolemy-storage/   # PostGIS storage backend
-├── ptolemy-api/       # Axum REST API server
-└── ptolemy-cli/       # CLI binary (server + admin commands)
+├── ptolemy-core/          # Domain types, merge logic, diff algorithms
+├── ptolemy-storage/       # PostGIS storage backend
+├── ptolemy-geopackage/    # GeoPackage import/export for offline editing
+├── ptolemy-mongodb/       # MongoDB storage backend
+├── ptolemy-elasticsearch/ # Elasticsearch indexing backend
+├── ptolemy-api/           # Axum REST API server
+└── ptolemy-cli/           # CLI binary (server + admin commands)
 ```
 
 ## License
