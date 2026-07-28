@@ -15,7 +15,7 @@
 use axum::{
     Json,
     extract::{FromRequestParts, Request, State},
-    http::{Method, StatusCode, header, request::Parts},
+    http::{HeaderMap, Method, StatusCode, Uri, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -25,6 +25,13 @@ use serde::{Deserialize, Serialize};
 
 /// Shortest HS256 secret we accept, matching collecta.
 pub const MIN_SECRET_LEN: usize = 32;
+
+/// Path prefix of the websocket endpoints (`/ws/branches/{id}`, `/ws/rooms/{id}`).
+pub const WS_PREFIX: &str = "/ws/";
+
+/// Subprotocol name that marks a WebSocket handshake as carrying a bearer token.
+/// See [`request_token`] for the full contract.
+pub const BEARER_SUBPROTOCOL: &str = "bearer";
 
 /// JWT claims structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +110,40 @@ pub enum Access {
     Admin,
 }
 
+/// Bearer token for a request: the `Authorization` header, or on a websocket
+/// path a `Sec-WebSocket-Protocol: bearer, <jwt>` offer.
+///
+/// The subprotocol form is there because a browser cannot set the Authorization
+/// header on a WebSocket handshake. It is preferred over a query parameter
+/// because proxies do not log request headers. It is scoped to [`WS_PREFIX`], so
+/// nowhere else does a subprotocol act as a credential. Mirrors tiletopia's
+/// contract so one platform token works against both services.
+pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    let header_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    let token = match header_token {
+        Some(token) => Some(token),
+        None if uri.path().starts_with(WS_PREFIX) => subprotocol_token(headers),
+        None => None,
+    };
+    token.filter(|t| !t.is_empty())
+}
+
+/// Token out of a `Sec-WebSocket-Protocol: bearer, <jwt>` offer. Order is fixed:
+/// the marker first, the token second, both in one header value, which is what
+/// `new WebSocket(url, ["bearer", jwt])` sends.
+fn subprotocol_token(headers: &HeaderMap) -> Option<&str> {
+    let offered = headers.get("Sec-WebSocket-Protocol")?.to_str().ok()?;
+    let mut entries = offered.split(',').map(str::trim);
+    if entries.next()? != BEARER_SUBPROTOCOL {
+        return None;
+    }
+    entries.next()
+}
+
 /// POST endpoints that only query, so they follow the same public rule as GET.
 /// Kept deliberately short: anything not listed is write-gated.
 const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
@@ -115,6 +156,14 @@ const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
 /// POSTs are public; privilege and delivery-config changes are admin-only;
 /// everything else that mutates needs write access.
 pub fn classify(method: &Method, path: &str) -> Access {
+    // A websocket handshake is a GET, so without this it would fall into the
+    // read-is-public rule below and both sockets would accept anonymous callers.
+    // /ws/rooms/{id} relays whatever a peer sends to every other peer in the
+    // room, so an anonymous socket is a write, not a read.
+    if path.starts_with(WS_PREFIX) {
+        return Access::Authenticated;
+    }
+
     // Grant management is authorized per dataset, not per role: the holder of an
     // `admin` grant manages their own dataset. The path alone cannot decide that,
     // so any valid token gets through to the handler, which enforces
@@ -286,12 +335,7 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(AuthEnabled);
 
     let access = classify(request.method(), request.uri().path());
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
+    let token = request_token(request.headers(), request.uri()).map(str::to_owned);
     let key = DecodingKey::from_secret(config.secret.as_bytes());
     let claims = token
         .as_deref()
@@ -705,5 +749,81 @@ mod tests {
         .claims;
         assert_eq!(claims.role, "admin");
         assert!(claims.can_admin());
+    }
+
+    fn headers_with(name: &str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+        headers
+    }
+
+    /// A handshake is a GET, so without the /ws rule it would fall into the
+    /// read-is-public branch and both sockets would take anonymous callers.
+    #[test]
+    fn classify_websockets_need_a_token() {
+        assert_eq!(
+            classify(&Method::GET, "/ws/branches/6f1c2d3e"),
+            Access::Authenticated
+        );
+        assert_eq!(
+            classify(&Method::GET, "/ws/rooms/design-review"),
+            Access::Authenticated
+        );
+    }
+
+    #[test]
+    fn request_token_reads_authorization_header() {
+        let headers = headers_with("authorization", "Bearer abc.def.ghi");
+        let uri: Uri = "/api/v1/datasets".parse().unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
+    }
+
+    #[test]
+    fn request_token_reads_subprotocol_on_ws_paths() {
+        let headers = headers_with("sec-websocket-protocol", "bearer, abc.def.ghi");
+        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
+    }
+
+    /// The subprotocol is a credential only on the websocket paths. Anywhere
+    /// else it must be ignored, or any route could be entered with a header a
+    /// browser sets from script without a preflight.
+    #[test]
+    fn subprotocol_is_not_a_credential_off_ws_paths() {
+        let headers = headers_with("sec-websocket-protocol", "bearer, abc.def.ghi");
+        let uri: Uri = "/api/v1/datasets".parse().unwrap();
+        assert_eq!(request_token(&headers, &uri), None);
+    }
+
+    #[test]
+    fn subprotocol_needs_the_marker_first_and_a_non_empty_token() {
+        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
+        // marker missing
+        let headers = headers_with("sec-websocket-protocol", "abc.def.ghi");
+        assert_eq!(request_token(&headers, &uri), None);
+        // marker not first
+        let headers = headers_with("sec-websocket-protocol", "abc.def.ghi, bearer");
+        assert_eq!(request_token(&headers, &uri), None);
+        // marker alone
+        let headers = headers_with("sec-websocket-protocol", "bearer");
+        assert_eq!(request_token(&headers, &uri), None);
+        // marker with an empty token
+        let headers = headers_with("sec-websocket-protocol", "bearer, ");
+        assert_eq!(request_token(&headers, &uri), None);
+    }
+
+    /// A real Authorization header wins, so a non-browser client is unaffected.
+    #[test]
+    fn authorization_header_wins_over_subprotocol() {
+        let mut headers = headers_with("authorization", "Bearer real.token");
+        headers.insert(
+            axum::http::HeaderName::from_static("sec-websocket-protocol"),
+            "bearer, other.token".parse().unwrap(),
+        );
+        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("real.token"));
     }
 }

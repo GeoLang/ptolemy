@@ -45,3 +45,6 @@ uuid = { workspace = true }
 # integration tests mint tokens the API layer must reject (expired, forged)
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
+# a real websocket handshake: tower's oneshot has no hyper upgrade state, so it
+# can never reach a 101 and cannot prove the subprotocol echo
+tokio-tungstenite = "0.29"

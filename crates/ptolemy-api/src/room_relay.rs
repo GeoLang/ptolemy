@@ -83,7 +83,11 @@ async fn ws_room_handler(
     Path(room_id): Path<String>,
     State(relay): State<Arc<RoomRelay>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_room_socket(socket, room_id, relay))
+    // auth_middleware already rejected an anonymous handshake. echoing the
+    // marker is required for a browser to accept the 101, and the token itself
+    // is never echoed
+    ws.protocols([crate::auth::BEARER_SUBPROTOCOL])
+        .on_upgrade(move |socket| handle_room_socket(socket, room_id, relay))
 }
 
 async fn handle_room_socket(socket: WebSocket, room_id: String, relay: Arc<RoomRelay>) {

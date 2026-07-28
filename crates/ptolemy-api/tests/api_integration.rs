@@ -5688,3 +5688,142 @@ async fn test_projected_external_still_obeys_visibility() {
     assert_eq!(status, StatusCode::OK, "owner: {body}");
     assert_eq!(body.as_array().unwrap().len(), 2, "owner: {body}");
 }
+
+// ─── WebSocket handshake auth ───────────────────────────────────────
+//
+// These run against a real listener rather than `oneshot`. The upgrade
+// extractor needs hyper's upgrade state, which a bare tower service never has,
+// so `oneshot` answers 426 for every handshake and can prove neither the 101
+// nor the echoed subprotocol.
+
+/// Serve `app` on an ephemeral port and return its `ws://` base URL.
+async fn spawn_ws_app(app: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("ws://{addr}")
+}
+
+/// Open a socket. `Ok` carries the subprotocol the server selected, `Err` the
+/// status it refused with.
+async fn ws_connect(
+    base: &str,
+    path: &str,
+    subprotocol: Option<&str>,
+    bearer: Option<&str>,
+) -> Result<Option<String>, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut req = format!("{base}{path}").into_client_request().unwrap();
+    if let Some(proto) = subprotocol {
+        req.headers_mut()
+            .insert("sec-websocket-protocol", proto.parse().unwrap());
+    }
+    if let Some(token) = bearer {
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    }
+
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((_stream, resp)) => Ok(resp
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+        Err(e) => panic!("unexpected websocket error: {e}"),
+    }
+}
+
+/// Both socket paths. The branch one parses its id as a UUID, so it needs a
+/// real one to get past the extractor once auth lets the request through.
+fn ws_paths() -> [String; 2] {
+    [
+        "/ws/branches/6f1c2d3e-0000-4000-8000-000000000001".to_string(),
+        "/ws/rooms/design-review".to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn test_ws_handshake_without_token_is_rejected() {
+    let base = spawn_ws_app(setup_app_authed().await).await;
+    for path in ws_paths() {
+        let result = ws_connect(&base, &path, None, None).await;
+        assert_eq!(result, Err(401), "anonymous {path}");
+    }
+}
+
+#[tokio::test]
+async fn test_ws_handshake_with_subprotocol_token_upgrades() {
+    let base = spawn_ws_app(setup_app_authed().await).await;
+    let token = token_for(Role::Viewer);
+    for path in ws_paths() {
+        let selected = ws_connect(&base, &path, Some(&format!("bearer, {token}")), None)
+            .await
+            .unwrap_or_else(|s| panic!("{path} refused with {s}"));
+        // the marker comes back so a browser accepts the 101, the token never does
+        assert_eq!(selected.as_deref(), Some("bearer"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn test_ws_handshake_with_bad_subprotocol_token_is_rejected() {
+    let base = spawn_ws_app(setup_app_authed().await).await;
+    let expired = expired_token(TEST_SECRET, Role::Viewer);
+    let forged = generate_token(
+        "a-different-secret-0123456789abcdef",
+        "u",
+        Role::Admin,
+        3600,
+    );
+    let valid = token_for(Role::Viewer);
+    let offers = [
+        "bearer, not-a-jwt".to_string(),
+        format!("bearer, {expired}"),
+        format!("bearer, {forged}"),
+        // the marker alone carries no credential
+        "bearer".to_string(),
+        // a token without the marker first is not an offer we accept
+        valid.clone(),
+        format!("{valid}, bearer"),
+    ];
+    for path in ws_paths() {
+        for offer in &offers {
+            let result = ws_connect(&base, &path, Some(offer), None).await;
+            assert_eq!(result, Err(401), "{path} offering {offer}");
+        }
+    }
+}
+
+/// Non-browser clients can still use the header, and it must be honoured.
+#[tokio::test]
+async fn test_ws_handshake_with_authorization_header_upgrades() {
+    let base = spawn_ws_app(setup_app_authed().await).await;
+    let token = token_for(Role::Viewer);
+    for path in ws_paths() {
+        ws_connect(&base, &path, None, Some(&token))
+            .await
+            .unwrap_or_else(|s| panic!("header auth {path} refused with {s}"));
+    }
+}
+
+/// The subprotocol must not act as a credential anywhere but the socket paths,
+/// or any route could be entered with a header script sets without a preflight.
+#[tokio::test]
+async fn test_subprotocol_token_does_not_authenticate_http_routes() {
+    let app = setup_app_authed().await;
+    let token = token_for(Role::Editor);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/datasets")
+        .header("content-type", "application/json")
+        .header("sec-websocket-protocol", format!("bearer, {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({"name": "x", "srid": 4326})).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

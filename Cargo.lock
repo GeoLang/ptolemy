@@ -2820,6 +2820,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tonic",
  "tower 0.5.3",
  "tower-http",

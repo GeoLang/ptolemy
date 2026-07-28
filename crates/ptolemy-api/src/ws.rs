@@ -68,7 +68,11 @@ async fn ws_branch_handler(
     Path(branch_id): Path<Uuid>,
     State(bus): State<Arc<EventBus>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, branch_id, bus))
+    // auth_middleware already rejected an anonymous handshake. echoing the
+    // marker is required for a browser to accept the 101, and the token itself
+    // is never echoed
+    ws.protocols([crate::auth::BEARER_SUBPROTOCOL])
+        .on_upgrade(move |socket| handle_socket(socket, branch_id, bus))
 }
 
 async fn handle_socket(mut socket: WebSocket, branch_id: Uuid, bus: Arc<EventBus>) {
