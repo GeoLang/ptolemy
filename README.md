@@ -581,8 +581,15 @@ client but any JSON structure will work.
 | GET | `/api/v1/branches/{id}/export/flatgeobuf` | Export FlatGeobuf |
 | POST | `/api/v1/branches/{id}/transform` | Transform single geometry CRS |
 | POST | `/api/v1/branches/{id}/reproject` | Reproject all features |
+| POST | `/api/v1/branches/{id}/import/geojson` | Import a FeatureCollection |
+| POST | `/api/v1/branches/{id}/import/csv` | Import point rows from CSV |
 | GET | `/api/v1/crs/search?q=` | Search coordinate systems |
 | GET | `/api/v1/crs/{srid}` | Get CRS details |
+
+Both imports answer `{imported, skipped, changeset_id, errors}`. Rows that
+cannot be parsed are skipped and named in `errors`; the rest land as one
+changeset on the branch, visible to reads like any other commit. A request whose
+rows all fail answers 422 and writes no changeset.
 
 ## CLI Commands
 

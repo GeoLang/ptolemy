@@ -5895,3 +5895,150 @@ async fn test_bulk_write_refreshes_planner_statistics() {
         "feature_versions was never analyzed"
     );
 }
+
+/// Helper: the branch's live features as GeoJSON, through the changeset walk
+/// every read shares.
+async fn exported_features(app: &axum::Router, branch_id: Uuid) -> Vec<Value> {
+    let (status, body) =
+        get_json(app, &format!("/api/v1/branches/{branch_id}/export/geojson")).await;
+    assert_eq!(status, StatusCode::OK, "export: {body}");
+    body["features"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn test_import_geojson_is_readable_on_the_branch() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/import/geojson"),
+        json!({
+            "message": "trees",
+            "author": "surveyor",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [1.5, 2.5]},
+                    "properties": {"name": "Oak"}
+                },
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": [[0.0, 0.0], [1.0, 1.0]]},
+                    "properties": {"name": "Path"}
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["imported"], 2, "{body}");
+    assert_eq!(body["skipped"], 0, "{body}");
+    assert!(body["changeset_id"].is_string(), "{body}");
+
+    let features = exported_features(&app, branch_id).await;
+    assert_eq!(features.len(), 2, "imported features must be readable");
+    assert_eq!(features[0]["properties"]["name"], "Oak");
+    assert_eq!(features[0]["geometry"]["coordinates"], json!([1.5, 2.5]));
+    assert_eq!(features[1]["properties"]["name"], "Path");
+    assert_eq!(features[1]["geometry"]["type"], "LineString");
+
+    // the import is a changeset like any other, so it shows up in the history
+    let (status, history) = get_json(&app, &format!("/api/v1/branches/{branch_id}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history[0]["message"], "trees", "{history}");
+    assert_eq!(history[0]["author"], "surveyor", "{history}");
+}
+
+#[tokio::test]
+async fn test_import_csv_is_readable_on_the_branch() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/import/csv"),
+        json!({
+            "csv": "longitude,latitude,name,height\n1.5,2.5,Alpha,10\n3.5,4.5,Beta,20\n",
+            "message": "poles",
+            "author": "surveyor"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["imported"], 2, "{body}");
+    assert_eq!(body["skipped"], 0, "{body}");
+
+    let features = exported_features(&app, branch_id).await;
+    assert_eq!(features.len(), 2, "imported rows must be readable");
+    assert_eq!(features[0]["properties"]["name"], "Alpha");
+    assert_eq!(features[0]["properties"]["height"], 10.0);
+    assert_eq!(features[0]["geometry"]["coordinates"], json!([1.5, 2.5]));
+    assert_eq!(features[1]["geometry"]["coordinates"], json!([3.5, 4.5]));
+}
+
+#[tokio::test]
+async fn test_import_reports_bad_rows_and_refuses_a_total_failure() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+
+    // every feature unusable: nothing to store, so this is not a success and
+    // must leave no changeset behind
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/import/geojson"),
+        json!({"features": [
+            {"type": "Feature", "properties": {"name": "no geometry"}},
+            {"type": "Feature", "geometry": null, "properties": {}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["imported"], 0, "{body}");
+    assert_eq!(body["skipped"], 2, "{body}");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 2, "{body}");
+    assert!(body["changeset_id"].is_null(), "{body}");
+    assert!(exported_features(&app, branch_id).await.is_empty());
+
+    // a mixed request keeps the good row and reports the bad one
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/import/geojson"),
+        json!({"features": [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [7.0, 8.0]},
+                "properties": {"name": "good"}
+            },
+            {"type": "Feature", "geometry": null, "properties": {}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["imported"], 1, "{body}");
+    assert_eq!(body["skipped"], 1, "{body}");
+
+    let features = exported_features(&app, branch_id).await;
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0]["properties"]["name"], "good");
+
+    // same rule for CSV
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/import/csv"),
+        json!({"csv": "longitude,latitude,name\nnorth,2.5,Alpha\n1.5\n"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["imported"], 0, "{body}");
+    assert_eq!(body["skipped"], 2, "{body}");
+    assert!(body["changeset_id"].is_null(), "{body}");
+    assert_eq!(
+        exported_features(&app, branch_id).await.len(),
+        1,
+        "a refused import must not disturb the branch"
+    );
+}

@@ -216,12 +216,45 @@ struct ImportResult {
     errors: Vec<String>,
 }
 
+/// An import that stored nothing but was given rows to store is not a success,
+/// so it answers 422 with the same body. A partial import stays 200: the caller
+/// gets the count and the per-row errors.
+fn import_response(result: ImportResult) -> (StatusCode, Json<ImportResult>) {
+    let status = if result.imported == 0 && result.skipped > 0 {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(result))
+}
+
+/// Store parsed features as one changeset, or nothing at all when every row was
+/// rejected: an empty changeset would advance the branch head for no content.
+/// Going through `commit` is what makes imported features visible to branch
+/// reads, which resolve a feature by walking the changeset chain.
+async fn commit_imported(
+    store: &AppState,
+    branch_id: Uuid,
+    message: &str,
+    author: &str,
+    ops: &[ptolemy_core::diff::DiffOp],
+    actor: &Actor,
+) -> Result<Option<Uuid>, FormatError> {
+    if ops.is_empty() {
+        return Ok(None);
+    }
+    let changeset = store
+        .commit(branch_id, message, author, ops, &actor.writer())
+        .await?;
+    Ok(Some(changeset.id))
+}
+
 async fn import_geojson(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
     actor: Actor,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ImportResult>, FormatError> {
+) -> Result<(StatusCode, Json<ImportResult>), FormatError> {
     store
         .ensure_branch_writable(branch_id, &actor.writer())
         .await?;
@@ -248,75 +281,40 @@ async fn import_geojson(
         ));
     }
 
-    // Create changeset
-    let changeset_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
-         SELECT $1, $2, head, $3, $4, NOW()
-         FROM branches WHERE id = $2",
-    )
-    .bind(changeset_id)
-    .bind(branch_id)
-    .bind(message)
-    .bind(author)
-    .execute(store.pool())
-    .await?;
-
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
+    let mut ops = Vec::with_capacity(features.len());
     let mut errors = Vec::new();
 
     for (i, feature) in features.iter().enumerate() {
-        let geometry = feature.get("geometry");
-        let properties = feature
-            .get("properties")
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-
-        let geom_json = match geometry {
-            Some(g) if !g.is_null() => serde_json::to_string(g).unwrap_or_default(),
+        let geometry = match feature.get("geometry") {
+            Some(g) if !g.is_null() => g,
             _ => {
-                skipped += 1;
                 errors.push(format!("feature {i}: no geometry"));
                 continue;
             }
         };
-
-        let feature_id = Uuid::now_v7();
-        let result = sqlx::query(
-            "INSERT INTO feature_versions (id, feature_id, changeset_id, operation, geometry, properties, created_at)
-             VALUES ($1, $2, $3, 'insert', ST_SetSRID(ST_GeomFromGeoJSON($4), 4326), $5, NOW())",
-        )
-        .bind(Uuid::now_v7())
-        .bind(feature_id)
-        .bind(changeset_id)
-        .bind(&geom_json)
-        .bind(&properties)
-        .execute(store.pool())
-        .await;
-
-        match result {
-            Ok(_) => imported += 1,
+        let geometry_wkb = match ptolemy_core::geoconvert::geojson_to_wkb(geometry) {
+            Ok(wkb) => wkb,
             Err(e) => {
-                skipped += 1;
                 errors.push(format!("feature {i}: {e}"));
+                continue;
             }
-        }
+        };
+        ops.push(ptolemy_core::diff::DiffOp::Insert {
+            feature_id: Uuid::now_v7(),
+            geometry_wkb,
+            properties: feature
+                .get("properties")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
+        });
     }
 
-    // Update branch head
-    sqlx::query("UPDATE branches SET head = $1 WHERE id = $2")
-        .bind(changeset_id)
-        .bind(branch_id)
-        .execute(store.pool())
-        .await?;
+    let changeset_id = commit_imported(&store, branch_id, message, author, &ops, &actor).await?;
 
-    store.analyzer().after_write(imported);
-
-    Ok(Json(ImportResult {
-        imported,
-        skipped,
-        changeset_id: Some(changeset_id),
+    Ok(import_response(ImportResult {
+        imported: ops.len(),
+        skipped: errors.len(),
+        changeset_id,
         errors,
     }))
 }
@@ -344,7 +342,7 @@ async fn import_csv(
     Path(branch_id): Path<Uuid>,
     actor: Actor,
     Json(req): Json<ImportCsvRequest>,
-) -> Result<Json<ImportResult>, FormatError> {
+) -> Result<(StatusCode, Json<ImportResult>), FormatError> {
     store
         .ensure_branch_writable(branch_id, &actor.writer())
         .await?;
@@ -393,22 +391,7 @@ async fn import_csv(
         return Err(FormatError::Bad("maximum 50,000 rows per import".into()));
     }
 
-    // Create changeset
-    let changeset_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
-         SELECT $1, $2, head, $3, $4, NOW()
-         FROM branches WHERE id = $2",
-    )
-    .bind(changeset_id)
-    .bind(branch_id)
-    .bind(&req.message)
-    .bind(actor.or_body(&req.author))
-    .execute(store.pool())
-    .await?;
-
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
+    let mut ops = Vec::with_capacity(lines.len().saturating_sub(1));
     let mut errors = Vec::new();
 
     for (row_num, line) in lines.iter().enumerate().skip(1) {
@@ -417,7 +400,6 @@ async fn import_csv(
             .map(|c| c.trim().trim_matches('"'))
             .collect();
         if cols.len() <= lng_idx.max(lat_idx) {
-            skipped += 1;
             errors.push(format!("row {row_num}: not enough columns"));
             continue;
         }
@@ -425,7 +407,6 @@ async fn import_csv(
         let lng: f64 = match cols[lng_idx].parse() {
             Ok(v) => v,
             Err(_) => {
-                skipped += 1;
                 errors.push(format!("row {row_num}: invalid longitude"));
                 continue;
             }
@@ -433,7 +414,6 @@ async fn import_csv(
         let lat: f64 = match cols[lat_idx].parse() {
             Ok(v) => v,
             Err(_) => {
-                skipped += 1;
                 errors.push(format!("row {row_num}: invalid latitude"));
                 continue;
             }
@@ -460,42 +440,35 @@ async fn import_csv(
             }
         }
 
-        let feature_id = Uuid::now_v7();
-        let result = sqlx::query(
-            "INSERT INTO feature_versions (id, feature_id, changeset_id, operation, geometry, properties, created_at)
-             VALUES ($1, $2, $3, 'insert', ST_SetSRID(ST_MakePoint($4, $5), 4326), $6, NOW())",
-        )
-        .bind(Uuid::now_v7())
-        .bind(feature_id)
-        .bind(changeset_id)
-        .bind(lng)
-        .bind(lat)
-        .bind(serde_json::Value::Object(props))
-        .execute(store.pool())
-        .await;
-
-        match result {
-            Ok(_) => imported += 1,
+        let point = serde_json::json!({"type": "Point", "coordinates": [lng, lat]});
+        let geometry_wkb = match ptolemy_core::geoconvert::geojson_to_wkb(&point) {
+            Ok(wkb) => wkb,
             Err(e) => {
-                skipped += 1;
                 errors.push(format!("row {row_num}: {e}"));
+                continue;
             }
-        }
+        };
+        ops.push(ptolemy_core::diff::DiffOp::Insert {
+            feature_id: Uuid::now_v7(),
+            geometry_wkb,
+            properties: serde_json::Value::Object(props),
+        });
     }
 
-    // Update branch head
-    sqlx::query("UPDATE branches SET head = $1 WHERE id = $2")
-        .bind(changeset_id)
-        .bind(branch_id)
-        .execute(store.pool())
-        .await?;
+    let changeset_id = commit_imported(
+        &store,
+        branch_id,
+        &req.message,
+        actor.or_body(&req.author),
+        &ops,
+        &actor,
+    )
+    .await?;
 
-    store.analyzer().after_write(imported);
-
-    Ok(Json(ImportResult {
-        imported,
-        skipped,
-        changeset_id: Some(changeset_id),
+    Ok(import_response(ImportResult {
+        imported: ops.len(),
+        skipped: errors.len(),
+        changeset_id,
         errors,
     }))
 }
