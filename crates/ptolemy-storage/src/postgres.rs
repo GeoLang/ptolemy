@@ -124,6 +124,14 @@ pub const EXTERNAL_READ_ONLY: &str =
 /// the guarantee holds at the database, not only in this process.
 pub const EXTERNAL_DATABASE_URL: &str = "PTOLEMY_EXTERNAL_DATABASE_URL";
 
+/// The owner a write has to be allowed on, resolved from whatever id the request
+/// named. See [`PgStore::write_targets_for_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteTarget {
+    Branch(Uuid),
+    Dataset(Uuid),
+}
+
 pub struct PgStore {
     pool: PgPool,
     /// Built on first external read, so an unset env var costs nothing and a
@@ -672,6 +680,83 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.get("dataset_id")).collect())
+    }
+
+    /// What a mutation aimed at `id` writes to, so the write gate can run the
+    /// ladder without knowing which route it is guarding. The mirror of
+    /// [`PgStore::private_datasets_for_ids`] for writes: the same set of tables,
+    /// resolved to the owner the ladder takes rather than to a visibility flag.
+    ///
+    /// A branch is returned as a branch, not as its dataset, so
+    /// [`PgStore::ensure_branch_writable`] can apply the branch scope. A
+    /// relationship class spans two datasets and yields both, and the caller has
+    /// to be allowed on each.
+    ///
+    /// Empty means the id names nothing this instance owns. There is nothing to
+    /// check, and the write fails on its own foreign key.
+    pub async fn write_targets_for_id(&self, id: Uuid) -> Result<Vec<WriteTarget>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT branch_id, dataset_id FROM (
+                 SELECT NULL::uuid AS branch_id, id AS dataset_id FROM datasets WHERE id = $1
+                 UNION ALL SELECT id, dataset_id FROM branches WHERE id = $1
+                 UNION ALL SELECT c.branch_id, b.dataset_id FROM changesets c
+                             JOIN branches b ON b.id = c.branch_id WHERE c.id = $1
+                 -- a review is approved, closed and commented on against the
+                 -- branch it would land on, so a branch grantee keeps working
+                 UNION ALL SELECT target_branch_id, dataset_id FROM merge_requests WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM feature_versions WHERE feature_id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM raster_catalogs WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, rc.dataset_id FROM raster_tiles rt
+                             JOIN raster_catalogs rc ON rc.id = rt.catalog_id WHERE rt.id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM pointcloud_catalogs WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, pc.dataset_id FROM pointcloud_patches pp
+                             JOIN pointcloud_catalogs pc ON pc.id = pp.catalog_id WHERE pp.id = $1
+                 UNION ALL SELECT a.branch_id, COALESCE(a.dataset_id, ab.dataset_id) FROM attachments a
+                        LEFT JOIN branches ab ON ab.id = a.branch_id WHERE a.id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM networks WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM routes WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM symbology_rules WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM label_rules WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM domains WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM subtypes WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM attribute_rules WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM trajectories WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM topology_rules WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, dataset_id FROM webhooks WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, unnest(ARRAY[origin_dataset_id, destination_dataset_id])
+                             FROM relationship_classes WHERE id = $1
+                 UNION ALL SELECT NULL::uuid, unnest(ARRAY[rc.origin_dataset_id, rc.destination_dataset_id])
+                             FROM relationship_records rr
+                             JOIN relationship_classes rc ON rc.id = rr.relationship_class_id
+                            WHERE rr.id = $1
+             ) owners",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| match r.get::<Option<Uuid>, _>("branch_id") {
+                Some(branch_id) => WriteTarget::Branch(branch_id),
+                None => WriteTarget::Dataset(r.get("dataset_id")),
+            })
+            .collect())
+    }
+
+    /// Run the ladder for every target [`PgStore::write_targets_for_id`] found.
+    pub async fn ensure_id_writable(&self, id: Uuid, writer: &Writer) -> Result<(), StoreError> {
+        for target in self.write_targets_for_id(id).await? {
+            match target {
+                WriteTarget::Branch(branch_id) => {
+                    self.ensure_branch_writable(branch_id, writer).await?
+                }
+                WriteTarget::Dataset(dataset_id) => {
+                    self.ensure_dataset_writable(dataset_id, writer).await?
+                }
+            }
+        }
+        Ok(())
     }
 
     // ─── Branch CRUD ────────────────────────────────────────────────
