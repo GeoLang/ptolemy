@@ -5,11 +5,15 @@
 //! Domains, subtypes, and attribute rules.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+};
+use ptolemy_storage::{
+    WriteGrant,
+    writes::{AttributeRuleInput, AttributeRulePatch, DomainInput, SubtypeInput},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -92,16 +96,22 @@ struct CreateDomainRequest {
 
 async fn create_domain(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), DomainError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO domains (id, dataset_id, name, domain_type, field_type, coded_values, range_min, range_max)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    ).bind(id).bind(dataset_id).bind(&req.name).bind(&req.domain_type).bind(&req.field_type)
-    .bind(&req.coded_values).bind(req.range_min).bind(req.range_max)
-    .execute(store.pool()).await?;
+    let id = store
+        .create_domain(
+            &grant,
+            &DomainInput {
+                name: &req.name,
+                domain_type: &req.domain_type,
+                field_type: &req.field_type,
+                coded_values: req.coded_values.as_ref(),
+                range_min: req.range_min,
+                range_max: req.range_max,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -130,12 +140,9 @@ async fn get_domain(
 
 async fn delete_domain(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, DomainError> {
-    sqlx::query("DELETE FROM domains WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_domain(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -189,23 +196,21 @@ struct CreateSubtypeRequest {
 
 async fn create_subtype(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateSubtypeRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), DomainError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO subtypes (id, dataset_id, subtype_field, name, code, default_values, domain_assignments)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(id)
-    .bind(dataset_id)
-    .bind(&req.subtype_field)
-    .bind(&req.name)
-    .bind(req.code)
-    .bind(&req.default_values)
-    .bind(&req.domain_assignments)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .create_subtype(
+            &grant,
+            &SubtypeInput {
+                subtype_field: &req.subtype_field,
+                name: &req.name,
+                code: req.code,
+                default_values: &req.default_values,
+                domain_assignments: &req.domain_assignments,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -232,12 +237,9 @@ async fn get_subtype(
 
 async fn delete_subtype(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, DomainError> {
-    sqlx::query("DELETE FROM subtypes WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_subtype(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -291,16 +293,21 @@ struct CreateRuleRequest {
 
 async fn create_rule(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), DomainError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO attribute_rules (id, dataset_id, name, rule_type, trigger_event, expression, error_message)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    ).bind(id).bind(dataset_id).bind(&req.name).bind(&req.rule_type)
-    .bind(&req.trigger_event).bind(&req.expression).bind(&req.error_message)
-    .execute(store.pool()).await?;
+    let id = store
+        .create_attribute_rule(
+            &grant,
+            &AttributeRuleInput {
+                name: &req.name,
+                rule_type: &req.rule_type,
+                trigger_event: &req.trigger_event,
+                expression: &req.expression,
+                error_message: req.error_message.as_deref(),
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -336,41 +343,27 @@ struct UpdateRuleRequest {
 
 async fn update_rule(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<UpdateRuleRequest>,
 ) -> Result<StatusCode, DomainError> {
-    if let Some(expr) = &req.expression {
-        sqlx::query("UPDATE attribute_rules SET expression = $2 WHERE id = $1")
-            .bind(id)
-            .bind(expr)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(msg) = &req.error_message {
-        sqlx::query("UPDATE attribute_rules SET error_message = $2 WHERE id = $1")
-            .bind(id)
-            .bind(msg)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(en) = req.enabled {
-        sqlx::query("UPDATE attribute_rules SET enabled = $2 WHERE id = $1")
-            .bind(id)
-            .bind(en)
-            .execute(store.pool())
-            .await?;
-    }
+    store
+        .update_attribute_rule(
+            &grant,
+            &AttributeRulePatch {
+                expression: req.expression.as_deref(),
+                error_message: req.error_message.as_deref(),
+                enabled: req.enabled,
+            },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_rule(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, DomainError> {
-    sqlx::query("DELETE FROM attribute_rules WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_attribute_rule(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -397,6 +390,7 @@ async fn validate_rule(
 
 enum DomainError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
 }
 impl From<sqlx::Error> for DomainError {
@@ -404,10 +398,16 @@ impl From<sqlx::Error> for DomainError {
         DomainError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for DomainError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        DomainError::Store(e)
+    }
+}
 impl IntoResponse for DomainError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             DomainError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            DomainError::Store(e) => crate::errors::store_error_status(&e),
             DomainError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

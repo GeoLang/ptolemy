@@ -5,11 +5,15 @@
 //! Cartographic representations — symbology and label rules per dataset.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
+};
+use ptolemy_storage::{
+    WriteGrant,
+    writes::{LabelRuleInput, LabelRulePatch, SymbologyRuleInput, SymbologyRulePatch},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -88,17 +92,22 @@ struct CreateSymbologyRequest {
 
 async fn create_symbology(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateSymbologyRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), CartoError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO symbology_rules (id, dataset_id, name, min_scale, max_scale, filter_expression, symbol, priority)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    ).bind(id).bind(dataset_id).bind(&req.name)
-    .bind(req.min_scale).bind(req.max_scale).bind(&req.filter_expression)
-    .bind(&req.symbol).bind(req.priority)
-    .execute(store.pool()).await?;
+    let id = store
+        .create_symbology_rule(
+            &grant,
+            &SymbologyRuleInput {
+                name: &req.name,
+                min_scale: req.min_scale,
+                max_scale: req.max_scale,
+                filter_expression: req.filter_expression.as_deref(),
+                symbol: &req.symbol,
+                priority: req.priority,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -137,41 +146,27 @@ struct UpdateSymbologyRequest {
 
 async fn update_symbology(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<UpdateSymbologyRequest>,
 ) -> Result<StatusCode, CartoError> {
-    if let Some(sym) = &req.symbol {
-        sqlx::query("UPDATE symbology_rules SET symbol = $2 WHERE id = $1")
-            .bind(id)
-            .bind(sym)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(expr) = &req.filter_expression {
-        sqlx::query("UPDATE symbology_rules SET filter_expression = $2 WHERE id = $1")
-            .bind(id)
-            .bind(expr)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(p) = req.priority {
-        sqlx::query("UPDATE symbology_rules SET priority = $2 WHERE id = $1")
-            .bind(id)
-            .bind(p)
-            .execute(store.pool())
-            .await?;
-    }
+    store
+        .update_symbology_rule(
+            &grant,
+            &SymbologyRulePatch {
+                symbol: req.symbol.as_ref(),
+                filter_expression: req.filter_expression.as_deref(),
+                priority: req.priority,
+            },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_symbology(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, CartoError> {
-    sqlx::query("DELETE FROM symbology_rules WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_symbology_rule(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -238,17 +233,23 @@ fn default_font() -> serde_json::Value {
 
 async fn create_label(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateLabelRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), CartoError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO label_rules (id, dataset_id, name, min_scale, max_scale, field_expression, placement, font, priority)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-    ).bind(id).bind(dataset_id).bind(&req.name)
-    .bind(req.min_scale).bind(req.max_scale)
-    .bind(&req.field_expression).bind(&req.placement).bind(&req.font).bind(req.priority)
-    .execute(store.pool()).await?;
+    let id = store
+        .create_label_rule(
+            &grant,
+            &LabelRuleInput {
+                name: &req.name,
+                min_scale: req.min_scale,
+                max_scale: req.max_scale,
+                field_expression: &req.field_expression,
+                placement: &req.placement,
+                font: &req.font,
+                priority: req.priority,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -286,53 +287,34 @@ struct UpdateLabelRequest {
 
 async fn update_label(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<UpdateLabelRequest>,
 ) -> Result<StatusCode, CartoError> {
-    if let Some(expr) = &req.field_expression {
-        sqlx::query("UPDATE label_rules SET field_expression = $2 WHERE id = $1")
-            .bind(id)
-            .bind(expr)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(p) = &req.placement {
-        sqlx::query("UPDATE label_rules SET placement = $2 WHERE id = $1")
-            .bind(id)
-            .bind(p)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(f) = &req.font {
-        sqlx::query("UPDATE label_rules SET font = $2 WHERE id = $1")
-            .bind(id)
-            .bind(f)
-            .execute(store.pool())
-            .await?;
-    }
-    if let Some(p) = req.priority {
-        sqlx::query("UPDATE label_rules SET priority = $2 WHERE id = $1")
-            .bind(id)
-            .bind(p)
-            .execute(store.pool())
-            .await?;
-    }
+    store
+        .update_label_rule(
+            &grant,
+            &LabelRulePatch {
+                field_expression: req.field_expression.as_deref(),
+                placement: req.placement.as_ref(),
+                font: req.font.as_ref(),
+                priority: req.priority,
+            },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_label(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, CartoError> {
-    sqlx::query("DELETE FROM label_rules WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_label_rule(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 enum CartoError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
 }
 impl From<sqlx::Error> for CartoError {
@@ -340,10 +322,16 @@ impl From<sqlx::Error> for CartoError {
         CartoError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for CartoError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        CartoError::Store(e)
+    }
+}
 impl IntoResponse for CartoError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             CartoError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            CartoError::Store(e) => crate::errors::store_error_status(&e),
             CartoError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
