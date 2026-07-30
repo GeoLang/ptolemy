@@ -6736,6 +6736,234 @@ async fn test_dataset_attachment_upload_requires_write() {
     assert_eq!(body.as_array().unwrap().len(), 1);
 }
 
+// ─── Attachment writes go through the write ladder ───────────────────
+
+/// A public dataset owned by carol with a branch and one committed feature, so a
+/// write denial is the ladder talking and not the visibility layer. Returns
+/// (dataset id, branch id, feature id, carol's token).
+async fn seed_attachment_targets(app: &axum::Router) -> (Uuid, Uuid, Uuid, String) {
+    let (dataset_id, carol) = seed_owned_public_dataset(app).await;
+
+    let (status, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let feature_id = Uuid::now_v7();
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&carol),
+        Some(json!({
+            "message": "attachment target",
+            "author": "carol",
+            "operations": [{
+                "type": "insert",
+                "feature_id": feature_id,
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {},
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    (dataset_id, branch_id, feature_id, carol)
+}
+
+/// Uploading an attachment is a write on the owning branch or dataset, so the
+/// editor role alone is not enough.
+#[tokio::test]
+async fn test_attachment_uploads_need_a_write_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, feature_id, _) = seed_attachment_targets(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let vic = token_for_user("vic", Role::Viewer);
+    let root = token_for_user("root", Role::Admin);
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let uris = [
+        format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments"),
+        format!("/api/v1/datasets/{dataset_id}/attachments"),
+    ];
+
+    for uri in &uris {
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            uri,
+            Some(&eve),
+            Some(upload_body("e.png", "x")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-granted editor {uri}: {body}"
+        );
+
+        // a read grant is not a write grant
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            uri,
+            Some(&vic),
+            Some(upload_body("v.png", "x")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-granted viewer {uri}: {body}"
+        );
+
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            uri,
+            Some(&root),
+            Some(upload_body("root.png", "x")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "instance admin {uri}: {body}");
+    }
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    for uri in &uris {
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            uri,
+            Some(&eve),
+            Some(upload_body("e.png", "x")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "write-granted editor {uri}: {body}"
+        );
+    }
+}
+
+/// Deleting one is the same write, and the owner it is checked against is
+/// whichever of the two shapes the attachment has.
+#[tokio::test]
+async fn test_attachment_delete_needs_a_write_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, feature_id, carol) = seed_attachment_targets(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let vic = token_for_user("vic", Role::Viewer);
+    let root = token_for_user("root", Role::Admin);
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let feature_uri = format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments");
+    let dataset_uri = format!("/api/v1/datasets/{dataset_id}/attachments");
+
+    // one attachment of each owner shape per caller under test
+    let upload = |uri: String, token: String| {
+        let app = app.clone();
+        async move {
+            let (status, body) = request_as(
+                &app,
+                "POST",
+                &uri,
+                Some(&token),
+                Some(upload_body("a.png", "x")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            format!("/api/v1/attachments/{}", body["id"].as_str().unwrap())
+        }
+    };
+
+    for owner_uri in [&feature_uri, &dataset_uri] {
+        let target = upload(owner_uri.clone(), carol.clone()).await;
+
+        let (status, body) = request_as(&app, "DELETE", &target, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-granted editor {target}: {body}"
+        );
+
+        let (status, body) = request_as(&app, "DELETE", &target, Some(&vic), None).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-granted viewer {target}: {body}"
+        );
+
+        // the blob survived both attempts
+        let (status, body) = request_as(&app, "GET", &format!("{target}/meta"), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = request_as(&app, "DELETE", &target, Some(&root), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "instance admin {target}: {body}"
+        );
+    }
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    for owner_uri in [&feature_uri, &dataset_uri] {
+        let target = upload(owner_uri.clone(), carol.clone()).await;
+        let (status, body) = request_as(&app, "DELETE", &target, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "write-granted editor {target}: {body}"
+        );
+    }
+}
+
+/// With auth off there is no identity to check, so the ladder is unenforced and
+/// the dev and CLI flows keep uploading and deleting.
+#[tokio::test]
+async fn test_attachment_writes_work_unenforced() {
+    let (app, _state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let feature_id = Uuid::now_v7();
+    commit_features(
+        &app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": feature_id,
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {},
+        }]),
+    )
+    .await;
+
+    for owner_uri in [
+        format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments"),
+        format!("/api/v1/datasets/{dataset_id}/attachments"),
+    ] {
+        let (status, body) = post_json(&app, &owner_uri, upload_body("a.png", "x")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let target = format!("/api/v1/attachments/{}", body["id"].as_str().unwrap());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(&target)
+            .header("authorization", "Bearer test-skip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{target}");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Feature Valid Time
 // ═══════════════════════════════════════════════════════════════════════

@@ -52,6 +52,9 @@ async fn upload_attachment(
     actor: Actor,
     Json(req): Json<UploadAttachmentRequest>,
 ) -> Result<(StatusCode, Json<AttachmentMeta>), AttachmentError> {
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     let data = base64_decode(&req.data)?;
     let size = data.len() as i64;
     let now = OffsetDateTime::now_utc();
@@ -105,6 +108,9 @@ async fn upload_dataset_attachment(
     actor: Actor,
     Json(req): Json<UploadAttachmentRequest>,
 ) -> Result<(StatusCode, Json<AttachmentMeta>), AttachmentError> {
+    store
+        .ensure_dataset_writable(dataset_id, &actor.writer())
+        .await?;
     let data = base64_decode(&req.data)?;
     let size = data.len() as i64;
     let now = OffsetDateTime::now_utc();
@@ -198,7 +204,11 @@ async fn get_attachment_meta(
 async fn delete_attachment(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
+    actor: Actor,
 ) -> Result<StatusCode, AttachmentError> {
+    store
+        .ensure_attachment_writable(id, &actor.writer())
+        .await?;
     store.delete_attachment(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

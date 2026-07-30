@@ -437,6 +437,31 @@ impl PgStore {
             .await
     }
 
+    /// The same ladder for an existing attachment, whose owner is either a branch
+    /// or a dataset. One query reads the two owner columns, so a delete does not
+    /// have to load the blob to find out who guards it.
+    pub async fn ensure_attachment_writable(
+        &self,
+        attachment_id: Uuid,
+        writer: &Writer,
+    ) -> Result<(), StoreError> {
+        let row = sqlx::query("SELECT branch_id, dataset_id FROM attachments WHERE id = $1")
+            .bind(attachment_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("attachment {attachment_id}")))?;
+
+        match (
+            row.get::<Option<Uuid>, _>("branch_id"),
+            row.get::<Option<Uuid>, _>("dataset_id"),
+        ) {
+            (Some(branch_id), _) => self.ensure_branch_writable(branch_id, writer).await,
+            (None, Some(dataset_id)) => self.ensure_dataset_writable(dataset_id, writer).await,
+            // the attachments_one_owner CHECK leaves no third case
+            (None, None) => Err(StoreError::NotFound(format!("attachment {attachment_id}"))),
+        }
+    }
+
     /// The write ladder on its own, for callers that already proved the target
     /// is not external.
     async fn ensure_branch_write_allowed(
