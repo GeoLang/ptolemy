@@ -554,9 +554,16 @@ impl PgStore {
 
     /// The private datasets any of `ids` refers to. An id may name a dataset, a
     /// branch, a changeset, a merge request, a feature, a raster catalog or tile,
-    /// a point cloud catalog or patch, or an attachment, because that is the full
-    /// set of ways a request identifies dataset content. Public datasets are left
+    /// a point cloud catalog or patch, or an attachment. Public datasets are left
     /// out, so an empty result means nothing to enforce.
+    ///
+    /// This list is NOT yet every id a route can name: network, route, symbology,
+    /// label, domain, subtype, attribute-rule, trajectory, relationship-class and
+    /// webhook ids all resolve to nothing here, so the layer passes them. An id
+    /// kind missing from this query is an unguarded read of private content, so a
+    /// new dataset-owned table belongs here at the same time as its route.
+    /// TODO: add the remaining kinds, several of which need a grandparent hop or
+    /// carry two owning datasets.
     pub async fn private_datasets_for_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, StoreError> {
         let rows = sqlx::query(
             "SELECT DISTINCT d.id FROM datasets d WHERE d.visibility = 'private' AND (
