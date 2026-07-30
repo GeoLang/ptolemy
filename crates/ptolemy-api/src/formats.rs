@@ -6,12 +6,13 @@
 //! Also CRS transformation via PostGIS (PROJ-backed ST_Transform).
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::WriteGrant;
 use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
@@ -519,24 +520,19 @@ struct ReprojectRequest {
 
 async fn reproject_features(
     State(store): State<AppState>,
-    Path(branch_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<ReprojectRequest>,
 ) -> Result<Json<serde_json::Value>, FormatError> {
     store
-        .ensure_branch_writable(branch_id, &actor.writer())
+        .ensure_branch_writable(grant.id(), &actor.writer())
         .await?;
-    let result = sqlx::query(
-        "UPDATE features SET geometry = ST_Transform(geometry, $2)
-         WHERE branch_id = $1 AND geometry IS NOT NULL",
-    )
-    .bind(branch_id)
-    .bind(req.target_srid)
-    .execute(store.pool())
-    .await?;
+    let reprojected = store
+        .reproject_branch_features(&grant, req.target_srid)
+        .await?;
 
     Ok(Json(serde_json::json!({
-        "reprojected": result.rows_affected(),
+        "reprojected": reprojected,
         "target_srid": req.target_srid,
     })))
 }

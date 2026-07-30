@@ -5,12 +5,13 @@
 //! Data catalog: tags, metadata, and search for datasets.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
+use ptolemy_storage::{WriteGrant, writes::DatasetMetadataInput};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -134,28 +135,21 @@ struct AddTagRequest {
 
 async fn add_tag(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<AddTagRequest>,
 ) -> Result<StatusCode, CatalogError> {
-    sqlx::query(
-        "INSERT INTO dataset_tags (dataset_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(dataset_id)
-    .bind(&req.tag)
-    .execute(store.pool())
-    .await?;
+    store.add_dataset_tag(&grant, &req.tag).await?;
     Ok(StatusCode::CREATED)
 }
 
+/// `{tag}` is the free-text segment the route-template rule exists for: it is
+/// only ever a tag string, never the write target.
 async fn remove_tag(
     State(store): State<AppState>,
-    Path((dataset_id, tag)): Path<(Uuid, String)>,
+    Extension(grant): Extension<WriteGrant>,
+    Path((_dataset_id, tag)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, CatalogError> {
-    sqlx::query("DELETE FROM dataset_tags WHERE dataset_id = $1 AND tag = $2")
-        .bind(dataset_id)
-        .bind(&tag)
-        .execute(store.pool())
-        .await?;
+    store.remove_dataset_tag(&grant, &tag).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -206,23 +200,21 @@ async fn get_metadata(
 
 async fn set_metadata(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<DatasetMetadata>,
 ) -> Result<StatusCode, CatalogError> {
-    sqlx::query(
-        "INSERT INTO dataset_metadata (dataset_id, description, source, license, attribution, keywords, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
-         ON CONFLICT (dataset_id) DO UPDATE SET
-            description = $2, source = $3, license = $4, attribution = $5, keywords = $6, updated_at = now()",
-    )
-    .bind(dataset_id)
-    .bind(&req.description)
-    .bind(&req.source)
-    .bind(&req.license)
-    .bind(&req.attribution)
-    .bind(&req.keywords)
-    .execute(store.pool())
-    .await?;
+    store
+        .set_dataset_metadata(
+            &grant,
+            &DatasetMetadataInput {
+                description: &req.description,
+                source: req.source.as_deref(),
+                license: req.license.as_deref(),
+                attribution: req.attribution.as_deref(),
+                keywords: &req.keywords,
+            },
+        )
+        .await?;
     Ok(StatusCode::OK)
 }
 
@@ -230,6 +222,7 @@ async fn set_metadata(
 
 enum CatalogError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
 }
 
 impl From<sqlx::Error> for CatalogError {
@@ -238,14 +231,24 @@ impl From<sqlx::Error> for CatalogError {
     }
 }
 
+impl From<ptolemy_storage::StoreError> for CatalogError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        CatalogError::Store(e)
+    }
+}
+
 impl IntoResponse for CatalogError {
     fn into_response(self) -> axum::response::Response {
-        let CatalogError::Db(e) = self;
-        tracing::error!("Database error: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
+        let (status, message) = match self {
+            CatalogError::Store(e) => crate::errors::store_error_status(&e),
+            CatalogError::Db(e) => {
+                tracing::error!("Database error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
+        };
+        (status, Json(serde_json::json!({"error": message}))).into_response()
     }
 }

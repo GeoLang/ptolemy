@@ -5,12 +5,13 @@
 //! H3 hexagonal spatial indexing and aggregation.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::WriteGrant;
 use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
@@ -40,24 +41,15 @@ fn default_resolution() -> i32 {
 
 async fn index_features_h3(
     State(store): State<AppState>,
-    Path(branch_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<IndexH3Request>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
-    let result = sqlx::query(
-        "UPDATE feature_versions fv
-         SET h3_index = h3_lat_lng_to_cell(ST_Centroid(fv.geometry), $2)
-         FROM changesets c
-         WHERE fv.changeset_id = c.id
-           AND c.branch_id = $1
-           AND fv.geometry IS NOT NULL",
-    )
-    .bind(branch_id)
-    .bind(req.resolution)
-    .execute(store.pool())
-    .await?;
+    let indexed = store
+        .index_branch_features_h3(&grant, req.resolution)
+        .await?;
 
     Ok(Json(serde_json::json!({
-        "indexed": result.rows_affected(),
+        "indexed": indexed,
         "resolution": req.resolution,
     })))
 }

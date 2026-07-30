@@ -5,12 +5,13 @@
 //! MobilityDB trajectories — moving objects and temporal geometry.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::{WriteGrant, writes::TrajectoryTrip};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -92,12 +93,10 @@ struct TrajectoryPoint {
 
 async fn create_trajectory(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateTrajectoryRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), TrajError> {
-    let id = Uuid::now_v7();
-
-    if has_mobilitydb(&store).await? {
+    let id = if has_mobilitydb(&store).await? {
         // Build MobilityDB tgeompoint from points
         let instants: Vec<String> = req
             .points
@@ -105,33 +104,19 @@ async fn create_trajectory(
             .map(|p| format!("POINT({} {})@{}", p.lng, p.lat, p.timestamp))
             .collect();
         let tgeompoint_str = format!("[{}]", instants.join(", "));
-
-        sqlx::query(
-            "INSERT INTO trajectories (id, dataset_id, name, trip, period)
-             VALUES ($1, $2, $3, $4::tgeompoint, period($4::tgeompoint))",
-        )
-        .bind(id)
-        .bind(dataset_id)
-        .bind(&req.name)
-        .bind(&tgeompoint_str)
-        .execute(store.pool())
-        .await?;
+        store
+            .create_trajectory(
+                &grant,
+                &req.name,
+                &TrajectoryTrip::MobilityDb(&tgeompoint_str),
+            )
+            .await?
     } else {
         let trip = serde_json::to_value(&req.points).unwrap_or_default();
-        sqlx::query(
-            "INSERT INTO trajectories (id, dataset_id, name, trip, period)
-             SELECT $1, $2, $3, $4,
-                    tstzrange(min((e->>'timestamp')::timestamptz),
-                              max((e->>'timestamp')::timestamptz), '[]')
-             FROM jsonb_array_elements($4) e",
-        )
-        .bind(id)
-        .bind(dataset_id)
-        .bind(&req.name)
-        .bind(&trip)
-        .execute(store.pool())
-        .await?;
-    }
+        store
+            .create_trajectory(&grant, &req.name, &TrajectoryTrip::Jsonb(&trip))
+            .await?
+    };
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
@@ -310,6 +295,7 @@ async fn nearest_approach(
 
 enum TrajError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
 }
 impl From<sqlx::Error> for TrajError {
@@ -317,10 +303,16 @@ impl From<sqlx::Error> for TrajError {
         TrajError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for TrajError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        TrajError::Store(e)
+    }
+}
 impl IntoResponse for TrajError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             TrajError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            TrajError::Store(e) => crate::errors::store_error_status(&e),
             TrajError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

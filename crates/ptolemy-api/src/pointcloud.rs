@@ -5,12 +5,13 @@
 //! Point cloud (LiDAR) management using the pointcloud extension.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::{WriteGrant, writes::PointCloudPatchInput};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -79,26 +80,17 @@ fn default_srid() -> i32 {
 
 async fn create_catalog(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<CreateCatalogRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), PcError> {
     // a catalog hangs off the dataset, so creating one is a dataset write
     store
-        .ensure_dataset_writable(dataset_id, &actor.writer())
+        .ensure_dataset_writable(grant.id(), &actor.writer())
         .await?;
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO pointcloud_catalogs (id, dataset_id, name, srid, schema_xml)
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(id)
-    .bind(dataset_id)
-    .bind(&req.name)
-    .bind(req.srid)
-    .bind(&req.schema_xml)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .create_pointcloud_catalog(&grant, &req.name, req.srid, req.schema_xml.as_deref())
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -171,30 +163,28 @@ async fn catalog_dataset(store: &AppState, catalog_id: Uuid) -> Result<Uuid, PcE
 
 async fn add_patch(
     State(store): State<AppState>,
-    Path(catalog_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<AddPatchRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), PcError> {
-    let dataset_id = catalog_dataset(&store, catalog_id).await?;
+    let dataset_id = catalog_dataset(&store, grant.id()).await?;
     store
         .ensure_dataset_writable(dataset_id, &actor.writer())
         .await?;
-    let id = Uuid::now_v7();
     let wkb =
         hex::decode(&req.bounds_wkb_hex).map_err(|_| PcError::Bad("invalid bounds hex".into()))?;
     let patch_data =
         hex::decode(&req.patch_hex).map_err(|_| PcError::Bad("invalid patch hex".into()))?;
-    sqlx::query(
-        "INSERT INTO pointcloud_patches (id, catalog_id, bounds, num_points, pa)
-         VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::pcpatch)",
-    )
-    .bind(id)
-    .bind(catalog_id)
-    .bind(&wkb)
-    .bind(req.num_points)
-    .bind(&patch_data)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .add_pointcloud_patch(
+            &grant,
+            &PointCloudPatchInput {
+                bounds_wkb: &wkb,
+                num_points: req.num_points,
+                patch: &patch_data,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 

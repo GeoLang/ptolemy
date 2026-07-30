@@ -5,11 +5,15 @@
 //! Raster/imagery catalog and tile management.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
+};
+use ptolemy_storage::{
+    WriteGrant,
+    writes::{RasterCatalogInput, RasterTileInput},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -91,27 +95,25 @@ fn default_bands() -> i32 {
 
 async fn create_catalog(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<CreateCatalogRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RasterError> {
     // a catalog hangs off the dataset, so creating one is a dataset write
     store
-        .ensure_dataset_writable(dataset_id, &actor.writer())
+        .ensure_dataset_writable(grant.id(), &actor.writer())
         .await?;
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO raster_catalogs (id, dataset_id, name, srid, pixel_type, num_bands)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(id)
-    .bind(dataset_id)
-    .bind(&req.name)
-    .bind(req.srid)
-    .bind(&req.pixel_type)
-    .bind(req.num_bands)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .create_raster_catalog(
+            &grant,
+            &RasterCatalogInput {
+                name: &req.name,
+                srid: req.srid,
+                pixel_type: &req.pixel_type,
+                num_bands: req.num_bands,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -187,30 +189,28 @@ async fn catalog_dataset(store: &AppState, catalog_id: Uuid) -> Result<Uuid, Ras
 
 async fn upload_tile(
     State(store): State<AppState>,
-    Path(catalog_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<UploadTileRequest>,
 ) -> Result<StatusCode, RasterError> {
-    let dataset_id = catalog_dataset(&store, catalog_id).await?;
+    let dataset_id = catalog_dataset(&store, grant.id()).await?;
     store
         .ensure_dataset_writable(dataset_id, &actor.writer())
         .await?;
-    let id = Uuid::now_v7();
     let bounds_wkb = hex::decode(&req.bounds_wkb_hex)
         .map_err(|_| RasterError::Bad("invalid bounds hex".into()))?;
     let rast_bytes =
         hex::decode(&req.rast_hex).map_err(|_| RasterError::Bad("invalid raster hex".into()))?;
-    sqlx::query(
-        "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level, rast)
-         VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::raster)",
-    )
-    .bind(id)
-    .bind(catalog_id)
-    .bind(&bounds_wkb)
-    .bind(req.zoom_level)
-    .bind(&rast_bytes)
-    .execute(store.pool())
-    .await?;
+    store
+        .upload_raster_tile(
+            &grant,
+            &RasterTileInput {
+                bounds_wkb: &bounds_wkb,
+                zoom_level: req.zoom_level,
+                rast: &rast_bytes,
+            },
+        )
+        .await?;
     Ok(StatusCode::CREATED)
 }
 

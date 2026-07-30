@@ -429,3 +429,574 @@ impl PgStore {
         Ok(())
     }
 }
+
+// ─── Catalog: tags and metadata ─────────────────────────────────────
+
+pub struct DatasetMetadataInput<'a> {
+    pub description: &'a str,
+    pub source: Option<&'a str>,
+    pub license: Option<&'a str>,
+    pub attribution: Option<&'a str>,
+    pub keywords: &'a [String],
+}
+
+impl PgStore {
+    pub async fn add_dataset_tag(&self, grant: &WriteGrant, tag: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO dataset_tags (dataset_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(grant.id())
+        .bind(tag)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `tag` is free text out of the path, so it can be anything; the dataset it
+    /// is deleted from comes from the grant and cannot be.
+    pub async fn remove_dataset_tag(
+        &self,
+        grant: &WriteGrant,
+        tag: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM dataset_tags WHERE dataset_id = $1 AND tag = $2")
+            .bind(grant.id())
+            .bind(tag)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_dataset_metadata(
+        &self,
+        grant: &WriteGrant,
+        input: &DatasetMetadataInput<'_>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO dataset_metadata (dataset_id, description, source, license, attribution, keywords, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (dataset_id) DO UPDATE SET
+                description = $2, source = $3, license = $4, attribution = $5, keywords = $6, updated_at = now()",
+        )
+        .bind(grant.id())
+        .bind(input.description)
+        .bind(input.source)
+        .bind(input.license)
+        .bind(input.attribution)
+        .bind(input.keywords)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+// ─── Networks ───────────────────────────────────────────────────────
+
+impl PgStore {
+    /// `grant` is on the dataset the network belongs to.
+    pub async fn create_network(
+        &self,
+        grant: &WriteGrant,
+        name: &str,
+        network_type: &str,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO networks (id, dataset_id, name, network_type) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(name)
+        .bind(network_type)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the network, which the ladder resolved to its dataset.
+    pub async fn add_network_junction(
+        &self,
+        grant: &WriteGrant,
+        feature_id: Option<Uuid>,
+        lng: f64,
+        lat: f64,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO network_junctions (id, network_id, feature_id, geometry)
+             VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(feature_id)
+        .bind(lng)
+        .bind(lat)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the network, which the ladder resolved to its dataset.
+    pub async fn add_network_edge(
+        &self,
+        grant: &WriteGrant,
+        feature_id: Uuid,
+        from_junction: Option<Uuid>,
+        to_junction: Option<Uuid>,
+        cost: f64,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO network_edges (id, network_id, feature_id, from_junction, to_junction, cost)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(feature_id)
+        .bind(from_junction)
+        .bind(to_junction)
+        .bind(cost)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+}
+
+// ─── Linear referencing ─────────────────────────────────────────────
+
+pub struct RouteEventInput<'a> {
+    pub event_type: &'a str,
+    pub from_measure: f64,
+    /// `Some` makes it a linear event located between the two measures, `None` a
+    /// point event located at the one.
+    pub to_measure: Option<f64>,
+    pub properties: &'a Value,
+}
+
+impl PgStore {
+    /// `grant` is on the dataset the route belongs to.
+    pub async fn create_route(
+        &self,
+        grant: &WriteGrant,
+        name: &str,
+        geometry_wkb: &[u8],
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
+             VALUES ($1, $2, $3, ST_GeomFromWKB($4, 4326), ST_Length(ST_GeomFromWKB($4, 4326)::geography))",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(name)
+        .bind(geometry_wkb)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the route, which the ladder resolved to its dataset. The
+    /// event's geometry is derived from that same route, so it cannot be placed
+    /// on one the caller was not checked against.
+    pub async fn create_route_event(
+        &self,
+        grant: &WriteGrant,
+        input: &RouteEventInput<'_>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        match input.to_measure {
+            Some(to_measure) => {
+                sqlx::query(
+                    "INSERT INTO route_events (id, route_id, event_type, from_measure, to_measure, properties, geometry)
+                     SELECT $1, $2, $3, $4, $5, $6,
+                            ST_LocateBetween(r.geometry, $4, $5)
+                     FROM routes r WHERE r.id = $2",
+                )
+                .bind(id)
+                .bind(grant.id())
+                .bind(input.event_type)
+                .bind(input.from_measure)
+                .bind(to_measure)
+                .bind(input.properties)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO route_events (id, route_id, event_type, from_measure, properties, geometry)
+                     SELECT $1, $2, $3, $4, $5,
+                            ST_LocateAlong(r.geometry, $4)
+                     FROM routes r WHERE r.id = $2",
+                )
+                .bind(id)
+                .bind(grant.id())
+                .bind(input.event_type)
+                .bind(input.from_measure)
+                .bind(input.properties)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(id)
+    }
+}
+
+// ─── Raster and point cloud catalogs ────────────────────────────────
+
+pub struct RasterCatalogInput<'a> {
+    pub name: &'a str,
+    pub srid: i32,
+    pub pixel_type: &'a str,
+    pub num_bands: i32,
+}
+
+pub struct RasterTileInput<'a> {
+    pub bounds_wkb: &'a [u8],
+    pub zoom_level: i32,
+    pub rast: &'a [u8],
+}
+
+pub struct PointCloudPatchInput<'a> {
+    pub bounds_wkb: &'a [u8],
+    pub num_points: i32,
+    pub patch: &'a [u8],
+}
+
+impl PgStore {
+    /// `grant` is on the dataset the catalog hangs off.
+    pub async fn create_raster_catalog(
+        &self,
+        grant: &WriteGrant,
+        input: &RasterCatalogInput<'_>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO raster_catalogs (id, dataset_id, name, srid, pixel_type, num_bands)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(input.name)
+        .bind(input.srid)
+        .bind(input.pixel_type)
+        .bind(input.num_bands)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the catalog, which the ladder resolved to its dataset.
+    pub async fn upload_raster_tile(
+        &self,
+        grant: &WriteGrant,
+        input: &RasterTileInput<'_>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level, rast)
+             VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::raster)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(input.bounds_wkb)
+        .bind(input.zoom_level)
+        .bind(input.rast)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the dataset the catalog hangs off.
+    pub async fn create_pointcloud_catalog(
+        &self,
+        grant: &WriteGrant,
+        name: &str,
+        srid: i32,
+        schema_xml: Option<&str>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO pointcloud_catalogs (id, dataset_id, name, srid, schema_xml)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(name)
+        .bind(srid)
+        .bind(schema_xml)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// `grant` is on the catalog, which the ladder resolved to its dataset.
+    pub async fn add_pointcloud_patch(
+        &self,
+        grant: &WriteGrant,
+        input: &PointCloudPatchInput<'_>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO pointcloud_patches (id, catalog_id, bounds, num_points, pa)
+             VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::pcpatch)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(input.bounds_wkb)
+        .bind(input.num_points)
+        .bind(input.patch)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+}
+
+// ─── Trajectories ───────────────────────────────────────────────────
+
+/// Migration 015 only gives `trajectories` the MobilityDB column types where the
+/// extension is installed, so the trip goes in as one of two different things.
+pub enum TrajectoryTrip<'a> {
+    /// A `tgeompoint` literal, which the query also derives the period from.
+    MobilityDb(&'a str),
+    /// The raw point array, with the period derived from its timestamps.
+    Jsonb(&'a Value),
+}
+
+impl PgStore {
+    /// `grant` is on the dataset the trajectory belongs to.
+    pub async fn create_trajectory(
+        &self,
+        grant: &WriteGrant,
+        name: &str,
+        trip: &TrajectoryTrip<'_>,
+    ) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        match trip {
+            TrajectoryTrip::MobilityDb(literal) => {
+                sqlx::query(
+                    "INSERT INTO trajectories (id, dataset_id, name, trip, period)
+                     VALUES ($1, $2, $3, $4::tgeompoint, period($4::tgeompoint))",
+                )
+                .bind(id)
+                .bind(grant.id())
+                .bind(name)
+                .bind(*literal)
+                .execute(&self.pool)
+                .await?;
+            }
+            TrajectoryTrip::Jsonb(points) => {
+                sqlx::query(
+                    "INSERT INTO trajectories (id, dataset_id, name, trip, period)
+                     SELECT $1, $2, $3, $4,
+                            tstzrange(min((e->>'timestamp')::timestamptz),
+                                      max((e->>'timestamp')::timestamptz), '[]')
+                     FROM jsonb_array_elements($4) e",
+                )
+                .bind(id)
+                .bind(grant.id())
+                .bind(name)
+                .bind(*points)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(id)
+    }
+}
+
+// ─── Branch-wide rewrites ───────────────────────────────────────────
+
+impl PgStore {
+    /// `grant` is on the branch, so a reprojection can only ever touch the
+    /// branch the ladder checked.
+    pub async fn reproject_branch_features(
+        &self,
+        grant: &WriteGrant,
+        target_srid: i32,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE features SET geometry = ST_Transform(geometry, $2)
+             WHERE branch_id = $1 AND geometry IS NOT NULL",
+        )
+        .bind(grant.id())
+        .bind(target_srid)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// `grant` is on the branch whose feature versions get an H3 cell.
+    pub async fn index_branch_features_h3(
+        &self,
+        grant: &WriteGrant,
+        resolution: i32,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE feature_versions fv
+             SET h3_index = h3_lat_lng_to_cell(ST_Centroid(fv.geometry), $2)
+             FROM changesets c
+             WHERE fv.changeset_id = c.id
+               AND c.branch_id = $1
+               AND fv.geometry IS NOT NULL",
+        )
+        .bind(grant.id())
+        .bind(resolution)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// `grant` is on the branch whose feature versions get an embedding.
+    ///
+    /// `fields` names property keys, and they are interpolated into the
+    /// statement because a JSON key cannot be a bind parameter. Each one is
+    /// quote-doubled before it goes into a single-quoted literal, which is the
+    /// whole escape needed while `standard_conforming_strings` is on — Postgres
+    /// has defaulted to on since 9.1 and nothing here turns it off.
+    pub async fn embed_branch_features(
+        &self,
+        grant: &WriteGrant,
+        fields: &[String],
+    ) -> Result<u64, StoreError> {
+        let fields_expr = fields
+            .iter()
+            .map(|f| format!("COALESCE(fv.properties->>'{}', '')", f.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(" || ' ' || ");
+
+        let props_expr = if fields_expr.is_empty() {
+            "fv.properties::text".to_string()
+        } else {
+            fields_expr
+        };
+
+        let query = format!(
+            "UPDATE feature_versions fv
+             SET embedding = (
+                SELECT array_agg(v)::vector(256)
+                FROM (
+                    SELECT (get_byte(digest(({props}) || i::text, 'sha256'), i % 32)::float / 255.0) as v
+                    FROM generate_series(0, 255) as i
+                ) sub
+             )
+             FROM changesets c
+             WHERE fv.changeset_id = c.id
+               AND c.branch_id = $1
+               AND fv.properties IS NOT NULL",
+            props = props_expr,
+        );
+
+        let result = sqlx::query(&query)
+            .bind(grant.id())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// `grant` is on the branch the conflict belongs to, and the branch is part
+    /// of the WHERE clause, so a conflict id from another branch matches nothing
+    /// and the caller gets the same 404 as for one that does not exist.
+    ///
+    /// `Ok(None)` is no such conflict on that branch. An `Err` also covers the
+    /// instance where `merge_conflicts` was never created, which the caller
+    /// reports rather than failing.
+    pub async fn resolve_merge_conflict(
+        &self,
+        grant: &WriteGrant,
+        conflict_id: Uuid,
+        resolution: &str,
+    ) -> Result<Option<Uuid>, StoreError> {
+        let row = sqlx::query_scalar(
+            "UPDATE merge_conflicts SET resolved = true, resolution = $2, resolved_at = now()
+             WHERE id = $1 AND branch_id = $3
+             RETURNING feature_id",
+        )
+        .bind(conflict_id)
+        .bind(resolution)
+        .bind(grant.id())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+}
+
+// ─── Writes with no grant, and why ──────────────────────────────────
+//
+// These three have no dataset or branch behind them, so there is no ladder to
+// run and no grant to demand. They live here rather than in `ptolemy-api` so
+// that `ci/no-raw-writes.sh` needs no allowlist entry for them and the reason
+// each one is ungrantable sits next to its SQL.
+
+impl PgStore {
+    /// An organization is not owned by a dataset and does not exist yet when it
+    /// is created, so there is no id for the ladder to resolve. `POST /orgs` is
+    /// instance-admin-only in [`crate::PgStore`]'s caller, which is the gate.
+    pub async fn create_organization(&self, name: &str, slug: &str) -> Result<Uuid, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(name)
+            .bind(slug)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
+    /// Background maintenance: no request, no caller, no target. Deletes locks
+    /// whose expiry has already passed, which is the row's own decision.
+    pub async fn delete_expired_feature_locks(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Background maintenance, as above: the retention window is fixed here and
+    /// nothing about it comes from a caller.
+    pub async fn delete_events_older_than_retention(&self) -> Result<u64, StoreError> {
+        let result =
+            sqlx::query("DELETE FROM events WHERE created_at < now() - interval '30 days'")
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+// ─── Organization membership ────────────────────────────────────────
+//
+// The org routes are instance-admin-only, and an org id resolves to no dataset,
+// so the grant the write layer mints for them proves the layer ran and pins the
+// org id rather than carrying a permission decision.
+
+impl PgStore {
+    pub async fn add_org_member(
+        &self,
+        grant: &WriteGrant,
+        user_id: &str,
+        role: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
+             ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3",
+        )
+        .bind(grant.id())
+        .bind(user_id)
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_org_member(
+        &self,
+        grant: &WriteGrant,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+            .bind(grant.id())
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}

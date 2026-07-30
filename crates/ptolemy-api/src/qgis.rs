@@ -8,12 +8,13 @@
 //! transaction interface so QGIS can natively sync changes via toolbar buttons.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::WriteGrant;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -700,31 +701,22 @@ struct ResolveConflictRequest {
 
 async fn resolve_conflict(
     State(store): State<AppState>,
-    Path(branch_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     actor: Actor,
     Json(req): Json<ResolveConflictRequest>,
 ) -> Result<Json<serde_json::Value>, QgisError> {
+    let branch_id = grant.id();
     // marking a conflict resolved is a write in its own right, and it runs
     // before the commit below that would otherwise be the only guard
     store
         .ensure_branch_writable(branch_id, &actor.writer())
         .await?;
-    // Mark conflict as resolved
-    let result = sqlx::query(
-        "UPDATE merge_conflicts SET resolved = true, resolution = $2, resolved_at = now()
-         WHERE id = $1 AND branch_id = $3
-         RETURNING feature_id",
-    )
-    .bind(req.conflict_id)
-    .bind(&req.resolution)
-    .bind(branch_id)
-    .fetch_optional(store.pool())
-    .await;
+    let result = store
+        .resolve_merge_conflict(&grant, req.conflict_id, &req.resolution)
+        .await;
 
     match result {
-        Ok(Some(row)) => {
-            let feature_id: Uuid = row.get("feature_id");
-
+        Ok(Some(feature_id)) => {
             // If custom resolution, apply the edit
             if req.resolution == "custom"
                 && let Some(hex) = &req.custom_geometry_wkb_hex

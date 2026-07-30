@@ -5,12 +5,13 @@
 //! Multi-tenancy: organization management and dataset isolation.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
+use ptolemy_storage::WriteGrant;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -68,13 +69,7 @@ async fn create_org(
     State(store): State<AppState>,
     Json(req): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<Organization>), TenantError> {
-    let id = Uuid::now_v7();
-    sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)")
-        .bind(id)
-        .bind(&req.name)
-        .bind(&req.slug)
-        .execute(store.pool())
-        .await?;
+    let id = store.create_organization(&req.name, &req.slug).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -135,30 +130,21 @@ fn default_role() -> String {
 
 async fn add_member(
     State(store): State<AppState>,
-    Path(org_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<StatusCode, TenantError> {
-    sqlx::query(
-        "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
-         ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3",
-    )
-    .bind(org_id)
-    .bind(&req.user_id)
-    .bind(&req.role)
-    .execute(store.pool())
-    .await?;
+    store
+        .add_org_member(&grant, &req.user_id, &req.role)
+        .await?;
     Ok(StatusCode::CREATED)
 }
 
 async fn remove_member(
     State(store): State<AppState>,
-    Path((org_id, user_id)): Path<(Uuid, String)>,
+    Extension(grant): Extension<WriteGrant>,
+    Path((_org_id, user_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, TenantError> {
-    sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
-        .bind(org_id)
-        .bind(&user_id)
-        .execute(store.pool())
-        .await?;
+    store.remove_org_member(&grant, &user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -197,6 +183,7 @@ async fn org_datasets(
 
 enum TenantError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound(String),
 }
 
@@ -206,10 +193,17 @@ impl From<sqlx::Error> for TenantError {
     }
 }
 
+impl From<ptolemy_storage::StoreError> for TenantError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        TenantError::Store(e)
+    }
+}
+
 impl IntoResponse for TenantError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             TenantError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            TenantError::Store(e) => crate::errors::store_error_status(&e),
             TenantError::Db(e) => {
                 tracing::error!("Database error: {e}");
                 (

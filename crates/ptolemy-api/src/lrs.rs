@@ -5,12 +5,13 @@
 //! Linear referencing: routes and events along measured geometries.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
+use ptolemy_storage::{WriteGrant, writes::RouteEventInput};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -76,17 +77,12 @@ struct CreateRouteRequest {
 
 async fn create_route(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateRouteRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), LrsError> {
-    let id = Uuid::now_v7();
     let wkb =
         hex::decode(&req.geometry_wkb_hex).map_err(|_| LrsError::Bad("invalid hex".into()))?;
-    sqlx::query(
-        "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
-         VALUES ($1, $2, $3, ST_GeomFromWKB($4, 4326), ST_Length(ST_GeomFromWKB($4, 4326)::geography))",
-    ).bind(id).bind(dataset_id).bind(&req.name).bind(&wkb)
-    .execute(store.pool()).await?;
+    let id = store.create_route(&grant, &req.name, &wkb).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -143,32 +139,22 @@ struct CreateEventRequest {
 
 async fn create_event(
     State(store): State<AppState>,
-    Path(route_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateEventRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), LrsError> {
-    let id = Uuid::now_v7();
-    // Generate geometry from route + measures using ST_LocateAlong / ST_LocateBetween
-    if req.to_measure.is_some() {
-        // Linear event
-        sqlx::query(
-            "INSERT INTO route_events (id, route_id, event_type, from_measure, to_measure, properties, geometry)
-             SELECT $1, $2, $3, $4, $5, $6,
-                    ST_LocateBetween(r.geometry, $4, $5)
-             FROM routes r WHERE r.id = $2",
-        ).bind(id).bind(route_id).bind(&req.event_type)
-        .bind(req.from_measure).bind(req.to_measure).bind(&req.properties)
-        .execute(store.pool()).await?;
-    } else {
-        // Point event
-        sqlx::query(
-            "INSERT INTO route_events (id, route_id, event_type, from_measure, properties, geometry)
-             SELECT $1, $2, $3, $4, $5,
-                    ST_LocateAlong(r.geometry, $4)
-             FROM routes r WHERE r.id = $2",
-        ).bind(id).bind(route_id).bind(&req.event_type)
-        .bind(req.from_measure).bind(&req.properties)
-        .execute(store.pool()).await?;
-    }
+    // the geometry comes from the route itself, via ST_LocateAlong for a point
+    // event and ST_LocateBetween for a linear one
+    let id = store
+        .create_route_event(
+            &grant,
+            &RouteEventInput {
+                event_type: &req.event_type,
+                from_measure: req.from_measure,
+                to_measure: req.to_measure,
+                properties: &req.properties,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -241,6 +227,7 @@ async fn get_subline(
 
 enum LrsError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
 }
@@ -249,11 +236,17 @@ impl From<sqlx::Error> for LrsError {
         LrsError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for LrsError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        LrsError::Store(e)
+    }
+}
 
 impl IntoResponse for LrsError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             LrsError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            LrsError::Store(e) => crate::errors::store_error_status(&e),
             LrsError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             LrsError::Db(e) => {
                 tracing::error!("DB: {e}");

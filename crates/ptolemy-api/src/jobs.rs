@@ -90,11 +90,8 @@ impl BackgroundJobs {
     }
 }
 
-async fn cleanup_expired_locks(store: &PgStore) -> Result<(), sqlx::Error> {
-    let result = sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
-        .execute(store.pool())
-        .await?;
-    let count = result.rows_affected();
+async fn cleanup_expired_locks(store: &PgStore) -> Result<(), ptolemy_storage::StoreError> {
+    let count = store.delete_expired_feature_locks().await?;
     if count > 0 {
         info!(count, "Cleaned up expired feature locks");
     }
@@ -127,11 +124,8 @@ async fn quality_check_alert(store: &PgStore) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-async fn cleanup_old_events(store: &PgStore) -> Result<(), sqlx::Error> {
-    let result = sqlx::query("DELETE FROM events WHERE created_at < now() - interval '30 days'")
-        .execute(store.pool())
-        .await?;
-    let count = result.rows_affected();
+async fn cleanup_old_events(store: &PgStore) -> Result<(), ptolemy_storage::StoreError> {
+    let count = store.delete_events_older_than_retention().await?;
     if count > 0 {
         info!(count, "Cleaned up old events");
     }

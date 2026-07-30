@@ -5,12 +5,13 @@
 //! Geometric network and utility network API — graph tracing and analysis.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::WriteGrant;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -98,24 +99,17 @@ fn default_network_type() -> String {
 
 async fn create_network(
     State(store): State<AppState>,
-    Path(dataset_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateNetworkRequest>,
 ) -> Result<(StatusCode, Json<Network>), NetworkError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO networks (id, dataset_id, name, network_type) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(id)
-    .bind(dataset_id)
-    .bind(&req.name)
-    .bind(&req.network_type)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .create_network(&grant, &req.name, &req.network_type)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(Network {
             id,
-            dataset_id,
+            dataset_id: grant.id(),
             name: req.name,
             network_type: req.network_type,
         }),
@@ -166,21 +160,12 @@ struct AddJunctionRequest {
 
 async fn add_junction(
     State(store): State<AppState>,
-    Path(network_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<AddJunctionRequest>,
 ) -> Result<(StatusCode, Json<Junction>), NetworkError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO network_junctions (id, network_id, feature_id, geometry)
-         VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326))",
-    )
-    .bind(id)
-    .bind(network_id)
-    .bind(req.feature_id)
-    .bind(req.lng)
-    .bind(req.lat)
-    .execute(store.pool())
-    .await?;
+    let id = store
+        .add_network_junction(&grant, req.feature_id, req.lng, req.lat)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(Junction {
@@ -227,22 +212,18 @@ fn default_cost() -> f64 {
 
 async fn add_edge(
     State(store): State<AppState>,
-    Path(network_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<AddEdgeRequest>,
 ) -> Result<StatusCode, NetworkError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO network_edges (id, network_id, feature_id, from_junction, to_junction, cost)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(id)
-    .bind(network_id)
-    .bind(req.feature_id)
-    .bind(req.from_junction)
-    .bind(req.to_junction)
-    .bind(req.cost)
-    .execute(store.pool())
-    .await?;
+    store
+        .add_network_edge(
+            &grant,
+            req.feature_id,
+            req.from_junction,
+            req.to_junction,
+            req.cost,
+        )
+        .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -654,6 +635,7 @@ async fn check_connectivity(
 
 enum NetworkError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
 }
 
@@ -663,10 +645,17 @@ impl From<sqlx::Error> for NetworkError {
     }
 }
 
+impl From<ptolemy_storage::StoreError> for NetworkError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        NetworkError::Store(e)
+    }
+}
+
 impl IntoResponse for NetworkError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             NetworkError::NotFound => (StatusCode::NOT_FOUND, "network not found".to_string()),
+            NetworkError::Store(e) => crate::errors::store_error_status(&e),
             NetworkError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

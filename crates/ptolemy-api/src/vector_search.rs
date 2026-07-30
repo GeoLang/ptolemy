@@ -5,12 +5,13 @@
 //! pgvector-based feature similarity search and deduplication.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use ptolemy_storage::WriteGrant;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -157,45 +158,13 @@ struct EmbedRequest {
 
 async fn generate_embeddings(
     State(store): State<AppState>,
-    Path(branch_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<serde_json::Value>, VectorError> {
-    // Generate deterministic property-based embeddings using pgcrypto
-    let fields_expr = req
-        .fields
-        .iter()
-        .map(|f| format!("COALESCE(fv.properties->>'{}', '')", f.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(" || ' ' || ");
-
-    let props_expr = if fields_expr.is_empty() {
-        "fv.properties::text".to_string()
-    } else {
-        fields_expr
-    };
-
-    let query = format!(
-        "UPDATE feature_versions fv
-         SET embedding = (
-            SELECT array_agg(v)::vector(256)
-            FROM (
-                SELECT (get_byte(digest(({props}) || i::text, 'sha256'), i % 32)::float / 255.0) as v
-                FROM generate_series(0, 255) as i
-            ) sub
-         )
-         FROM changesets c
-         WHERE fv.changeset_id = c.id
-           AND c.branch_id = $1
-           AND fv.properties IS NOT NULL",
-        props = props_expr,
-    );
-
-    let result = sqlx::query(&query)
-        .bind(branch_id)
-        .execute(store.pool())
-        .await?;
+    // deterministic property-based embeddings, computed by pgcrypto in the store
+    let embedded = store.embed_branch_features(&grant, &req.fields).await?;
     Ok(Json(
-        serde_json::json!({"embedded": result.rows_affected(), "dimensions": 256}),
+        serde_json::json!({"embedded": embedded, "dimensions": 256}),
     ))
 }
 
@@ -253,20 +222,30 @@ async fn cluster_by_embedding(
 
 enum VectorError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
 }
 impl From<sqlx::Error> for VectorError {
     fn from(e: sqlx::Error) -> Self {
         VectorError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for VectorError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        VectorError::Store(e)
+    }
+}
 impl IntoResponse for VectorError {
     fn into_response(self) -> axum::response::Response {
-        let VectorError::Db(e) = self;
-        tracing::error!("DB: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
+        let (status, message) = match self {
+            VectorError::Store(e) => crate::errors::store_error_status(&e),
+            VectorError::Db(e) => {
+                tracing::error!("DB: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                )
+            }
+        };
+        (status, Json(serde_json::json!({"error": message}))).into_response()
     }
 }
