@@ -1103,9 +1103,222 @@ async fn test_trajectory_list() {
     let ds_id = create_dataset(&app).await;
     let _branch_id = create_branch(&app, ds_id, "main").await;
 
-    let (status, _body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/trajectories")).await;
-    // MobilityDB might not be installed
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/trajectories")).await;
+    assert_eq!(status, StatusCode::OK, "trajectory list: {body}");
+    assert_eq!(body, json!([]), "{body}");
+}
+
+/// Create and read back a trajectory. The path and instant count come out of
+/// MobilityDB where it is installed and out of the JSONB fallback where it is
+/// not, so this holds either way.
+#[tokio::test]
+async fn test_trajectory_create_and_read_back() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/trajectories"),
+        json!({
+            "name": "bus 12",
+            "points": [
+                {"lng": 1.0, "lat": 2.0, "timestamp": "2024-01-01T00:00:00Z"},
+                {"lng": 3.0, "lat": 4.0, "timestamp": "2024-01-01T01:00:00Z"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create trajectory: {body}");
+    let traj_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/trajectories/{traj_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get trajectory: {body}");
+    assert_eq!(body["name"], "bus 12", "{body}");
+    assert_eq!(body["num_points"], 2, "{body}");
+    assert_eq!(body["path"]["type"], "LineString", "{body}");
+    assert!(
+        body["start_time"]
+            .as_str()
+            .unwrap()
+            .starts_with("2024-01-01"),
+        "{body}"
+    );
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/trajectories")).await;
+    assert_eq!(status, StatusCode::OK, "list trajectories: {body}");
+    assert_eq!(body[0]["id"], traj_id, "{body}");
+    assert_eq!(body[0]["name"], "bus 12", "{body}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Cartography Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_label_rule_create_and_read_back() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/labels"),
+        json!({
+            "name": "street names",
+            "field_expression": "name",
+            "placement": {"type": "curved"},
+            "font": {"family": "Inter", "size": 14},
+            "min_scale": 1000.0,
+            "priority": 3,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create label: {body}");
+    let label_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/labels/{label_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get label: {body}");
+    assert_eq!(body["field_expression"], "name", "{body}");
+    assert_eq!(body["placement"]["type"], "curved", "{body}");
+    assert_eq!(body["font"]["family"], "Inter", "{body}");
+    assert_eq!(body["min_scale"], 1000.0, "{body}");
+    assert_eq!(body["priority"], 3, "{body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds_id}/labels")).await;
+    assert_eq!(status, StatusCode::OK, "list labels: {body}");
+    assert_eq!(body[0]["id"], label_id, "{body}");
+    assert_eq!(body[0]["field_expression"], "name", "{body}");
+}
+
+/// Placement and font are jsonb columns with schema defaults, so a create that
+/// names neither still reads back as objects.
+#[tokio::test]
+async fn test_label_rule_defaults_are_json_objects() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/labels"),
+        json!({"name": "plain", "field_expression": "code"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create label: {body}");
+    let label_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/labels/{label_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get label: {body}");
+    assert_eq!(body["placement"]["type"], "point_on_surface", "{body}");
+    assert_eq!(body["font"]["family"], "Arial", "{body}");
+}
+
+#[tokio::test]
+async fn test_symbology_rule_create_and_read_back() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/symbology"),
+        json!({
+            "name": "water",
+            "symbol": {"type": "simple_fill", "color": [0, 0, 255, 255]},
+            "filter_expression": "kind = 'lake'",
+            "priority": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create symbology: {body}");
+    let rule_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/symbology/{rule_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get symbology: {body}");
+    assert_eq!(body["symbol"]["type"], "simple_fill", "{body}");
+    assert_eq!(body["filter_expression"], "kind = 'lake'", "{body}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Relationship Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_relationship_class_and_record_round_trip() {
+    let (app, _) = setup_app().await;
+    let origin = create_dataset(&app).await;
+    let destination = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{origin}/relationships"),
+        json!({
+            "name": "parcel to owner",
+            "origin_dataset_id": origin,
+            "destination_dataset_id": destination,
+            "origin_foreign_key": "parcel_id",
+            "cardinality": "one_to_many",
+            "forward_label": "owned by",
+            "backward_label": "owns",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create class: {body}");
+    let class_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/relationship-classes/{class_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get class: {body}");
+    assert_eq!(body["name"], "parcel to owner", "{body}");
+    assert_eq!(body["cardinality"], "one_to_many", "{body}");
+    assert_eq!(body["forward_label"], "owned by", "{body}");
+    assert_eq!(body["backward_label"], "owns", "{body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{origin}/relationships")).await;
+    assert_eq!(status, StatusCode::OK, "list classes: {body}");
+    assert_eq!(body[0]["id"], class_id, "{body}");
+
+    let parcel = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/relationship-classes/{class_id}/records"),
+        json!({
+            "origin_feature_id": parcel,
+            "destination_feature_id": owner,
+            "properties": {"since": 2024},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create record: {body}");
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/relationship-classes/{class_id}/records"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list records: {body}");
+    assert_eq!(body[0]["origin_feature_id"], parcel.to_string(), "{body}");
+    assert_eq!(
+        body[0]["destination_feature_id"],
+        owner.to_string(),
+        "{body}"
+    );
+    assert_eq!(body[0]["properties"]["since"], 2024, "{body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/features/{parcel}/related")).await;
+    assert_eq!(status, StatusCode::OK, "related: {body}");
+    assert_eq!(
+        body["forward"][0]["feature_id"],
+        owner.to_string(),
+        "{body}"
+    );
+    assert_eq!(body["forward"][0]["label"], "owned by", "{body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/features/{owner}/related")).await;
+    assert_eq!(status, StatusCode::OK, "related: {body}");
+    assert_eq!(
+        body["backward"][0]["feature_id"],
+        parcel.to_string(),
+        "{body}"
+    );
+    assert_eq!(body["backward"][0]["label"], "owns", "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4706,69 +4919,56 @@ struct ChildIdKind {
     insert: &'static str,
     /// route paths naming that id, `{id}` substituted
     paths: &'static [&'static str],
-    /// Whether an authorized read of this kind actually answers 200. Where it is
-    /// false the handler's own SQL names columns its table does not have, so the
-    /// most that can be pinned is that visibility does not turn the caller away.
-    reads_ok: bool,
 }
 
 /// The read-reachable kinds. Rows go in through the pool, not the create
-/// endpoints, because several of those endpoints insert the same columns their
-/// read handler selects, and those columns do not exist either.
+/// endpoints, so seeding does not itself depend on the grants under test.
 const CHILD_ID_KINDS: &[ChildIdKind] = &[
     ChildIdKind {
         name: "network",
         insert: "INSERT INTO networks (id, dataset_id, name) VALUES ($1, $2, 'net')",
         paths: &["/networks/{id}", "/networks/{id}/edges", "/networks/{id}/junctions"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "lrs route",
         insert: "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
                  VALUES ($1, $2, 'route', ST_GeomFromText('LINESTRINGM(0 0 0, 1 1 100)', 4326), 100)",
         paths: &["/routes/{id}", "/routes/{id}/events"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "symbology rule",
         insert: "INSERT INTO symbology_rules (id, dataset_id, name, symbol)
                  VALUES ($1, $2, 'sym', '{}')",
         paths: &["/symbology/{id}"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "label rule",
         insert: "INSERT INTO label_rules (id, dataset_id, name, field_expression)
                  VALUES ($1, $2, 'label', 'name')",
         paths: &["/labels/{id}"],
-        reads_ok: false,
     },
     ChildIdKind {
         name: "domain",
         insert: "INSERT INTO domains (id, dataset_id, name, domain_type, field_type)
                  VALUES ($1, $2, 'dom', 'coded_value', 'string')",
         paths: &["/domains/{id}"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "subtype",
         insert: "INSERT INTO subtypes (id, dataset_id, subtype_field, code, name)
                  VALUES ($1, $2, 'kind', 1, 'sub')",
         paths: &["/subtypes/{id}"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "attribute rule",
         insert: "INSERT INTO attribute_rules (id, dataset_id, name, rule_type, trigger_event, expression)
                  VALUES ($1, $2, 'rule', 'constraint', 'insert', 'name IS NOT NULL')",
         paths: &["/attribute-rules/{id}"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "trajectory",
         insert: "INSERT INTO trajectories (id, dataset_id, name) VALUES ($1, $2, 'traj')",
         paths: &["/trajectories/{id}"],
-        reads_ok: false,
     },
     ChildIdKind {
         name: "relationship class",
@@ -4776,7 +4976,6 @@ const CHILD_ID_KINDS: &[ChildIdKind] = &[
                      (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key)
                  VALUES ($1, 'rel', $2, $2, 'fk')",
         paths: &["/relationship-classes/{id}", "/relationship-classes/{id}/records"],
-        reads_ok: false,
     },
 ];
 
@@ -4791,7 +4990,6 @@ const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[
         insert: "INSERT INTO topology_rules (id, dataset_id, rule_type, description)
                  VALUES ($1, $2, '\"must_not_overlap\"', '')",
         paths: &["/topology/{id}"],
-        reads_ok: true,
     },
     ChildIdKind {
         name: "relationship record",
@@ -4805,7 +5003,6 @@ const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[
                      (id, relationship_class_id, origin_feature_id, destination_feature_id)
                  SELECT $1, c.id, gen_random_uuid(), gen_random_uuid() FROM c",
         paths: &["/relationship-records/{id}"],
-        reads_ok: true,
     },
 ];
 
@@ -4864,21 +5061,12 @@ async fn test_private_dataset_children_are_404_for_outsiders() {
                 ("admin", &root),
             ] {
                 let (status, body) = request_as(&app, "GET", &uri, Some(token), None).await;
-                if kind.reads_ok {
-                    assert_eq!(
-                        status,
-                        StatusCode::OK,
-                        "{who} GET a {} at {uri}: {body}",
-                        kind.name
-                    );
-                } else {
-                    assert_ne!(
-                        status,
-                        StatusCode::NOT_FOUND,
-                        "{who} GET a {} at {uri}: {body}",
-                        kind.name
-                    );
-                }
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{who} GET a {} at {uri}: {body}",
+                    kind.name
+                );
             }
         }
     }
@@ -4894,21 +5082,12 @@ async fn test_public_dataset_children_stay_anonymous() {
         let child = seed_child_id(&state, kind, dataset_id).await;
         for uri in child_uris(kind, child) {
             let (status, body) = request_as(&app, "GET", &uri, None, None).await;
-            if kind.reads_ok {
-                assert_eq!(
-                    status,
-                    StatusCode::OK,
-                    "anonymous GET a public {} at {uri}: {body}",
-                    kind.name
-                );
-            } else {
-                assert_ne!(
-                    status,
-                    StatusCode::NOT_FOUND,
-                    "anonymous GET a public {} at {uri}: {body}",
-                    kind.name
-                );
-            }
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "anonymous GET a public {} at {uri}: {body}",
+                kind.name
+            );
         }
     }
 }
@@ -4992,11 +5171,10 @@ async fn test_relationship_class_needs_every_dataset_granted() {
         "one grant was enough: {body}"
     );
 
-    // with both granted the layer lets the request through to the handler, which
-    // selects a column relationship_records does not have
+    // with both granted the layer lets the request through to the handler
     grant(&app, "datasets", destination, "vic", "read").await;
     let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
-    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// A catalog can only hang off a dataset that exists, and saying so is a 404
