@@ -3,10 +3,13 @@
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
 pub mod analyze;
+pub mod grant;
 pub mod permission;
 pub mod postgres;
+pub mod writes;
 
 pub use analyze::{ANALYZE_ROW_THRESHOLD, Analyzer, DEFAULT_ANALYZE_ROW_THRESHOLD};
+pub use grant::WriteGrant;
 pub use permission::{
     Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
 };

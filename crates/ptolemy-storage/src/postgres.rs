@@ -5,6 +5,7 @@
 //! PostgreSQL/PostGIS backend for the versioned feature store.
 
 use crate::analyze::Analyzer;
+use crate::grant::WriteGrant;
 use crate::permission::{
     Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
 };
@@ -133,7 +134,10 @@ pub enum WriteTarget {
 }
 
 pub struct PgStore {
-    pool: PgPool,
+    /// `pub(crate)` so the guarded writes in [`crate::writes`] can reach it.
+    /// Outside this crate the only handles are [`PgStore::read_pool`] and
+    /// [`PgStore::unguarded_pool`].
+    pub(crate) pool: PgPool,
     /// Built on first external read, so an unset env var costs nothing and a
     /// bad URL fails the request rather than startup.
     external_pool: tokio::sync::OnceCell<PgPool>,
@@ -745,7 +749,15 @@ impl PgStore {
     }
 
     /// Run the ladder for every target [`PgStore::write_targets_for_id`] found.
-    pub async fn ensure_id_writable(&self, id: Uuid, writer: &Writer) -> Result<(), StoreError> {
+    ///
+    /// The [`WriteGrant`] it returns is the proof a guarded write demands, and
+    /// this is the only thing that mints one. It carries `id`, so a write that
+    /// scopes itself by the grant is aimed at exactly what was checked here.
+    pub async fn ensure_id_writable(
+        &self,
+        id: Uuid,
+        writer: &Writer,
+    ) -> Result<WriteGrant, StoreError> {
         for target in self.write_targets_for_id(id).await? {
             match target {
                 WriteTarget::Branch(branch_id) => {
@@ -756,7 +768,7 @@ impl PgStore {
                 }
             }
         }
-        Ok(())
+        Ok(WriteGrant::issue(id))
     }
 
     // ─── Branch CRUD ────────────────────────────────────────────────
@@ -2062,7 +2074,13 @@ impl PgStore {
 
     // ─── Merge Requests (Reviews) ───────────────────────────────────
 
-    pub async fn create_merge_request(&self, mr: &MergeRequest) -> Result<(), StoreError> {
+    /// The review's target branch is taken from `grant`, not from `mr`, so the
+    /// branch it would eventually land on is the one the ladder checked.
+    pub async fn create_merge_request(
+        &self,
+        grant: &WriteGrant,
+        mr: &MergeRequest,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO merge_requests (id, dataset_id, source_branch_id, target_branch_id, title, description, author, status, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -2070,7 +2088,7 @@ impl PgStore {
         .bind(mr.id)
         .bind(mr.dataset_id)
         .bind(mr.source_branch_id)
-        .bind(mr.target_branch_id)
+        .bind(grant.id())
         .bind(&mr.title)
         .bind(&mr.description)
         .bind(&mr.author)

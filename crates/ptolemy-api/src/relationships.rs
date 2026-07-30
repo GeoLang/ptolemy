@@ -5,12 +5,13 @@
 //! Relationship classes — define and navigate typed associations between features.
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get},
 };
+use ptolemy_storage::{WriteGrant, writes::RelationshipClassInput};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -103,20 +104,22 @@ async fn create_class(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RelError> {
     // the class names its own two datasets and ignores the path, so the write
     // layer checked the wrong one: both sides have to be writable
-    crate::visibility::ensure_writable(
-        &store,
-        &actor,
-        &[req.origin_dataset_id, req.destination_dataset_id],
-    )
-    .await?;
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO relationship_classes
-            (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key, cardinality, forward_label, backward_label)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    ).bind(id).bind(&req.name).bind(req.origin_dataset_id).bind(req.destination_dataset_id)
-    .bind(&req.origin_foreign_key).bind(&req.cardinality).bind(&req.forward_label).bind(&req.backward_label)
-    .execute(store.pool()).await?;
+    let origin = crate::visibility::ensure_writable(&store, &actor, req.origin_dataset_id).await?;
+    let destination =
+        crate::visibility::ensure_writable(&store, &actor, req.destination_dataset_id).await?;
+    let id = store
+        .create_relationship_class(
+            &origin,
+            &destination,
+            &RelationshipClassInput {
+                name: &req.name,
+                origin_foreign_key: &req.origin_foreign_key,
+                cardinality: &req.cardinality,
+                forward_label: &req.forward_label,
+                backward_label: &req.backward_label,
+            },
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
@@ -147,12 +150,9 @@ async fn get_class(
 
 async fn delete_class(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, RelError> {
-    sqlx::query("DELETE FROM relationship_classes WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_relationship_class(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -199,26 +199,25 @@ struct CreateRecordRequest {
 
 async fn create_record(
     State(store): State<AppState>,
-    Path(class_id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
     Json(req): Json<CreateRecordRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RelError> {
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO relationship_records (id, relationship_class_id, origin_feature_id, destination_feature_id, properties)
-         VALUES ($1, $2, $3, $4, $5)",
-    ).bind(id).bind(class_id).bind(req.origin_feature_id).bind(req.destination_feature_id).bind(&req.properties)
-    .execute(store.pool()).await?;
+    let id = store
+        .create_relationship_record(
+            &grant,
+            req.origin_feature_id,
+            req.destination_feature_id,
+            &req.properties,
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
 
 async fn delete_record(
     State(store): State<AppState>,
-    Path(id): Path<Uuid>,
+    Extension(grant): Extension<WriteGrant>,
 ) -> Result<StatusCode, RelError> {
-    sqlx::query("DELETE FROM relationship_records WHERE id = $1")
-        .bind(id)
-        .execute(store.pool())
-        .await?;
+    store.delete_relationship_record(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -44,7 +44,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use ptolemy_storage::StoreError;
+use ptolemy_storage::{StoreError, WriteGrant};
 use uuid::Uuid;
 
 use crate::{
@@ -167,44 +167,60 @@ fn write_target_id(template: &str, path: &str) -> Option<Uuid> {
 
 /// Refuse any mutation the caller is not allowed to make against the dataset or
 /// branch it names, using the store's ladder so the rule stays in one place.
+///
+/// On the way through it puts the [`WriteGrant`] the ladder minted into the
+/// request extensions. A handler that writes takes it with
+/// `Extension<WriteGrant>` and hands it to the store method that does the write,
+/// which reads the id it writes under off the grant. A route that never reaches
+/// the ladder therefore has no grant to hand over and cannot call one of those
+/// methods at all.
 pub async fn write_middleware(
     State(store): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // dev mode: no verified identity, so `Writer::Unenforced` would skip every
-    // check anyway and running the resolver would only cost a query
-    if request.extensions().get::<AuthEnabled>().is_none() {
-        return next.run(request).await;
-    }
+    // check anyway and running the resolver would only cost a query. The target
+    // is still resolved and still granted, so a handler is handed the same grant
+    // either way and cannot quietly come to depend on auth being on.
+    let enforced = request.extensions().get::<AuthEnabled>().is_some();
 
-    let Some(template) = route_template(request.extensions()) else {
-        // No route matched, so the fallback is about to answer 404 and no
-        // handler will run. Refusing anyway keeps the gate from ever deciding
-        // policy without a template, which is the whole point of keying on one.
-        if needs_write_grant(request.method(), "") {
-            return denied("no route matched");
+    let target = {
+        let Some(template) = route_template(request.extensions()) else {
+            // No route matched, so the fallback is about to answer 404 and no
+            // handler will run. Refusing anyway keeps the gate from ever deciding
+            // policy without a template, which is the whole point of keying on one.
+            if enforced && needs_write_grant(request.method(), "") {
+                return denied("no route matched");
+            }
+            return next.run(request).await;
+        };
+        if !needs_write_grant(request.method(), template) {
+            return next.run(request).await;
         }
-        return next.run(request).await;
+        write_target_id(template, request.uri().path())
     };
-    if !needs_write_grant(request.method(), template) {
-        return next.run(request).await;
-    }
-    let Some(id) = write_target_id(template, request.uri().path()) else {
+    let Some(id) = target else {
         // the template names no id, so there is nothing to attribute the write
         // to: `POST /datasets` is the case that matters, and it grants its
         // creator on the way out
         return next.run(request).await;
     };
 
-    let actor = crate::Actor::from_extensions(request.extensions());
-    match store.ensure_id_writable(id, &actor.writer()).await {
-        Ok(()) => next.run(request).await,
-        Err(e) => {
-            let (status, message) = store_error_status(&e);
-            (status, axum::Json(serde_json::json!({"error": message}))).into_response()
+    let grant = if enforced {
+        let actor = crate::Actor::from_extensions(request.extensions());
+        match store.ensure_id_writable(id, &actor.writer()).await {
+            Ok(grant) => grant,
+            Err(e) => {
+                let (status, message) = store_error_status(&e);
+                return (status, axum::Json(serde_json::json!({"error": message}))).into_response();
+            }
         }
-    }
+    } else {
+        WriteGrant::unenforced(id)
+    };
+    request.extensions_mut().insert(grant);
+    next.run(request).await
 }
 
 fn denied(message: &str) -> Response {
@@ -216,17 +232,18 @@ fn denied(message: &str) -> Response {
 }
 
 /// The write ladder for a handler whose target arrives in the request body,
-/// where [`write_middleware`] cannot see it. The mirror of [`ensure_readable`].
+/// where [`write_middleware`] cannot see it. The mirror of [`ensure_readable`],
+/// and the other source of a [`WriteGrant`]: a handler that names two targets
+/// calls it once per target and holds a grant for each.
+///
+/// Unlike [`ensure_readable`] this runs even with auth off, because the ladder
+/// also refuses a target that does not exist or is an external read-only table.
 pub async fn ensure_writable(
     store: &AppState,
     actor: &crate::Actor,
-    ids: &[Uuid],
-) -> Result<(), StoreError> {
-    let writer = actor.writer();
-    for id in ids {
-        store.ensure_id_writable(*id, &writer).await?;
-    }
-    Ok(())
+    id: Uuid,
+) -> Result<WriteGrant, StoreError> {
+    store.ensure_id_writable(id, &actor.writer()).await
 }
 
 #[cfg(test)]
