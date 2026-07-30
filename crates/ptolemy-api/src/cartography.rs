@@ -183,8 +183,8 @@ struct LabelRule {
     name: String,
     min_scale: Option<f64>,
     max_scale: Option<f64>,
-    label_expression: String,
-    placement: String,
+    field_expression: String,
+    placement: serde_json::Value,
     font: serde_json::Value,
     priority: i32,
 }
@@ -194,7 +194,7 @@ async fn list_labels(
     Path(dataset_id): Path<Uuid>,
 ) -> Result<Json<Vec<LabelRule>>, CartoError> {
     let rows = sqlx::query(
-        "SELECT id, name, min_scale, max_scale, label_expression, placement, font, priority
+        "SELECT id, name, min_scale, max_scale, field_expression, placement, font, priority
          FROM label_rules WHERE dataset_id = $1 ORDER BY priority",
     )
     .bind(dataset_id)
@@ -207,7 +207,7 @@ async fn list_labels(
                 name: r.get("name"),
                 min_scale: r.get("min_scale"),
                 max_scale: r.get("max_scale"),
-                label_expression: r.get("label_expression"),
+                field_expression: r.get("field_expression"),
                 placement: r.get("placement"),
                 font: r.get("font"),
                 priority: r.get("priority"),
@@ -221,16 +221,16 @@ struct CreateLabelRequest {
     name: String,
     min_scale: Option<f64>,
     max_scale: Option<f64>,
-    label_expression: String,
+    field_expression: String,
     #[serde(default = "default_placement")]
-    placement: String,
+    placement: serde_json::Value,
     #[serde(default = "default_font")]
     font: serde_json::Value,
     #[serde(default)]
     priority: i32,
 }
-fn default_placement() -> String {
-    "point_on_surface".into()
+fn default_placement() -> serde_json::Value {
+    serde_json::json!({"type": "point_on_surface"})
 }
 fn default_font() -> serde_json::Value {
     serde_json::json!({"family": "Arial", "size": 12})
@@ -243,11 +243,11 @@ async fn create_label(
 ) -> Result<(StatusCode, Json<serde_json::Value>), CartoError> {
     let id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO label_rules (id, dataset_id, name, min_scale, max_scale, label_expression, placement, font, priority)
+        "INSERT INTO label_rules (id, dataset_id, name, min_scale, max_scale, field_expression, placement, font, priority)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     ).bind(id).bind(dataset_id).bind(&req.name)
     .bind(req.min_scale).bind(req.max_scale)
-    .bind(&req.label_expression).bind(&req.placement).bind(&req.font).bind(req.priority)
+    .bind(&req.field_expression).bind(&req.placement).bind(&req.font).bind(req.priority)
     .execute(store.pool()).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
@@ -257,7 +257,7 @@ async fn get_label(
     Path(id): Path<Uuid>,
 ) -> Result<Json<LabelRule>, CartoError> {
     let r = sqlx::query(
-        "SELECT id, name, min_scale, max_scale, label_expression, placement, font, priority
+        "SELECT id, name, min_scale, max_scale, field_expression, placement, font, priority
          FROM label_rules WHERE id = $1",
     )
     .bind(id)
@@ -269,7 +269,7 @@ async fn get_label(
         name: r.get("name"),
         min_scale: r.get("min_scale"),
         max_scale: r.get("max_scale"),
-        label_expression: r.get("label_expression"),
+        field_expression: r.get("field_expression"),
         placement: r.get("placement"),
         font: r.get("font"),
         priority: r.get("priority"),
@@ -278,8 +278,8 @@ async fn get_label(
 
 #[derive(Deserialize)]
 struct UpdateLabelRequest {
-    label_expression: Option<String>,
-    placement: Option<String>,
+    field_expression: Option<String>,
+    placement: Option<serde_json::Value>,
     font: Option<serde_json::Value>,
     priority: Option<i32>,
 }
@@ -289,8 +289,8 @@ async fn update_label(
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateLabelRequest>,
 ) -> Result<StatusCode, CartoError> {
-    if let Some(expr) = &req.label_expression {
-        sqlx::query("UPDATE label_rules SET label_expression = $2 WHERE id = $1")
+    if let Some(expr) = &req.field_expression {
+        sqlx::query("UPDATE label_rules SET field_expression = $2 WHERE id = $1")
             .bind(id)
             .bind(expr)
             .execute(store.pool())
