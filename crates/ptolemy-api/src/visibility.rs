@@ -11,11 +11,18 @@
 //! the path, that take one in a query parameter. What they all share is the id
 //! itself, so the layer resolves every uuid the request names.
 //!
-//! An id may name a dataset, a branch, a changeset, a merge request, a feature,
-//! a raster catalog or tile, a point cloud catalog or patch, or an attachment:
-//! the store's `private_datasets_for_ids` resolves all of them to a dataset. A
-//! request that names none of them has no dataset in scope and passes, and so
-//! does a request that names only public ones.
+//! An id may name a dataset or any of the things that belong to one: a branch, a
+//! changeset, a merge request, a feature, a raster or point cloud catalog and its
+//! tiles or patches, an attachment, a network, an LRS route, a symbology or label
+//! rule, a domain, a subtype, an attribute rule, a trajectory, a topology rule, a
+//! webhook, a relationship class or record. The store's
+//! `private_datasets_for_ids` resolves all of them to a dataset. A request that
+//! names none of them has no dataset in scope and passes, and so does a request
+//! that names only public ones.
+//!
+//! A relationship class spans two datasets and resolves to both, which is why
+//! `allowed` requires every private dataset in scope to be granted rather than
+//! any one of them.
 //!
 //! Unauthorized reads answer 404, not 403, so a private dataset id cannot be
 //! confirmed by probing.

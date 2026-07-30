@@ -4696,6 +4696,309 @@ async fn test_public_dataset_attachments_stay_anonymous() {
     assert_eq!(body["name"], "icon.png", "{body}");
 }
 
+// ─── The remaining dataset-owned id kinds ───────────────────────────
+
+/// One id kind a route names that is neither a dataset nor a branch id, so the
+/// layer can only gate it by resolving it back to its owning dataset.
+struct ChildIdKind {
+    name: &'static str,
+    /// inserts one row, `$1` the id a route will name and `$2` its dataset
+    insert: &'static str,
+    /// route paths naming that id, `{id}` substituted
+    paths: &'static [&'static str],
+    /// Whether an authorized read of this kind actually answers 200. Where it is
+    /// false the handler's own SQL names columns its table does not have, so the
+    /// most that can be pinned is that visibility does not turn the caller away.
+    reads_ok: bool,
+}
+
+/// The read-reachable kinds. Rows go in through the pool, not the create
+/// endpoints, because several of those endpoints insert the same columns their
+/// read handler selects, and those columns do not exist either.
+const CHILD_ID_KINDS: &[ChildIdKind] = &[
+    ChildIdKind {
+        name: "network",
+        insert: "INSERT INTO networks (id, dataset_id, name) VALUES ($1, $2, 'net')",
+        paths: &["/networks/{id}", "/networks/{id}/edges", "/networks/{id}/junctions"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "lrs route",
+        insert: "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
+                 VALUES ($1, $2, 'route', ST_GeomFromText('LINESTRINGM(0 0 0, 1 1 100)', 4326), 100)",
+        paths: &["/routes/{id}", "/routes/{id}/events"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "symbology rule",
+        insert: "INSERT INTO symbology_rules (id, dataset_id, name, symbol)
+                 VALUES ($1, $2, 'sym', '{}')",
+        paths: &["/symbology/{id}"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "label rule",
+        insert: "INSERT INTO label_rules (id, dataset_id, name, field_expression)
+                 VALUES ($1, $2, 'label', 'name')",
+        paths: &["/labels/{id}"],
+        reads_ok: false,
+    },
+    ChildIdKind {
+        name: "domain",
+        insert: "INSERT INTO domains (id, dataset_id, name, domain_type, field_type)
+                 VALUES ($1, $2, 'dom', 'coded_value', 'string')",
+        paths: &["/domains/{id}"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "subtype",
+        insert: "INSERT INTO subtypes (id, dataset_id, subtype_field, code, name)
+                 VALUES ($1, $2, 'kind', 1, 'sub')",
+        paths: &["/subtypes/{id}"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "attribute rule",
+        insert: "INSERT INTO attribute_rules (id, dataset_id, name, rule_type, trigger_event, expression)
+                 VALUES ($1, $2, 'rule', 'constraint', 'insert', 'name IS NOT NULL')",
+        paths: &["/attribute-rules/{id}"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "trajectory",
+        insert: "INSERT INTO trajectories (id, dataset_id, name) VALUES ($1, $2, 'traj')",
+        paths: &["/trajectories/{id}"],
+        reads_ok: false,
+    },
+    ChildIdKind {
+        name: "relationship class",
+        insert: "INSERT INTO relationship_classes
+                     (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key)
+                 VALUES ($1, 'rel', $2, $2, 'fk')",
+        paths: &["/relationship-classes/{id}", "/relationship-classes/{id}/records"],
+        reads_ok: false,
+    },
+];
+
+/// The kinds whose only route is a delete. An anonymous request there is a 401
+/// from the auth layer, so what visibility decides is whether an editor without
+/// a grant on the dataset can reach the row. A webhook id is not in here: every
+/// method on `/webhooks/{id}` is admin-only, and an instance admin skips
+/// visibility, so nothing it decides is observable there.
+const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[
+    ChildIdKind {
+        name: "topology rule",
+        insert: "INSERT INTO topology_rules (id, dataset_id, rule_type, description)
+                 VALUES ($1, $2, '\"must_not_overlap\"', '')",
+        paths: &["/topology/{id}"],
+        reads_ok: true,
+    },
+    ChildIdKind {
+        name: "relationship record",
+        insert: "WITH c AS (
+                     INSERT INTO relationship_classes
+                         (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key)
+                     VALUES (gen_random_uuid(), 'rel', $2, $2, 'fk')
+                     RETURNING id
+                 )
+                 INSERT INTO relationship_records
+                     (id, relationship_class_id, origin_feature_id, destination_feature_id)
+                 SELECT $1, c.id, gen_random_uuid(), gen_random_uuid() FROM c",
+        paths: &["/relationship-records/{id}"],
+        reads_ok: true,
+    },
+];
+
+async fn seed_child_id(state: &AppState, kind: &ChildIdKind, dataset_id: Uuid) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(kind.insert)
+        .bind(id)
+        .bind(dataset_id)
+        .execute(state.pool())
+        .await
+        .unwrap_or_else(|e| panic!("seeding a {}: {e}", kind.name));
+    id
+}
+
+fn child_uris(kind: &ChildIdKind, id: Uuid) -> Vec<String> {
+    kind.paths
+        .iter()
+        .map(|p| format!("/api/v1{}", p.replace("{id}", &id.to_string())))
+        .collect()
+}
+
+/// Reads that name a network, an LRS route, a symbology or label rule, a domain,
+/// a subtype, an attribute rule, a trajectory or a relationship class never name
+/// the dataset, so the layer has to resolve each of those ids to it.
+#[tokio::test]
+async fn test_private_dataset_children_are_404_for_outsiders() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, _, carol) = seed_private_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let root = token_for_user("root", Role::Admin);
+    let vic = token_for_user("vic", Role::Viewer);
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    for kind in CHILD_ID_KINDS {
+        let child = seed_child_id(&state, kind, dataset_id).await;
+        for uri in child_uris(kind, child) {
+            let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "anonymous GET a {} at {uri}: {body}",
+                kind.name
+            );
+
+            let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "non-granted editor GET a {} at {uri}: {body}",
+                kind.name
+            );
+
+            for (who, token) in [
+                ("owner", &carol),
+                ("granted viewer", &vic),
+                ("admin", &root),
+            ] {
+                let (status, body) = request_as(&app, "GET", &uri, Some(token), None).await;
+                if kind.reads_ok {
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "{who} GET a {} at {uri}: {body}",
+                        kind.name
+                    );
+                } else {
+                    assert_ne!(
+                        status,
+                        StatusCode::NOT_FOUND,
+                        "{who} GET a {} at {uri}: {body}",
+                        kind.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The same children under a public dataset stay anonymously readable.
+#[tokio::test]
+async fn test_public_dataset_children_stay_anonymous() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, _) = seed_owned_public_dataset(&app).await;
+
+    for kind in CHILD_ID_KINDS {
+        let child = seed_child_id(&state, kind, dataset_id).await;
+        for uri in child_uris(kind, child) {
+            let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+            if kind.reads_ok {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "anonymous GET a public {} at {uri}: {body}",
+                    kind.name
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "anonymous GET a public {} at {uri}: {body}",
+                    kind.name
+                );
+            }
+        }
+    }
+}
+
+/// The delete-only kinds: without a grant on the private dataset the row is not
+/// there to delete, with one it is.
+#[tokio::test]
+async fn test_private_dataset_delete_only_children_need_a_grant() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, _, _) = seed_private_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    let mut granted = Vec::new();
+    for kind in DELETE_ONLY_ID_KINDS {
+        let child = seed_child_id(&state, kind, dataset_id).await;
+        for uri in child_uris(kind, child) {
+            let (status, body) = request_as(&app, "DELETE", &uri, Some(&eve), None).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "non-granted editor DELETE a {} at {uri}: {body}",
+                kind.name
+            );
+        }
+        granted.push((kind, seed_child_id(&state, kind, dataset_id).await));
+    }
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+
+    for (kind, child) in granted {
+        for uri in child_uris(kind, child) {
+            let (status, body) = request_as(&app, "DELETE", &uri, Some(&eve), None).await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "granted editor DELETE a {} at {uri}: {body}",
+                kind.name
+            );
+        }
+    }
+}
+
+/// A relationship class spans two datasets, so it resolves to both and a grant on
+/// only one of them is not enough.
+#[tokio::test]
+async fn test_relationship_class_needs_every_dataset_granted() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (origin, _, _) = seed_private_dataset(&app).await;
+    let (destination, _, _) = seed_private_dataset(&app).await;
+    let vic = token_for_user("vic", Role::Viewer);
+
+    let class_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO relationship_classes
+             (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key)
+         VALUES ($1, 'rel', $2, $3, 'fk')",
+    )
+    .bind(class_id)
+    .bind(origin)
+    .bind(destination)
+    .execute(state.pool())
+    .await
+    .unwrap();
+
+    let resolved = state.private_datasets_for_ids(&[class_id]).await.unwrap();
+    assert_eq!(resolved.len(), 2, "{resolved:?}");
+    assert!(
+        resolved.contains(&origin) && resolved.contains(&destination),
+        "{resolved:?}"
+    );
+
+    let uri = format!("/api/v1/relationship-classes/{class_id}/records");
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    grant(&app, "datasets", origin, "vic", "read").await;
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "one grant was enough: {body}"
+    );
+
+    // with both granted the layer lets the request through to the handler, which
+    // selects a column relationship_records does not have
+    grant(&app, "datasets", destination, "vic", "read").await;
+    let (status, body) = request_as(&app, "GET", &uri, Some(&vic), None).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 /// A catalog can only hang off a dataset that exists, and saying so is a 404
 /// rather than the foreign key failing as a 500.
 #[tokio::test]
