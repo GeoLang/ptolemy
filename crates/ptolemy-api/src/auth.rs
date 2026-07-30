@@ -152,6 +152,89 @@ const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
     "/features/filter",
 ];
 
+/// Whole subtrees whose mutating methods only compute. Every route under them
+/// reads features and returns a derived geometry without persisting anything.
+const COMPUTE_ONLY_SEGMENTS: [&str; 2] = ["/geoprocessing/", "/3d/"];
+
+/// The rest of the endpoints that take a POST body because the request is too
+/// big for a query string but write nothing. See [`needs_write_grant`].
+const COMPUTE_ONLY_SUFFIXES: [&str; 17] = [
+    // network analysis over an existing graph
+    "/trace",
+    "/shortest-path",
+    "/astar",
+    "/isochrone",
+    "/tsp",
+    // point cloud
+    "/query",
+    "/profile",
+    // rule and topology checks
+    "/validate",
+    // similarity
+    "/similarity/search",
+    "/similarity/cluster",
+    // hex and projection maths that touch no branch
+    "/h3/compact",
+    "/transform",
+    // trajectory pair maths
+    "/trajectories/nearest",
+    // vertical slices that return a computed answer and tell the caller to
+    // commit it themselves
+    "/parcels/split",
+    "/parcels/merge",
+    "/surveys/compare",
+    "/coverage/simulate",
+];
+
+/// Whether the per-dataset write ladder applies to this request.
+///
+/// Default is yes for every mutating method, so a route added tomorrow is
+/// guarded without its author doing anything. The exceptions are listed above
+/// and each one has to be opted in by hand.
+///
+/// The failure modes are deliberately asymmetric. Forgetting to list a new
+/// compute endpoint denies a read-only caller and shows up as a 403 the first
+/// time someone without a write grant uses it. Forgetting anything about a new
+/// write endpoint leaves it guarded. Only the loud mistake is possible in the
+/// direction that matters.
+pub fn needs_write_grant(method: &Method, path: &str) -> bool {
+    if !matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return false;
+    }
+
+    // Grant management has its own, stricter gate in rbac.rs: an admin grant on
+    // the dataset. Running the ladder here as well would deny a dataset admin
+    // managing permissions on a branch whose rows do not include them, which is
+    // exactly the case they need it for.
+    if path.contains("/permissions") {
+        return false;
+    }
+
+    if COMPUTE_ONLY_SEGMENTS.iter().any(|s| path.contains(s)) {
+        return false;
+    }
+    if PUBLIC_QUERY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+        return false;
+    }
+    if COMPUTE_ONLY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+        return false;
+    }
+    // an evacuation route is pure arithmetic; POST /incidents commits a feature
+    if path.ends_with("/incidents/evacuate") {
+        return false;
+    }
+    // simplifying a trajectory reports what the simplification would do without
+    // storing it, while simplifying a topology edits the topology in place
+    if path.contains("/trajectories/") && path.ends_with("/simplify") {
+        return false;
+    }
+
+    true
+}
+
 /// Decide what a request needs. Reads (GET/HEAD/OPTIONS) and the query-shaped
 /// POSTs are public; privilege and delivery-config changes are admin-only;
 /// everything else that mutates needs write access.
@@ -207,6 +290,17 @@ pub fn classify(method: &Method, path: &str) -> Access {
             return Access::Admin;
         }
         return Access::Public;
+    }
+
+    // A PostGIS topology is a Postgres schema, not rows inside a dataset:
+    // CreateTopology issues DDL and the route's `{id}` is discarded. There is no
+    // owner for the write ladder to check, so these stay admin-only until a
+    // topology is bound to a dataset. Reads already returned above.
+    if path.ends_with("/topologies")
+        || path.ends_with("/add-face")
+        || (path.starts_with("/api/v1/topologies/") && path.ends_with("/simplify"))
+    {
+        return Access::Admin;
     }
 
     if PUBLIC_QUERY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
@@ -449,16 +543,23 @@ impl Actor {
             Some(claims) => Writer::user(claims.sub.clone(), claims.can_admin()),
         }
     }
+
+    /// The caller as seen from a layer, which has the whole request rather than
+    /// its parts. Same construction the extractor uses, so a middleware and a
+    /// handler always agree on who is calling.
+    pub fn from_extensions(extensions: &axum::http::Extensions) -> Self {
+        Actor {
+            claims: extensions.get::<Claims>().cloned(),
+            auth_enabled: extensions.get::<AuthEnabled>().is_some(),
+        }
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Actor {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Actor {
-            claims: parts.extensions.get::<Claims>().cloned(),
-            auth_enabled: parts.extensions.get::<AuthEnabled>().is_some(),
-        })
+        Ok(Actor::from_extensions(&parts.extensions))
     }
 }
 

@@ -704,6 +704,11 @@ async fn resolve_conflict(
     actor: Actor,
     Json(req): Json<ResolveConflictRequest>,
 ) -> Result<Json<serde_json::Value>, QgisError> {
+    // marking a conflict resolved is a write in its own right, and it runs
+    // before the commit below that would otherwise be the only guard
+    store
+        .ensure_branch_writable(branch_id, &actor.writer())
+        .await?;
     // Mark conflict as resolved
     let result = sqlx::query(
         "UPDATE merge_conflicts SET resolved = true, resolution = $2, resolved_at = now()

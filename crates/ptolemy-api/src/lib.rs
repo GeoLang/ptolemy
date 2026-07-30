@@ -136,6 +136,12 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
         .layer(middleware::from_fn(metrics::metrics_middleware))
+        // inside visibility, so a caller who cannot read a private dataset gets
+        // its 404 rather than a 403 that would confirm the id exists
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            visibility::write_middleware,
+        ))
         // inside the auth layer, so the token is already decoded and a bad one
         // is a 401 before visibility ever runs
         .layer(middleware::from_fn_with_state(

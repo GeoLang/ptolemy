@@ -3274,6 +3274,23 @@ async fn test_lock_cannot_be_released_by_another_user() {
 
     let uri = format!("/api/v1/branches/{branch_id}/locks/{feature_id}");
 
+    // an editor with no grant on the dataset never reaches the lock rule: the
+    // write layer refuses the branch first
+    let (status, body) = request_as(&app, "DELETE", &uri, Some(&intruder), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "ungranted unlock: {body}");
+
+    // with a grant they clear the write layer, and the lock is still not theirs
+    let (_, branch) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}"),
+        None,
+        None,
+    )
+    .await;
+    let dataset_id = Uuid::parse_str(branch["dataset_id"].as_str().unwrap()).unwrap();
+    grant(&app, "datasets", dataset_id, "intruder", "write").await;
+
     let (status, body) = request_as(&app, "DELETE", &uri, Some(&intruder), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "intruder unlock: {body}");
 
@@ -7220,4 +7237,434 @@ async fn test_features_valid_at_query() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ─── The write ladder reaches every mutating route ──────────────────
+
+/// A dataset and branch owned by `carol`, who gets the creator's admin grant.
+/// Every other editor is an outsider to it.
+async fn owned_dataset(app: &axum::Router) -> (Uuid, Uuid, String) {
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = commit_as(app, branch_id, &carol).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    (dataset_id, branch_id, carol)
+}
+
+/// One representative mutating route per module that used to reach the database
+/// on the editor role alone. Bodies are the shapes the handlers deserialize, so
+/// the same table drives the denial and the success case.
+fn gated_writes(dataset_id: Uuid, branch_id: Uuid) -> Vec<(&'static str, String, Value)> {
+    vec![
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/tags"),
+            json!({"tag": "roads"}),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/datasets/{dataset_id}/metadata"),
+            json!({"description": "notes"}),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/datasets/{dataset_id}/schema"),
+            json!({"fields": []}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/topology"),
+            json!({"rule_type": "no_overlap", "description": "none"}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/schema/migrations"),
+            json!({
+                "description": "add a field",
+                "migration_type": "add_field",
+                "applied_by": "ignored",
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/symbology"),
+            json!({"name": "water", "symbol": {"type": "simple_fill"}}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/labels"),
+            json!({"name": "plain", "field_expression": "code"}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/domains"),
+            json!({"name": "surface", "domain_type": "coded", "field_type": "text"}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/subtypes"),
+            json!({"name": "primary", "code": 1}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/attribute-rules"),
+            json!({
+                "name": "positive width",
+                "rule_type": "constraint",
+                "trigger_event": "insert",
+                "expression": "width > 0",
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/networks"),
+            json!({"name": "mains"}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/trajectories"),
+            json!({
+                "name": "bus 12",
+                "points": [
+                    {"lng": 1.0, "lat": 2.0, "timestamp": "2024-01-01T00:00:00Z"},
+                    {"lng": 3.0, "lat": 4.0, "timestamp": "2024-01-01T01:00:00Z"},
+                ],
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/datasets/{dataset_id}/events"),
+            json!({"event_type": "custom", "payload": {}}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/branches/{branch_id}/locks"),
+            json!({"feature_id": Uuid::now_v7(), "locked_by": "ignored"}),
+        ),
+        // the two bulk feature writers: these rewrite rows on someone else's
+        // branch, so they are the ones that mattered most
+        (
+            "POST",
+            format!("/api/v1/branches/{branch_id}/h3/index"),
+            json!({"resolution": 7}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/branches/{branch_id}/similarity/embed"),
+            json!({"fields": ["name"]}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn test_ungranted_editor_cannot_write_through_any_route() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _carol) = owned_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    for (method, uri, body) in gated_writes(dataset_id, branch_id) {
+        let (status, response) =
+            request_as(&app, method, &uri, Some(&eve), Some(body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} should be refused: {response}"
+        );
+    }
+}
+
+/// Routes whose handler is broken for a reason that has nothing to do with
+/// permissions, so only the gate's behaviour can be asserted on them.
+/// `POST /datasets/{id}/subtypes` omits `subtype_field`, which the table
+/// declares NOT NULL with no default, so it 500s for anyone.
+fn handler_is_independently_broken(uri: &str) -> bool {
+    uri.ends_with("/subtypes")
+}
+
+#[tokio::test]
+async fn test_granted_editor_still_writes_through_every_route() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _carol) = owned_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+
+    for (method, uri, body) in gated_writes(dataset_id, branch_id) {
+        let (status, response) =
+            request_as(&app, method, &uri, Some(&eve), Some(body.clone())).await;
+        // h3-pg and pgvector are optional, so their handlers may still fail on a
+        // database without them. What matters is that the gate let the call in.
+        if needs_optional_extension(&uri) || handler_is_independently_broken(&uri) {
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} should clear the write gate: {response}"
+            );
+            continue;
+        }
+        assert!(
+            status.is_success(),
+            "{method} {uri} should succeed for a granted editor: {status} {response}"
+        );
+    }
+}
+
+/// The instance admin bypasses per-dataset permissions, as it does everywhere
+/// else, so the new layer must not shut it out.
+#[tokio::test]
+async fn test_instance_admin_writes_through_every_route() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _carol) = owned_dataset(&app).await;
+    let root = token_for_user("root", Role::Admin);
+
+    for (method, uri, body) in gated_writes(dataset_id, branch_id) {
+        let (status, response) =
+            request_as(&app, method, &uri, Some(&root), Some(body.clone())).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} should clear the write gate for an admin: {response}"
+        );
+    }
+}
+
+/// A mutating method is not the same as a write. These POST because their input
+/// does not fit in a query string, and they persist nothing, so a caller who may
+/// only read the dataset has to keep being able to run them.
+#[tokio::test]
+async fn test_read_only_caller_can_still_run_compute_posts() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _carol) = seed_private_dataset(&app).await;
+    let vic = token_for_user("vic", Role::Editor);
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    let compute: Vec<(String, Value)> = vec![
+        (
+            format!("/api/v1/branches/{branch_id}/geoprocessing/centroid"),
+            json!({}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/geoprocessing/dissolve"),
+            json!({}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/features/intersects"),
+            json!({"geometry": {"type": "Point", "coordinates": [1.0, 1.0]}}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/transform"),
+            json!({
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "from_srid": 4326,
+                "to_srid": 3857,
+            }),
+        ),
+        (
+            "/api/v1/coverage/simulate".to_string(),
+            json!({
+                "tower_lng": 0.0, "tower_lat": 0.0, "radius_m": 1000.0,
+                "frequency_mhz": 900.0, "height_m": 30.0, "power_dbm": 40.0,
+            }),
+        ),
+    ];
+
+    for (uri, body) in compute {
+        let (status, response) =
+            request_as(&app, "POST", &uri, Some(&vic), Some(body.clone())).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "read-only caller must keep {uri}: {response}"
+        );
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "read-only caller must keep {uri}: {response}"
+        );
+    }
+}
+
+/// The write gate takes the first path id, so merging still only needs a grant
+/// on the branch being written, not on the one being read.
+#[tokio::test]
+async fn test_merge_needs_write_on_the_target_only() {
+    let app = setup_app_authed().await;
+    let (dataset_id, target_id, carol) = owned_dataset(&app).await;
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "feature", "created_by": "x", "fork_from_branch": target_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let source_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+    let (status, body) = commit_as(&app, source_id, &carol).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // a grant on the target alone, and nothing on the source
+    let dana = token_for_user("dana", Role::Editor);
+    grant(&app, "branches", target_id, "dana", "write").await;
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{target_id}/merge/{source_id}"),
+        Some(&dana),
+        None,
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "merge as dana: {body}");
+}
+
+/// A review names its branches in the body, where neither layer can see them, so
+/// the handler runs the ladder itself.
+#[tokio::test]
+async fn test_create_review_needs_write_on_the_target_branch() {
+    let app = setup_app_authed().await;
+    let (dataset_id, target_id, carol) = owned_dataset(&app).await;
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "feature", "created_by": "x", "fork_from_branch": target_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let source_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let body = json!({
+        "dataset_id": dataset_id,
+        "source_branch_id": source_id,
+        "target_branch_id": target_id,
+        "title": "please merge",
+        "author": "ignored",
+    });
+
+    let eve = token_for_user("eve", Role::Editor);
+    let (status, response) = request_as(
+        &app,
+        "POST",
+        "/api/v1/reviews",
+        Some(&eve),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "outsider review: {response}");
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    let (status, response) =
+        request_as(&app, "POST", "/api/v1/reviews", Some(&eve), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "granted review: {response}");
+}
+
+/// A relationship class names its two datasets in the body and ignores the path,
+/// so the handler has to check both sides itself.
+#[tokio::test]
+async fn test_create_relationship_class_checks_both_datasets() {
+    let app = setup_app_authed().await;
+    let (origin, _, _carol) = owned_dataset(&app).await;
+    let (destination, _, _) = owned_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    let body = json!({
+        "name": "parcel to owner",
+        "origin_dataset_id": origin,
+        "destination_dataset_id": destination,
+        "origin_foreign_key": "parcel_id",
+    });
+
+    // the path names a dataset eve may write, but the body names two she may not
+    grant(&app, "datasets", origin, "eve", "write").await;
+    let (status, response) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{origin}/relationships"),
+        Some(&eve),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "half-granted class: {response}"
+    );
+
+    grant(&app, "datasets", destination, "eve", "write").await;
+    let (status, response) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{origin}/relationships"),
+        Some(&eve),
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "fully granted class: {response}"
+    );
+}
+
+/// A PostGIS topology is a Postgres schema with no dataset behind it, so it has
+/// no owner for the ladder and stays admin-only.
+#[tokio::test]
+async fn test_topology_ddl_is_admin_only() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, _carol) = owned_dataset(&app).await;
+    let editor = token_for_user("carol", Role::Editor);
+
+    for (uri, body) in [
+        (
+            format!("/api/v1/datasets/{dataset_id}/topologies"),
+            json!({"name": "roads_topo"}),
+        ),
+        (
+            "/api/v1/topologies/roads_topo/add-face".to_string(),
+            json!({"geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f"}),
+        ),
+        (
+            "/api/v1/topologies/roads_topo/simplify".to_string(),
+            json!({"tolerance": 0.001}),
+        ),
+    ] {
+        let (status, response) = request_as(&app, "POST", &uri, Some(&editor), Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "editor {uri}: {response}");
+    }
+
+    // reading a topology is unchanged
+    let (status, _) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/topologies"),
+        Some(&editor),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

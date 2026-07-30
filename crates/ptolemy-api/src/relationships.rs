@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn relationship_routes() -> Router<AppState> {
     Router::new()
@@ -98,8 +98,17 @@ fn default_cardinality() -> String {
 async fn create_class(
     State(store): State<AppState>,
     Path(_dataset_id): Path<Uuid>,
+    actor: Actor,
     Json(req): Json<CreateClassRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), RelError> {
+    // the class names its own two datasets and ignores the path, so the write
+    // layer checked the wrong one: both sides have to be writable
+    crate::visibility::ensure_writable(
+        &store,
+        &actor,
+        &[req.origin_dataset_id, req.destination_dataset_id],
+    )
+    .await?;
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO relationship_classes
@@ -282,6 +291,7 @@ async fn get_related_features(
 
 enum RelError {
     Db(sqlx::Error),
+    Store(ptolemy_storage::StoreError),
     NotFound,
 }
 impl From<sqlx::Error> for RelError {
@@ -289,10 +299,16 @@ impl From<sqlx::Error> for RelError {
         RelError::Db(e)
     }
 }
+impl From<ptolemy_storage::StoreError> for RelError {
+    fn from(e: ptolemy_storage::StoreError) -> Self {
+        RelError::Store(e)
+    }
+}
 impl IntoResponse for RelError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             RelError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            RelError::Store(e) => crate::errors::store_error_status(&e),
             RelError::Db(e) => {
                 tracing::error!("DB: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

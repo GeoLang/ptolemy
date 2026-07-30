@@ -73,6 +73,10 @@ async fn create_review(
     actor: Actor,
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<MergeRequest>), ReviewError> {
+    // every id is in the body, where neither layer can see it. The target branch
+    // is what the review would eventually write, so that is what it needs.
+    crate::visibility::ensure_readable(&store, &actor, &[req.source_branch_id]).await?;
+    crate::visibility::ensure_writable(&store, &actor, &[req.target_branch_id]).await?;
     let now = OffsetDateTime::now_utc();
     let mr = MergeRequest {
         id: Uuid::now_v7(),
