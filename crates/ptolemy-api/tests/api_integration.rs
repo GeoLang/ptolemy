@@ -7325,7 +7325,7 @@ fn gated_writes(dataset_id: Uuid, branch_id: Uuid) -> Vec<(&'static str, String,
         (
             "POST",
             format!("/api/v1/datasets/{dataset_id}/subtypes"),
-            json!({"name": "primary", "code": 1}),
+            json!({"subtype_field": "kind", "name": "primary", "code": 1}),
         ),
         (
             "POST",
@@ -7395,14 +7395,6 @@ async fn test_ungranted_editor_cannot_write_through_any_route() {
     }
 }
 
-/// Routes whose handler is broken for a reason that has nothing to do with
-/// permissions, so only the gate's behaviour can be asserted on them.
-/// `POST /datasets/{id}/subtypes` omits `subtype_field`, which the table
-/// declares NOT NULL with no default, so it 500s for anyone.
-fn handler_is_independently_broken(uri: &str) -> bool {
-    uri.ends_with("/subtypes")
-}
-
 #[tokio::test]
 async fn test_granted_editor_still_writes_through_every_route() {
     let app = setup_app_authed().await;
@@ -7415,7 +7407,7 @@ async fn test_granted_editor_still_writes_through_every_route() {
             request_as(&app, method, &uri, Some(&eve), Some(body.clone())).await;
         // h3-pg and pgvector are optional, so their handlers may still fail on a
         // database without them. What matters is that the gate let the call in.
-        if needs_optional_extension(&uri) || handler_is_independently_broken(&uri) {
+        if needs_optional_extension(&uri) {
             assert_ne!(
                 status,
                 StatusCode::FORBIDDEN,

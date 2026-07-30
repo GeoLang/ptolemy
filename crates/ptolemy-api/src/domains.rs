@@ -144,6 +144,7 @@ async fn delete_domain(
 #[derive(Serialize)]
 struct Subtype {
     id: Uuid,
+    subtype_field: String,
     name: String,
     code: i32,
     default_values: serde_json::Value,
@@ -155,7 +156,7 @@ async fn list_subtypes(
     Path(dataset_id): Path<Uuid>,
 ) -> Result<Json<Vec<Subtype>>, DomainError> {
     let rows = sqlx::query(
-        "SELECT id, name, code, default_values, domain_assignments
+        "SELECT id, subtype_field, name, code, default_values, domain_assignments
          FROM subtypes WHERE dataset_id = $1 ORDER BY code",
     )
     .bind(dataset_id)
@@ -165,6 +166,7 @@ async fn list_subtypes(
         rows.into_iter()
             .map(|r| Subtype {
                 id: r.get("id"),
+                subtype_field: r.get("subtype_field"),
                 name: r.get("name"),
                 code: r.get("code"),
                 default_values: r.get("default_values"),
@@ -176,6 +178,7 @@ async fn list_subtypes(
 
 #[derive(Deserialize)]
 struct CreateSubtypeRequest {
+    subtype_field: String,
     name: String,
     code: i32,
     #[serde(default)]
@@ -191,11 +194,12 @@ async fn create_subtype(
 ) -> Result<(StatusCode, Json<serde_json::Value>), DomainError> {
     let id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO subtypes (id, dataset_id, name, code, default_values, domain_assignments)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO subtypes (id, dataset_id, subtype_field, name, code, default_values, domain_assignments)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(id)
     .bind(dataset_id)
+    .bind(&req.subtype_field)
     .bind(&req.name)
     .bind(req.code)
     .bind(&req.default_values)
@@ -210,7 +214,7 @@ async fn get_subtype(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Subtype>, DomainError> {
     let r = sqlx::query(
-        "SELECT id, name, code, default_values, domain_assignments FROM subtypes WHERE id = $1",
+        "SELECT id, subtype_field, name, code, default_values, domain_assignments FROM subtypes WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(store.pool())
@@ -218,6 +222,7 @@ async fn get_subtype(
     .ok_or(DomainError::NotFound)?;
     Ok(Json(Subtype {
         id: r.get("id"),
+        subtype_field: r.get("subtype_field"),
         name: r.get("name"),
         code: r.get("code"),
         default_values: r.get("default_values"),
