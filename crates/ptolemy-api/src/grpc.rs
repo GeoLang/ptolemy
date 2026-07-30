@@ -162,7 +162,7 @@ impl GrpcService {
         .bind(branch_id)
         .bind(request.limit as i64)
         .bind(request.offset as i64)
-        .fetch_all(self.store.pool())
+        .fetch_all(self.store.read_pool())
         .await
         .map_err(|e| format!("query failed: {e}"))?;
 

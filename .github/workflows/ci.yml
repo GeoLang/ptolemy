@@ -24,6 +24,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: No unguarded writes in ptolemy-api
+        if: runner.os == 'Linux'
+        run: ./ci/no-raw-writes.sh
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Unit tests

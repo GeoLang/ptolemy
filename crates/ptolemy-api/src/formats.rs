@@ -63,7 +63,7 @@ async fn export_geojson(
     .bind(limit)
     .bind(offset)
     .bind(target_srid)
-    .fetch_all(store.read_pool(external.as_ref()).await?)
+    .fetch_all(store.source_pool(external.as_ref()).await?)
     .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -118,7 +118,7 @@ async fn export_csv(
     .bind(branch_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(store.read_pool(external.as_ref()).await?)
+    .fetch_all(store.source_pool(external.as_ref()).await?)
     .await?;
 
     let mut csv = String::from("id,longitude,latitude,properties\n");
@@ -166,7 +166,7 @@ async fn export_flatgeobuf(
     ))
     .bind(branch_id)
     .bind(limit)
-    .fetch_all(store.read_pool(external.as_ref()).await?)
+    .fetch_all(store.source_pool(external.as_ref()).await?)
     .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -501,7 +501,7 @@ async fn transform_crs(
     .bind(&wkb)
     .bind(req.from_srid)
     .bind(req.to_srid)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(serde_json::json!({
@@ -558,7 +558,7 @@ async fn search_crs(
     )
     .bind(&q.q)
     .bind(q.limit.unwrap_or(20))
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let results: Vec<serde_json::Value> = rows
@@ -585,7 +585,7 @@ async fn get_crs_info(
         "SELECT srid, auth_name, auth_srid, srtext, proj4text FROM spatial_ref_sys WHERE srid = $1",
     )
     .bind(srid)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(FormatError::NotFound)?;
 

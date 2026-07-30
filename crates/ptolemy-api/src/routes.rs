@@ -80,7 +80,7 @@ async fn liveness() -> &'static str {
 
 /// Readiness probe — checks database connectivity.
 async fn readiness(State(state): State<AppState>) -> (axum::http::StatusCode, &'static str) {
-    match sqlx::query("SELECT 1").execute(state.pool()).await {
+    match sqlx::query("SELECT 1").execute(state.read_pool()).await {
         Ok(_) => (axum::http::StatusCode::OK, "ready"),
         Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }

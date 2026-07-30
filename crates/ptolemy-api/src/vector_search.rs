@@ -79,7 +79,7 @@ async fn similarity_search(
     .bind(&embedding_str)
     .bind(req.threshold)
     .bind(req.limit)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -134,7 +134,7 @@ async fn find_duplicates(
     .bind(branch_id)
     .bind(q.threshold)
     .bind(q.limit.unwrap_or(100))
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -202,7 +202,7 @@ async fn cluster_by_embedding(
         GROUP BY kmeans_cluster
         ORDER BY kmeans_cluster",
     ).bind(branch_id).bind(req.num_clusters)
-    .fetch_all(store.pool()).await?;
+    .fetch_all(store.read_pool()).await?;
 
     let clusters: Vec<serde_json::Value> = rows
         .iter()

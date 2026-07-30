@@ -114,7 +114,7 @@ async fn cql2_filter(
     let rows = q
         .bind(limit)
         .bind(offset)
-        .fetch_all(store.read_pool(external.as_ref()).await?)
+        .fetch_all(store.source_pool(external.as_ref()).await?)
         .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -614,7 +614,7 @@ async fn ogc_tile(
         .bind(z)
         .bind(x)
         .bind(y)
-        .fetch_one(store.read_pool(external.as_ref()).await?)
+        .fetch_one(store.source_pool(external.as_ref()).await?)
         .await?;
 
     let mvt: Vec<u8> = row.get("mvt");

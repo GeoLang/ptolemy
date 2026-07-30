@@ -1680,7 +1680,7 @@ async fn test_cql2_spatial_filter_matches_features() {
     assert_eq!(status, StatusCode::OK, "geometry collection: {body}");
     assert_eq!(body["numberReturned"], 1, "{body}");
 
-    assert_eq!(feature_version_count(state.pool()).await, 2);
+    assert_eq!(feature_version_count(state.read_pool()).await, 2);
 }
 
 #[tokio::test]
@@ -1696,7 +1696,7 @@ async fn test_cql2_spatial_geojson_injection_is_rejected() {
         {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": WKB_POINT_50_50, "properties": {"name": "outside"}}
     ])).await;
     let uri = format!("/api/v1/branches/{branch_id}/features/filter");
-    let before = feature_version_count(state.pool()).await;
+    let before = feature_version_count(state.read_pool()).await;
 
     // each payload tries to close the GeoJSON string literal and append SQL;
     // "OR (true)" would widen the result to both features if it ever ran
@@ -1730,7 +1730,7 @@ async fn test_cql2_spatial_geojson_injection_is_rejected() {
             );
         }
         assert_eq!(
-            feature_version_count(state.pool()).await,
+            feature_version_count(state.read_pool()).await,
             before,
             "rows changed by {payload}"
         );
@@ -1818,7 +1818,7 @@ async fn test_cql2_property_name_injection_is_neutralized() {
             "property {name:?} must match nothing: {body}"
         );
         assert_eq!(
-            feature_version_count(state.pool()).await,
+            feature_version_count(state.read_pool()).await,
             1,
             "property {name:?} changed data"
         );
@@ -1852,7 +1852,7 @@ async fn test_cql2_value_injection_is_neutralized() {
                 "{op} {value:?} must match nothing: {body}"
             );
             assert_eq!(
-                feature_version_count(state.pool()).await,
+                feature_version_count(state.read_pool()).await,
                 1,
                 "{op} {value:?} changed data"
             );
@@ -2812,7 +2812,7 @@ async fn test_external_dataset_rejects_every_write() {
     let versions: i64 =
         sqlx::query_scalar("SELECT count(*) FROM feature_versions WHERE dataset_id = $1")
             .bind(dataset_id)
-            .fetch_one(state.pool())
+            .fetch_one(state.read_pool())
             .await
             .unwrap();
     assert_eq!(versions, 0, "a write reached ptolemy's version table");
@@ -2906,7 +2906,7 @@ async fn test_external_fields_are_all_or_none() {
          VALUES ($1, 'partial', 4326, 'point', 'test', 'ext_parcels')",
     )
     .bind(Uuid::now_v7())
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap_err();
     assert!(
@@ -4297,7 +4297,7 @@ async fn seed_private_raster(app: &axum::Router, state: &AppState) -> (Uuid, Uui
     )
     .bind(tile_id)
     .bind(catalog_id)
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap();
 
@@ -4440,7 +4440,7 @@ async fn test_public_raster_reads_stay_anonymous() {
     )
     .bind(tile_id)
     .bind(catalog_id)
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap();
 
@@ -4499,7 +4499,7 @@ async fn test_stac_search_collections_filter() {
         )
         .bind(tile_id)
         .bind(catalog_id)
-        .execute(state.pool())
+        .execute(state.unguarded_pool())
         .await
         .unwrap();
         tiles.push((catalog_id, tile_id));
@@ -4557,7 +4557,7 @@ async fn seed_private_pointcloud(
     )
     .bind(patch_id)
     .bind(catalog_id)
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap();
 
@@ -4665,7 +4665,7 @@ async fn test_public_pointcloud_queries_stay_anonymous() {
     )
     .bind(Uuid::now_v7())
     .bind(catalog_id)
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap();
 
@@ -5028,7 +5028,7 @@ async fn seed_child_id(state: &AppState, kind: &ChildIdKind, dataset_id: Uuid) -
     sqlx::query(kind.insert)
         .bind(id)
         .bind(dataset_id)
-        .execute(state.pool())
+        .execute(state.unguarded_pool())
         .await
         .unwrap_or_else(|e| panic!("seeding a {}: {e}", kind.name));
     id
@@ -5165,7 +5165,7 @@ async fn test_relationship_class_needs_every_dataset_granted() {
     .bind(class_id)
     .bind(origin)
     .bind(destination)
-    .execute(state.pool())
+    .execute(state.unguarded_pool())
     .await
     .unwrap();
 
@@ -6614,7 +6614,7 @@ async fn test_bulk_write_refreshes_planner_statistics() {
     let last_analyze: Option<time::OffsetDateTime> = sqlx::query_scalar(
         "SELECT last_analyze FROM pg_stat_user_tables WHERE relname = 'feature_versions'",
     )
-    .fetch_one(state.pool())
+    .fetch_one(state.read_pool())
     .await
     .unwrap();
     assert!(

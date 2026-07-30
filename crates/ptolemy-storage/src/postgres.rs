@@ -159,7 +159,23 @@ impl PgStore {
         }
     }
 
-    pub fn pool(&self) -> &PgPool {
+    /// The pool a caller runs reads on. Every `SELECT` in `ptolemy-api` uses
+    /// this.
+    ///
+    /// It is the same handle a write would run on, so the name is a convention
+    /// and not a barrier: nothing in the type system stops an `INSERT` here.
+    /// What actually keeps write SQL out of `ptolemy-api` is
+    /// `ci/no-raw-writes.sh`; what makes the guarded path the easy one is that
+    /// every write already has a [`WriteGrant`]-taking method in
+    /// [`crate::writes`].
+    pub fn read_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// The pool for callers with no request and no write ladder behind them:
+    /// the CLI's admin commands and test fixtures. `ci/no-raw-writes.sh`
+    /// refuses this name anywhere in `ptolemy-api`.
+    pub fn unguarded_pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -512,7 +528,9 @@ impl PgStore {
     }
 
     /// The pool a read should use, given whether it targets an external dataset.
-    pub async fn read_pool(
+    /// Distinct from [`PgStore::read_pool`], which is the primary handle on its
+    /// own: this one picks between the primary and the external database.
+    pub async fn source_pool(
         &self,
         external: Option<&ExternalSource>,
     ) -> Result<&PgPool, StoreError> {
@@ -1167,7 +1185,7 @@ impl PgStore {
             WHERE operation != 'delete'"
         ))
         .bind(branch_id)
-        .fetch_all(self.read_pool(external.as_ref()).await?)
+        .fetch_all(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1777,7 +1795,7 @@ impl PgStore {
         valid_at: Option<OffsetDateTime>,
     ) -> Result<Vec<Feature>, StoreError> {
         let (external, prelude, source) = self.latest_source(branch_id).await?;
-        let pool = self.read_pool(external.as_ref()).await?;
+        let pool = self.source_pool(external.as_ref()).await?;
         let query = if let Some(cursor_id) = cursor {
             sqlx::query(&format!(
                 "{prelude}
@@ -1857,7 +1875,7 @@ impl PgStore {
         .bind(key)
         .bind(escaped)
         .bind(limit)
-        .fetch_all(self.read_pool(external.as_ref()).await?)
+        .fetch_all(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1907,7 +1925,7 @@ impl PgStore {
         .bind(max_x)
         .bind(max_y)
         .bind(limit)
-        .fetch_all(self.read_pool(external.as_ref()).await?)
+        .fetch_all(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1945,7 +1963,7 @@ impl PgStore {
         .bind(branch_id)
         .bind(geojson_geometry)
         .bind(limit)
-        .fetch_all(self.read_pool(external.as_ref()).await?)
+        .fetch_all(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -1985,7 +2003,7 @@ impl PgStore {
         .bind(branch_id)
         .bind(geojson_geometry)
         .bind(limit)
-        .fetch_all(self.read_pool(external.as_ref()).await?)
+        .fetch_all(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(rows
@@ -2013,7 +2031,7 @@ impl PgStore {
             WHERE operation != 'delete'"
         ))
         .bind(branch_id)
-        .fetch_one(self.read_pool(external.as_ref()).await?)
+        .fetch_one(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(row.get::<i64, _>("cnt"))
@@ -2066,7 +2084,7 @@ impl PgStore {
         .bind(z as i32)
         .bind(x as i32)
         .bind(y as i32)
-        .fetch_one(self.read_pool(external.as_ref()).await?)
+        .fetch_one(self.source_pool(external.as_ref()).await?)
         .await?;
 
         Ok(row.get::<Vec<u8>, _>("tile"))

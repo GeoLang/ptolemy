@@ -62,7 +62,7 @@ async fn list_symbology(
          FROM symbology_rules WHERE dataset_id = $1 ORDER BY priority",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -120,7 +120,7 @@ async fn get_symbology(
          FROM symbology_rules WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(CartoError::NotFound)?;
     Ok(Json(SymbologyRule {
@@ -193,7 +193,7 @@ async fn list_labels(
          FROM label_rules WHERE dataset_id = $1 ORDER BY priority",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -262,7 +262,7 @@ async fn get_label(
          FROM label_rules WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(CartoError::NotFound)?;
     Ok(Json(LabelRule {

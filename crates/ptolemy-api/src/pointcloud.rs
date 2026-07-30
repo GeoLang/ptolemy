@@ -52,7 +52,7 @@ async fn list_catalogs(
          FROM pointcloud_catalogs WHERE dataset_id = $1 ORDER BY name",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -103,7 +103,7 @@ async fn get_catalog(
          FROM pointcloud_catalogs WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(PcError::NotFound)?;
     Ok(Json(PointCloudCatalog {
@@ -131,7 +131,7 @@ async fn list_patches(
          FROM pointcloud_patches WHERE catalog_id = $1",
     )
     .bind(catalog_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -156,7 +156,7 @@ struct AddPatchRequest {
 async fn catalog_dataset(store: &AppState, catalog_id: Uuid) -> Result<Uuid, PcError> {
     sqlx::query_scalar("SELECT dataset_id FROM pointcloud_catalogs WHERE id = $1")
         .bind(catalog_id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or(PcError::NotFound)
 }
@@ -213,7 +213,7 @@ async fn spatial_query(
     .bind(req.min_y)
     .bind(req.max_x)
     .bind(req.max_y)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let patches: Vec<serde_json::Value> = rows
@@ -250,7 +250,7 @@ async fn catalog_stats(
          FROM pointcloud_patches WHERE catalog_id = $1",
     )
     .bind(catalog_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(serde_json::json!({
@@ -308,7 +308,7 @@ async fn elevation_profile(
     .bind(catalog_id)
     .bind(&wkb)
     .bind(req.num_samples)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let profile: Vec<serde_json::Value> = rows

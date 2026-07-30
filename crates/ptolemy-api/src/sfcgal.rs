@@ -50,7 +50,7 @@ async fn extrude_3d(
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(req.height)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -73,7 +73,7 @@ async fn compute_volume(
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(serde_json::json!({
@@ -103,7 +103,7 @@ async fn intersection_3d(
     .bind(req.feature_a)
     .bind(req.feature_b)
     .bind(branch_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -126,7 +126,7 @@ async fn straight_skeleton(
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -153,7 +153,7 @@ async fn minkowski_sum(
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(&wkb)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -176,7 +176,7 @@ async fn tesselate(
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -215,7 +215,7 @@ async fn visibility(
     .bind(req.observer_x)
     .bind(req.observer_y)
     .bind(req.observer_z)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(serde_json::json!({

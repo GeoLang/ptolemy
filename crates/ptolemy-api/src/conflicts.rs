@@ -85,7 +85,7 @@ async fn list_conflicts(
            OR ST_AsBinary(s.geometry) IS DISTINCT FROM ST_AsBinary(t.geometry)",
     )
     .bind(merge_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -506,7 +506,7 @@ async fn get_op_geojson(store: &AppState, op: &DiffOp) -> Option<serde_json::Val
     let wkb = op_wkb(op)?;
     let row = sqlx::query("SELECT ST_AsGeoJSON(ST_GeomFromWKB($1))::jsonb as g")
         .bind(wkb)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await
         .ok()??;
     Some(row.get("g"))
@@ -518,7 +518,7 @@ async fn get_feature_base_geojson(store: &AppState, feature_id: Uuid) -> Option<
          WHERE feature_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
     )
     .bind(feature_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await
     .ok()??;
     Some(row.get("g"))

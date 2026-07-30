@@ -75,7 +75,7 @@ async fn get_hexagons(
          WHERE geometry IS NOT NULL
          LIMIT $3"
     )).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(1000))
-    .fetch_all(store.pool()).await?;
+    .fetch_all(store.read_pool()).await?;
 
     let hexagons: Vec<serde_json::Value> = rows
         .iter()
@@ -111,7 +111,7 @@ async fn aggregate_by_hex(
     .bind(branch_id)
     .bind(q.resolution)
     .bind(q.limit.unwrap_or(500))
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let cells: Vec<serde_json::Value> = rows
@@ -146,7 +146,7 @@ async fn hex_neighbors(
     let rows = sqlx::query("SELECT h3_grid_disk($1::h3index, $2) as neighbors")
         .bind(&q.cell)
         .bind(q.k)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
 
     let neighbors: Vec<String> = rows
@@ -172,7 +172,7 @@ async fn compact_hexes(
     let row = sqlx::query(
         "SELECT array_agg(h3_compact_cells(ARRAY(SELECT unnest($1::h3index[]))::h3index[])::text) as compacted",
     ).bind(&req.cells)
-    .fetch_one(store.pool()).await?;
+    .fetch_one(store.read_pool()).await?;
 
     let compacted: Option<Vec<String>> = row.get("compacted");
     Ok(Json(
@@ -196,7 +196,7 @@ async fn point_to_cell(
     let row = sqlx::query(
         "SELECT h3_lat_lng_to_cell(ST_SetSRID(ST_MakePoint($1, $2), 4326)::point, $3)::text as cell",
     ).bind(q.lng).bind(q.lat).bind(q.resolution)
-    .fetch_one(store.pool()).await?;
+    .fetch_one(store.read_pool()).await?;
     Ok(Json(
         serde_json::json!({"cell": row.get::<String, _>("cell"), "resolution": q.resolution}),
     ))
@@ -216,7 +216,7 @@ async fn cell_boundary(
         "SELECT ST_AsGeoJSON(h3_cell_to_boundary($1::h3index)::geometry)::jsonb as boundary",
     )
     .bind(&q.cell)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
     Ok(Json(row.get("boundary")))
 }

@@ -71,7 +71,7 @@ async fn list_networks(
         "SELECT id, dataset_id, name, network_type FROM networks WHERE dataset_id = $1",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -122,7 +122,7 @@ async fn get_network(
 ) -> Result<Json<Network>, NetworkError> {
     let r = sqlx::query("SELECT id, dataset_id, name, network_type FROM networks WHERE id = $1")
         .bind(id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or(NetworkError::NotFound)?;
     Ok(Json(Network {
@@ -139,7 +139,7 @@ async fn list_junctions(
 ) -> Result<Json<Vec<Junction>>, NetworkError> {
     let rows = sqlx::query(
         "SELECT id, feature_id, ST_AsGeoJSON(geometry)::jsonb as geojson FROM network_junctions WHERE network_id = $1",
-    ).bind(network_id).fetch_all(store.pool()).await?;
+    ).bind(network_id).fetch_all(store.read_pool()).await?;
     Ok(Json(
         rows.into_iter()
             .map(|r| Junction {
@@ -182,7 +182,7 @@ async fn list_edges(
 ) -> Result<Json<Vec<Edge>>, NetworkError> {
     let rows = sqlx::query(
         "SELECT id, feature_id, from_junction, to_junction, cost, enabled FROM network_edges WHERE network_id = $1",
-    ).bind(network_id).fetch_all(store.pool()).await?;
+    ).bind(network_id).fetch_all(store.read_pool()).await?;
     Ok(Json(
         rows.into_iter()
             .map(|r| Edge {
@@ -272,7 +272,7 @@ async fn trace_network(
                 )
                 SELECT junction, edge_id, cost FROM trace",
             ).bind(network_id).bind(req.start_junction).bind(max_depth)
-            .fetch_all(store.pool()).await?
+            .fetch_all(store.read_pool()).await?
         }
         _ => {
             sqlx::query(
@@ -291,7 +291,7 @@ async fn trace_network(
                 )
                 SELECT DISTINCT junction, edge_id, cost FROM trace",
             ).bind(network_id).bind(req.start_junction).bind(max_depth)
-            .fetch_all(store.pool()).await?
+            .fetch_all(store.read_pool()).await?
         }
     };
 
@@ -352,7 +352,7 @@ async fn shortest_path(
     .bind(network_id)
     .bind(req.from_junction)
     .bind(req.to_junction)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     if rows.is_empty() {
@@ -419,7 +419,7 @@ async fn astar_path(
     .bind(network_id)
     .bind(req.from_junction)
     .bind(req.to_junction)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     if rows.is_empty() {
@@ -493,7 +493,7 @@ async fn driving_distance(
     .bind(network_id)
     .bind(req.start_junction)
     .bind(req.max_cost)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let nodes: Vec<IsochroneNode> = rows
@@ -553,7 +553,7 @@ async fn tsp_tour(
     .bind(&ids)
     .bind(start)
     .bind(network_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let mut ordered = Vec::new();
@@ -590,7 +590,7 @@ async fn check_connectivity(
             (SELECT COUNT(*) FROM network_edges WHERE network_id = $1) as edges",
     )
     .bind(network_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     // Use pgRouting connectedComponents for accurate component count
@@ -603,7 +603,7 @@ async fn check_connectivity(
          )",
     )
     .bind(network_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?;
 
     let num_components = components
@@ -620,7 +620,7 @@ async fn check_connectivity(
            )",
     )
     .bind(network_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(ConnectivityReport {

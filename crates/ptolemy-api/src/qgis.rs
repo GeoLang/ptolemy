@@ -130,7 +130,7 @@ async fn list_datasets_for_qgis(
     ))
     .bind(reader.bypass)
     .bind(reader.id.as_deref())
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let mut datasets: Vec<QgisDataset> = Vec::new();
@@ -201,7 +201,7 @@ async fn layer_definition(
          WHERE b.id = $1",
     )
     .bind(branch_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(QgisError::NotFound)?;
 
@@ -212,7 +212,7 @@ async fn layer_definition(
     // Count features and compute extent. The "features" view already resolves the
     // latest live version per feature from the branch head's ancestor chain.
     let (external, source) = store.features_source(branch_id).await?;
-    let pool = store.read_pool(external.as_ref()).await?;
+    let pool = store.source_pool(external.as_ref()).await?;
     let stats = sqlx::query(&format!(
         "SELECT count(*) as cnt,
                 ST_XMin(ST_Extent(geometry)) as min_x,
@@ -495,7 +495,7 @@ async fn qgis_pull(
     )
     .bind(branch_id)
     .bind(limit)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features: Vec<serde_json::Value> = rows
@@ -588,7 +588,7 @@ async fn qgis_push(
         // Convert GeoJSON geometry to WKB via PostGIS
         let row = sqlx::query("SELECT ST_AsBinary(ST_GeomFromGeoJSON($1)) as wkb")
             .bind(&geom_str)
-            .fetch_one(store.pool())
+            .fetch_one(store.read_pool())
             .await?;
         let wkb: Vec<u8> = row.get("wkb");
 
@@ -599,7 +599,7 @@ async fn qgis_push(
         let exists = sqlx::query(&format!("SELECT 1 FROM {live} f WHERE f.id = $1 LIMIT 1"))
             .bind(fid)
             .bind(branch_id)
-            .fetch_optional(store.pool())
+            .fetch_optional(store.read_pool())
             .await?;
 
         if exists.is_some() {
@@ -655,7 +655,7 @@ async fn list_conflicts(
          ORDER BY created_at DESC",
     )
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await;
 
     match rows {

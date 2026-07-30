@@ -118,7 +118,7 @@ async fn collections(
     ))
     .bind(reader.bypass)
     .bind(reader.id.as_deref())
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let cols: Vec<Collection> = rows
@@ -150,7 +150,7 @@ async fn collection_info(
 ) -> Result<Json<Collection>, OgcError> {
     let row = sqlx::query("SELECT id, name FROM datasets WHERE id = $1")
         .bind(id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or_else(|| OgcError::NotFound("collection not found".into()))?;
 
@@ -209,7 +209,7 @@ async fn collection_branch(
     let row =
         sqlx::query("SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1")
             .bind(dataset_id)
-            .fetch_optional(store.pool())
+            .fetch_optional(store.read_pool())
             .await?
             .ok_or_else(|| OgcError::NotFound("no main branch".into()))?;
     Ok(row.get("id"))
@@ -245,7 +245,7 @@ async fn items(
                 .map(|_| "ST_MakeEnvelope($2, $3, $4, $5, 4326)"),
         )
         .await?;
-    let pool = store.read_pool(external.as_ref()).await?;
+    let pool = store.source_pool(external.as_ref()).await?;
 
     let features = if let Some(parts) = &bbox {
         sqlx::query(&format!(
@@ -322,7 +322,7 @@ async fn item(
     ))
     .bind(feature_id)
     .bind(branch_id)
-    .fetch_optional(store.read_pool(external.as_ref()).await?)
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or_else(|| OgcError::NotFound("feature not found".into()))?;
 

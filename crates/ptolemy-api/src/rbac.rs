@@ -183,7 +183,7 @@ async fn list_branch_permissions(
          FROM branch_permissions WHERE branch_id = $1 ORDER BY granted_at",
     )
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     use sqlx::Row;

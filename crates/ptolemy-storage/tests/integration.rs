@@ -1676,7 +1676,7 @@ async fn test_features_view_inherits_pre_fork_features() {
     ) -> std::collections::BTreeMap<Uuid, serde_json::Value> {
         sqlx::query("SELECT id, properties FROM features WHERE branch_id = $1")
             .bind(branch_id)
-            .fetch_all(store.pool())
+            .fetch_all(store.read_pool())
             .await
             .unwrap()
             .into_iter()
@@ -1863,7 +1863,7 @@ async fn test_bulk_commit_refreshes_planner_statistics() {
               WHERE c.relname = $1",
         )
         .bind(table)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .unwrap();
         assert!(
@@ -1902,7 +1902,7 @@ async fn test_mixed_geometry_dataset_round_trips() {
 
     let stored: String = sqlx::query("SELECT geometry_type FROM datasets WHERE id = $1")
         .bind(ds.id)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .unwrap()
         .get("geometry_type");
@@ -2225,7 +2225,7 @@ async fn test_attachment_owner_check_rejects_bad_rows() {
         .bind(feature)
         .bind(branch)
         .bind(dataset)
-        .execute(store.pool())
+        .execute(store.unguarded_pool())
     };
 
     let fid = Uuid::now_v7();

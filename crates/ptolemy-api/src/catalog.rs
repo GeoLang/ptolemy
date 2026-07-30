@@ -81,7 +81,7 @@ async fn search_datasets(
         .bind(q.limit)
         .bind(reader.bypass)
         .bind(reader.id.as_deref())
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?
     } else {
         let visible = ptolemy_storage::visible_datasets_sql("d", 3, 4);
@@ -98,7 +98,7 @@ async fn search_datasets(
         .bind(q.limit)
         .bind(reader.bypass)
         .bind(reader.id.as_deref())
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?
     };
 
@@ -122,7 +122,7 @@ async fn list_tags(
 ) -> Result<Json<Vec<String>>, CatalogError> {
     let rows = sqlx::query("SELECT tag FROM dataset_tags WHERE dataset_id = $1 ORDER BY tag")
         .bind(dataset_id)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
 
     Ok(Json(rows.into_iter().map(|r| r.get("tag")).collect()))
@@ -177,7 +177,7 @@ async fn get_metadata(
          FROM dataset_metadata WHERE dataset_id = $1",
     )
     .bind(dataset_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?;
 
     match row {

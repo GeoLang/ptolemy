@@ -107,7 +107,7 @@ async fn clip(
     ))
     .bind(branch_id)
     .bind(&clip_geojson)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -156,7 +156,7 @@ async fn intersect(
     ))
     .bind(branch_id)
     .bind(&overlay)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -204,7 +204,7 @@ async fn difference(
     ))
     .bind(branch_id)
     .bind(&subtract)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -275,7 +275,7 @@ async fn dissolve(
         key = req.group_by
     ))
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let groups = rows
@@ -348,7 +348,7 @@ async fn spatial_join(
     ))
     .bind(branch_id)
     .bind(&target_ids)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let joined = rows
@@ -415,7 +415,7 @@ async fn voronoi(
     ))
     .bind(branch_id)
     .bind(req.tolerance)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -472,7 +472,7 @@ async fn convex_hull(
          WHERE TRUE {filter}"
     ))
     .bind(branch_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(SingleGeometryResult {
@@ -497,7 +497,7 @@ async fn centroid(
          FROM live"
     ))
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -568,7 +568,7 @@ async fn nearest_neighbor(
     .bind(branch_id)
     .bind(req.feature_id)
     .bind(req.k)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let neighbors = rows
@@ -627,7 +627,7 @@ async fn distance_matrix(
     ))
     .bind(branch_id)
     .bind(&ids)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let matrix = rows
@@ -691,7 +691,7 @@ async fn contour(
     ))
     .bind(branch_id)
     .bind(req.interval)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -738,7 +738,7 @@ async fn merge_features(
     ))
     .bind(branch_id)
     .bind(&ids)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(SingleGeometryResult {
@@ -777,7 +777,7 @@ async fn split_features(
     .bind(branch_id)
     .bind(req.feature_id)
     .bind(&line)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -832,7 +832,7 @@ async fn simplify(
     ))
     .bind(branch_id)
     .bind(req.tolerance)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows
@@ -878,7 +878,7 @@ async fn densify(
     ))
     .bind(branch_id)
     .bind(req.max_segment_length)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features = rows

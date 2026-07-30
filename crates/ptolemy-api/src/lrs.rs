@@ -54,7 +54,7 @@ async fn list_routes(
          FROM routes WHERE dataset_id = $1 ORDER BY name",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -92,7 +92,7 @@ async fn get_route(
 ) -> Result<Json<Route>, LrsError> {
     let r = sqlx::query(
         "SELECT id, name, total_length, ST_AsGeoJSON(geometry)::jsonb as geojson FROM routes WHERE id = $1",
-    ).bind(id).fetch_optional(store.pool()).await?.ok_or(LrsError::NotFound)?;
+    ).bind(id).fetch_optional(store.read_pool()).await?.ok_or(LrsError::NotFound)?;
     Ok(Json(Route {
         id: r.get("id"),
         name: r.get("name"),
@@ -111,7 +111,7 @@ async fn list_events(
          FROM route_events WHERE route_id = $1 ORDER BY from_measure",
     )
     .bind(route_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -178,7 +178,7 @@ async fn locate_point(
     .bind(route_id)
     .bind(q.lng)
     .bind(q.lat)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(LrsError::NotFound)?;
 
@@ -216,7 +216,7 @@ async fn get_subline(
     .bind(route_id)
     .bind(q.from_measure)
     .bind(q.to_measure)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(LrsError::NotFound)?;
 

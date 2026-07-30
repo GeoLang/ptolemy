@@ -60,7 +60,7 @@ async fn list_classes(
          ORDER BY name",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -134,7 +134,7 @@ async fn get_class(
          FROM relationship_classes WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(RelError::NotFound)?;
     Ok(Json(RelationshipClass {
@@ -175,7 +175,7 @@ async fn list_records(
          FROM relationship_records WHERE relationship_class_id = $1",
     )
     .bind(class_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -243,7 +243,7 @@ async fn get_related_features(
              WHERE rr.origin_feature_id = $1",
         )
         .bind(feature_id)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
         rows.into_iter()
             .map(|r| {
@@ -267,7 +267,7 @@ async fn get_related_features(
              WHERE rr.destination_feature_id = $1",
         )
         .bind(feature_id)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
         rows.into_iter()
             .map(|r| {

@@ -66,7 +66,7 @@ async fn list_domains(
          FROM domains WHERE dataset_id = $1 ORDER BY name",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -124,7 +124,7 @@ async fn get_domain(
          FROM domains WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(DomainError::NotFound)?;
     Ok(Json(Domain {
@@ -167,7 +167,7 @@ async fn list_subtypes(
          FROM subtypes WHERE dataset_id = $1 ORDER BY code",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -222,7 +222,7 @@ async fn get_subtype(
         "SELECT id, subtype_field, name, code, default_values, domain_assignments FROM subtypes WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(DomainError::NotFound)?;
     Ok(Json(Subtype {
@@ -265,7 +265,7 @@ async fn list_rules(
          FROM attribute_rules WHERE dataset_id = $1 ORDER BY name",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -320,7 +320,7 @@ async fn get_rule(
          FROM attribute_rules WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(DomainError::NotFound)?;
     Ok(Json(AttributeRule {
@@ -374,7 +374,7 @@ async fn validate_rule(
 ) -> Result<Json<serde_json::Value>, DomainError> {
     let r = sqlx::query("SELECT expression, dataset_id FROM attribute_rules WHERE id = $1")
         .bind(id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or(DomainError::NotFound)?;
     let _dataset_id: Uuid = r.get("dataset_id");

@@ -44,7 +44,7 @@ async fn list_topologies(
     Path(_dataset_id): Path<Uuid>,
 ) -> Result<Json<Vec<TopologyInfo>>, TopoError> {
     let rows = sqlx::query("SELECT id, name, srid, precision FROM topology.topology ORDER BY name")
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
     Ok(Json(
         rows.into_iter()
@@ -82,7 +82,7 @@ async fn create_topology(
         .bind(&req.name)
         .bind(req.srid)
         .bind(req.precision)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await?;
     let topo_id: i32 = row.get("topo_id");
     Ok((
@@ -97,7 +97,7 @@ async fn validate_topology(
 ) -> Result<Json<serde_json::Value>, TopoError> {
     let rows = sqlx::query("SELECT error, id1, id2 FROM topology.ValidateTopology($1)")
         .bind(&name)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
 
     let errors: Vec<serde_json::Value> = rows
@@ -127,7 +127,7 @@ async fn list_faces(
         "SELECT face_id, ST_AsGeoJSON(mbr)::jsonb as bounds FROM {}.face WHERE face_id > 0",
         sanitize_topo_name(&name)
     );
-    let rows = sqlx::query(&query).fetch_all(store.pool()).await?;
+    let rows = sqlx::query(&query).fetch_all(store.read_pool()).await?;
     let faces: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -150,7 +150,7 @@ async fn list_topo_edges(
          FROM {}.edge_data ORDER BY edge_id",
         sanitize_topo_name(&name)
     );
-    let rows = sqlx::query(&query).fetch_all(store.pool()).await?;
+    let rows = sqlx::query(&query).fetch_all(store.read_pool()).await?;
     let edges: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -176,7 +176,7 @@ async fn list_topo_nodes(
          FROM {}.node ORDER BY node_id",
         sanitize_topo_name(&name)
     );
-    let rows = sqlx::query(&query).fetch_all(store.pool()).await?;
+    let rows = sqlx::query(&query).fetch_all(store.read_pool()).await?;
     let nodes: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -205,7 +205,7 @@ async fn add_face(
     let row = sqlx::query("SELECT topology.AddFace($1, ST_GeomFromWKB($2, 4326)) as face_id")
         .bind(&name)
         .bind(&wkb)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await?;
     let face_id: i32 = row.get("face_id");
     Ok((
@@ -232,7 +232,7 @@ async fn simplify_topology(
     )
     .bind(&name)
     .bind(req.tolerance)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?;
     Ok(Json(
         serde_json::json!({"status": "simplified", "tolerance": req.tolerance}),

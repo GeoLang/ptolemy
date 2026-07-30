@@ -68,7 +68,7 @@ async fn stac_collections(
     ))
     .bind(reader.bypass)
     .bind(reader.id.as_deref())
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let collections: Vec<serde_json::Value> = rows
@@ -116,7 +116,7 @@ async fn stac_collection(
          WHERE rc.id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(StacError::NotFound)?;
 
@@ -151,7 +151,7 @@ async fn stac_items(
          ORDER BY zoom_level LIMIT 100",
     )
     .bind(catalog_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     let features: Vec<serde_json::Value> = rows.iter().map(|r| {
@@ -198,7 +198,7 @@ async fn stac_item(
     )
     .bind(item_id)
     .bind(catalog_id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(StacError::NotFound)?;
 
@@ -289,7 +289,7 @@ async fn stac_search(
     if let Some(ids) = &collections {
         search = search.bind(ids.as_slice());
     }
-    let rows = search.fetch_all(store.pool()).await?;
+    let rows = search.fetch_all(store.read_pool()).await?;
 
     let features: Vec<serde_json::Value> = rows
         .iter()

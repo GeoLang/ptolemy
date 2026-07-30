@@ -54,7 +54,7 @@ async fn list_catalogs(
          FROM raster_catalogs WHERE dataset_id = $1",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -126,7 +126,7 @@ async fn get_catalog(
          FROM raster_catalogs WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(RasterError::NotFound)?;
     Ok(Json(RasterCatalog {
@@ -157,7 +157,7 @@ async fn list_tiles(
          FROM raster_tiles WHERE catalog_id = $1 ORDER BY zoom_level",
     )
     .bind(catalog_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -182,7 +182,7 @@ struct UploadTileRequest {
 async fn catalog_dataset(store: &AppState, catalog_id: Uuid) -> Result<Uuid, RasterError> {
     sqlx::query_scalar("SELECT dataset_id FROM raster_catalogs WHERE id = $1")
         .bind(catalog_id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or(RasterError::NotFound)
 }
@@ -236,7 +236,7 @@ async fn point_value(
     .bind(catalog_id)
     .bind(q.lng)
     .bind(q.lat)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?;
 
     match row {
@@ -262,7 +262,7 @@ async fn band_stats(
          FROM raster_tiles WHERE catalog_id = $1",
     )
     .bind(catalog_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(serde_json::json!({

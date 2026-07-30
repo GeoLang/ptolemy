@@ -534,7 +534,9 @@ async fn main() -> anyhow::Result<()> {
                 _ => {
                     // Fall back to psql for plain SQL files
                     let content = std::fs::read_to_string(path)?;
-                    sqlx::raw_sql(&content).execute(store.pool()).await?;
+                    sqlx::raw_sql(&content)
+                        .execute(store.unguarded_pool())
+                        .await?;
                     println!("Restore complete from {input} (plain SQL)");
                 }
             }
@@ -568,7 +570,7 @@ async fn main() -> anyhow::Result<()> {
                 .bind(&key[..8])
                 .bind(role_enum)
                 .bind(expires_at)
-                .execute(store.pool())
+                .execute(store.unguarded_pool())
                 .await?;
                 println!("API Key created (save this — it won't be shown again):");
                 println!("  Key:  {key}");
@@ -579,7 +581,7 @@ async fn main() -> anyhow::Result<()> {
                 let rows = sqlx::query_as::<_, (String, String, String, Option<time::OffsetDateTime>)>(
                     "SELECT key_prefix, name, role, expires_at FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC",
                 )
-                .fetch_all(store.pool())
+                .fetch_all(store.read_pool())
                 .await?;
                 println!("{:<10} {:<20} {:<8} EXPIRES", "PREFIX", "NAME", "ROLE");
                 for (prefix, name, role, expires) in rows {
@@ -595,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .bind(&key)
                 .bind(hash_api_key(&key))
-                .execute(store.pool())
+                .execute(store.unguarded_pool())
                 .await?;
                 if result.rows_affected() > 0 {
                     println!("API key revoked.");

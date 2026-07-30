@@ -112,7 +112,7 @@ async fn quality_check_alert(store: &PgStore) -> Result<(), sqlx::Error> {
                  WHERE c.branch_id = b.id AND fv.geometry IS NOT NULL
                    AND NOT ST_IsValid(fv.geometry)) > 0",
     )
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     for row in rows {

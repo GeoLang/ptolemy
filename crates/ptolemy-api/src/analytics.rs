@@ -56,7 +56,7 @@ async fn buffer_analysis(
     )
     .bind(q.feature_id)
     .bind(q.distance)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or_else(|| AnalyticsError::NotFound("feature not found".into()))?;
 
@@ -104,7 +104,7 @@ async fn union_analysis(
         FROM live",
     )
     .bind(branch_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(UnionResult {
@@ -176,7 +176,7 @@ async fn cluster_analysis(
     .bind(branch_id)
     .bind(q.eps)
     .bind(q.min_points)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -239,7 +239,7 @@ async fn anomaly_detection(
         WHERE NOT ST_IsSimple(geometry)",
     )
     .bind(branch_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(
@@ -294,7 +294,7 @@ async fn spatial_stats(
         FROM live",
     )
     .bind(branch_id)
-    .fetch_one(store.pool())
+    .fetch_one(store.read_pool())
     .await?;
 
     Ok(Json(SpatialStats {

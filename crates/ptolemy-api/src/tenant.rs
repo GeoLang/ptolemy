@@ -45,7 +45,7 @@ struct OrgMember {
 
 async fn list_orgs(State(store): State<AppState>) -> Result<Json<Vec<Organization>>, TenantError> {
     let rows = sqlx::query("SELECT id, name, slug FROM organizations ORDER BY name")
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
 
     Ok(Json(
@@ -87,7 +87,7 @@ async fn get_org(
 ) -> Result<Json<Organization>, TenantError> {
     let row = sqlx::query("SELECT id, name, slug FROM organizations WHERE id = $1")
         .bind(id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or_else(|| TenantError::NotFound("organization not found".into()))?;
 
@@ -104,7 +104,7 @@ async fn list_members(
 ) -> Result<Json<Vec<OrgMember>>, TenantError> {
     let rows = sqlx::query("SELECT user_id, role FROM org_members WHERE org_id = $1")
         .bind(org_id)
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await?;
 
     Ok(Json(
@@ -162,7 +162,7 @@ async fn org_datasets(
     .bind(org_id)
     .bind(reader.bypass)
     .bind(reader.id.as_deref())
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
 
     Ok(Json(

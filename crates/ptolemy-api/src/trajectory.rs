@@ -40,7 +40,7 @@ pub fn trajectory_routes() -> Router<AppState> {
 /// and none of the MobilityDB functions parse.
 async fn has_mobilitydb(store: &AppState) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'mobilitydb')")
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
 }
 
@@ -63,7 +63,7 @@ async fn list_trajectories(
          FROM trajectories WHERE dataset_id = $1 ORDER BY period",
     )
     .bind(dataset_id)
-    .fetch_all(store.pool())
+    .fetch_all(store.read_pool())
     .await?;
     Ok(Json(
         rows.into_iter()
@@ -145,7 +145,7 @@ async fn get_trajectory(
     };
     let r = sqlx::query(sql)
         .bind(id)
-        .fetch_optional(store.pool())
+        .fetch_optional(store.read_pool())
         .await?
         .ok_or(TrajError::NotFound)?;
 
@@ -176,7 +176,7 @@ async fn position_at_time(
     )
     .bind(id)
     .bind(&q.timestamp)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(TrajError::NotFound)?;
 
@@ -198,7 +198,7 @@ async fn trajectory_speed(
          FROM trajectories WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(TrajError::NotFound)?;
 
@@ -220,7 +220,7 @@ async fn trajectory_distance(
          FROM trajectories WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(TrajError::NotFound)?;
 
@@ -252,7 +252,7 @@ async fn simplify_trajectory(
     )
     .bind(id)
     .bind(req.tolerance)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(TrajError::NotFound)?;
 
@@ -283,7 +283,7 @@ async fn nearest_approach(
     )
     .bind(req.trajectory_a)
     .bind(req.trajectory_b)
-    .fetch_optional(store.pool())
+    .fetch_optional(store.read_pool())
     .await?
     .ok_or(TrajError::NotFound)?;
 
