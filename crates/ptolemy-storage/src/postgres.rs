@@ -955,8 +955,8 @@ impl PgStore {
                     valid_to,
                 } => {
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry)
-                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9))",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry, native_crs_wkt)
+                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9), $10)",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
@@ -966,7 +966,8 @@ impl PgStore {
                     .bind(valid_from)
                     .bind(valid_to)
                     .bind(native.as_ref().map(|n| n.wkb()))
-                    .bind(native.as_ref().map(|n| n.srid()))
+                    .bind(native.as_ref().map(|n| n.srid().unwrap_or(0)))
+                    .bind(native.as_ref().and_then(|n| n.crs_wkt()))
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -1042,8 +1043,8 @@ impl PgStore {
                     // native is not inherited the way the fields above are: an
                     // omitted one means the new version has no original
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry)
-                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9))",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry, native_crs_wkt)
+                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9), $10)",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
@@ -1053,7 +1054,8 @@ impl PgStore {
                     .bind(from)
                     .bind(to)
                     .bind(native.as_ref().map(|n| n.wkb()))
-                    .bind(native.as_ref().map(|n| n.srid()))
+                    .bind(native.as_ref().map(|n| n.srid().unwrap_or(0)))
+                    .bind(native.as_ref().and_then(|n| n.crs_wkt()))
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -1221,10 +1223,12 @@ impl PgStore {
         if self.external_for_branch(branch_id).await?.is_some() {
             return Ok(None);
         }
-        let prelude = latest_cte("fv.feature_id, fv.operation, fv.native_geometry");
+        let prelude =
+            latest_cte("fv.feature_id, fv.operation, fv.native_geometry, fv.native_crs_wkt");
         let row = sqlx::query(&format!(
             "{prelude}
-            SELECT ST_AsBinary(native_geometry) as wkb, ST_SRID(native_geometry) as srid
+            SELECT ST_AsBinary(native_geometry) as wkb, ST_SRID(native_geometry) as srid,
+                   native_crs_wkt
             FROM latest
             WHERE feature_id = $2 AND operation != 'delete'"
         ))
@@ -1237,11 +1241,7 @@ impl PgStore {
                 "feature {feature_id} on branch {branch_id}"
             )));
         };
-        let wkb: Option<Vec<u8>> = row.get("wkb");
-        let srid: Option<i32> = row.get("srid");
-        Ok(wkb
-            .zip(srid)
-            .and_then(|(wkb, srid)| NativeGeometry::new(wkb, srid)))
+        Ok(native_from_row(&row, "wkb", "srid", "native_crs_wkt"))
     }
 
     /// Get a single feature's state at a specific changeset.
@@ -1312,7 +1312,8 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
                     fv.valid_from, fv.valid_to,
                     ST_AsBinary(fv.native_geometry) as native_wkb,
-                    ST_SRID(fv.native_geometry) as native_srid
+                    ST_SRID(fv.native_geometry) as native_srid,
+                    fv.native_crs_wkt
                 FROM feature_versions fv
                 JOIN new_changesets nc ON fv.changeset_id = nc.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1333,7 +1334,8 @@ impl PgStore {
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
                     fv.valid_from, fv.valid_to,
                     ST_AsBinary(fv.native_geometry) as native_wkb,
-                    ST_SRID(fv.native_geometry) as native_srid
+                    ST_SRID(fv.native_geometry) as native_srid,
+                    fv.native_crs_wkt
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1349,10 +1351,7 @@ impl PgStore {
                 let op: String = row.get("operation");
                 let feature_id: Uuid = row.get("feature_id");
                 // carried so replaying this diff (merge) keeps the original
-                let native = row
-                    .get::<Option<Vec<u8>>, _>("native_wkb")
-                    .zip(row.get::<Option<i32>, _>("native_srid"))
-                    .and_then(|(wkb, srid)| NativeGeometry::new(wkb, srid));
+                let native = native_from_row(&row, "native_wkb", "native_srid", "native_crs_wkt");
                 match op.as_str() {
                     "insert" => DiffOp::Insert {
                         feature_id,
@@ -3857,6 +3856,27 @@ fn op_feature_id(op: &DiffOp) -> Uuid {
         DiffOp::Insert { feature_id, .. }
         | DiffOp::Update { feature_id, .. }
         | DiffOp::Delete { feature_id } => *feature_id,
+    }
+}
+
+/// Rebuild a version's original from its three stored parts. A WKT wins when
+/// present (its geometry is stamped srid 0), a nonzero srid names a code, and
+/// anything else is no distinct original.
+fn native_from_row(
+    row: &sqlx::postgres::PgRow,
+    wkb_col: &str,
+    srid_col: &str,
+    wkt_col: &str,
+) -> Option<NativeGeometry> {
+    let wkb: Option<Vec<u8>> = row.get(wkb_col);
+    let wkb = wkb?;
+    match (
+        row.get::<Option<String>, _>(wkt_col),
+        row.get::<Option<i32>, _>(srid_col),
+    ) {
+        (Some(wkt), _) => NativeGeometry::wkt(wkb, wkt),
+        (None, Some(srid)) if srid != 0 => NativeGeometry::epsg(wkb, srid),
+        _ => None,
     }
 }
 

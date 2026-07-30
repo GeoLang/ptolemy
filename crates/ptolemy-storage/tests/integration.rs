@@ -2367,7 +2367,7 @@ async fn test_native_geometry_round_trip_exact() {
         &store,
         branch.id,
         fid,
-        NativeGeometry::new(original.clone(), 26919),
+        NativeGeometry::epsg(original.clone(), 26919),
     )
     .await;
 
@@ -2377,7 +2377,7 @@ async fn test_native_geometry_round_trip_exact() {
         .unwrap()
         .unwrap();
     assert_eq!(native.wkb(), original.as_slice());
-    assert_eq!(native.srid(), 26919);
+    assert_eq!(native.srid(), Some(26919));
 }
 
 #[tokio::test]
@@ -2409,7 +2409,7 @@ async fn test_native_geometry_not_inherited_on_update() {
         &store,
         branch.id,
         fid,
-        NativeGeometry::new(native_point(), 26919),
+        NativeGeometry::epsg(native_point(), 26919),
     )
     .await;
 
@@ -2467,7 +2467,17 @@ async fn test_native_geometry_survives_merge() {
         &store,
         feature_branch.id,
         fid,
-        NativeGeometry::new(original.clone(), 26919),
+        NativeGeometry::epsg(original.clone(), 26919),
+    )
+    .await;
+    // a second feature whose reference only a WKT can name, so the merge is
+    // proven to carry both ways of saying one
+    let fid_wkt = Uuid::now_v7();
+    insert_with_native(
+        &store,
+        feature_branch.id,
+        fid_wkt,
+        NativeGeometry::wkt(original.clone(), COMPOUND_WKT.into()),
     )
     .await;
 
@@ -2479,7 +2489,47 @@ async fn test_native_geometry_survives_merge() {
 
     let native = store.native_geometry(main.id, fid).await.unwrap().unwrap();
     assert_eq!(native.wkb(), original.as_slice());
-    assert_eq!(native.srid(), 26919);
+    assert_eq!(native.srid(), Some(26919));
+
+    let native = store
+        .native_geometry(main.id, fid_wkt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.wkb(), original.as_slice());
+    assert_eq!(native.srid(), None);
+    assert_eq!(native.crs_wkt(), Some(COMPOUND_WKT));
+}
+
+/// A reference no single EPSG code names, abbreviated: storage keeps the
+/// string as given, so nothing here depends on it being resolvable.
+const COMPOUND_WKT: &str =
+    "COMPD_CS[\"NAD83 + NAVD88 height\",GEOGCS[\"NAD83\"],VERT_CS[\"NAVD88 height\"]]";
+
+#[tokio::test]
+async fn test_native_geometry_wkt_round_trip_exact() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let fid = Uuid::now_v7();
+
+    let original = native_point();
+    insert_with_native(
+        &store,
+        branch.id,
+        fid,
+        NativeGeometry::wkt(original.clone(), COMPOUND_WKT.into()),
+    )
+    .await;
+
+    let native = store
+        .native_geometry(branch.id, fid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(native.wkb(), original.as_slice());
+    assert_eq!(native.srid(), None);
+    assert_eq!(native.crs_wkt(), Some(COMPOUND_WKT));
 }
 
 #[tokio::test]

@@ -18,27 +18,65 @@ pub struct Diff {
 /// because reprojecting to 4326 moves every vertex and a survey-grade consumer
 /// wants the coordinates that were measured, not recomputed ones.
 ///
-/// One construction path: [`NativeGeometry::new`] refuses srid 4326, so a
-/// value of this type is always a *distinct* original. "No distinct original"
+/// Two construction paths and no other: [`NativeGeometry::epsg`] refuses srid
+/// 4326 and [`NativeGeometry::wkt`] refuses a blank definition, so a value of
+/// this type is always a *distinct*, nameable original. "No distinct original"
 /// is said with `None`, never with a duplicate of the 4326 geometry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeGeometry {
     wkb: Vec<u8>,
-    srid: i32,
+    #[serde(flatten)]
+    crs: NativeCrs,
+}
+
+/// How the original's reference is named: by EPSG code when a single code
+/// names it, or by its full WKT definition when none does, which is what a
+/// compound reference (NAD83 + NAVD88 height, say) comes as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeCrs {
+    #[serde(rename = "srid")]
+    Epsg(i32),
+    #[serde(rename = "crs_wkt")]
+    Wkt(String),
 }
 
 impl NativeGeometry {
     /// None for 4326: a copy in the storage srid is not a distinct original.
-    pub fn new(wkb: Vec<u8>, srid: i32) -> Option<Self> {
-        (srid != 4326).then_some(NativeGeometry { wkb, srid })
+    pub fn epsg(wkb: Vec<u8>, srid: i32) -> Option<Self> {
+        (srid != 4326).then_some(NativeGeometry {
+            wkb,
+            crs: NativeCrs::Epsg(srid),
+        })
+    }
+
+    /// A reference no single EPSG code names, carried as its WKT definition.
+    /// None for a blank definition: coordinates in an unstatable reference
+    /// claim nothing.
+    pub fn wkt(wkb: Vec<u8>, wkt: String) -> Option<Self> {
+        (!wkt.trim().is_empty()).then_some(NativeGeometry {
+            wkb,
+            crs: NativeCrs::Wkt(wkt),
+        })
     }
 
     pub fn wkb(&self) -> &[u8] {
         &self.wkb
     }
 
-    pub fn srid(&self) -> i32 {
-        self.srid
+    /// The EPSG code, when a single code names the reference.
+    pub fn srid(&self) -> Option<i32> {
+        match &self.crs {
+            NativeCrs::Epsg(code) => Some(*code),
+            NativeCrs::Wkt(_) => None,
+        }
+    }
+
+    /// The WKT definition, when no single code names the reference.
+    pub fn crs_wkt(&self) -> Option<&str> {
+        match &self.crs {
+            NativeCrs::Wkt(wkt) => Some(wkt),
+            NativeCrs::Epsg(_) => None,
+        }
     }
 }
 

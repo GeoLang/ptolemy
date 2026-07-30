@@ -464,10 +464,27 @@ fn test_diff_delete_operation() {
 #[test]
 fn test_native_geometry_refuses_4326() {
     use ptolemy_core::diff::NativeGeometry;
-    assert!(NativeGeometry::new(vec![1, 2, 3], 4326).is_none());
-    let native = NativeGeometry::new(vec![1, 2, 3], 26919).unwrap();
+    assert!(NativeGeometry::epsg(vec![1, 2, 3], 4326).is_none());
+    let native = NativeGeometry::epsg(vec![1, 2, 3], 26919).unwrap();
     assert_eq!(native.wkb(), &[1, 2, 3]);
-    assert_eq!(native.srid(), 26919);
+    assert_eq!(native.srid(), Some(26919));
+    assert_eq!(native.crs_wkt(), None);
+}
+
+#[test]
+fn test_native_geometry_wkt_reference() {
+    use ptolemy_core::diff::NativeGeometry;
+    assert!(NativeGeometry::wkt(vec![1, 2, 3], "  ".into()).is_none());
+    let native = NativeGeometry::wkt(vec![1, 2, 3], "COMPD_CS[\"NAD83 + NAVD88\"]".into()).unwrap();
+    assert_eq!(native.srid(), None);
+    assert_eq!(native.crs_wkt(), Some("COMPD_CS[\"NAD83 + NAVD88\"]"));
+
+    // the wire says exactly one of srid or crs_wkt, never a tagged enum
+    let json = serde_json::to_value(&native).unwrap();
+    assert!(json.get("srid").is_none(), "{json}");
+    assert_eq!(json["crs_wkt"], "COMPD_CS[\"NAD83 + NAVD88\"]");
+    let back: NativeGeometry = serde_json::from_value(json).unwrap();
+    assert_eq!(back, native);
 }
 
 #[test]
@@ -481,7 +498,7 @@ fn test_diff_multiple_operations() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: vec![1],
                 properties: json!({}),
-                native: NativeGeometry::new(vec![7, 8, 9], 26919),
+                native: NativeGeometry::epsg(vec![7, 8, 9], 26919),
                 valid_from: None,
                 valid_to: None,
             },
