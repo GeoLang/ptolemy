@@ -8153,17 +8153,28 @@ async fn test_native_geometry_commit_and_read_back_exact() {
     let f1 = Uuid::now_v7();
 
     let point_hex = "0101000000000000000000F03F0000000000000040";
-    commit_features(&app, branch_id, json!([
-        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex,
-         "properties": {}, "native_geometry_wkb_hex": NATIVE_HEX, "native_srid": 26919}
-    ])).await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex,
+             "properties": {}, "native_geometry_wkb_hex": NATIVE_HEX, "native_srid": 26919}
+        ]),
+    )
+    .await;
 
-    let (status, body) =
-        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}/native")).await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/{f1}/native"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     // exact, not approximate: the original must survive the round trip untouched
     assert_eq!(
-        body["native_geometry_wkb_hex"].as_str().unwrap().to_uppercase(),
+        body["native_geometry_wkb_hex"]
+            .as_str()
+            .unwrap()
+            .to_uppercase(),
         NATIVE_HEX
     );
     assert_eq!(body["native_srid"], 26919);
@@ -8181,8 +8192,11 @@ async fn test_native_geometry_null_when_never_sent() {
         {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
     ])).await;
 
-    let (status, body) =
-        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}/native")).await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/{f1}/native"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["native_geometry_wkb_hex"].is_null());
     assert!(body["native_srid"].is_null());
@@ -8216,7 +8230,10 @@ async fn test_native_geometry_unknown_feature_404() {
 
     let (status, _) = get_json(
         &app,
-        &format!("/api/v1/branches/{branch_id}/features/{}/native", Uuid::now_v7()),
+        &format!(
+            "/api/v1/branches/{branch_id}/features/{}/native",
+            Uuid::now_v7()
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

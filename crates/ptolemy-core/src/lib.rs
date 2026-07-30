@@ -21,8 +21,8 @@ pub use datastore::{
     Bbox, BoxFuture, DataStore, DataStoreError, DataStoreRegistry, FeatureQuery, StoreCapabilities,
     StoreResult,
 };
-pub use event::{Event, EventType, Webhook};
 pub use diff::NativeGeometry;
+pub use event::{Event, EventType, Webhook};
 pub use external::{ExternalError, ExternalSource, ExternalTable};
 pub use feature::Feature;
 pub use review::{MergeRequest, MergeRequestStatus, ReviewComment};

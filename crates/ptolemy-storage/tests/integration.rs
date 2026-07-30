@@ -2371,7 +2371,11 @@ async fn test_native_geometry_round_trip_exact() {
     )
     .await;
 
-    let native = store.native_geometry(branch.id, fid).await.unwrap().unwrap();
+    let native = store
+        .native_geometry(branch.id, fid)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(native.wkb(), original.as_slice());
     assert_eq!(native.srid(), 26919);
 }
@@ -2385,7 +2389,13 @@ async fn test_native_geometry_none_without_original() {
 
     insert_with_native(&store, branch.id, fid, None).await;
 
-    assert!(store.native_geometry(branch.id, fid).await.unwrap().is_none());
+    assert!(
+        store
+            .native_geometry(branch.id, fid)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2422,7 +2432,13 @@ async fn test_native_geometry_not_inherited_on_update() {
         .await
         .unwrap();
 
-    assert!(store.native_geometry(branch.id, fid).await.unwrap().is_none());
+    assert!(
+        store
+            .native_geometry(branch.id, fid)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2455,7 +2471,10 @@ async fn test_native_geometry_survives_merge() {
     )
     .await;
 
-    let result = store.merge(feature_branch.id, main.id, "alice", &W).await.unwrap();
+    let result = store
+        .merge(feature_branch.id, main.id, "alice", &W)
+        .await
+        .unwrap();
     assert!(matches!(result, MergeResult::Success { .. }));
 
     let native = store.native_geometry(main.id, fid).await.unwrap().unwrap();
@@ -2469,5 +2488,10 @@ async fn test_native_geometry_unknown_feature_not_found() {
     let ds = create_test_dataset(&store).await;
     let branch = create_test_branch(&store, ds.id, "main").await;
 
-    assert!(store.native_geometry(branch.id, Uuid::now_v7()).await.is_err());
+    assert!(
+        store
+            .native_geometry(branch.id, Uuid::now_v7())
+            .await
+            .is_err()
+    );
 }
