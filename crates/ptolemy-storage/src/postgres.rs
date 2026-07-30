@@ -554,9 +554,9 @@ impl PgStore {
 
     /// The private datasets any of `ids` refers to. An id may name a dataset, a
     /// branch, a changeset, a merge request, a feature, a raster catalog or tile,
-    /// or a point cloud catalog or patch, because that is the full set of ways a
-    /// request identifies dataset content. Public datasets are left out, so an
-    /// empty result means nothing to enforce.
+    /// a point cloud catalog or patch, or an attachment, because that is the full
+    /// set of ways a request identifies dataset content. Public datasets are left
+    /// out, so an empty result means nothing to enforce.
     pub async fn private_datasets_for_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, StoreError> {
         let rows = sqlx::query(
             "SELECT DISTINCT d.id FROM datasets d WHERE d.visibility = 'private' AND (
@@ -579,6 +579,12 @@ impl PgStore {
                  OR EXISTS (SELECT 1 FROM pointcloud_patches pp
                               JOIN pointcloud_catalogs pc ON pc.id = pp.catalog_id
                              WHERE pc.dataset_id = d.id AND pp.id = ANY($1))
+                 -- an attachment belongs to a dataset directly or to a feature on
+                 -- a branch, and the CHECK makes it exactly one of the two
+                 OR EXISTS (SELECT 1 FROM attachments a
+                        LEFT JOIN branches ab ON ab.id = a.branch_id
+                             WHERE COALESCE(a.dataset_id, ab.dataset_id) = d.id
+                               AND a.id = ANY($1))
              )",
         )
         .bind(ids)

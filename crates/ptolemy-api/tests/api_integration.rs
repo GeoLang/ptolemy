@@ -4468,6 +4468,234 @@ async fn test_public_pointcloud_queries_stay_anonymous() {
     assert_ne!(status, StatusCode::NOT_FOUND, "anonymous profile: {resp}");
 }
 
+/// Both attachment shapes inside a private dataset: one owned by the dataset,
+/// one owned by a feature on its branch. Returns
+/// (dataset id, branch id, feature id, dataset attachment, feature attachment,
+/// carol's token).
+async fn seed_private_attachments(app: &axum::Router) -> (Uuid, Uuid, Uuid, Uuid, Uuid, String) {
+    let (dataset_id, branch_id, carol) = seed_private_dataset(app).await;
+
+    let feature_id = Uuid::now_v7();
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&carol),
+        Some(json!({
+            "message": "attachment target",
+            "author": "carol",
+            "operations": [{
+                "type": "insert",
+                "feature_id": feature_id,
+                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+                "properties": {},
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/attachments"),
+        Some(&carol),
+        Some(upload_body("icon.png", "dataset-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let dataset_attachment = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments"),
+        Some(&carol),
+        Some(upload_body("photo.jpg", "feature-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let feature_attachment = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    (
+        dataset_id,
+        branch_id,
+        feature_id,
+        dataset_attachment,
+        feature_attachment,
+        carol,
+    )
+}
+
+/// Downloading an attachment names only the attachment id, so it relies on the
+/// layer resolving that id back to the owning dataset. Both owner shapes count.
+#[tokio::test]
+async fn test_private_dataset_attachments_are_404_for_outsiders() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, feature_id, dataset_attachment, feature_attachment, carol) =
+        seed_private_attachments(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let root = token_for_user("root", Role::Admin);
+
+    for uri in [
+        format!("/api/v1/attachments/{dataset_attachment}"),
+        format!("/api/v1/attachments/{dataset_attachment}/meta"),
+        format!("/api/v1/attachments/{feature_attachment}"),
+        format!("/api/v1/attachments/{feature_attachment}/meta"),
+        // the list routes name a dataset or a branch, and stay as they were
+        format!("/api/v1/datasets/{dataset_id}/attachments"),
+        format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "non-granted editor GET {uri}: {body}"
+        );
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+
+        let (status, body) = request_as(&app, "GET", &uri, Some(&root), None).await;
+        assert_eq!(status, StatusCode::OK, "admin GET {uri}: {body}");
+    }
+}
+
+/// A read grant opens the attachment reads exactly as it opens the feature reads.
+#[tokio::test]
+async fn test_read_grant_opens_a_private_attachment() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, _, dataset_attachment, feature_attachment, _) =
+        seed_private_attachments(&app).await;
+    let vic = token_for_user("vic", Role::Viewer);
+
+    let uris = [
+        format!("/api/v1/attachments/{dataset_attachment}"),
+        format!("/api/v1/attachments/{dataset_attachment}/meta"),
+        format!("/api/v1/attachments/{feature_attachment}"),
+        format!("/api/v1/attachments/{feature_attachment}/meta"),
+    ];
+
+    for uri in &uris {
+        let (status, body) = request_as(&app, "GET", uri, Some(&vic), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "before the grant {uri}: {body}"
+        );
+    }
+
+    grant(&app, "datasets", dataset_id, "vic", "read").await;
+
+    for uri in &uris {
+        let (status, body) = request_as(&app, "GET", uri, Some(&vic), None).await;
+        assert_eq!(status, StatusCode::OK, "after the grant {uri}: {body}");
+    }
+}
+
+/// Deleting an attachment is a write, and the layer gates it on the same
+/// resolution: an editor with no grant on the private dataset cannot reach it.
+#[tokio::test]
+async fn test_private_attachment_delete_needs_a_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, _, dataset_attachment, feature_attachment, carol) =
+        seed_private_attachments(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    let uris = [
+        format!("/api/v1/attachments/{dataset_attachment}"),
+        format!("/api/v1/attachments/{feature_attachment}"),
+    ];
+
+    for uri in &uris {
+        let (status, body) = request_as(&app, "DELETE", uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "outsider DELETE {uri}: {body}"
+        );
+
+        // the blob is still there
+        let (status, body) = request_as(&app, "GET", uri, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {uri}: {body}");
+    }
+
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+
+    for uri in &uris {
+        let (status, body) = request_as(&app, "DELETE", uri, Some(&eve), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "granted DELETE {uri}: {body}"
+        );
+    }
+}
+
+/// A public dataset's attachments stay anonymously readable, which is what a
+/// style's icon depends on.
+#[tokio::test]
+async fn test_public_dataset_attachments_stay_anonymous() {
+    let app = setup_app_authed().await;
+    let (dataset_id, carol) = seed_owned_public_dataset(&app).await;
+
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+    let feature_id = Uuid::now_v7();
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/attachments"),
+        Some(&carol),
+        Some(upload_body("icon.png", "dataset-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let dataset_attachment = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments"),
+        Some(&carol),
+        Some(upload_body("photo.jpg", "feature-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let feature_attachment = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    for uri in [
+        format!("/api/v1/attachments/{dataset_attachment}"),
+        format!("/api/v1/attachments/{feature_attachment}"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "anonymous GET {uri}: {body}");
+    }
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/attachments/{dataset_attachment}/meta"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "icon.png", "{body}");
+}
+
 /// A catalog can only hang off a dataset that exists, and saying so is a 404
 /// rather than the foreign key failing as a 500.
 #[tokio::test]
