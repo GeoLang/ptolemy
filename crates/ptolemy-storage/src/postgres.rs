@@ -614,6 +614,8 @@ impl PgStore {
                              JOIN relationship_classes rc ON rc.id = rr.relationship_class_id
                             WHERE rr.id = ANY($1)
              )
+             -- ANY(ARRAY(...)) rather than a join to owners: the join makes the
+             -- planner seq-scan every dataset and hash-join, 16ms against 1.3ms
              SELECT id FROM datasets
               WHERE visibility = 'private'
                 AND id = ANY(ARRAY(SELECT dataset_id FROM owners))",
