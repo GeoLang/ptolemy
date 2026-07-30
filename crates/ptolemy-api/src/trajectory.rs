@@ -34,11 +34,19 @@ pub fn trajectory_routes() -> Router<AppState> {
         )
 }
 
+/// Migration 015 only gives `trajectories` the MobilityDB column types where the
+/// extension is installed; without it `trip` is JSONB and `period` a tstzrange,
+/// and none of the MobilityDB functions parse.
+async fn has_mobilitydb(store: &AppState) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'mobilitydb')")
+        .fetch_one(store.pool())
+        .await
+}
+
 #[derive(Serialize)]
 struct Trajectory {
     id: Uuid,
     name: String,
-    feature_id: Option<Uuid>,
     start_time: Option<String>,
     end_time: Option<String>,
 }
@@ -48,7 +56,7 @@ async fn list_trajectories(
     Path(dataset_id): Path<Uuid>,
 ) -> Result<Json<Vec<Trajectory>>, TrajError> {
     let rows = sqlx::query(
-        "SELECT id, name, feature_id,
+        "SELECT id, name,
                 lower(period)::text as start_time,
                 upper(period)::text as end_time
          FROM trajectories WHERE dataset_id = $1 ORDER BY period",
@@ -61,7 +69,6 @@ async fn list_trajectories(
             .map(|r| Trajectory {
                 id: r.get("id"),
                 name: r.get("name"),
-                feature_id: r.get("feature_id"),
                 start_time: r.get("start_time"),
                 end_time: r.get("end_time"),
             })
@@ -72,12 +79,11 @@ async fn list_trajectories(
 #[derive(Deserialize)]
 struct CreateTrajectoryRequest {
     name: String,
-    feature_id: Option<Uuid>,
     /// Array of [lng, lat, timestamp_iso] points
     points: Vec<TrajectoryPoint>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TrajectoryPoint {
     lng: f64,
     lat: f64,
@@ -91,25 +97,41 @@ async fn create_trajectory(
 ) -> Result<(StatusCode, Json<serde_json::Value>), TrajError> {
     let id = Uuid::now_v7();
 
-    // Build MobilityDB tgeompoint from points
-    let instants: Vec<String> = req
-        .points
-        .iter()
-        .map(|p| format!("POINT({} {})@{}", p.lng, p.lat, p.timestamp))
-        .collect();
-    let tgeompoint_str = format!("[{}]", instants.join(", "));
+    if has_mobilitydb(&store).await? {
+        // Build MobilityDB tgeompoint from points
+        let instants: Vec<String> = req
+            .points
+            .iter()
+            .map(|p| format!("POINT({} {})@{}", p.lng, p.lat, p.timestamp))
+            .collect();
+        let tgeompoint_str = format!("[{}]", instants.join(", "));
 
-    sqlx::query(
-        "INSERT INTO trajectories (id, dataset_id, feature_id, name, trip, period)
-         VALUES ($1, $2, $3, $4, $5::tgeompoint, period($5::tgeompoint))",
-    )
-    .bind(id)
-    .bind(dataset_id)
-    .bind(req.feature_id)
-    .bind(&req.name)
-    .bind(&tgeompoint_str)
-    .execute(store.pool())
-    .await?;
+        sqlx::query(
+            "INSERT INTO trajectories (id, dataset_id, name, trip, period)
+             VALUES ($1, $2, $3, $4::tgeompoint, period($4::tgeompoint))",
+        )
+        .bind(id)
+        .bind(dataset_id)
+        .bind(&req.name)
+        .bind(&tgeompoint_str)
+        .execute(store.pool())
+        .await?;
+    } else {
+        let trip = serde_json::to_value(&req.points).unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO trajectories (id, dataset_id, name, trip, period)
+             SELECT $1, $2, $3, $4,
+                    tstzrange(min((e->>'timestamp')::timestamptz),
+                              max((e->>'timestamp')::timestamptz), '[]')
+             FROM jsonb_array_elements($4) e",
+        )
+        .bind(id)
+        .bind(dataset_id)
+        .bind(&req.name)
+        .bind(&trip)
+        .execute(store.pool())
+        .await?;
+    }
 
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
@@ -118,23 +140,33 @@ async fn get_trajectory(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
-    let r = sqlx::query(
-        "SELECT id, name, feature_id,
+    let sql = if has_mobilitydb(&store).await? {
+        "SELECT id, name,
                 lower(period)::text as start_time,
                 upper(period)::text as end_time,
                 ST_AsGeoJSON(trajectory(trip))::jsonb as path_geojson,
                 numInstants(trip) as num_points
-         FROM trajectories WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(store.pool())
-    .await?
-    .ok_or(TrajError::NotFound)?;
+         FROM trajectories WHERE id = $1"
+    } else {
+        "SELECT id, name,
+                lower(period)::text as start_time,
+                upper(period)::text as end_time,
+                ST_AsGeoJSON(ST_MakeLine(ARRAY(
+                    SELECT ST_SetSRID(ST_MakePoint((e->>'lng')::float8, (e->>'lat')::float8), 4326)
+                    FROM jsonb_array_elements(trip) e
+                )))::jsonb as path_geojson,
+                jsonb_array_length(trip) as num_points
+         FROM trajectories WHERE id = $1"
+    };
+    let r = sqlx::query(sql)
+        .bind(id)
+        .fetch_optional(store.pool())
+        .await?
+        .ok_or(TrajError::NotFound)?;
 
     Ok(Json(serde_json::json!({
         "id": r.get::<Uuid, _>("id"),
         "name": r.get::<String, _>("name"),
-        "feature_id": r.get::<Option<Uuid>, _>("feature_id"),
         "start_time": r.get::<Option<String>, _>("start_time"),
         "end_time": r.get::<Option<String>, _>("end_time"),
         "path": r.get::<Option<serde_json::Value>, _>("path_geojson"),
