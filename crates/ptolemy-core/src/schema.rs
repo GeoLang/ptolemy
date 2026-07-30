@@ -24,6 +24,11 @@ pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,
     pub required: bool,
+    /// Human label for the column, where the source had one. Carried so a
+    /// migration does not drop the name its users have always read; nothing in
+    /// the platform displays it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     /// Optional: allowed values for enum-like fields
     #[serde(default)]
     pub allowed_values: Vec<serde_json::Value>,

@@ -8100,3 +8100,41 @@ async fn test_no_mutating_route_is_missing_its_write_grant() {
         "substituted only {checked} routes, the parser or the parameter names moved"
     );
 }
+
+/// A field alias is the label a source's users have always read, and a
+/// migration that drops it makes the data visibly worse the day it lands.
+/// Nothing displays it yet, so the round trip is the whole contract.
+#[tokio::test]
+async fn test_a_field_alias_survives_the_schema_round_trip() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _branch_id, carol) = owned_dataset(&app).await;
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset_id}/schema"),
+        Some(&carol),
+        Some(json!({"fields": [
+            {"name": "constructionmaterial", "field_type": "string", "required": false,
+             "alias": "Construction Material"},
+            {"name": "plain", "field_type": "string", "required": false},
+        ]})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    let (status, schema) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/schema"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{schema}");
+
+    let fields = schema["fields"].as_array().expect("fields");
+    assert_eq!(fields[0]["alias"], "Construction Material", "{schema}");
+    // a field with no alias keeps none rather than gaining an empty one
+    assert!(fields[1]["alias"].is_null(), "{schema}");
+}
