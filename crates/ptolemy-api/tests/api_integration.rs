@@ -8050,3 +8050,53 @@ async fn test_no_free_text_segment_opens_a_mutating_route() {
         }
     }
 }
+
+/// A handler that writes takes its [`WriteGrant`] out of the request extensions,
+/// where [`write_middleware`] put it. That is a runtime lookup, so a write
+/// handler mounted on a route the write layer exempts would compile and then
+/// answer 500 the first time anyone called it.
+///
+/// This walks every mounted mutating route and requires that none of them ever
+/// answers the missing-extension rejection. Bad bodies are expected and fine:
+/// a 400 or a 422 means the handler ran, which is what is being checked.
+#[tokio::test]
+async fn test_no_mutating_route_is_missing_its_write_grant() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = owned_dataset(&app).await;
+
+    let mut checked = 0;
+    for (method, template) in mounted_mutating_routes() {
+        let uri = template
+            .replace("{dataset_id}", &dataset_id.to_string())
+            .replace("{branch_id}", &branch_id.to_string())
+            .replace("{target_id}", &branch_id.to_string())
+            .replace("{source_id}", &branch_id.to_string())
+            .replace("{id}", &dataset_id.to_string());
+        // anything still parameterised needs a value this test cannot invent
+        if uri.contains('{') {
+            continue;
+        }
+        checked += 1;
+
+        let req = Request::builder()
+            .method(method.as_str())
+            .uri(&uri)
+            .header("authorization", format!("Bearer {carol}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(
+            !body.contains("Missing request extension"),
+            "{method} {uri} answered {status} with no write grant in scope: {body}"
+        );
+    }
+    assert!(
+        checked > 50,
+        "substituted only {checked} routes, the parser or the parameter names moved"
+    );
+}
