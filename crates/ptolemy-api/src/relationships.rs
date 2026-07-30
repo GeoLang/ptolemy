@@ -41,7 +41,6 @@ struct RelationshipClass {
     name: String,
     origin_dataset_id: Uuid,
     destination_dataset_id: Uuid,
-    rel_type: String,
     cardinality: String,
     forward_label: String,
     backward_label: String,
@@ -52,8 +51,9 @@ async fn list_classes(
     Path(dataset_id): Path<Uuid>,
 ) -> Result<Json<Vec<RelationshipClass>>, RelError> {
     let rows = sqlx::query(
-        "SELECT id, name, origin_dataset_id, destination_dataset_id,
-                rel_type, cardinality, forward_label, backward_label
+        "SELECT id, name, origin_dataset_id, destination_dataset_id, cardinality,
+                COALESCE(forward_label, '') AS forward_label,
+                COALESCE(backward_label, '') AS backward_label
          FROM relationship_classes
          WHERE origin_dataset_id = $1 OR destination_dataset_id = $1
          ORDER BY name",
@@ -69,7 +69,6 @@ async fn list_classes(
                 name: r.get("name"),
                 origin_dataset_id: r.get("origin_dataset_id"),
                 destination_dataset_id: r.get("destination_dataset_id"),
-                rel_type: r.get("rel_type"),
                 cardinality: r.get("cardinality"),
                 forward_label: r.get("forward_label"),
                 backward_label: r.get("backward_label"),
@@ -83,17 +82,14 @@ struct CreateClassRequest {
     name: String,
     origin_dataset_id: Uuid,
     destination_dataset_id: Uuid,
-    #[serde(default = "default_rel_type")]
-    rel_type: String,
+    /// the field on the destination side holding the origin's key
+    origin_foreign_key: String,
     #[serde(default = "default_cardinality")]
     cardinality: String,
     #[serde(default)]
     forward_label: String,
     #[serde(default)]
     backward_label: String,
-}
-fn default_rel_type() -> String {
-    "simple".into()
 }
 fn default_cardinality() -> String {
     "one_to_many".into()
@@ -107,10 +103,10 @@ async fn create_class(
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO relationship_classes
-            (id, name, origin_dataset_id, destination_dataset_id, rel_type, cardinality, forward_label, backward_label)
+            (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key, cardinality, forward_label, backward_label)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     ).bind(id).bind(&req.name).bind(req.origin_dataset_id).bind(req.destination_dataset_id)
-    .bind(&req.rel_type).bind(&req.cardinality).bind(&req.forward_label).bind(&req.backward_label)
+    .bind(&req.origin_foreign_key).bind(&req.cardinality).bind(&req.forward_label).bind(&req.backward_label)
     .execute(store.pool()).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({"id": id}))))
 }
@@ -120,8 +116,9 @@ async fn get_class(
     Path(id): Path<Uuid>,
 ) -> Result<Json<RelationshipClass>, RelError> {
     let r = sqlx::query(
-        "SELECT id, name, origin_dataset_id, destination_dataset_id,
-                rel_type, cardinality, forward_label, backward_label
+        "SELECT id, name, origin_dataset_id, destination_dataset_id, cardinality,
+                COALESCE(forward_label, '') AS forward_label,
+                COALESCE(backward_label, '') AS backward_label
          FROM relationship_classes WHERE id = $1",
     )
     .bind(id)
@@ -133,7 +130,6 @@ async fn get_class(
         name: r.get("name"),
         origin_dataset_id: r.get("origin_dataset_id"),
         destination_dataset_id: r.get("destination_dataset_id"),
-        rel_type: r.get("rel_type"),
         cardinality: r.get("cardinality"),
         forward_label: r.get("forward_label"),
         backward_label: r.get("backward_label"),
@@ -167,7 +163,7 @@ async fn list_records(
 ) -> Result<Json<Vec<RelRecord>>, RelError> {
     let rows = sqlx::query(
         "SELECT id, origin_feature_id, destination_feature_id, properties
-         FROM relationship_records WHERE class_id = $1",
+         FROM relationship_records WHERE relationship_class_id = $1",
     )
     .bind(class_id)
     .fetch_all(store.pool())
@@ -199,7 +195,7 @@ async fn create_record(
 ) -> Result<(StatusCode, Json<serde_json::Value>), RelError> {
     let id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO relationship_records (id, class_id, origin_feature_id, destination_feature_id, properties)
+        "INSERT INTO relationship_records (id, relationship_class_id, origin_feature_id, destination_feature_id, properties)
          VALUES ($1, $2, $3, $4, $5)",
     ).bind(id).bind(class_id).bind(req.origin_feature_id).bind(req.destination_feature_id).bind(&req.properties)
     .execute(store.pool()).await?;
@@ -232,9 +228,10 @@ async fn get_related_features(
 
     let forward = if dir != "backward" {
         let rows = sqlx::query(
-            "SELECT rr.destination_feature_id, rc.name as class_name, rc.forward_label
+            "SELECT rr.destination_feature_id, rc.name as class_name,
+                    COALESCE(rc.forward_label, '') AS forward_label
              FROM relationship_records rr
-             JOIN relationship_classes rc ON rc.id = rr.class_id
+             JOIN relationship_classes rc ON rc.id = rr.relationship_class_id
              WHERE rr.origin_feature_id = $1",
         )
         .bind(feature_id)
@@ -255,9 +252,10 @@ async fn get_related_features(
 
     let backward = if dir != "forward" {
         let rows = sqlx::query(
-            "SELECT rr.origin_feature_id, rc.name as class_name, rc.backward_label
+            "SELECT rr.origin_feature_id, rc.name as class_name,
+                    COALESCE(rc.backward_label, '') AS backward_label
              FROM relationship_records rr
-             JOIN relationship_classes rc ON rc.id = rr.class_id
+             JOIN relationship_classes rc ON rc.id = rr.relationship_class_id
              WHERE rr.destination_feature_id = $1",
         )
         .bind(feature_id)
