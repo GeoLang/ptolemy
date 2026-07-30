@@ -120,6 +120,9 @@ async fn sync_pull(
                     feature_id,
                     geometry_wkb,
                     properties,
+                    // the sync protocol carries the 4326 working copy only; a
+                    // client wanting originals reads the native route
+                    native: _,
                     valid_from,
                     valid_to,
                 } => SyncDiffOp::Insert {
@@ -133,6 +136,7 @@ async fn sync_pull(
                     feature_id,
                     geometry_wkb,
                     properties,
+                    native: _,
                     valid_from,
                     valid_to,
                 } => SyncDiffOp::Update {
@@ -239,6 +243,7 @@ async fn sync_push(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    native: None,
                     valid_from,
                     valid_to,
                 })
@@ -258,6 +263,7 @@ async fn sync_push(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    native: None,
                     valid_from,
                     valid_to,
                 })

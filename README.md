@@ -378,6 +378,7 @@ client but any JSON structure will work.
 | GET | `/api/v1/branches/{id}` | Get branch |
 | GET | `/api/v1/branches/{id}/history` | Commit log |
 | GET | `/api/v1/branches/{id}/features` | List features (paginated) |
+| GET | `/api/v1/branches/{id}/features/{feature_id}/native` | Pre-reprojection original geometry, exact |
 | GET | `/api/v1/branches/{id}/features/bbox` | Spatial bbox filter |
 | POST | `/api/v1/branches/{id}/features/intersects` | Spatial intersects filter |
 | POST | `/api/v1/branches/{id}/features/within` | Spatial within filter |

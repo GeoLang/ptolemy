@@ -417,6 +417,7 @@ fn test_diff_insert_operation() {
             feature_id: fid,
             geometry_wkb: vec![1, 2, 3],
             properties: json!({"name": "new feature"}),
+            native: None,
             valid_from: None,
             valid_to: None,
         }],
@@ -437,6 +438,7 @@ fn test_diff_update_operation() {
             feature_id: fid,
             geometry_wkb: Some(vec![4, 5, 6]),
             properties: None,
+            native: None,
             valid_from: None,
             valid_to: None,
         }],
@@ -460,8 +462,17 @@ fn test_diff_delete_operation() {
 }
 
 #[test]
+fn test_native_geometry_refuses_4326() {
+    use ptolemy_core::diff::NativeGeometry;
+    assert!(NativeGeometry::new(vec![1, 2, 3], 4326).is_none());
+    let native = NativeGeometry::new(vec![1, 2, 3], 26919).unwrap();
+    assert_eq!(native.wkb(), &[1, 2, 3]);
+    assert_eq!(native.srid(), 26919);
+}
+
+#[test]
 fn test_diff_multiple_operations() {
-    use ptolemy_core::diff::{Diff, DiffOp};
+    use ptolemy_core::diff::{Diff, DiffOp, NativeGeometry};
     let diff = Diff {
         from_changeset: Some(Uuid::now_v7()),
         to_changeset: Uuid::now_v7(),
@@ -470,6 +481,7 @@ fn test_diff_multiple_operations() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: vec![1],
                 properties: json!({}),
+                native: NativeGeometry::new(vec![7, 8, 9], 26919),
                 valid_from: None,
                 valid_to: None,
             },
@@ -477,6 +489,7 @@ fn test_diff_multiple_operations() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: None,
                 properties: Some(json!({"updated": true})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             },

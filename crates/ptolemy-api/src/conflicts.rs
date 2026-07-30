@@ -378,6 +378,8 @@ async fn resolve_and_merge(
                                 feature_id: *fid,
                                 geometry_wkb: geom,
                                 properties: Some(merged_props),
+                                // the geometry is theirs wholesale, so its original is too
+                                native: op_native(theirs).cloned(),
                                 valid_from: None,
                                 valid_to: None,
                             });
@@ -391,6 +393,8 @@ async fn resolve_and_merge(
                                 feature_id: *fid,
                                 geometry_wkb: wkb,
                                 properties: res.custom_properties.clone(),
+                                // a hand-resolved geometry has no survey original
+                                native: None,
                                 valid_from: None,
                                 valid_to: None,
                             });
@@ -454,6 +458,7 @@ fn diff_ops_match(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                native: na,
                 valid_from: vfa,
                 valid_to: vta,
             },
@@ -461,15 +466,17 @@ fn diff_ops_match(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                native: nb,
                 valid_from: vfb,
                 valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
+        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
         (
             DiffOp::Update {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                native: na,
                 valid_from: vfa,
                 valid_to: vta,
             },
@@ -477,10 +484,11 @@ fn diff_ops_match(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                native: nb,
                 valid_from: vfb,
                 valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
+        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
         (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
         _ => false,
     }
@@ -490,6 +498,13 @@ fn op_wkb(op: &DiffOp) -> Option<&[u8]> {
     match op {
         DiffOp::Insert { geometry_wkb, .. } => Some(geometry_wkb),
         DiffOp::Update { geometry_wkb, .. } => geometry_wkb.as_deref(),
+        DiffOp::Delete { .. } => None,
+    }
+}
+
+fn op_native(op: &DiffOp) -> Option<&ptolemy_core::NativeGeometry> {
+    match op {
+        DiffOp::Insert { native, .. } | DiffOp::Update { native, .. } => native.as_ref(),
         DiffOp::Delete { .. } => None,
     }
 }

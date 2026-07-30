@@ -22,6 +22,7 @@ pub use datastore::{
     StoreResult,
 };
 pub use event::{Event, EventType, Webhook};
+pub use diff::NativeGeometry;
 pub use external::{ExternalError, ExternalSource, ExternalTable};
 pub use feature::Feature;
 pub use review::{MergeRequest, MergeRequestStatus, ReviewComment};

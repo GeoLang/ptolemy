@@ -19,6 +19,15 @@ All notable changes to this project will be documented in this file.
   recorded. `GET /branches/{id}/features?valid_at=<RFC3339>` keeps only the
   features whose half-open range `[valid_from, valid_to)` covers the instant.
 
+- A feature version may carry the geometry as its source recorded it, before
+  reprojection to 4326, via `native_geometry_wkb_hex` and `native_srid` on a
+  commit operation (both or neither), read back exactly with
+  `GET /branches/{id}/features/{feature_id}/native`. NULL means the version has
+  no distinct original: a 4326 source, an edit, or a repaired geometry. An
+  original with srid 4326 is stored as NULL rather than as a duplicate, an
+  update never inherits the previous version's original, and a merge carries
+  originals across unchanged.
+
 ### Fixed
 
 - `POST /branches/{id}/import/geojson` and `/import/csv` imported nothing: every

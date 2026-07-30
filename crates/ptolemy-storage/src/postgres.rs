@@ -13,7 +13,7 @@ use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
 use ptolemy_core::dataset::{Dataset, GeometryType, Visibility};
-use ptolemy_core::diff::{Diff, DiffOp};
+use ptolemy_core::diff::{Diff, DiffOp, NativeGeometry};
 use ptolemy_core::event::{Event, Webhook};
 use ptolemy_core::external::{ExternalSource, ExternalTable};
 use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
@@ -950,12 +950,13 @@ impl PgStore {
                     feature_id,
                     geometry_wkb,
                     properties,
+                    native,
                     valid_from,
                     valid_to,
                 } => {
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to)
-                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5, $6, $7)",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry)
+                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9))",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
@@ -964,6 +965,8 @@ impl PgStore {
                     .bind(properties)
                     .bind(valid_from)
                     .bind(valid_to)
+                    .bind(native.as_ref().map(|n| n.wkb()))
+                    .bind(native.as_ref().map(|n| n.srid()))
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -971,6 +974,7 @@ impl PgStore {
                     feature_id,
                     geometry_wkb,
                     properties,
+                    native,
                     valid_from,
                     valid_to,
                 } => {
@@ -1035,9 +1039,11 @@ impl PgStore {
                     } else {
                         (*valid_from, *valid_to)
                     };
+                    // native is not inherited the way the fields above are: an
+                    // omitted one means the new version has no original
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to)
-                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5, $6, $7)",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to, native_geometry)
+                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5, $6, $7, ST_GeomFromWKB($8, $9))",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
@@ -1046,6 +1052,8 @@ impl PgStore {
                     .bind(&props)
                     .bind(from)
                     .bind(to)
+                    .bind(native.as_ref().map(|n| n.wkb()))
+                    .bind(native.as_ref().map(|n| n.srid()))
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -1201,6 +1209,41 @@ impl PgStore {
             .collect())
     }
 
+    /// The pre-reprojection original of one live feature, or None when its
+    /// current version has no distinct original. An external dataset is a view
+    /// over someone else's table, nothing was reprojected on the way in, so
+    /// every feature there answers None without a per-feature lookup.
+    pub async fn native_geometry(
+        &self,
+        branch_id: Uuid,
+        feature_id: Uuid,
+    ) -> Result<Option<NativeGeometry>, StoreError> {
+        if self.external_for_branch(branch_id).await?.is_some() {
+            return Ok(None);
+        }
+        let prelude = latest_cte("fv.feature_id, fv.operation, fv.native_geometry");
+        let row = sqlx::query(&format!(
+            "{prelude}
+            SELECT ST_AsBinary(native_geometry) as wkb, ST_SRID(native_geometry) as srid
+            FROM latest
+            WHERE feature_id = $2 AND operation != 'delete'"
+        ))
+        .bind(branch_id)
+        .bind(feature_id)
+        .fetch_optional(self.read_pool())
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!(
+                "feature {feature_id} on branch {branch_id}"
+            )));
+        };
+        let wkb: Option<Vec<u8>> = row.get("wkb");
+        let srid: Option<i32> = row.get("srid");
+        Ok(wkb
+            .zip(srid)
+            .and_then(|(wkb, srid)| NativeGeometry::new(wkb, srid)))
+    }
+
     /// Get a single feature's state at a specific changeset.
     pub async fn get_feature_at(
         &self,
@@ -1267,7 +1310,9 @@ impl PgStore {
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
-                    fv.valid_from, fv.valid_to
+                    fv.valid_from, fv.valid_to,
+                    ST_AsBinary(fv.native_geometry) as native_wkb,
+                    ST_SRID(fv.native_geometry) as native_srid
                 FROM feature_versions fv
                 JOIN new_changesets nc ON fv.changeset_id = nc.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1286,7 +1331,9 @@ impl PgStore {
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
-                    fv.valid_from, fv.valid_to
+                    fv.valid_from, fv.valid_to,
+                    ST_AsBinary(fv.native_geometry) as native_wkb,
+                    ST_SRID(fv.native_geometry) as native_srid
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1301,11 +1348,17 @@ impl PgStore {
             .map(|row| {
                 let op: String = row.get("operation");
                 let feature_id: Uuid = row.get("feature_id");
+                // carried so replaying this diff (merge) keeps the original
+                let native = row
+                    .get::<Option<Vec<u8>>, _>("native_wkb")
+                    .zip(row.get::<Option<i32>, _>("native_srid"))
+                    .and_then(|(wkb, srid)| NativeGeometry::new(wkb, srid));
                 match op.as_str() {
                     "insert" => DiffOp::Insert {
                         feature_id,
                         geometry_wkb: row.get("geometry_wkb"),
                         properties: row.get("properties"),
+                        native,
                         valid_from: row.get("valid_from"),
                         valid_to: row.get("valid_to"),
                     },
@@ -1313,6 +1366,7 @@ impl PgStore {
                         feature_id,
                         geometry_wkb: Some(row.get("geometry_wkb")),
                         properties: Some(row.get("properties")),
+                        native,
                         valid_from: row.get("valid_from"),
                         valid_to: row.get("valid_to"),
                     },
@@ -1671,6 +1725,8 @@ impl PgStore {
                                 feature_id: fid_b,
                                 geometry_wkb: Some(fixed_wkb),
                                 properties: None,
+                                // recomputed geometry, no survey original
+                                native: None,
                                 valid_from: None,
                                 valid_to: None,
                             });
@@ -1710,6 +1766,7 @@ impl PgStore {
                                 feature_id: fid_b,
                                 geometry_wkb: Some(snapped_wkb),
                                 properties: None,
+                                native: None,
                                 valid_from: None,
                                 valid_to: None,
                             });
@@ -2427,6 +2484,7 @@ impl PgStore {
                 feature_id: row.get("feature_id"),
                 geometry_wkb: Some(row.get("fixed_geom")),
                 properties: None,
+                native: None,
                 valid_from: None,
                 valid_to: None,
             })
@@ -3809,6 +3867,7 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                native: na,
                 valid_from: vfa,
                 valid_to: vta,
             },
@@ -3816,15 +3875,17 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                native: nb,
                 valid_from: vfb,
                 valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
+        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
         (
             DiffOp::Update {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                native: na,
                 valid_from: vfa,
                 valid_to: vta,
             },
@@ -3832,10 +3893,11 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                native: nb,
                 valid_from: vfb,
                 valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
+        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
         (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
         _ => false,
     }

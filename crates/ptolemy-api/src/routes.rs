@@ -11,7 +11,7 @@ use axum::{
 };
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType, Visibility};
-use ptolemy_core::diff::DiffOp;
+use ptolemy_core::diff::{DiffOp, NativeGeometry};
 use ptolemy_core::external::ExternalTable;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -38,6 +38,10 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/branches/{id}", get(get_branch))
         .route("/branches/{id}/history", get(get_branch_history))
         .route("/branches/{id}/features", get(list_features))
+        .route(
+            "/branches/{id}/features/{feature_id}/native",
+            get(feature_native),
+        )
         // Spatial queries
         .route("/branches/{id}/features/bbox", get(features_bbox))
         .route(
@@ -333,6 +337,28 @@ struct FeaturePage {
     next_cursor: Option<Uuid>,
 }
 
+/// The coordinates as the source recorded them, before reprojection to 4326.
+/// 404 for a feature that is not live on the branch, null fields for one whose
+/// current version has no distinct original.
+async fn feature_native(
+    State(store): State<AppState>,
+    Path((id, feature_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<NativeGeometryResponse>, AppError> {
+    let native = store.native_geometry(id, feature_id).await?;
+    Ok(Json(NativeGeometryResponse {
+        feature_id,
+        native_geometry_wkb_hex: native.as_ref().map(|n| hex::encode(n.wkb())),
+        native_srid: native.as_ref().map(|n| n.srid()),
+    }))
+}
+
+#[derive(Serialize)]
+struct NativeGeometryResponse {
+    feature_id: Uuid,
+    native_geometry_wkb_hex: Option<String>,
+    native_srid: Option<i32>,
+}
+
 // ─── Spatial Queries ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -483,6 +509,8 @@ async fn batch_commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                native_geometry_wkb_hex,
+                native_srid,
                 valid_from,
                 valid_to,
             } => {
@@ -492,6 +520,7 @@ async fn batch_commit(
                     feature_id: feature_id.unwrap_or_else(Uuid::now_v7),
                     geometry_wkb: wkb,
                     properties,
+                    native: native_from(native_geometry_wkb_hex, native_srid)?,
                     valid_from,
                     valid_to,
                 })
@@ -500,6 +529,8 @@ async fn batch_commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                native_geometry_wkb_hex,
+                native_srid,
                 valid_from,
                 valid_to,
             } => {
@@ -511,6 +542,7 @@ async fn batch_commit(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    native: native_from(native_geometry_wkb_hex, native_srid)?,
                     valid_from,
                     valid_to,
                 })
@@ -561,6 +593,12 @@ enum DiffOpRequest {
         feature_id: Option<Uuid>,
         geometry_wkb_hex: String,
         properties: serde_json::Value,
+        /// The geometry before reprojection to 4326, with the srid it is in.
+        /// Both or neither; see [`native_from`].
+        #[serde(default)]
+        native_geometry_wkb_hex: Option<String>,
+        #[serde(default)]
+        native_srid: Option<i32>,
         #[serde(default, with = "time::serde::rfc3339::option")]
         valid_from: Option<time::OffsetDateTime>,
         #[serde(default, with = "time::serde::rfc3339::option")]
@@ -572,6 +610,11 @@ enum DiffOpRequest {
         geometry_wkb_hex: Option<String>,
         #[serde(default)]
         properties: Option<serde_json::Value>,
+        /// Omitted means the new version has no original, never inherited.
+        #[serde(default)]
+        native_geometry_wkb_hex: Option<String>,
+        #[serde(default)]
+        native_srid: Option<i32>,
         #[serde(default, with = "time::serde::rfc3339::option")]
         valid_from: Option<time::OffsetDateTime>,
         #[serde(default, with = "time::serde::rfc3339::option")]
@@ -580,6 +623,27 @@ enum DiffOpRequest {
     Delete {
         feature_id: Uuid,
     },
+}
+
+/// The optional pre-reprojection original of a commit operation. Half of one
+/// is a client bug, so wkb without srid or srid without wkb is refused rather
+/// than guessed at. srid 4326 comes back None: a copy in the storage srid is
+/// not a distinct original, and NULL is how that is said everywhere.
+fn native_from(
+    wkb_hex: Option<String>,
+    srid: Option<i32>,
+) -> Result<Option<NativeGeometry>, AppError> {
+    match (wkb_hex, srid) {
+        (None, None) => Ok(None),
+        (Some(hex_str), Some(srid)) => {
+            let wkb = hex::decode(&hex_str)
+                .map_err(|e| AppError::BadRequest(format!("invalid native hex: {e}")))?;
+            Ok(NativeGeometry::new(wkb, srid))
+        }
+        _ => Err(AppError::BadRequest(
+            "native_geometry_wkb_hex and native_srid go together".into(),
+        )),
+    }
 }
 
 async fn commit(
@@ -596,6 +660,8 @@ async fn commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                native_geometry_wkb_hex,
+                native_srid,
                 valid_from,
                 valid_to,
             } => {
@@ -605,6 +671,7 @@ async fn commit(
                     feature_id: feature_id.unwrap_or_else(Uuid::now_v7),
                     geometry_wkb: wkb,
                     properties,
+                    native: native_from(native_geometry_wkb_hex, native_srid)?,
                     valid_from,
                     valid_to,
                 })
@@ -613,6 +680,8 @@ async fn commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                native_geometry_wkb_hex,
+                native_srid,
                 valid_from,
                 valid_to,
             } => {
@@ -624,6 +693,7 @@ async fn commit(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    native: native_from(native_geometry_wkb_hex, native_srid)?,
                     valid_from,
                     valid_to,
                 })

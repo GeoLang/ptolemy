@@ -641,6 +641,7 @@ fn parse_geojson_to_ops(content: &str) -> anyhow::Result<Vec<DiffOp>> {
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties,
+            native: None,
             valid_from: None,
             valid_to: None,
         });
@@ -854,6 +855,7 @@ fn parse_shapefile_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>>
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties: serde_json::Value::Object(properties),
+            native: None,
             valid_from: None,
             valid_to: None,
         });
@@ -998,6 +1000,7 @@ fn parse_geopackage_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties: serde_json::Value::Object(properties),
+            native: None,
             valid_from: None,
             valid_to: None,
         });

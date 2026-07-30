@@ -8138,3 +8138,86 @@ async fn test_a_field_alias_survives_the_schema_round_trip() {
     // a field with no alias keeps none rather than gaining an empty one
     assert!(fields[1]["alias"].is_null(), "{schema}");
 }
+
+// ─── Native geometry ────────────────────────────────────────────────
+
+/// WKB hex for a point with survey-precision coordinates, distinct from the
+/// 4326 working copy sent beside it.
+const NATIVE_HEX: &str = "0101000000ADFB5E7CC4841F41E92631C9C0BA5141";
+
+#[tokio::test]
+async fn test_native_geometry_commit_and_read_back_exact() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex,
+         "properties": {}, "native_geometry_wkb_hex": NATIVE_HEX, "native_srid": 26919}
+    ])).await;
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}/native")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // exact, not approximate: the original must survive the round trip untouched
+    assert_eq!(
+        body["native_geometry_wkb_hex"].as_str().unwrap().to_uppercase(),
+        NATIVE_HEX
+    );
+    assert_eq!(body["native_srid"], 26919);
+}
+
+#[tokio::test]
+async fn test_native_geometry_null_when_never_sent() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
+    ])).await;
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}/native")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["native_geometry_wkb_hex"].is_null());
+    assert!(body["native_srid"].is_null());
+}
+
+#[tokio::test]
+async fn test_native_geometry_half_supplied_is_rejected() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        json!({
+            "message": "half", "author": "test",
+            "operations": [{"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                "geometry_wkb_hex": point_hex, "properties": {}, "native_srid": 26919}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_native_geometry_unknown_feature_404() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    let (status, _) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/{}/native", Uuid::now_v7()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -708,6 +708,7 @@ async fn create_incident(
         feature_id,
         geometry_wkb: wkb,
         properties: properties.clone(),
+        native: None,
         valid_from: None,
         valid_to: None,
     }];

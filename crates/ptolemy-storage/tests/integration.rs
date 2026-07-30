@@ -6,7 +6,7 @@
 
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
-use ptolemy_core::diff::DiffOp;
+use ptolemy_core::diff::{DiffOp, NativeGeometry};
 use ptolemy_storage::permission::{Reader, Writer};
 use ptolemy_storage::postgres::{MergeResult, PgStore};
 use serde_json::json;
@@ -176,6 +176,7 @@ async fn test_commit_insert_features() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(1.0, 2.0),
                     properties: json!({"name": "Park"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -183,6 +184,7 @@ async fn test_commit_insert_features() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(3.0, 4.0),
                     properties: json!({"name": "School"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -223,6 +225,7 @@ async fn test_commit_update_feature() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -241,6 +244,7 @@ async fn test_commit_update_feature() {
                 feature_id: f1,
                 geometry_wkb: None, // keep geometry
                 properties: Some(json!({"name": "Central Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -273,6 +277,7 @@ async fn test_commit_delete_feature() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -313,6 +318,7 @@ async fn test_feature_at_specific_changeset() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"version": 1}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -330,6 +336,7 @@ async fn test_feature_at_specific_changeset() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"version": 2})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -364,6 +371,7 @@ async fn test_branch_history() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -381,6 +389,7 @@ async fn test_branch_history() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"updated": true})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -418,6 +427,7 @@ async fn test_diff_from_root() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"a": 1}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -425,6 +435,7 @@ async fn test_diff_from_root() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"b": 2}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -456,6 +467,7 @@ async fn test_diff_between_changesets() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -473,6 +485,7 @@ async fn test_diff_between_changesets() {
                 feature_id: f2,
                 geometry_wkb: point_wkb(1.0, 1.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -507,6 +520,7 @@ async fn test_merge_no_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Origin"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -538,6 +552,7 @@ async fn test_merge_no_conflicts() {
                 feature_id: f2,
                 geometry_wkb: point_wkb(5.0, 5.0),
                 properties: json!({"name": "School"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -556,6 +571,7 @@ async fn test_merge_no_conflicts() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Town Center"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -599,6 +615,7 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -629,6 +646,7 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Central Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -646,6 +664,7 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(10.0, 10.0)),
                 properties: Some(json!({"name": "Park", "moved": true})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -685,6 +704,7 @@ async fn test_merge_same_change_no_conflict() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -754,6 +774,7 @@ async fn test_merge_base_finding() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -783,6 +804,7 @@ async fn test_merge_base_finding() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(1.0, 0.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -800,6 +822,7 @@ async fn test_merge_base_finding() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(0.0, 1.0),
                 properties: json!({}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -862,6 +885,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -882,6 +906,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"name": "Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -898,6 +923,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(2.0, 2.0)),
                 properties: Some(json!({"name": "Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -934,6 +960,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -954,6 +981,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "North Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -970,6 +998,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "South Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1006,6 +1035,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"name": "A"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1013,6 +1043,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"name": "B"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1036,6 +1067,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f2,
                     geometry_wkb: Some(point_wkb(1.5, 1.5)),
                     properties: Some(json!({"name": "B"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1054,6 +1086,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(0.5, 0.5)),
                     properties: Some(json!({"name": "A"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1101,6 +1134,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park", "capacity": 100}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1120,6 +1154,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Central Park", "capacity": 100})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1136,6 +1171,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Park", "capacity": 250})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1172,6 +1208,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1196,6 +1233,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Main2"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1203,6 +1241,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(0.1, 0.1)),
                     properties: Some(json!({"name": "Base v2"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1221,6 +1260,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f3,
                     geometry_wkb: point_wkb(3.0, 3.0),
                     properties: json!({"name": "Feat3"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1228,6 +1268,7 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f4,
                     geometry_wkb: point_wkb(4.0, 4.0),
                     properties: json!({"name": "Feat4"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1268,6 +1309,7 @@ async fn test_diff_round_trip_after_merge() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1291,6 +1333,7 @@ async fn test_diff_round_trip_after_merge() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Base moved"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1298,6 +1341,7 @@ async fn test_diff_round_trip_after_merge() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Feat2"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1315,6 +1359,7 @@ async fn test_diff_round_trip_after_merge() {
                 feature_id: f3,
                 geometry_wkb: point_wkb(3.0, 3.0),
                 properties: json!({"name": "Main3"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1369,6 +1414,7 @@ async fn test_merge_idempotent_remerge() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1390,6 +1436,7 @@ async fn test_merge_idempotent_remerge() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Base moved"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1397,6 +1444,7 @@ async fn test_merge_idempotent_remerge() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Feat2"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1432,6 +1480,7 @@ async fn test_concurrent_commits_same_branch_no_lost_update() {
         feature_id: fa,
         geometry_wkb: point_wkb(1.0, 1.0),
         properties: json!({"who": "a"}),
+        native: None,
         valid_from: None,
         valid_to: None,
     }];
@@ -1439,6 +1488,7 @@ async fn test_concurrent_commits_same_branch_no_lost_update() {
         feature_id: fb,
         geometry_wkb: point_wkb(2.0, 2.0),
         properties: json!({"who": "b"}),
+        native: None,
         valid_from: None,
         valid_to: None,
     }];
@@ -1481,6 +1531,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1501,6 +1552,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(9.0, 9.0)),
                 properties: Some(json!({"name": "Bob's Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1521,6 +1573,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Alice's Park"})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1545,6 +1598,7 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.5, 0.5)),
                 properties: None,
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -1580,6 +1634,7 @@ async fn test_insert_then_update_same_feature_in_one_commit() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"v": 1}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1587,6 +1642,7 @@ async fn test_insert_then_update_same_feature_in_one_commit() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(1.0, 1.0)),
                     properties: Some(json!({"v": 2})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1624,6 +1680,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"name": "Park"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1631,6 +1688,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"name": "School"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1654,6 +1712,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Bob's Park"})),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1661,6 +1720,7 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f3,
                     geometry_wkb: point_wkb(3.0, 3.0),
                     properties: json!({"name": "Cafe"}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1722,6 +1782,7 @@ async fn test_multiple_commits_chain() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(i as f64, 0.0),
                 properties: json!({"step": i}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }
@@ -1730,6 +1791,7 @@ async fn test_multiple_commits_chain() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(i as f64, 0.0)),
                 properties: Some(json!({"step": i})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }
@@ -1800,6 +1862,7 @@ async fn test_insert_many_features() {
             feature_id: Uuid::now_v7(),
             geometry_wkb: point_wkb(i as f64, i as f64),
             properties: json!({"index": i}),
+            native: None,
             valid_from: None,
             valid_to: None,
         })
@@ -1830,6 +1893,7 @@ async fn test_bulk_commit_refreshes_planner_statistics() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(i as f64, i as f64),
                 properties: json!({"index": i}),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             })
@@ -1936,6 +2000,7 @@ async fn test_mixed_geometry_dataset_accepts_any_geometry() {
                     feature_id: Uuid::now_v7(),
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1943,6 +2008,7 @@ async fn test_mixed_geometry_dataset_accepts_any_geometry() {
                     feature_id: Uuid::now_v7(),
                     geometry_wkb: linestring_wkb(),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -1995,6 +2061,7 @@ async fn test_valid_time_round_trips() {
                     feature_id: timed,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: Some(ts(1_000)),
                     valid_to: Some(ts(2_000)),
                 },
@@ -2002,6 +2069,7 @@ async fn test_valid_time_round_trips() {
                     feature_id: untimed,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -2040,6 +2108,7 @@ async fn test_valid_time_open_ranges_round_trip() {
                     feature_id: open_end,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: Some(ts(1_000)),
                     valid_to: None,
                 },
@@ -2047,6 +2116,7 @@ async fn test_valid_time_open_ranges_round_trip() {
                     feature_id: open_start,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: Some(ts(2_000)),
                 },
@@ -2083,6 +2153,7 @@ async fn test_update_keeps_valid_time_when_omitted() {
                 feature_id: fid,
                 geometry_wkb: point_wkb(1.0, 1.0),
                 properties: json!({"n": 1}),
+                native: None,
                 valid_from: Some(ts(1_000)),
                 valid_to: Some(ts(2_000)),
             }],
@@ -2100,6 +2171,7 @@ async fn test_update_keeps_valid_time_when_omitted() {
                 feature_id: fid,
                 geometry_wkb: None,
                 properties: Some(json!({"n": 2})),
+                native: None,
                 valid_from: None,
                 valid_to: None,
             }],
@@ -2138,6 +2210,7 @@ async fn test_valid_at_filters_features() {
                     feature_id: closed,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: Some(ts(1_000)),
                     valid_to: Some(ts(2_000)),
                 },
@@ -2145,6 +2218,7 @@ async fn test_valid_at_filters_features() {
                     feature_id: open_end,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: Some(ts(1_500)),
                     valid_to: None,
                 },
@@ -2152,6 +2226,7 @@ async fn test_valid_at_filters_features() {
                     feature_id: open_start,
                     geometry_wkb: point_wkb(3.0, 3.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: Some(ts(1_500)),
                 },
@@ -2159,6 +2234,7 @@ async fn test_valid_at_filters_features() {
                     feature_id: untimed,
                     geometry_wkb: point_wkb(4.0, 4.0),
                     properties: json!({}),
+                    native: None,
                     valid_from: None,
                     valid_to: None,
                 },
@@ -2242,4 +2318,156 @@ async fn test_attachment_owner_check_rejects_bad_rows() {
     // each of the two valid shapes is accepted
     assert!(insert(Some(fid), Some(branch.id), None).await.is_ok());
     assert!(insert(None, None, Some(ds.id)).await.is_ok());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Native Geometry Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The original must come back byte for byte, so the coordinates use every
+/// mantissa bit a survey double could.
+fn native_point() -> Vec<u8> {
+    point_wkb(500000.123456789, 4649776.987654321)
+}
+
+async fn insert_with_native(
+    store: &PgStore,
+    branch_id: Uuid,
+    fid: Uuid,
+    native: Option<NativeGeometry>,
+) {
+    store
+        .commit(
+            branch_id,
+            "import",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: fid,
+                geometry_wkb: point_wkb(-69.99, 41.99),
+                properties: json!({}),
+                native,
+                valid_from: None,
+                valid_to: None,
+            }],
+            &W,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_native_geometry_round_trip_exact() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let fid = Uuid::now_v7();
+
+    let original = native_point();
+    insert_with_native(
+        &store,
+        branch.id,
+        fid,
+        NativeGeometry::new(original.clone(), 26919),
+    )
+    .await;
+
+    let native = store.native_geometry(branch.id, fid).await.unwrap().unwrap();
+    assert_eq!(native.wkb(), original.as_slice());
+    assert_eq!(native.srid(), 26919);
+}
+
+#[tokio::test]
+async fn test_native_geometry_none_without_original() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let fid = Uuid::now_v7();
+
+    insert_with_native(&store, branch.id, fid, None).await;
+
+    assert!(store.native_geometry(branch.id, fid).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_native_geometry_not_inherited_on_update() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let fid = Uuid::now_v7();
+
+    insert_with_native(
+        &store,
+        branch.id,
+        fid,
+        NativeGeometry::new(native_point(), 26919),
+    )
+    .await;
+
+    // an edit's new version has no original, even though the import's does
+    store
+        .commit(
+            branch.id,
+            "edit",
+            "bob",
+            &[DiffOp::Update {
+                feature_id: fid,
+                geometry_wkb: Some(point_wkb(-70.01, 42.01)),
+                properties: None,
+                native: None,
+                valid_from: None,
+                valid_to: None,
+            }],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    assert!(store.native_geometry(branch.id, fid).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_native_geometry_survives_merge() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let main = create_test_branch(&store, ds.id, "main").await;
+
+    let base = Uuid::now_v7();
+    insert_with_native(&store, main.id, base, None).await;
+
+    let main_updated = store.get_branch(main.id).await.unwrap();
+    let feature_branch = Branch {
+        id: Uuid::now_v7(),
+        dataset_id: ds.id,
+        name: "import".to_string(),
+        head: main_updated.head,
+        created_at: OffsetDateTime::now_utc(),
+        created_by: "bob".to_string(),
+    };
+    store.create_branch(&feature_branch, &W).await.unwrap();
+
+    let fid = Uuid::now_v7();
+    let original = native_point();
+    insert_with_native(
+        &store,
+        feature_branch.id,
+        fid,
+        NativeGeometry::new(original.clone(), 26919),
+    )
+    .await;
+
+    let result = store.merge(feature_branch.id, main.id, "alice", &W).await.unwrap();
+    assert!(matches!(result, MergeResult::Success { .. }));
+
+    let native = store.native_geometry(main.id, fid).await.unwrap().unwrap();
+    assert_eq!(native.wkb(), original.as_slice());
+    assert_eq!(native.srid(), 26919);
+}
+
+#[tokio::test]
+async fn test_native_geometry_unknown_feature_not_found() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    assert!(store.native_geometry(branch.id, Uuid::now_v7()).await.is_err());
 }
