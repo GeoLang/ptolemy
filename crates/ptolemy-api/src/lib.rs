@@ -15,7 +15,6 @@ pub mod domains;
 pub mod errors;
 pub mod formats;
 pub mod geoprocessing;
-pub mod grpc;
 pub mod h3;
 pub mod jobs;
 pub mod locks;

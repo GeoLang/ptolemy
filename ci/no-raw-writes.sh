@@ -35,17 +35,11 @@ status=0
 allowed_lines() {
   cat <<'ENTRIES'
 crates/ptolemy-api/src/routes.rs|match sqlx::query("SELECT 1").execute(state.read_pool()).await {
-crates/ptolemy-api/src/grpc.rs|&ptolemy_storage::Writer::Unenforced,
 ENTRIES
 }
-# The two entries above:
+# The entry above:
 #   routes.rs   the readiness probe. `SELECT 1` run for its effect rather than
 #               its row, which is what a liveness check is.
-#   grpc.rs     bulk_import commits with no caller identity. Nothing constructs
-#               or mounts this service, which is why it is here rather than
-#               fixed; the comment above the line says an Actor has to be wired
-#               through before it is mounted. Mounting it without doing that
-#               reopens the whole bug class over gRPC.
 
 # hits: `file:line:text` on stdin, one per line. Prints and fails anything the
 # allowlist does not name.

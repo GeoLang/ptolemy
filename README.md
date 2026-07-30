@@ -53,7 +53,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 | **v1.3** | Webhook delivery engine, schema enforcement, topology gate | ✓ Done |
 | **v1.4** | SSE streaming, feature locking, temporal queries | ✓ Done |
 | **v1.5** | Data catalog, multi-tenancy, rate limiting | ✓ Done |
-| **v1.6** | Background jobs, conflict resolution API, gRPC bulk ops | ✓ Done |
+| **v1.6** | Background jobs, conflict resolution API | ✓ Done |
 
 ## Architecture
 
@@ -61,7 +61,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 ┌───────────────────────────────────────────┐
 │  Clients (QGIS Plugin, Web UI, CLI)       │
 ├───────────────────────────────────────────┤
-│  ptolemy-api (Axum REST/gRPC service)     │
+│  ptolemy-api (Axum REST service)          │
 │  - Dataset CRUD                           │
 │  - Branch/commit/merge operations         │
 │  - Feature read/write scoped to branches  │
