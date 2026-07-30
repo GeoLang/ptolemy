@@ -7660,3 +7660,393 @@ async fn test_topology_ddl_is_admin_only() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ─── Policy is read off the route template, not the raw path ────────
+
+/// Single path segments a caller can plant in a free-text parameter that name a
+/// rule in `classify` or `needs_write_grant`. Every one of these turned
+/// `DELETE /api/v1/datasets/{id}/tags/{tag}` into some other endpoint's policy
+/// while the exemption lists were matched against the raw request path.
+const POLICY_KEYWORDS: [&str; 14] = [
+    "trace",
+    "astar",
+    "transform",
+    "validate",
+    "query",
+    "profile",
+    "tsp",
+    "isochrone",
+    "shortest-path",
+    "permissions",
+    "topologies",
+    "add-face",
+    "simplify",
+    "webhooks",
+];
+
+/// The exploit that refuted the first write gate, run against the live router.
+#[tokio::test]
+async fn test_a_planted_tag_cannot_opt_out_of_the_write_ladder() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, carol) = owned_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    // carol owns the dataset, so every tag below exists to be deleted
+    for tag in POLICY_KEYWORDS {
+        let (status, body) = request_as(
+            &app,
+            "POST",
+            &format!("/api/v1/datasets/{dataset_id}/tags"),
+            Some(&carol),
+            Some(json!({"tag": tag})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "seed tag {tag}: {body}");
+    }
+
+    // an editor with no grant is refused whatever they put in the tag segment
+    for tag in POLICY_KEYWORDS {
+        let (status, body) = request_as(
+            &app,
+            "DELETE",
+            &format!("/api/v1/datasets/{dataset_id}/tags/{tag}"),
+            Some(&eve),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "planted tag {tag} must not bypass the ladder: {body}"
+        );
+    }
+
+    // and nothing was deleted
+    let (status, tags) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/tags"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tags}");
+    assert_eq!(
+        tags.as_array().unwrap().len(),
+        POLICY_KEYWORDS.len(),
+        "planted tags were deleted: {tags}"
+    );
+
+    // a granted editor still deletes them, so the gate did not simply break the
+    // route for everyone
+    grant(&app, "datasets", dataset_id, "eve", "write").await;
+    for tag in POLICY_KEYWORDS {
+        let (status, body) = request_as(
+            &app,
+            "DELETE",
+            &format!("/api/v1/datasets/{dataset_id}/tags/{tag}"),
+            Some(&eve),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "granted delete of {tag}: {body}"
+        );
+    }
+    let (_, tags) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/tags"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert!(tags.as_array().unwrap().is_empty(), "{tags}");
+}
+
+/// The same trick against the other free-text terminal segments in the API.
+/// These are gated by `classify` returning Admin today; the assertion is that a
+/// planted keyword does not change that.
+#[tokio::test]
+async fn test_planted_segments_do_not_downgrade_other_routes() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _carol) = owned_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let org_id = Uuid::now_v7();
+
+    for planted in POLICY_KEYWORDS {
+        for uri in [
+            format!("/api/v1/orgs/{org_id}/members/{planted}"),
+            format!("/api/v1/datasets/{dataset_id}/permissions/{planted}"),
+            format!("/api/v1/branches/{branch_id}/permissions/{planted}"),
+        ] {
+            let (status, body) = request_as(&app, "DELETE", &uri, Some(&eve), None).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{uri} must stay refused for a non-admin: {body}"
+            );
+        }
+    }
+}
+
+// ─── Every mounted mutating route, read from the route tables ───────
+
+/// The route templates the router registers, parsed out of the `.route(...)`
+/// calls in this crate rather than hand-listed, so a route added tomorrow shows
+/// up here without anyone remembering to add it.
+///
+/// `lib.rs` says where each module's table is mounted; the module's own file
+/// says what it registers. That is the same pair of facts axum builds the
+/// matcher from, so the templates below are the ones `MatchedPath` will report.
+fn mounted_mutating_routes() -> Vec<(String, String)> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+
+    let mut prefixes: Vec<(String, String)> = Vec::new();
+    for (call, has_prefix) in [(".nest(", true), (".merge(", false)] {
+        for chunk in lib.split(call).skip(1) {
+            let prefix = if has_prefix {
+                match quoted(chunk) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                String::new()
+            };
+            let rest = if has_prefix {
+                match chunk.split_once(',') {
+                    Some((_, rest)) => rest,
+                    None => continue,
+                }
+            } else {
+                chunk
+            };
+            if let Some(module) = rest.trim().split("::").next() {
+                let module = module.trim();
+                if !module.is_empty() && module.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    prefixes.push((module.to_string(), prefix));
+                }
+            }
+        }
+    }
+    assert!(
+        prefixes.len() > 20,
+        "failed to parse the mount table in lib.rs: {prefixes:?}"
+    );
+
+    let mut routes = Vec::new();
+    for (module, prefix) in prefixes {
+        let file = src.join(format!("{module}.rs"));
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for (template, methods) in route_table(&text) {
+            for method in methods {
+                routes.push((method, format!("{prefix}{template}")));
+            }
+        }
+    }
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+/// The first double-quoted string in `s`.
+fn quoted(s: &str) -> Option<String> {
+    let start = s.find('"')? + 1;
+    let end = start + s[start..].find('"')?;
+    Some(s[start..end].to_string())
+}
+
+/// Every `.route("<template>", <method router>)` in one module's source, with
+/// the mutating methods attached to it.
+fn route_table(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(".route(") {
+        let after = &rest[at + ".route(".len()..];
+        rest = after;
+        let Some(template) = quoted(after) else {
+            continue;
+        };
+
+        // the argument list, up to the paren that closes `.route(`
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &after[..end];
+
+        let methods: Vec<String> = ["post", "put", "patch", "delete"]
+            .iter()
+            .filter(|m| calls(args, m))
+            .map(|m| m.to_uppercase())
+            .collect();
+        if !methods.is_empty() {
+            out.push((template, methods));
+        }
+    }
+    out
+}
+
+/// Whether `args` calls the method constructor `name`, not merely mentions it
+/// inside a handler's name (`delete_attachment` is not `delete(`).
+fn calls(args: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    let mut from = 0;
+    while let Some(at) = args[from..].find(&needle) {
+        let at = from + at;
+        let before = args[..at].chars().next_back();
+        if !before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
+/// Mutating route templates deliberately left outside the write ladder. Every
+/// entry is either a POST that only computes, or grant management, which
+/// rbac.rs gates harder. Adding a route to this list is the only way to opt out,
+/// and it cannot be done from a request.
+const UNGATED_TEMPLATES: [&str; 49] = [
+    "/api/v1/attribute-rules/{id}/validate",
+    "/api/v1/branches/{branch_id}/permissions/{user_id}",
+    "/api/v1/branches/{id}/3d/extrude",
+    "/api/v1/branches/{id}/3d/intersection",
+    "/api/v1/branches/{id}/3d/minkowski-sum",
+    "/api/v1/branches/{id}/3d/straight-skeleton",
+    "/api/v1/branches/{id}/3d/tesselate",
+    "/api/v1/branches/{id}/3d/visibility",
+    "/api/v1/branches/{id}/3d/volume",
+    "/api/v1/branches/{id}/features/filter",
+    "/api/v1/branches/{id}/features/intersects",
+    "/api/v1/branches/{id}/features/within",
+    "/api/v1/branches/{id}/geoprocessing/centroid",
+    "/api/v1/branches/{id}/geoprocessing/clip",
+    "/api/v1/branches/{id}/geoprocessing/contour",
+    "/api/v1/branches/{id}/geoprocessing/convex-hull",
+    "/api/v1/branches/{id}/geoprocessing/densify",
+    "/api/v1/branches/{id}/geoprocessing/difference",
+    "/api/v1/branches/{id}/geoprocessing/dissolve",
+    "/api/v1/branches/{id}/geoprocessing/distance-matrix",
+    "/api/v1/branches/{id}/geoprocessing/intersect",
+    "/api/v1/branches/{id}/geoprocessing/merge",
+    "/api/v1/branches/{id}/geoprocessing/nearest-neighbor",
+    "/api/v1/branches/{id}/geoprocessing/simplify",
+    "/api/v1/branches/{id}/geoprocessing/spatial-join",
+    "/api/v1/branches/{id}/geoprocessing/split",
+    "/api/v1/branches/{id}/geoprocessing/voronoi",
+    "/api/v1/branches/{id}/h3/compact",
+    "/api/v1/branches/{id}/permissions",
+    "/api/v1/branches/{id}/similarity/cluster",
+    "/api/v1/branches/{id}/similarity/search",
+    "/api/v1/branches/{id}/transform",
+    "/api/v1/coverage/simulate",
+    "/api/v1/datasets/{dataset_id}/permissions/{user_id}",
+    "/api/v1/datasets/{id}/permissions",
+    "/api/v1/datasets/{id}/trajectories/nearest",
+    "/api/v1/incidents/evacuate",
+    "/api/v1/networks/{id}/astar",
+    "/api/v1/networks/{id}/isochrone",
+    "/api/v1/networks/{id}/shortest-path",
+    "/api/v1/networks/{id}/trace",
+    "/api/v1/networks/{id}/tsp",
+    "/api/v1/parcels/merge",
+    "/api/v1/parcels/split",
+    "/api/v1/pointclouds/{id}/profile",
+    "/api/v1/pointclouds/{id}/query",
+    "/api/v1/surveys/compare",
+    "/api/v1/topologies/{name}/validate",
+    "/api/v1/trajectories/{id}/simplify",
+];
+
+#[test]
+fn test_every_mounted_mutating_route_is_gated_or_listed() {
+    let routes = mounted_mutating_routes();
+    assert!(
+        routes.len() > 100,
+        "parsed only {} routes, the route-table parser is broken",
+        routes.len()
+    );
+
+    for (method, template) in &routes {
+        let method = axum::http::Method::from_bytes(method.as_bytes()).unwrap();
+        let gated = ptolemy_api::auth::needs_write_grant(&method, template);
+        let listed = UNGATED_TEMPLATES.contains(&template.as_str());
+        assert_eq!(
+            gated, !listed,
+            "{method} {template}: gated={gated} but the exemption list says {listed}. \
+             A route that writes must be gated; one that only computes must be listed."
+        );
+    }
+
+    // and no stale entries, so the list cannot drift away from the router
+    for template in UNGATED_TEMPLATES {
+        assert!(
+            routes.iter().any(|(_, t)| t == template),
+            "{template} is exempt but no longer mounted"
+        );
+    }
+}
+
+/// The bug class, swept across the whole router instead of a hand-picked route.
+///
+/// Every mutating template whose last segment is a parameter hands the caller
+/// that segment. This walks all of them, plants each policy keyword there, fires
+/// the request as an editor with no grant on anything, and requires that none of
+/// them succeeds. Under raw-path matching ten of these returned 204.
+#[tokio::test]
+async fn test_no_free_text_segment_opens_a_mutating_route() {
+    let app = setup_app_authed().await;
+    let eve = token_for_user("eve", Role::Editor);
+
+    let free_text: Vec<(String, String)> = mounted_mutating_routes()
+        .into_iter()
+        .filter(|(_, t)| {
+            t.rsplit('/')
+                .next()
+                .is_some_and(|last| last.starts_with('{'))
+        })
+        .collect();
+    assert!(
+        free_text.len() >= 15,
+        "expected the API to have free-text terminal routes, found {}",
+        free_text.len()
+    );
+
+    for (method, template) in &free_text {
+        let stem = template.rsplit_once('/').unwrap().0;
+        // a real dataset the caller has no grant on, so a resolved target is
+        // refused rather than merely missing
+        let (dataset_id, branch_id, _owner) = owned_dataset(&app).await;
+        let stem = stem
+            .replace("{dataset_id}", &dataset_id.to_string())
+            .replace("{branch_id}", &branch_id.to_string())
+            .replace("{id}", &dataset_id.to_string())
+            .replace("{target_id}", &branch_id.to_string());
+
+        for planted in POLICY_KEYWORDS {
+            let uri = format!("{stem}/{planted}");
+            let (status, body) = request_as(&app, method, &uri, Some(&eve), None).await;
+            assert!(
+                !status.is_success(),
+                "{method} {uri} succeeded with {status}: {body}"
+            );
+        }
+    }
+}

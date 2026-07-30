@@ -14,7 +14,7 @@
 
 use axum::{
     Json,
-    extract::{FromRequestParts, Request, State},
+    extract::{FromRequestParts, MatchedPath, Request, State},
     http::{HeaderMap, Method, StatusCode, Uri, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -144,6 +144,27 @@ fn subprotocol_token(headers: &HeaderMap) -> Option<&str> {
     entries.next()
 }
 
+/// The route template a request matched, such as
+/// `/api/v1/datasets/{id}/tags/{tag}`.
+///
+/// **Every path-based policy decision has to be made on this and never on the
+/// raw request path.** A route whose template ends in a free-text parameter
+/// (`{tag}`, `{user_id}`, `{name}`) lets the caller put any single segment they
+/// like exactly where a raw-path match would look. Keying on the raw path made
+/// `DELETE /api/v1/datasets/{id}/tags/trace` read as the compute-only `/trace`
+/// endpoint and skip the write ladder, and `.../tags/permissions` read as grant
+/// management and drop the required role from editor to any. A template comes
+/// from the route tables in this crate, so nothing in it is caller-controlled.
+///
+/// `None` means no route matched: axum sets `MatchedPath` while routing and
+/// leaves it unset only on the fallback. Every router here is mounted with
+/// `nest`, `merge` or `route`, all of which register in the outer matcher, so a
+/// request that will reach a handler always carries one. `matched_route_is_known`
+/// in the integration tests pins that.
+pub fn route_template(extensions: &axum::http::Extensions) -> Option<&str> {
+    extensions.get::<MatchedPath>().map(MatchedPath::as_str)
+}
+
 /// POST endpoints that only query, so they follow the same public rule as GET.
 /// Kept deliberately short: anything not listed is write-gated.
 const PUBLIC_QUERY_SUFFIXES: [&str; 3] = [
@@ -188,6 +209,10 @@ const COMPUTE_ONLY_SUFFIXES: [&str; 17] = [
 
 /// Whether the per-dataset write ladder applies to this request.
 ///
+/// `route` is a [`route_template`], never a raw path. The exemption lists are
+/// matched against it, so an entry can only ever collide with a literal segment
+/// this crate wrote, not with a value a caller supplied.
+///
 /// Default is yes for every mutating method, so a route added tomorrow is
 /// guarded without its author doing anything. The exceptions are listed above
 /// and each one has to be opted in by hand.
@@ -197,7 +222,7 @@ const COMPUTE_ONLY_SUFFIXES: [&str; 17] = [
 /// time someone without a write grant uses it. Forgetting anything about a new
 /// write endpoint leaves it guarded. Only the loud mistake is possible in the
 /// direction that matters.
-pub fn needs_write_grant(method: &Method, path: &str) -> bool {
+pub fn needs_write_grant(method: &Method, route: &str) -> bool {
     if !matches!(
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -209,26 +234,26 @@ pub fn needs_write_grant(method: &Method, path: &str) -> bool {
     // the dataset. Running the ladder here as well would deny a dataset admin
     // managing permissions on a branch whose rows do not include them, which is
     // exactly the case they need it for.
-    if path.contains("/permissions") {
+    if route.contains("/permissions") {
         return false;
     }
 
-    if COMPUTE_ONLY_SEGMENTS.iter().any(|s| path.contains(s)) {
+    if COMPUTE_ONLY_SEGMENTS.iter().any(|s| route.contains(s)) {
         return false;
     }
-    if PUBLIC_QUERY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+    if PUBLIC_QUERY_SUFFIXES.iter().any(|s| route.ends_with(s)) {
         return false;
     }
-    if COMPUTE_ONLY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+    if COMPUTE_ONLY_SUFFIXES.iter().any(|s| route.ends_with(s)) {
         return false;
     }
     // an evacuation route is pure arithmetic; POST /incidents commits a feature
-    if path.ends_with("/incidents/evacuate") {
+    if route.ends_with("/incidents/evacuate") {
         return false;
     }
     // simplifying a trajectory reports what the simplification would do without
     // storing it, while simplifying a topology edits the topology in place
-    if path.contains("/trajectories/") && path.ends_with("/simplify") {
+    if route.contains("/trajectories/") && route.ends_with("/simplify") {
         return false;
     }
 
@@ -238,30 +263,34 @@ pub fn needs_write_grant(method: &Method, path: &str) -> bool {
 /// Decide what a request needs. Reads (GET/HEAD/OPTIONS) and the query-shaped
 /// POSTs are public; privilege and delivery-config changes are admin-only;
 /// everything else that mutates needs write access.
-pub fn classify(method: &Method, path: &str) -> Access {
+///
+/// `route` is a [`route_template`]. Callers may fall back to the raw path only
+/// when no route matched, where the answer decides which error the client sees
+/// and nothing else: no handler runs on that path.
+pub fn classify(method: &Method, route: &str) -> Access {
     // A websocket handshake is a GET, so without this it would fall into the
     // read-is-public rule below and both sockets would accept anonymous callers.
     // /ws/rooms/{id} relays whatever a peer sends to every other peer in the
     // room, so an anonymous socket is a write, not a read.
-    if path.starts_with(WS_PREFIX) {
+    if route.starts_with(WS_PREFIX) {
         return Access::Authenticated;
     }
 
     // Grant management is authorized per dataset, not per role: the holder of an
-    // `admin` grant manages their own dataset. The path alone cannot decide that,
+    // `admin` grant manages their own dataset. The route alone cannot decide that,
     // so any valid token gets through to the handler, which enforces
     // instance-admin-or-dataset-admin and answers 403 otherwise. This still has
     // to sit above the read-is-public rule, or an anonymous GET would leak the ACL.
-    if path.contains("/permissions") {
+    if route.contains("/permissions") {
         return Access::Authenticated;
     }
 
     // webhook config, org membership and audit are ACL/config that both hand out
     // access and exfiltrate data, and have no per-dataset owner to delegate to,
     // so they stay admin-only for every method.
-    if path.contains("/webhooks")
-        || path.starts_with("/api/v1/orgs")
-        || path.starts_with("/api/v1/audit")
+    if route.contains("/webhooks")
+        || route.starts_with("/api/v1/orgs")
+        || route.starts_with("/api/v1/audit")
     {
         return Access::Admin;
     }
@@ -269,7 +298,7 @@ pub fn classify(method: &Method, path: &str) -> Access {
     // /metrics leaks traffic shape and the non-uuid path identifiers the label
     // normalizer keeps (topology names, room ids). The platform compose publishes
     // ptolemy's port straight to the host, so a proxy allowlist can't cover it.
-    if path == "/metrics" {
+    if route == "/metrics" {
         return Access::Admin;
     }
 
@@ -281,12 +310,12 @@ pub fn classify(method: &Method, path: &str) -> Access {
         // payloads that were sent and the traffic shape. lrs has
         // /routes/{id}/events, map data with the same suffix, so the dataset
         // prefix is part of the match. Emitting an event stays a normal write.
-        if path.starts_with("/api/v1/datasets/") && path.ends_with("/events") {
+        if route.starts_with("/api/v1/datasets/") && route.ends_with("/events") {
             return Access::Admin;
         }
         // the change feed dumps every change on a branch for a replication peer,
         // and registering a peer is already admin-only
-        if path.starts_with("/api/v1/replication/feed") {
+        if route.starts_with("/api/v1/replication/feed") {
             return Access::Admin;
         }
         return Access::Public;
@@ -296,29 +325,29 @@ pub fn classify(method: &Method, path: &str) -> Access {
     // CreateTopology issues DDL and the route's `{id}` is discarded. There is no
     // owner for the write ladder to check, so these stay admin-only until a
     // topology is bound to a dataset. Reads already returned above.
-    if path.ends_with("/topologies")
-        || path.ends_with("/add-face")
-        || (path.starts_with("/api/v1/topologies/") && path.ends_with("/simplify"))
+    if route.ends_with("/topologies")
+        || route.ends_with("/add-face")
+        || (route.starts_with("/api/v1/topologies/") && route.ends_with("/simplify"))
     {
         return Access::Admin;
     }
 
-    if PUBLIC_QUERY_SUFFIXES.iter().any(|s| path.ends_with(s)) {
+    if PUBLIC_QUERY_SUFFIXES.iter().any(|s| route.ends_with(s)) {
         return Access::Public;
     }
 
     // the point cloud spatial query and elevation profile only SELECT, so they
     // are reads that happen to take a POST body. The prefix is part of the match
     // because /query and /profile are generic enough to catch a future write.
-    if path.starts_with("/api/v1/pointclouds/")
-        && (path.ends_with("/query") || path.ends_with("/profile"))
+    if route.starts_with("/api/v1/pointclouds/")
+        && (route.ends_with("/query") || route.ends_with("/profile"))
     {
         return Access::Public;
     }
 
     // registering a replication peer hands out a data feed, so admin only;
     // listing peers (GET) stays public under the read rule above
-    if path.starts_with("/api/v1/replication/peers") {
+    if route.starts_with("/api/v1/replication/peers") {
         return Access::Admin;
     }
 
@@ -428,7 +457,14 @@ pub async fn auth_middleware(
     // auth ran at all, not just whether this request carried a token
     request.extensions_mut().insert(AuthEnabled);
 
-    let access = classify(request.method(), request.uri().path());
+    // the matched template, so a caller cannot put a policy keyword in a
+    // free-text segment. Falling back to the raw path is only reachable when no
+    // route matched, where the fallback answers 404 and no handler runs, so the
+    // decision picks the error the client sees and grants nothing.
+    let access = {
+        let route = route_template(request.extensions()).unwrap_or_else(|| request.uri().path());
+        classify(request.method(), route)
+    };
     let token = request_token(request.headers(), request.uri()).map(str::to_owned);
     let key = DecodingKey::from_secret(config.secret.as_bytes());
     let claims = token

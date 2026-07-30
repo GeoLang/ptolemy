@@ -33,10 +33,14 @@
 //! being routed through the layer rather than by its handler remembering to
 //! check. It runs inside [`visibility_middleware`], so a caller who cannot read
 //! a private dataset still gets 404 rather than a 403 that confirms the id.
+//!
+//! Both the exemption policy and the target id are read off the matched route
+//! template, never the raw path. See [`crate::auth::route_template`] for what
+//! goes wrong otherwise.
 
 use axum::{
     extract::{Request, State},
-    http::{StatusCode, Uri},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -45,7 +49,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState, Claims,
-    auth::{AuthEnabled, needs_write_grant},
+    auth::{AuthEnabled, needs_write_grant, route_template},
     errors::store_error_status,
 };
 
@@ -141,16 +145,24 @@ pub async fn ensure_readable(
 
 // ─── Writes ─────────────────────────────────────────────────────────
 
-/// The id a mutation is aimed at: the first one in the path.
+/// The id a mutation is aimed at: the request segment sitting under the first
+/// `{param}` of the matched route template.
 ///
-/// This rests on a convention the whole API already follows, and only that one:
-/// the resource being written is the first id in the path. Later path ids are
-/// either sub-resources of the same dataset (a feature, a lock) or read-only
-/// inputs, and query ids are filters. Taking only the first is what keeps
-/// `POST /branches/{target}/merge/{source}` from demanding a write grant on the
-/// branch it is merging *from*, which the store's own ladder never asked for.
-fn write_target_id(uri: &Uri) -> Option<Uuid> {
-    uri.path().split('/').find_map(|s| Uuid::parse_str(s).ok())
+/// The position comes from the template rather than from scanning the raw path
+/// for something uuid-shaped, so a free-text segment can never pose as the
+/// target. In `/api/v1/datasets/{id}/tags/{tag}` only `{id}` is ever consulted,
+/// whatever the caller puts in `{tag}`.
+///
+/// This rests on a convention the route tables follow throughout, and only that
+/// one: the resource being written is the first parameter in the template. Later
+/// ones are sub-resources of the same dataset (a feature, a lock) or read-only
+/// inputs, which is what keeps `/branches/{target_id}/merge/{source_id}` from
+/// demanding a write grant on the branch it is merging *from*.
+fn write_target_id(template: &str, path: &str) -> Option<Uuid> {
+    let at = template
+        .split('/')
+        .position(|segment| segment.starts_with('{'))?;
+    Uuid::parse_str(path.split('/').nth(at)?).ok()
 }
 
 /// Refuse any mutation the caller is not allowed to make against the dataset or
@@ -165,12 +177,23 @@ pub async fn write_middleware(
     if request.extensions().get::<AuthEnabled>().is_none() {
         return next.run(request).await;
     }
-    if !needs_write_grant(request.method(), request.uri().path()) {
+
+    let Some(template) = route_template(request.extensions()) else {
+        // No route matched, so the fallback is about to answer 404 and no
+        // handler will run. Refusing anyway keeps the gate from ever deciding
+        // policy without a template, which is the whole point of keying on one.
+        if needs_write_grant(request.method(), "") {
+            return denied("no route matched");
+        }
+        return next.run(request).await;
+    };
+    if !needs_write_grant(request.method(), template) {
         return next.run(request).await;
     }
-    let Some(id) = write_target_id(request.uri()) else {
-        // nothing named, so nothing to attribute the write to: `POST /datasets`
-        // is the case that matters, and it grants its creator on the way out
+    let Some(id) = write_target_id(template, request.uri().path()) else {
+        // the template names no id, so there is nothing to attribute the write
+        // to: `POST /datasets` is the case that matters, and it grants its
+        // creator on the way out
         return next.run(request).await;
     };
 
@@ -182,6 +205,14 @@ pub async fn write_middleware(
             (status, axum::Json(serde_json::json!({"error": message}))).into_response()
         }
     }
+}
+
+fn denied(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({"error": message})),
+    )
+        .into_response()
 }
 
 /// The write ladder for a handler whose target arrives in the request body,
@@ -240,132 +271,189 @@ mod tests {
         assert_eq!(ids_of(&format!("/api/v1/diff/{a}/{a}")), vec![a]);
     }
 
-    fn target_of(uri: &str) -> Option<Uuid> {
-        write_target_id(&uri.parse().unwrap())
-    }
-
     /// The convention the write gate rests on, stated as a test: the resource
-    /// being written is the first id in the path.
+    /// being written is the first parameter in the route template.
     #[test]
-    fn write_target_is_the_first_path_id() {
+    fn write_target_is_the_first_template_parameter() {
         let target = Uuid::now_v7();
         let source = Uuid::now_v7();
         assert_eq!(
-            target_of(&format!("/api/v1/branches/{target}/merge/{source}")),
+            write_target_id(
+                "/api/v1/branches/{target_id}/merge/{source_id}",
+                &format!("/api/v1/branches/{target}/merge/{source}"),
+            ),
             Some(target)
         );
         assert_eq!(
-            target_of(&format!(
-                "/api/v1/branches/{target}/conflicts/{source}/resolve-merge"
-            )),
+            write_target_id(
+                "/api/v1/branches/{target_id}/conflicts/{source_id}/resolve-merge",
+                &format!("/api/v1/branches/{target}/conflicts/{source}/resolve-merge"),
+            ),
             Some(target)
         );
         let branch = Uuid::now_v7();
         let feature = Uuid::now_v7();
         assert_eq!(
-            target_of(&format!(
-                "/api/v1/branches/{branch}/features/{feature}/attachments"
-            )),
+            write_target_id(
+                "/api/v1/branches/{branch_id}/features/{feature_id}/attachments",
+                &format!("/api/v1/branches/{branch}/features/{feature}/attachments"),
+            ),
             Some(branch)
         );
     }
 
+    /// The exploit that refuted the raw-path version: a caller-supplied segment
+    /// cannot become the target, whatever it is made to look like.
     #[test]
-    fn write_target_ignores_query_ids() {
-        let a = Uuid::now_v7();
-        // sync push takes its branch in the body, so nothing in the path or
-        // query is the target and store.commit stays the only guard
-        assert_eq!(target_of(&format!("/api/v1/sync/push?trace={a}")), None);
-        assert_eq!(target_of("/api/v1/datasets"), None);
+    fn a_free_text_segment_is_never_the_target() {
+        let dataset = Uuid::now_v7();
+        let planted = Uuid::now_v7();
+        assert_eq!(
+            write_target_id(
+                "/api/v1/datasets/{id}/tags/{tag}",
+                &format!("/api/v1/datasets/{dataset}/tags/{planted}"),
+            ),
+            Some(dataset)
+        );
     }
 
-    fn gated(method: &str, path: &str) -> bool {
-        needs_write_grant(&Method::from_bytes(method.as_bytes()).unwrap(), path)
+    #[test]
+    fn a_template_with_no_parameter_has_no_target() {
+        let a = Uuid::now_v7();
+        // sync push takes its branch in the body, so nothing in the path is the
+        // target and store.commit stays the only guard
+        assert_eq!(
+            write_target_id("/api/v1/sync/push", &format!("/api/v1/sync/push?trace={a}")),
+            None
+        );
+        assert_eq!(
+            write_target_id("/api/v1/datasets", "/api/v1/datasets"),
+            None
+        );
+    }
+
+    /// These take route templates, the same strings the route tables register.
+    /// They document intent; the authority on which mounted routes are gated is
+    /// `test_every_mounted_mutating_route_is_gated_or_listed` in the integration
+    /// tests, which walks the route tables instead of a hand-picked list.
+    fn gated(method: &str, route: &str) -> bool {
+        needs_write_grant(&Method::from_bytes(method.as_bytes()).unwrap(), route)
     }
 
     #[test]
     fn reads_are_never_write_gated() {
-        assert!(!gated("GET", "/api/v1/datasets/x/tags"));
-        assert!(!gated("HEAD", "/api/v1/datasets/x/tags"));
+        assert!(!gated("GET", "/api/v1/datasets/{id}/tags"));
+        assert!(!gated("HEAD", "/api/v1/datasets/{id}/tags"));
     }
 
     #[test]
     fn mutations_are_gated_by_default() {
-        for (method, path) in [
-            ("POST", "/api/v1/datasets/x/tags"),
-            ("DELETE", "/api/v1/datasets/x/tags/y"),
-            ("PUT", "/api/v1/datasets/x/metadata"),
-            ("PUT", "/api/v1/datasets/x/schema"),
-            ("POST", "/api/v1/datasets/x/schema/migrations"),
-            ("PUT", "/api/v1/reviews/x/approve"),
-            ("POST", "/api/v1/reviews/x/comments"),
-            ("PUT", "/api/v1/symbology/x"),
-            ("DELETE", "/api/v1/labels/x"),
-            ("DELETE", "/api/v1/domains/x"),
-            ("PUT", "/api/v1/attribute-rules/x"),
-            ("POST", "/api/v1/networks/x/edges"),
-            ("POST", "/api/v1/routes/x/events"),
-            ("POST", "/api/v1/datasets/x/events"),
-            ("POST", "/api/v1/branches/x/h3/index"),
-            ("POST", "/api/v1/branches/x/similarity/embed"),
-            ("POST", "/api/v1/branches/x/locks"),
-            ("POST", "/api/v1/datasets/x/trajectories"),
-            ("POST", "/api/v1/qgis/branches/x/conflicts/resolve"),
+        for (method, route) in [
+            ("POST", "/api/v1/datasets/{id}/tags"),
+            ("DELETE", "/api/v1/datasets/{id}/tags/{tag}"),
+            ("PUT", "/api/v1/datasets/{id}/metadata"),
+            ("PUT", "/api/v1/datasets/{id}/schema"),
+            ("POST", "/api/v1/datasets/{id}/schema/migrations"),
+            ("PUT", "/api/v1/reviews/{id}/approve"),
+            ("POST", "/api/v1/reviews/{id}/comments"),
+            ("PUT", "/api/v1/symbology/{id}"),
+            ("DELETE", "/api/v1/labels/{id}"),
+            ("DELETE", "/api/v1/domains/{id}"),
+            ("PUT", "/api/v1/attribute-rules/{id}"),
+            ("POST", "/api/v1/networks/{id}/edges"),
+            ("POST", "/api/v1/routes/{id}/events"),
+            ("POST", "/api/v1/datasets/{id}/events"),
+            ("POST", "/api/v1/branches/{id}/h3/index"),
+            ("POST", "/api/v1/branches/{id}/similarity/embed"),
+            ("POST", "/api/v1/branches/{id}/locks"),
+            ("POST", "/api/v1/datasets/{id}/trajectories"),
+            (
+                "POST",
+                "/api/v1/qgis/branches/{branch_id}/conflicts/resolve",
+            ),
         ] {
-            assert!(gated(method, path), "{method} {path} should be gated");
+            assert!(gated(method, route), "{method} {route} should be gated");
         }
     }
 
     #[test]
     fn compute_only_posts_are_exempt() {
-        for path in [
-            "/api/v1/branches/x/geoprocessing/clip",
-            "/api/v1/branches/x/geoprocessing/voronoi",
-            "/api/v1/branches/x/3d/extrude",
-            "/api/v1/branches/x/3d/minkowski-sum",
-            "/api/v1/networks/x/trace",
-            "/api/v1/networks/x/shortest-path",
-            "/api/v1/networks/x/astar",
-            "/api/v1/networks/x/isochrone",
-            "/api/v1/networks/x/tsp",
-            "/api/v1/pointclouds/x/query",
-            "/api/v1/pointclouds/x/profile",
-            "/api/v1/attribute-rules/x/validate",
-            "/api/v1/topologies/roads/validate",
-            "/api/v1/branches/x/similarity/search",
-            "/api/v1/branches/x/similarity/cluster",
-            "/api/v1/branches/x/h3/compact",
-            "/api/v1/branches/x/transform",
-            "/api/v1/branches/x/features/intersects",
-            "/api/v1/branches/x/features/within",
-            "/api/v1/branches/x/features/filter",
-            "/api/v1/trajectories/x/simplify",
-            "/api/v1/datasets/x/trajectories/nearest",
+        for route in [
+            "/api/v1/branches/{id}/geoprocessing/clip",
+            "/api/v1/branches/{id}/geoprocessing/voronoi",
+            "/api/v1/branches/{id}/3d/extrude",
+            "/api/v1/branches/{id}/3d/minkowski-sum",
+            "/api/v1/networks/{id}/trace",
+            "/api/v1/networks/{id}/shortest-path",
+            "/api/v1/networks/{id}/astar",
+            "/api/v1/networks/{id}/isochrone",
+            "/api/v1/networks/{id}/tsp",
+            "/api/v1/pointclouds/{id}/query",
+            "/api/v1/pointclouds/{id}/profile",
+            "/api/v1/attribute-rules/{id}/validate",
+            "/api/v1/topologies/{name}/validate",
+            "/api/v1/branches/{id}/similarity/search",
+            "/api/v1/branches/{id}/similarity/cluster",
+            "/api/v1/branches/{id}/h3/compact",
+            "/api/v1/branches/{id}/transform",
+            "/api/v1/branches/{id}/features/intersects",
+            "/api/v1/branches/{id}/features/within",
+            "/api/v1/branches/{id}/features/filter",
+            "/api/v1/trajectories/{id}/simplify",
+            "/api/v1/datasets/{id}/trajectories/nearest",
             "/api/v1/parcels/split",
             "/api/v1/parcels/merge",
             "/api/v1/surveys/compare",
             "/api/v1/coverage/simulate",
             "/api/v1/incidents/evacuate",
         ] {
-            assert!(!gated("POST", path), "{path} writes nothing");
+            assert!(!gated("POST", route), "{route} writes nothing");
         }
     }
 
     /// The near-miss pairs, so a broadened suffix cannot quietly exempt a write.
     #[test]
     fn lookalike_write_routes_stay_gated() {
-        assert!(gated("POST", "/api/v1/branches/x/merge/y"));
+        assert!(gated("POST", "/api/v1/branches/{t}/merge/{s}"));
         assert!(gated("POST", "/api/v1/incidents"));
-        assert!(gated("POST", "/api/v1/branches/x/reproject"));
-        assert!(gated("POST", "/api/v1/branches/x/import/geojson"));
+        assert!(gated("POST", "/api/v1/branches/{id}/reproject"));
+        assert!(gated("POST", "/api/v1/branches/{id}/import/geojson"));
+    }
+
+    /// A caller can put any single segment in `{tag}`, including the name of a
+    /// policy rule. The refuted version matched its lists against the raw path,
+    /// so `.../tags/trace` read as the compute-only `/trace` endpoint and
+    /// `.../tags/permissions` dropped the required role to any. On a template
+    /// those strings are inert: they can only ever appear as a parameter name,
+    /// and no policy entry is one. The live exploit runs in
+    /// `test_a_planted_tag_cannot_opt_out_of_the_write_ladder`.
+    #[test]
+    fn the_template_is_what_policy_reads() {
+        let template = "/api/v1/datasets/{id}/tags/{tag}";
+        assert!(gated("DELETE", template));
+        assert_eq!(
+            crate::auth::classify(&Method::DELETE, template),
+            crate::Access::Write
+        );
     }
 
     /// Grant management is gated harder elsewhere, and the ladder would deny the
     /// dataset admin who needs it most.
     #[test]
     fn permission_routes_are_left_to_rbac() {
-        assert!(!gated("POST", "/api/v1/datasets/x/permissions"));
-        assert!(!gated("POST", "/api/v1/branches/x/permissions"));
-        assert!(!gated("DELETE", "/api/v1/branches/x/permissions/bob"));
+        assert!(!gated("POST", "/api/v1/datasets/{id}/permissions"));
+        assert!(!gated("POST", "/api/v1/branches/{id}/permissions"));
+        assert!(!gated(
+            "DELETE",
+            "/api/v1/branches/{id}/permissions/{user_id}"
+        ));
+    }
+
+    /// With no template there is no policy to read, so a mutation is refused.
+    #[test]
+    fn a_missing_template_refuses_mutations_and_allows_reads() {
+        assert!(gated("POST", ""));
+        assert!(gated("DELETE", ""));
+        assert!(!gated("GET", ""));
     }
 }
