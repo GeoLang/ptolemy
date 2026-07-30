@@ -2,10 +2,11 @@
 // License, v. 3.0. If a copy of the AGPL was not distributed with this
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
-//! Feature attachment endpoints — binary files linked to features.
+//! Attachment endpoints — binary files linked to a feature or to a dataset.
 //!
-//! Supports photos, documents, GPS logs, and other files associated with
-//! individual features in a branch.
+//! Feature attachments are photos, documents and GPS logs about one feature.
+//! Dataset attachments are the files a whole dataset refers to, such as the
+//! icon or overlay image a style names.
 
 use axum::{
     Json, Router,
@@ -27,6 +28,10 @@ pub fn attachment_routes() -> Router<AppState> {
         .route(
             "/branches/{branch_id}/features/{feature_id}/attachments",
             get(list_attachments).post(upload_attachment),
+        )
+        .route(
+            "/datasets/{dataset_id}/attachments",
+            get(list_dataset_attachments).post(upload_dataset_attachment),
         )
         .route("/attachments/{id}", get(download_attachment))
         .route("/attachments/{id}/meta", get(get_attachment_meta))
@@ -53,8 +58,9 @@ async fn upload_attachment(
 
     let attachment = Attachment {
         id: Uuid::now_v7(),
-        feature_id,
-        branch_id,
+        feature_id: Some(feature_id),
+        branch_id: Some(branch_id),
+        dataset_id: None,
         name: req.name.clone(),
         content_type: req
             .content_type
@@ -71,8 +77,62 @@ async fn upload_attachment(
 
     let meta = AttachmentMeta {
         id: attachment.id,
-        feature_id,
-        branch_id,
+        feature_id: Some(feature_id),
+        branch_id: Some(branch_id),
+        dataset_id: None,
+        name: attachment.name,
+        content_type: attachment.content_type,
+        size_bytes: size,
+        metadata: attachment.metadata,
+        created_by: attachment.created_by,
+        created_at: now,
+    };
+
+    Ok((StatusCode::CREATED, Json(meta)))
+}
+
+async fn list_dataset_attachments(
+    State(store): State<AppState>,
+    Path(dataset_id): Path<Uuid>,
+) -> Result<Json<Vec<AttachmentMeta>>, AttachmentError> {
+    let attachments = store.list_dataset_attachments(dataset_id).await?;
+    Ok(Json(attachments))
+}
+
+async fn upload_dataset_attachment(
+    State(store): State<AppState>,
+    Path(dataset_id): Path<Uuid>,
+    actor: Actor,
+    Json(req): Json<UploadAttachmentRequest>,
+) -> Result<(StatusCode, Json<AttachmentMeta>), AttachmentError> {
+    let data = base64_decode(&req.data)?;
+    let size = data.len() as i64;
+    let now = OffsetDateTime::now_utc();
+
+    let attachment = Attachment {
+        id: Uuid::now_v7(),
+        feature_id: None,
+        branch_id: None,
+        dataset_id: Some(dataset_id),
+        name: req.name.clone(),
+        content_type: req
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".into()),
+        size_bytes: size,
+        data,
+        thumbnail: None,
+        metadata: req.metadata.unwrap_or(serde_json::json!({})),
+        created_by: actor.or_body(&req.created_by).to_string(),
+        created_at: now,
+    };
+
+    store.create_attachment(&attachment).await?;
+
+    let meta = AttachmentMeta {
+        id: attachment.id,
+        feature_id: None,
+        branch_id: None,
+        dataset_id: Some(dataset_id),
         name: attachment.name,
         content_type: attachment.content_type,
         size_bytes: size,
@@ -125,6 +185,7 @@ async fn get_attachment_meta(
         id: a.id,
         feature_id: a.feature_id,
         branch_id: a.branch_id,
+        dataset_id: a.dataset_id,
         name: a.name,
         content_type: a.content_type,
         size_bytes: a.size_bytes,

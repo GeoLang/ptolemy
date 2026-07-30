@@ -378,6 +378,8 @@ async fn resolve_and_merge(
                                 feature_id: *fid,
                                 geometry_wkb: geom,
                                 properties: Some(merged_props),
+                                valid_from: None,
+                                valid_to: None,
                             });
                         }
                         "custom" => {
@@ -389,6 +391,8 @@ async fn resolve_and_merge(
                                 feature_id: *fid,
                                 geometry_wkb: wkb,
                                 properties: res.custom_properties.clone(),
+                                valid_from: None,
+                                valid_to: None,
                             });
                         }
                         _ => {
@@ -450,25 +454,33 @@ fn diff_ops_match(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                valid_from: vfa,
+                valid_to: vta,
             },
             DiffOp::Insert {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                valid_from: vfb,
+                valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb,
+        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
         (
             DiffOp::Update {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                valid_from: vfa,
+                valid_to: vta,
             },
             DiffOp::Update {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                valid_from: vfb,
+                valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb,
+        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
         (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
         _ => false,
     }

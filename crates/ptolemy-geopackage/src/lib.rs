@@ -129,7 +129,9 @@ fn geometry_type_from_name(name: &str) -> GeometryType {
         "MULTIPOINT" => GeometryType::MultiPoint,
         "MULTILINESTRING" => GeometryType::MultiLineString,
         "MULTIPOLYGON" => GeometryType::MultiPolygon,
-        _ => GeometryType::GeometryCollection,
+        "GEOMETRYCOLLECTION" => GeometryType::GeometryCollection,
+        // gpkg_geometry_columns says GEOMETRY for a layer with mixed types
+        _ => GeometryType::Geometry,
     }
 }
 
@@ -283,6 +285,8 @@ fn row_to_feature(table: &str, id: &str, blob: &[u8], props: &str) -> StoreResul
         dataset_id: dataset_uuid(table),
         geometry_wkb: wkb,
         properties,
+        valid_from: None,
+        valid_to: None,
     })
 }
 

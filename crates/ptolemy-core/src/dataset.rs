@@ -64,4 +64,7 @@ pub enum GeometryType {
     MultiLineString,
     MultiPolygon,
     GeometryCollection,
+    /// Features in the dataset differ from each other, so nothing narrower fits.
+    /// Not GeometryCollection: that is one feature whose geometry is a collection.
+    Geometry,
 }

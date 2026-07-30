@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `geometry_type: "geometry"` on a dataset, for a source container whose features
+  differ from each other. Distinct from `geometry_collection`, which is one
+  feature whose geometry is a collection.
+
+- Attachments may belong to a dataset instead of a feature, via
+  `GET`/`POST /datasets/{id}/attachments`. A style's icon or overlay image
+  belongs to no single feature. Download, meta and delete serve both kinds.
+
+- A feature version carries an optional valid time, `valid_from` and `valid_to`,
+  set per operation on commit and returned on reads. Both null means no time was
+  recorded. `GET /branches/{id}/features?valid_at=<RFC3339>` keeps only the
+  features whose half-open range `[valid_from, valid_to)` covers the instant.
+
 ### Fixed
 
 - `POST /branches/{id}/import/geojson` and `/import/csv` imported nothing: every

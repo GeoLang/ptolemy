@@ -97,6 +97,8 @@ impl GrpcService {
                     geometry_wkb: f.geometry_wkb,
                     properties: serde_json::from_str(&f.properties_json)
                         .unwrap_or(serde_json::Value::Object(Default::default())),
+                    valid_from: None,
+                    valid_to: None,
                 }
             })
             .collect();

@@ -161,7 +161,9 @@ fn geometry_type_from_geojson(geom: &Value) -> GeometryType {
         "MultiPoint" => GeometryType::MultiPoint,
         "MultiLineString" => GeometryType::MultiLineString,
         "MultiPolygon" => GeometryType::MultiPolygon,
-        _ => GeometryType::GeometryCollection,
+        "GeometryCollection" => GeometryType::GeometryCollection,
+        // no usable type on the sample, so nothing narrower can be claimed
+        _ => GeometryType::Geometry,
     }
 }
 
@@ -181,6 +183,8 @@ fn source_to_feature(dataset: &str, id: &str, source: &Value) -> StoreResult<Fea
         dataset_id: dataset_uuid(dataset),
         geometry_wkb: wkb,
         properties,
+        valid_from: None,
+        valid_to: None,
     })
 }
 

@@ -306,6 +306,8 @@ async fn import_geojson(
                 .get("properties")
                 .cloned()
                 .unwrap_or(serde_json::json!({})),
+            valid_from: None,
+            valid_to: None,
         });
     }
 
@@ -452,6 +454,8 @@ async fn import_csv(
             feature_id: Uuid::now_v7(),
             geometry_wkb,
             properties: serde_json::Value::Object(props),
+            valid_from: None,
+            valid_to: None,
         });
     }
 

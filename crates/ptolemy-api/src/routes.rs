@@ -289,6 +289,10 @@ struct FeatureListParams {
     /// Page size (default 100, max 10000)
     #[serde(default = "default_limit")]
     limit: i64,
+    /// RFC 3339 instant; keeps only features whose valid time covers it.
+    /// A feature with no valid time recorded always matches.
+    #[serde(default)]
+    valid_at: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -301,8 +305,16 @@ async fn list_features(
     Query(params): Query<FeatureListParams>,
 ) -> Result<Json<FeaturePage>, AppError> {
     let limit = params.limit.clamp(1, 10000);
+    let valid_at = params
+        .valid_at
+        .as_deref()
+        .map(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                .map_err(|e| AppError::BadRequest(format!("invalid valid_at (use RFC 3339): {e}")))
+        })
+        .transpose()?;
     let features = store
-        .list_features_paginated(id, params.cursor, limit)
+        .list_features_paginated(id, params.cursor, limit, valid_at)
         .await?;
     let next_cursor = if features.len() as i64 == limit {
         features.last().map(|f| f.id)
@@ -471,6 +483,8 @@ async fn batch_commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = hex::decode(&geometry_wkb_hex)
                     .map_err(|e| AppError::BadRequest(format!("invalid hex: {e}")))?;
@@ -478,12 +492,16 @@ async fn batch_commit(
                     feature_id: feature_id.unwrap_or_else(Uuid::now_v7),
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             DiffOpRequest::Update {
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = geometry_wkb_hex
                     .map(|h| hex::decode(&h))
@@ -493,6 +511,8 @@ async fn batch_commit(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             DiffOpRequest::Delete { feature_id } => Ok(DiffOp::Delete { feature_id }),
@@ -541,6 +561,10 @@ enum DiffOpRequest {
         feature_id: Option<Uuid>,
         geometry_wkb_hex: String,
         properties: serde_json::Value,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_from: Option<time::OffsetDateTime>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_to: Option<time::OffsetDateTime>,
     },
     Update {
         feature_id: Uuid,
@@ -548,6 +572,10 @@ enum DiffOpRequest {
         geometry_wkb_hex: Option<String>,
         #[serde(default)]
         properties: Option<serde_json::Value>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_from: Option<time::OffsetDateTime>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_to: Option<time::OffsetDateTime>,
     },
     Delete {
         feature_id: Uuid,
@@ -568,6 +596,8 @@ async fn commit(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = hex::decode(&geometry_wkb_hex)
                     .map_err(|e| AppError::BadRequest(format!("invalid hex: {e}")))?;
@@ -575,12 +605,16 @@ async fn commit(
                     feature_id: feature_id.unwrap_or_else(Uuid::now_v7),
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             DiffOpRequest::Update {
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = geometry_wkb_hex
                     .map(|h| hex::decode(&h))
@@ -590,6 +624,8 @@ async fn commit(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             DiffOpRequest::Delete { feature_id } => Ok(DiffOp::Delete { feature_id }),
@@ -807,6 +843,7 @@ fn parse_geometry_type(s: &str) -> GeometryType {
         "multilinestring" => GeometryType::MultiLineString,
         "multipolygon" => GeometryType::MultiPolygon,
         "geometrycollection" => GeometryType::GeometryCollection,
+        "geometry" => GeometryType::Geometry,
         _ => GeometryType::Point,
     }
 }

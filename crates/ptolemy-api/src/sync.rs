@@ -68,6 +68,10 @@ enum SyncDiffOp {
         feature_id: Uuid,
         geometry_wkb_hex: String,
         properties: serde_json::Value,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_from: Option<time::OffsetDateTime>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_to: Option<time::OffsetDateTime>,
     },
     Update {
         feature_id: Uuid,
@@ -75,6 +79,10 @@ enum SyncDiffOp {
         geometry_wkb_hex: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         properties: Option<serde_json::Value>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_from: Option<time::OffsetDateTime>,
+        #[serde(default, with = "time::serde::rfc3339::option")]
+        valid_to: Option<time::OffsetDateTime>,
     },
     Delete {
         feature_id: Uuid,
@@ -112,19 +120,27 @@ async fn sync_pull(
                     feature_id,
                     geometry_wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 } => SyncDiffOp::Insert {
                     feature_id,
                     geometry_wkb_hex: hex::encode(&geometry_wkb),
                     properties,
+                    valid_from,
+                    valid_to,
                 },
                 ptolemy_core::diff::DiffOp::Update {
                     feature_id,
                     geometry_wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 } => SyncDiffOp::Update {
                     feature_id,
                     geometry_wkb_hex: geometry_wkb.map(|w| hex::encode(&w)),
                     properties,
+                    valid_from,
+                    valid_to,
                 },
                 ptolemy_core::diff::DiffOp::Delete { feature_id } => {
                     SyncDiffOp::Delete { feature_id }
@@ -214,6 +230,8 @@ async fn sync_push(
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = hex::decode(&geometry_wkb_hex)
                     .map_err(|e| SyncError::BadRequest(format!("invalid hex: {e}")))?;
@@ -221,12 +239,16 @@ async fn sync_push(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             SyncDiffOp::Update {
                 feature_id,
                 geometry_wkb_hex,
                 properties,
+                valid_from,
+                valid_to,
             } => {
                 let wkb = geometry_wkb_hex
                     .map(|h| hex::decode(&h))
@@ -236,6 +258,8 @@ async fn sync_push(
                     feature_id,
                     geometry_wkb: wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 })
             }
             SyncDiffOp::Delete { feature_id } => {

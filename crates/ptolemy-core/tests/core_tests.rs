@@ -277,6 +277,8 @@ fn test_feature_serialization_roundtrip() {
         dataset_id: Uuid::now_v7(),
         geometry_wkb: vec![0x01, 0x01, 0x00, 0x00, 0x00], // WKB point header
         properties: json!({"name": "test", "value": 42}),
+        valid_from: None,
+        valid_to: None,
     };
     let serialized = serde_json::to_string(&feature).unwrap();
     let deserialized: Feature = serde_json::from_str(&serialized).unwrap();
@@ -297,12 +299,53 @@ fn test_dataset_geometry_types() {
         GeometryType::MultiLineString,
         GeometryType::MultiPolygon,
         GeometryType::GeometryCollection,
+        GeometryType::Geometry,
     ];
     for gt in types {
         let json = serde_json::to_string(&gt).unwrap();
         let back: GeometryType = serde_json::from_str(&json).unwrap();
         assert_eq!(gt, back);
     }
+}
+
+#[test]
+fn test_mixed_geometry_type_serialises_as_geometry() {
+    use ptolemy_core::dataset::GeometryType;
+
+    assert_eq!(
+        serde_json::to_string(&GeometryType::Geometry).unwrap(),
+        "\"geometry\""
+    );
+    let back: GeometryType = serde_json::from_str("\"geometry\"").unwrap();
+    assert_eq!(back, GeometryType::Geometry);
+    // the two are distinct: one feature's collection vs a dataset's mixed types
+    assert_ne!(GeometryType::Geometry, GeometryType::GeometryCollection);
+}
+
+#[test]
+fn test_feature_valid_time_serde_round_trip() {
+    let with_range = Feature {
+        id: Uuid::now_v7(),
+        dataset_id: Uuid::now_v7(),
+        geometry_wkb: vec![1, 2, 3],
+        properties: json!({}),
+        valid_from: Some(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+        valid_to: Some(OffsetDateTime::from_unix_timestamp(2_000).unwrap()),
+    };
+    let back: Feature = serde_json::from_str(&serde_json::to_string(&with_range).unwrap()).unwrap();
+    assert_eq!(back.valid_from, with_range.valid_from);
+    assert_eq!(back.valid_to, with_range.valid_to);
+
+    // absent fields deserialise as no time recorded
+    let json = json!({
+        "id": Uuid::now_v7(),
+        "dataset_id": Uuid::now_v7(),
+        "geometry_wkb": [1, 2, 3],
+        "properties": {},
+    });
+    let back: Feature = serde_json::from_value(json).unwrap();
+    assert_eq!(back.valid_from, None);
+    assert_eq!(back.valid_to, None);
 }
 
 #[test]
@@ -369,6 +412,8 @@ fn test_diff_insert_operation() {
             feature_id: fid,
             geometry_wkb: vec![1, 2, 3],
             properties: json!({"name": "new feature"}),
+            valid_from: None,
+            valid_to: None,
         }],
     };
     assert_eq!(diff.operations.len(), 1);
@@ -387,6 +432,8 @@ fn test_diff_update_operation() {
             feature_id: fid,
             geometry_wkb: Some(vec![4, 5, 6]),
             properties: None,
+            valid_from: None,
+            valid_to: None,
         }],
     };
     let json = serde_json::to_string(&diff).unwrap();
@@ -418,11 +465,15 @@ fn test_diff_multiple_operations() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: vec![1],
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             },
             DiffOp::Update {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: None,
                 properties: Some(json!({"updated": true})),
+                valid_from: None,
+                valid_to: None,
             },
             DiffOp::Delete {
                 feature_id: Uuid::now_v7(),

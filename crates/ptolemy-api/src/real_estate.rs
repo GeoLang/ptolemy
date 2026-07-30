@@ -326,7 +326,7 @@ async fn parcel_split(
         .map_err(RealEstateError::Store)?;
     // Get the feature
     let features = store
-        .list_features_paginated(req.branch_id, None, 10000)
+        .list_features_paginated(req.branch_id, None, 10000, None)
         .await
         .map_err(RealEstateError::Store)?;
     let feature = features
@@ -375,7 +375,7 @@ async fn parcel_merge(
     }
 
     let features = store
-        .list_features_paginated(req.branch_id, None, 10000)
+        .list_features_paginated(req.branch_id, None, 10000, None)
         .await
         .map_err(RealEstateError::Store)?;
 

@@ -38,8 +38,7 @@ pub enum StoreError {
 
 /// Columns every read query needs from `latest`. Public so a handler that builds
 /// its own query can ask for the same projection.
-pub const LATEST_COLUMNS: &str =
-    "fv.feature_id, fv.dataset_id, fv.operation, fv.geometry, fv.properties";
+pub const LATEST_COLUMNS: &str = "fv.feature_id, fv.dataset_id, fv.operation, fv.geometry, fv.properties, fv.valid_from, fv.valid_to";
 
 /// Latest live version of each feature on the branch bound to `$1`, resolved by
 /// walking the branch head's ancestor chain. Shared by the read queries so the
@@ -95,13 +94,25 @@ pub fn branch_features_subquery(branch_expr: &str) -> String {
           live AS (
               SELECT DISTINCT ON (fv.feature_id)
                      fv.feature_id AS id, fv.dataset_id, fv.operation,
-                     fv.geometry, fv.properties, fv.created_at
+                     fv.geometry, fv.properties, fv.created_at,
+                     fv.valid_from, fv.valid_to
                 FROM feature_versions fv JOIN chain ch ON fv.changeset_id = ch.id
                ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
           )
           SELECT id, {branch_expr}::uuid AS branch_id, dataset_id, geometry,
-                 properties, created_at
+                 properties, created_at, valid_from, valid_to
             FROM live WHERE operation <> 'delete')"
+    )
+}
+
+/// Keeps rows whose valid time covers the instant at `placeholder`, which the
+/// caller always binds: NULL there means no filter, so one query shape serves
+/// both. Half-open, [valid_from, valid_to), and a NULL end is unbounded.
+fn valid_at_predicate(placeholder: &str) -> String {
+    format!(
+        "({placeholder}::timestamptz IS NULL
+                  OR ((valid_from IS NULL OR valid_from <= {placeholder})
+                      AND (valid_to IS NULL OR valid_to > {placeholder})))"
     )
 }
 
@@ -760,16 +771,20 @@ impl PgStore {
                     feature_id,
                     geometry_wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 } => {
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties)
-                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5)",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to)
+                         VALUES ($1, $2, $3, 'insert', ST_GeomFromWKB($4, 4326), $5, $6, $7)",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
                     .bind(changeset_id)
                     .bind(geometry_wkb)
                     .bind(properties)
+                    .bind(valid_from)
+                    .bind(valid_to)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -777,6 +792,8 @@ impl PgStore {
                     feature_id,
                     geometry_wkb,
                     properties,
+                    valid_from,
+                    valid_to,
                 } => {
                     // fill omitted fields from this branch's own chain, never other branches
                     let geom = if let Some(wkb) = geometry_wkb {
@@ -819,19 +836,42 @@ impl PgStore {
                         .await?;
                         row.get::<serde_json::Value, _>("properties")
                     };
+                    let (from, to) = if valid_from.is_none() && valid_to.is_none() {
+                        let row = sqlx::query(
+                            "WITH RECURSIVE chain AS (
+                                SELECT id, parent_id FROM changesets WHERE id = $2
+                              UNION ALL
+                                SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
+                            )
+                            SELECT fv.valid_from, fv.valid_to FROM feature_versions fv
+                            JOIN chain ch ON fv.changeset_id = ch.id
+                            WHERE fv.feature_id = $1 AND fv.operation != 'delete'
+                            ORDER BY fv.id DESC LIMIT 1",
+                        )
+                        .bind(feature_id)
+                        .bind(changeset_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        (row.get("valid_from"), row.get("valid_to"))
+                    } else {
+                        (*valid_from, *valid_to)
+                    };
                     sqlx::query(
-                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties)
-                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5)",
+                        "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties, valid_from, valid_to)
+                         VALUES ($1, $2, $3, 'update', ST_GeomFromWKB($4, 4326), $5, $6, $7)",
                     )
                     .bind(feature_id)
                     .bind(dataset_id)
                     .bind(changeset_id)
                     .bind(&geom)
                     .bind(&props)
+                    .bind(from)
+                    .bind(to)
                     .execute(&mut *tx)
                     .await?;
                 }
                 DiffOp::Delete { feature_id } => {
+                    // no valid time on a delete: there is no version to be true
                     sqlx::query(
                         "INSERT INTO feature_versions (feature_id, dataset_id, changeset_id, operation, geometry, properties)
                          VALUES ($1, $2, $3, 'delete', NULL, '{}')",
@@ -960,7 +1000,8 @@ impl PgStore {
         let (external, prelude, source) = self.latest_source(branch_id).await?;
         let rows = sqlx::query(&format!(
             "{prelude}
-            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
             FROM {source}
             WHERE operation != 'delete'"
         ))
@@ -975,6 +1016,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -992,7 +1035,8 @@ impl PgStore {
                 SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
             )
             SELECT fv.feature_id, fv.dataset_id, fv.operation,
-                   ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
+                   ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
+                   fv.valid_from, fv.valid_to
             FROM feature_versions fv
             JOIN chain ch ON fv.changeset_id = ch.id
             WHERE fv.feature_id = $1
@@ -1010,6 +1054,8 @@ impl PgStore {
                 dataset_id: r.get("dataset_id"),
                 geometry_wkb: r.get("geometry_wkb"),
                 properties: r.get("properties"),
+                valid_from: r.get("valid_from"),
+                valid_to: r.get("valid_to"),
             })),
             _ => Ok(None),
         }
@@ -1041,7 +1087,8 @@ impl PgStore {
                 )
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
-                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
+                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
+                    fv.valid_from, fv.valid_to
                 FROM feature_versions fv
                 JOIN new_changesets nc ON fv.changeset_id = nc.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1059,7 +1106,8 @@ impl PgStore {
                 )
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
-                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties
+                    ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
+                    fv.valid_from, fv.valid_to
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
@@ -1079,11 +1127,15 @@ impl PgStore {
                         feature_id,
                         geometry_wkb: row.get("geometry_wkb"),
                         properties: row.get("properties"),
+                        valid_from: row.get("valid_from"),
+                        valid_to: row.get("valid_to"),
                     },
                     "update" => DiffOp::Update {
                         feature_id,
                         geometry_wkb: Some(row.get("geometry_wkb")),
                         properties: Some(row.get("properties")),
+                        valid_from: row.get("valid_from"),
+                        valid_to: row.get("valid_to"),
                     },
                     "delete" => DiffOp::Delete { feature_id },
                     _ => unreachable!(),
@@ -1440,6 +1492,8 @@ impl PgStore {
                                 feature_id: fid_b,
                                 geometry_wkb: Some(fixed_wkb),
                                 properties: None,
+                                valid_from: None,
+                                valid_to: None,
                             });
                             repaired.push(TopologyRepair {
                                 feature_id: fid_b,
@@ -1477,6 +1531,8 @@ impl PgStore {
                                 feature_id: fid_b,
                                 geometry_wkb: Some(snapped_wkb),
                                 properties: None,
+                                valid_from: None,
+                                valid_to: None,
                             });
                             repaired.push(TopologyRepair {
                                 feature_id: fid_b,
@@ -1549,40 +1605,51 @@ impl PgStore {
 
     // ─── Paginated Feature List ─────────────────────────────────────
 
-    /// List features with cursor-based pagination.
+    /// List features with cursor-based pagination, optionally only those valid
+    /// at `valid_at`. A row with no valid time recorded always matches, and the
+    /// range is half-open: [valid_from, valid_to).
     pub async fn list_features_paginated(
         &self,
         branch_id: Uuid,
         cursor: Option<Uuid>,
         limit: i64,
+        valid_at: Option<OffsetDateTime>,
     ) -> Result<Vec<Feature>, StoreError> {
         let (external, prelude, source) = self.latest_source(branch_id).await?;
         let pool = self.read_pool(external.as_ref()).await?;
         let query = if let Some(cursor_id) = cursor {
             sqlx::query(&format!(
                 "{prelude}
-                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                       properties, valid_from, valid_to
                 FROM {source}
                 WHERE operation != 'delete' AND feature_id > $2
+                  AND {valid}
                 ORDER BY feature_id
-                LIMIT $3"
+                LIMIT $3",
+                valid = valid_at_predicate("$4")
             ))
             .bind(branch_id)
             .bind(cursor_id)
             .bind(limit)
+            .bind(valid_at)
             .fetch_all(pool)
             .await?
         } else {
             sqlx::query(&format!(
                 "{prelude}
-                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+                SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                       properties, valid_from, valid_to
                 FROM {source}
                 WHERE operation != 'delete'
+                  AND {valid}
                 ORDER BY feature_id
-                LIMIT $2"
+                LIMIT $2",
+                valid = valid_at_predicate("$3")
             ))
             .bind(branch_id)
             .bind(limit)
+            .bind(valid_at)
             .fetch_all(pool)
             .await?
         };
@@ -1594,6 +1661,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -1615,7 +1684,8 @@ impl PgStore {
         let (external, prelude, source) = self.latest_source(branch_id).await?;
         let rows = sqlx::query(&format!(
             "{prelude}
-            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
             FROM {source}
             WHERE operation != 'delete'
               AND properties->>$2 ILIKE '%' || $3 || '%'
@@ -1636,6 +1706,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -1661,7 +1733,8 @@ impl PgStore {
             .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
-            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
             FROM {source}
             WHERE operation != 'delete'
               AND geometry && ST_MakeEnvelope($2, $3, $4, $5, 4326)
@@ -1683,6 +1756,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -1699,7 +1774,8 @@ impl PgStore {
             .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
-            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
             FROM {source}
             WHERE operation != 'delete'
               AND ST_Intersects(geometry, ST_GeomFromGeoJSON($2))
@@ -1718,6 +1794,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -1736,7 +1814,8 @@ impl PgStore {
             .await?;
         let rows = sqlx::query(&format!(
             "{prelude}
-            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb, properties
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
             FROM {source}
             WHERE operation != 'delete'
               AND ST_Within(geometry, ST_GeomFromGeoJSON($2))
@@ -1755,6 +1834,8 @@ impl PgStore {
                 dataset_id: row.get("dataset_id"),
                 geometry_wkb: row.get("geometry_wkb"),
                 properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
@@ -2161,6 +2242,8 @@ impl PgStore {
                 feature_id: row.get("feature_id"),
                 geometry_wkb: Some(row.get("fixed_geom")),
                 properties: None,
+                valid_from: None,
+                valid_to: None,
             })
             .collect();
 
@@ -2379,13 +2462,13 @@ impl PgStore {
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
                     ST_AsGeoJSON(fv.geometry)::jsonb as geojson,
-                    fv.properties
+                    fv.properties, fv.valid_from, fv.valid_to
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 WHERE fv.created_at <= $2
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
-            SELECT feature_id, geojson, properties
+            SELECT feature_id, geojson, properties, valid_from, valid_to
             FROM latest
             WHERE operation != 'delete'
             LIMIT $3 OFFSET $4",
@@ -2407,6 +2490,8 @@ impl PgStore {
                     dataset_id: Uuid::nil(),
                     geometry_wkb: geom_str.into_bytes(),
                     properties: row.get("properties"),
+                    valid_from: row.get("valid_from"),
+                    valid_to: row.get("valid_to"),
                 }
             })
             .collect())
@@ -2564,12 +2649,13 @@ impl PgStore {
 
     pub async fn create_attachment(&self, attachment: &Attachment) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO attachments (id, feature_id, branch_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO attachments (id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(attachment.id)
         .bind(attachment.feature_id)
         .bind(attachment.branch_id)
+        .bind(attachment.dataset_id)
         .bind(&attachment.name)
         .bind(&attachment.content_type)
         .bind(attachment.size_bytes)
@@ -2588,7 +2674,7 @@ impl PgStore {
         branch_id: Uuid,
     ) -> Result<Vec<AttachmentMeta>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, feature_id, branch_id, name, content_type, size_bytes, metadata, created_by, created_at
+            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
              FROM attachments
              WHERE feature_id = $1 AND branch_id = $2
              ORDER BY created_at DESC",
@@ -2598,25 +2684,31 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| AttachmentMeta {
-                id: row.get("id"),
-                feature_id: row.get("feature_id"),
-                branch_id: row.get("branch_id"),
-                name: row.get("name"),
-                content_type: row.get("content_type"),
-                size_bytes: row.get("size_bytes"),
-                metadata: row.get("metadata"),
-                created_by: row.get("created_by"),
-                created_at: row.get("created_at"),
-            })
-            .collect())
+        Ok(rows.into_iter().map(attachment_meta_from_row).collect())
+    }
+
+    /// The dataset's own attachments: the ones a style refers to, which belong
+    /// to no single feature.
+    pub async fn list_dataset_attachments(
+        &self,
+        dataset_id: Uuid,
+    ) -> Result<Vec<AttachmentMeta>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
+             FROM attachments
+             WHERE dataset_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(attachment_meta_from_row).collect())
     }
 
     pub async fn get_attachment(&self, id: Uuid) -> Result<Attachment, StoreError> {
         let row = sqlx::query(
-            "SELECT id, feature_id, branch_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
+            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
              FROM attachments WHERE id = $1",
         )
         .bind(id)
@@ -2628,6 +2720,7 @@ impl PgStore {
             id: row.get("id"),
             feature_id: row.get("feature_id"),
             branch_id: row.get("branch_id"),
+            dataset_id: row.get("dataset_id"),
             name: row.get("name"),
             content_type: row.get("content_type"),
             size_bytes: row.get("size_bytes"),
@@ -3277,11 +3370,14 @@ pub struct TopologyRepair {
 
 // ─── Attachment types ───────────────────────────────────────────────
 
+/// Owned by either a feature on a branch or a dataset, never both and never
+/// neither; the `attachments_one_owner` CHECK is the authority.
 #[derive(Debug, Clone, Serialize)]
 pub struct Attachment {
     pub id: Uuid,
-    pub feature_id: Uuid,
-    pub branch_id: Uuid,
+    pub feature_id: Option<Uuid>,
+    pub branch_id: Option<Uuid>,
+    pub dataset_id: Option<Uuid>,
     pub name: String,
     pub content_type: String,
     pub size_bytes: i64,
@@ -3299,8 +3395,9 @@ pub struct Attachment {
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentMeta {
     pub id: Uuid,
-    pub feature_id: Uuid,
-    pub branch_id: Uuid,
+    pub feature_id: Option<Uuid>,
+    pub branch_id: Option<Uuid>,
+    pub dataset_id: Option<Uuid>,
     pub name: String,
     pub content_type: String,
     pub size_bytes: i64,
@@ -3527,25 +3624,33 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                valid_from: vfa,
+                valid_to: vta,
             },
             DiffOp::Insert {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                valid_from: vfb,
+                valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb,
+        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
         (
             DiffOp::Update {
                 feature_id: fa,
                 geometry_wkb: ga,
                 properties: pa,
+                valid_from: vfa,
+                valid_to: vta,
             },
             DiffOp::Update {
                 feature_id: fb,
                 geometry_wkb: gb,
                 properties: pb,
+                valid_from: vfb,
+                valid_to: vtb,
             },
-        ) => fa == fb && ga == gb && pa == pb,
+        ) => fa == fb && ga == gb && pa == pb && vfa == vfb && vta == vtb,
         (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
         _ => false,
     }
@@ -3554,6 +3659,21 @@ fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
 /// Rebuild the validated [`ExternalTable`] from a `datasets` row. Names in the
 /// table passed validation when they were written, so a row that fails it now
 /// was tampered with outside the API and must not reach a query.
+fn attachment_meta_from_row(row: sqlx::postgres::PgRow) -> AttachmentMeta {
+    AttachmentMeta {
+        id: row.get("id"),
+        feature_id: row.get("feature_id"),
+        branch_id: row.get("branch_id"),
+        dataset_id: row.get("dataset_id"),
+        name: row.get("name"),
+        content_type: row.get("content_type"),
+        size_bytes: row.get("size_bytes"),
+        metadata: row.get("metadata"),
+        created_by: row.get("created_by"),
+        created_at: row.get("created_at"),
+    }
+}
+
 fn external_table_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<Option<ExternalTable>, StoreError> {
@@ -3606,6 +3726,7 @@ fn parse_geometry_type(s: String) -> GeometryType {
         "multilinestring" => GeometryType::MultiLineString,
         "multipolygon" => GeometryType::MultiPolygon,
         "geometrycollection" => GeometryType::GeometryCollection,
+        "geometry" => GeometryType::Geometry,
         _ => GeometryType::Point,
     }
 }

@@ -67,7 +67,7 @@ async fn list_sensors(
 ) -> Result<Json<Vec<SensorInfo>>, VerticalError> {
     let limit = params.limit.clamp(1, 500);
     let features = store
-        .list_features_paginated(params.branch_id, None, limit)
+        .list_features_paginated(params.branch_id, None, limit, None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -125,7 +125,7 @@ async fn sensor_readings(
 ) -> Result<Json<Vec<SensorReading>>, VerticalError> {
     let limit = params.limit.clamp(1, 1000);
     let features = store
-        .list_features_paginated(params.branch_id, None, limit)
+        .list_features_paginated(params.branch_id, None, limit, None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -194,7 +194,7 @@ async fn survey_compare(
         .map_err(VerticalError::Store)?;
     // Fetch both surveys
     let features = store
-        .list_features_paginated(req.branch_id, None, 10000)
+        .list_features_paginated(req.branch_id, None, 10000, None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -266,7 +266,7 @@ async fn list_surveys(
     Query(params): Query<SurveyListParams>,
 ) -> Result<Json<Vec<SurveyInfo>>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500))
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500), None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -316,7 +316,7 @@ async fn list_milestones(
     Query(params): Query<MilestoneParams>,
 ) -> Result<Json<Vec<Milestone>>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 200))
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 200), None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -368,7 +368,7 @@ async fn list_fields(
     Query(params): Query<FieldListParams>,
 ) -> Result<Json<Vec<FieldInfo>>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500))
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500), None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -414,7 +414,7 @@ async fn field_ndvi(
     Query(params): Query<NdviParams>,
 ) -> Result<Json<NdviResponse>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, 10000)
+        .list_features_paginated(params.branch_id, None, 10000, None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -475,7 +475,7 @@ async fn list_towers(
     Query(params): Query<TowerListParams>,
 ) -> Result<Json<Vec<TowerInfo>>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500))
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500), None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -620,7 +620,7 @@ async fn list_incidents(
     Query(params): Query<IncidentListParams>,
 ) -> Result<Json<Vec<IncidentInfo>>, VerticalError> {
     let features = store
-        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500))
+        .list_features_paginated(params.branch_id, None, params.limit.clamp(1, 500), None)
         .await
         .map_err(VerticalError::Store)?;
 
@@ -708,6 +708,8 @@ async fn create_incident(
         feature_id,
         geometry_wkb: wkb,
         properties: properties.clone(),
+        valid_from: None,
+        valid_to: None,
     }];
 
     store

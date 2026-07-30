@@ -191,7 +191,9 @@ impl ExternalSource {
              {branch_expr}::uuid AS branch_id, \
              '{dataset_id}'::uuid AS dataset_id, \
              {geometry} AS geometry, \
-             to_jsonb(t) - {geom_key} AS properties \
+             to_jsonb(t) - {geom_key} AS properties, \
+             NULL::timestamptz AS valid_from, \
+             NULL::timestamptz AS valid_to \
              FROM {relation} t WHERE t.{id} IS NOT NULL{prefilter})"
         )
     }
@@ -202,7 +204,7 @@ impl ExternalSource {
         let inner = self.features_subquery(branch_expr, overlaps_4326);
         format!(
             "(SELECT id AS feature_id, branch_id, dataset_id, 'insert' AS operation, \
-             geometry, properties FROM {inner} ext)"
+             geometry, properties, valid_from, valid_to FROM {inner} ext)"
         )
     }
 

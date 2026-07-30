@@ -617,6 +617,7 @@ fn parse_geom_type(s: &str) -> GeometryType {
         "multipoint" => GeometryType::MultiPoint,
         "multilinestring" => GeometryType::MultiLineString,
         "multipolygon" => GeometryType::MultiPolygon,
+        "geometry" => GeometryType::Geometry,
         _ => GeometryType::Point,
     }
 }
@@ -638,6 +639,8 @@ fn parse_geojson_to_ops(content: &str) -> anyhow::Result<Vec<DiffOp>> {
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties,
+            valid_from: None,
+            valid_to: None,
         });
     }
     Ok(ops)
@@ -849,6 +852,8 @@ fn parse_shapefile_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>>
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties: serde_json::Value::Object(properties),
+            valid_from: None,
+            valid_to: None,
         });
     }
     Ok(ops)
@@ -991,6 +996,8 @@ fn parse_geopackage_to_ops(path: &std::path::Path) -> anyhow::Result<Vec<DiffOp>
             feature_id: Uuid::now_v7(),
             geometry_wkb: wkb,
             properties: serde_json::Value::Object(properties),
+            valid_from: None,
+            valid_to: None,
         });
     }
     Ok(ops)

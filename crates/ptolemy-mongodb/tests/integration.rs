@@ -20,6 +20,8 @@ fn feature(wkb: Vec<u8>, props: serde_json::Value) -> Feature {
         dataset_id: Uuid::new_v4(),
         geometry_wkb: wkb,
         properties: props,
+        valid_from: None,
+        valid_to: None,
     }
 }
 

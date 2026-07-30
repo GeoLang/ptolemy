@@ -50,6 +50,7 @@ async fn setup_with_analyze_threshold(rows: usize) -> PgStore {
     // Clean slate
     sqlx::raw_sql(
         "DROP TABLE IF EXISTS conflicts CASCADE;
+         DROP TABLE IF EXISTS attachments CASCADE;
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
          DROP TABLE IF EXISTS branches CASCADE;
@@ -175,11 +176,15 @@ async fn test_commit_insert_features() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(1.0, 2.0),
                     properties: json!({"name": "Park"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(3.0, 4.0),
                     properties: json!({"name": "School"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -218,6 +223,8 @@ async fn test_commit_update_feature() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -234,6 +241,8 @@ async fn test_commit_update_feature() {
                 feature_id: f1,
                 geometry_wkb: None, // keep geometry
                 properties: Some(json!({"name": "Central Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -264,6 +273,8 @@ async fn test_commit_delete_feature() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -302,6 +313,8 @@ async fn test_feature_at_specific_changeset() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(1.0, 2.0),
                 properties: json!({"version": 1}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -317,6 +330,8 @@ async fn test_feature_at_specific_changeset() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"version": 2})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -349,6 +364,8 @@ async fn test_branch_history() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -364,6 +381,8 @@ async fn test_branch_history() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"updated": true})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -399,11 +418,15 @@ async fn test_diff_from_root() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"a": 1}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"b": 2}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -433,6 +456,8 @@ async fn test_diff_between_changesets() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -448,6 +473,8 @@ async fn test_diff_between_changesets() {
                 feature_id: f2,
                 geometry_wkb: point_wkb(1.0, 1.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -480,6 +507,8 @@ async fn test_merge_no_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Origin"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -509,6 +538,8 @@ async fn test_merge_no_conflicts() {
                 feature_id: f2,
                 geometry_wkb: point_wkb(5.0, 5.0),
                 properties: json!({"name": "School"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -525,6 +556,8 @@ async fn test_merge_no_conflicts() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Town Center"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -566,6 +599,8 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -594,6 +629,8 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Central Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -609,6 +646,8 @@ async fn test_merge_with_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(10.0, 10.0)),
                 properties: Some(json!({"name": "Park", "moved": true})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -646,6 +685,8 @@ async fn test_merge_same_change_no_conflict() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -713,6 +754,8 @@ async fn test_merge_base_finding() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -740,6 +783,8 @@ async fn test_merge_base_finding() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(1.0, 0.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -755,6 +800,8 @@ async fn test_merge_base_finding() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(0.0, 1.0),
                 properties: json!({}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -815,6 +862,8 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -833,6 +882,8 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(1.0, 1.0)),
                 properties: Some(json!({"name": "Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -847,6 +898,8 @@ async fn test_merge_conflict_geometry_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(2.0, 2.0)),
                 properties: Some(json!({"name": "Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -881,6 +934,8 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -899,6 +954,8 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "North Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -913,6 +970,8 @@ async fn test_merge_conflict_attribute_edit_edit() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "South Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -947,11 +1006,15 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"name": "A"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"name": "B"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -973,6 +1036,8 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f2,
                     geometry_wkb: Some(point_wkb(1.5, 1.5)),
                     properties: Some(json!({"name": "B"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -989,6 +1054,8 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(0.5, 0.5)),
                     properties: Some(json!({"name": "A"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Delete { feature_id: f2 },
             ],
@@ -1034,6 +1101,8 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park", "capacity": 100}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1051,6 +1120,8 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Central Park", "capacity": 100})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1065,6 +1136,8 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.0, 0.0)),
                 properties: Some(json!({"name": "Park", "capacity": 250})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1099,6 +1172,8 @@ async fn test_merge_disjoint_feature_sets_clean() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1121,11 +1196,15 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Main2"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Update {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(0.1, 0.1)),
                     properties: Some(json!({"name": "Base v2"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1142,11 +1221,15 @@ async fn test_merge_disjoint_feature_sets_clean() {
                     feature_id: f3,
                     geometry_wkb: point_wkb(3.0, 3.0),
                     properties: json!({"name": "Feat3"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f4,
                     geometry_wkb: point_wkb(4.0, 4.0),
                     properties: json!({"name": "Feat4"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1185,6 +1268,8 @@ async fn test_diff_round_trip_after_merge() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1206,11 +1291,15 @@ async fn test_diff_round_trip_after_merge() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Base moved"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Feat2"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1226,6 +1315,8 @@ async fn test_diff_round_trip_after_merge() {
                 feature_id: f3,
                 geometry_wkb: point_wkb(3.0, 3.0),
                 properties: json!({"name": "Main3"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1278,6 +1369,8 @@ async fn test_merge_idempotent_remerge() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Base"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1297,11 +1390,15 @@ async fn test_merge_idempotent_remerge() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Base moved"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(2.0, 2.0),
                     properties: json!({"name": "Feat2"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1335,11 +1432,15 @@ async fn test_concurrent_commits_same_branch_no_lost_update() {
         feature_id: fa,
         geometry_wkb: point_wkb(1.0, 1.0),
         properties: json!({"who": "a"}),
+        valid_from: None,
+        valid_to: None,
     }];
     let ops_b = [DiffOp::Insert {
         feature_id: fb,
         geometry_wkb: point_wkb(2.0, 2.0),
         properties: json!({"who": "b"}),
+        valid_from: None,
+        valid_to: None,
     }];
     let (ra, rb) = tokio::join!(
         store.commit(branch.id, "A", "alice", &ops_a, &W),
@@ -1380,6 +1481,8 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(0.0, 0.0),
                 properties: json!({"name": "Park"}),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1398,6 +1501,8 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(9.0, 9.0)),
                 properties: Some(json!({"name": "Bob's Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1416,6 +1521,8 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: None,
                 properties: Some(json!({"name": "Alice's Park"})),
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1438,6 +1545,8 @@ async fn test_partial_update_does_not_leak_across_branches() {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(0.5, 0.5)),
                 properties: None,
+                valid_from: None,
+                valid_to: None,
             }],
             &W,
         )
@@ -1471,11 +1580,15 @@ async fn test_insert_then_update_same_feature_in_one_commit() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"v": 1}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Update {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(1.0, 1.0)),
                     properties: Some(json!({"v": 2})),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1511,11 +1624,15 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f1,
                     geometry_wkb: point_wkb(0.0, 0.0),
                     properties: json!({"name": "Park"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f2,
                     geometry_wkb: point_wkb(1.0, 1.0),
                     properties: json!({"name": "School"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1537,11 +1654,15 @@ async fn test_features_view_inherits_pre_fork_features() {
                     feature_id: f1,
                     geometry_wkb: Some(point_wkb(9.0, 9.0)),
                     properties: Some(json!({"name": "Bob's Park"})),
+                    valid_from: None,
+                    valid_to: None,
                 },
                 DiffOp::Insert {
                     feature_id: f3,
                     geometry_wkb: point_wkb(3.0, 3.0),
                     properties: json!({"name": "Cafe"}),
+                    valid_from: None,
+                    valid_to: None,
                 },
             ],
             &W,
@@ -1601,12 +1722,16 @@ async fn test_multiple_commits_chain() {
                 feature_id: f1,
                 geometry_wkb: point_wkb(i as f64, 0.0),
                 properties: json!({"step": i}),
+                valid_from: None,
+                valid_to: None,
             }
         } else {
             DiffOp::Update {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(i as f64, 0.0)),
                 properties: Some(json!({"step": i})),
+                valid_from: None,
+                valid_to: None,
             }
         };
         store
@@ -1675,6 +1800,8 @@ async fn test_insert_many_features() {
             feature_id: Uuid::now_v7(),
             geometry_wkb: point_wkb(i as f64, i as f64),
             properties: json!({"index": i}),
+            valid_from: None,
+            valid_to: None,
         })
         .collect();
 
@@ -1703,6 +1830,8 @@ async fn test_bulk_commit_refreshes_planner_statistics() {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: point_wkb(i as f64, i as f64),
                 properties: json!({"index": i}),
+                valid_from: None,
+                valid_to: None,
             })
             .collect()
     };
@@ -1747,4 +1876,370 @@ async fn test_bulk_commit_refreshes_planner_statistics() {
             "{table} still has no row estimate"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Mixed Geometry Datasets
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_mixed_geometry_dataset_round_trips() {
+    let store = setup().await;
+    let ds = Dataset {
+        id: Uuid::now_v7(),
+        name: format!("mixed_{}", Uuid::now_v7()),
+        srid: 4326,
+        geometry_type: GeometryType::Geometry,
+        created_at: OffsetDateTime::now_utc(),
+        created_by: "test".to_string(),
+        external: None,
+        visibility: Default::default(),
+    };
+    store.create_dataset(&ds, None).await.unwrap();
+
+    let fetched = store.get_dataset(ds.id).await.unwrap();
+    assert_eq!(fetched.geometry_type, GeometryType::Geometry);
+
+    let stored: String = sqlx::query("SELECT geometry_type FROM datasets WHERE id = $1")
+        .bind(ds.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("geometry_type");
+    assert_eq!(stored, "geometry");
+}
+
+#[tokio::test]
+async fn test_mixed_geometry_dataset_accepts_any_geometry() {
+    let store = setup().await;
+    let ds = Dataset {
+        id: Uuid::now_v7(),
+        name: format!("mixed_{}", Uuid::now_v7()),
+        srid: 4326,
+        geometry_type: GeometryType::Geometry,
+        created_at: OffsetDateTime::now_utc(),
+        created_by: "test".to_string(),
+        external: None,
+        visibility: Default::default(),
+    };
+    store.create_dataset(&ds, None).await.unwrap();
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    // a point and a linestring in one dataset
+    store
+        .commit(
+            branch.id,
+            "mixed",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: Uuid::now_v7(),
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: None,
+                },
+                DiffOp::Insert {
+                    feature_id: Uuid::now_v7(),
+                    geometry_wkb: linestring_wkb(),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: None,
+                },
+            ],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    let features = store.list_features_at_head(branch.id).await.unwrap();
+    assert_eq!(features.len(), 2);
+}
+
+/// WKB for LINESTRING(0 0, 1 1) (little-endian).
+fn linestring_wkb() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0x01);
+    buf.extend_from_slice(&2u32.to_le_bytes()); // type: LineString
+    buf.extend_from_slice(&2u32.to_le_bytes()); // point count
+    for (x, y) in [(0.0f64, 0.0f64), (1.0, 1.0)] {
+        buf.extend_from_slice(&x.to_le_bytes());
+        buf.extend_from_slice(&y.to_le_bytes());
+    }
+    buf
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Feature Valid Time
+// ═══════════════════════════════════════════════════════════════════════
+
+fn ts(secs: i64) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(secs).unwrap()
+}
+
+#[tokio::test]
+async fn test_valid_time_round_trips() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let timed = Uuid::now_v7();
+    let untimed = Uuid::now_v7();
+    store
+        .commit(
+            branch.id,
+            "with and without a valid time",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: timed,
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({}),
+                    valid_from: Some(ts(1_000)),
+                    valid_to: Some(ts(2_000)),
+                },
+                DiffOp::Insert {
+                    feature_id: untimed,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: None,
+                },
+            ],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    let features = store
+        .list_features_paginated(branch.id, None, 100, None)
+        .await
+        .unwrap();
+    let got = |id: Uuid| features.iter().find(|f| f.id == id).unwrap();
+    assert_eq!(got(timed).valid_from, Some(ts(1_000)));
+    assert_eq!(got(timed).valid_to, Some(ts(2_000)));
+    assert_eq!(got(untimed).valid_from, None);
+    assert_eq!(got(untimed).valid_to, None);
+}
+
+#[tokio::test]
+async fn test_valid_time_open_ranges_round_trip() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let open_end = Uuid::now_v7();
+    let open_start = Uuid::now_v7();
+    store
+        .commit(
+            branch.id,
+            "open ranges",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: open_end,
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({}),
+                    valid_from: Some(ts(1_000)),
+                    valid_to: None,
+                },
+                DiffOp::Insert {
+                    feature_id: open_start,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: Some(ts(2_000)),
+                },
+            ],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    let features = store
+        .list_features_paginated(branch.id, None, 100, None)
+        .await
+        .unwrap();
+    let got = |id: Uuid| features.iter().find(|f| f.id == id).unwrap();
+    assert_eq!(got(open_end).valid_from, Some(ts(1_000)));
+    assert_eq!(got(open_end).valid_to, None);
+    assert_eq!(got(open_start).valid_from, None);
+    assert_eq!(got(open_start).valid_to, Some(ts(2_000)));
+}
+
+#[tokio::test]
+async fn test_update_keeps_valid_time_when_omitted() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let fid = Uuid::now_v7();
+    store
+        .commit(
+            branch.id,
+            "insert",
+            "alice",
+            &[DiffOp::Insert {
+                feature_id: fid,
+                geometry_wkb: point_wkb(1.0, 1.0),
+                properties: json!({"n": 1}),
+                valid_from: Some(ts(1_000)),
+                valid_to: Some(ts(2_000)),
+            }],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    store
+        .commit(
+            branch.id,
+            "edit properties only",
+            "alice",
+            &[DiffOp::Update {
+                feature_id: fid,
+                geometry_wkb: None,
+                properties: Some(json!({"n": 2})),
+                valid_from: None,
+                valid_to: None,
+            }],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    let features = store
+        .list_features_paginated(branch.id, None, 100, None)
+        .await
+        .unwrap();
+    let f = features.iter().find(|f| f.id == fid).unwrap();
+    assert_eq!(f.properties["n"], 2);
+    assert_eq!(f.valid_from, Some(ts(1_000)));
+    assert_eq!(f.valid_to, Some(ts(2_000)));
+}
+
+#[tokio::test]
+async fn test_valid_at_filters_features() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let closed = Uuid::now_v7();
+    let open_end = Uuid::now_v7();
+    let open_start = Uuid::now_v7();
+    let untimed = Uuid::now_v7();
+    store
+        .commit(
+            branch.id,
+            "four shapes of valid time",
+            "alice",
+            &[
+                DiffOp::Insert {
+                    feature_id: closed,
+                    geometry_wkb: point_wkb(1.0, 1.0),
+                    properties: json!({}),
+                    valid_from: Some(ts(1_000)),
+                    valid_to: Some(ts(2_000)),
+                },
+                DiffOp::Insert {
+                    feature_id: open_end,
+                    geometry_wkb: point_wkb(2.0, 2.0),
+                    properties: json!({}),
+                    valid_from: Some(ts(1_500)),
+                    valid_to: None,
+                },
+                DiffOp::Insert {
+                    feature_id: open_start,
+                    geometry_wkb: point_wkb(3.0, 3.0),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: Some(ts(1_500)),
+                },
+                DiffOp::Insert {
+                    feature_id: untimed,
+                    geometry_wkb: point_wkb(4.0, 4.0),
+                    properties: json!({}),
+                    valid_from: None,
+                    valid_to: None,
+                },
+            ],
+            &W,
+        )
+        .await
+        .unwrap();
+
+    async fn at(store: &PgStore, branch_id: Uuid, t: i64) -> Vec<Uuid> {
+        store
+            .list_features_paginated(branch_id, None, 100, Some(ts(t)))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    // t=500: before the closed range starts, before open_end starts,
+    // inside open_start, and untimed always matches
+    let ids = at(&store, branch.id, 500).await;
+    assert!(!ids.contains(&closed));
+    assert!(!ids.contains(&open_end));
+    assert!(ids.contains(&open_start));
+    assert!(ids.contains(&untimed));
+
+    // t=1200: inside the closed range and still inside open_start's (-inf, 1500)
+    let ids = at(&store, branch.id, 1_200).await;
+    assert!(ids.contains(&closed));
+    assert!(!ids.contains(&open_end));
+    assert!(ids.contains(&open_start));
+    assert!(ids.contains(&untimed));
+
+    // t=1500: closed still covers it, open_end starts here, open_start ends
+    // here and is excluded because the range is half-open
+    let ids = at(&store, branch.id, 1_500).await;
+    assert!(ids.contains(&closed));
+    assert!(ids.contains(&open_end));
+    assert!(!ids.contains(&open_start));
+
+    // t=2000: the closed range's end is excluded, open_end runs on
+    let ids = at(&store, branch.id, 2_000).await;
+    assert!(!ids.contains(&closed));
+    assert!(ids.contains(&open_end));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Attachment Ownership
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_attachment_owner_check_rejects_bad_rows() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+
+    let insert = |feature: Option<Uuid>, branch: Option<Uuid>, dataset: Option<Uuid>| {
+        sqlx::query(
+            "INSERT INTO attachments (id, feature_id, branch_id, dataset_id, name, data, created_by)
+             VALUES ($1, $2, $3, $4, 'x', '\\x00'::bytea, 'test')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(feature)
+        .bind(branch)
+        .bind(dataset)
+        .execute(store.pool())
+    };
+
+    let fid = Uuid::now_v7();
+    // both owners set
+    assert!(
+        insert(Some(fid), Some(branch.id), Some(ds.id))
+            .await
+            .is_err()
+    );
+    // neither owner set
+    assert!(insert(None, None, None).await.is_err());
+    // a branch without a feature is half an owner
+    assert!(insert(None, Some(branch.id), None).await.is_err());
+    // each of the two valid shapes is accepted
+    assert!(insert(Some(fid), Some(branch.id), None).await.is_ok());
+    assert!(insert(None, None, Some(ds.id)).await.is_ok());
 }

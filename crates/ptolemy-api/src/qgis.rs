@@ -348,6 +348,8 @@ async fn wfs_transaction(
                             feature_id: fid,
                             geometry_wkb: wkb,
                             properties: properties.clone(),
+                            valid_from: None,
+                            valid_to: None,
                         });
                         inserted += 1;
                     }
@@ -366,6 +368,8 @@ async fn wfs_transaction(
                             feature_id: *feature_id,
                             geometry_wkb: w,
                             properties: properties.clone(),
+                            valid_from: None,
+                            valid_to: None,
                         });
                         updated += 1;
                     }
@@ -602,12 +606,16 @@ async fn qgis_push(
                 feature_id: fid,
                 geometry_wkb: Some(wkb),
                 properties: Some(properties),
+                valid_from: None,
+                valid_to: None,
             });
         } else {
             ops.push(ptolemy_core::diff::DiffOp::Insert {
                 feature_id: fid,
                 geometry_wkb: wkb,
                 properties,
+                valid_from: None,
+                valid_to: None,
             });
         }
     }
@@ -722,6 +730,8 @@ async fn resolve_conflict(
                     feature_id,
                     geometry_wkb: Some(wkb),
                     properties: req.custom_properties,
+                    valid_from: None,
+                    valid_to: None,
                 }];
                 store
                     .commit(

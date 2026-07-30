@@ -34,6 +34,7 @@ async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
     // Clean relevant tables (order matters for FK constraints)
     sqlx::raw_sql(
         "DROP TABLE IF EXISTS conflicts CASCADE;
+         DROP TABLE IF EXISTS attachments CASCADE;
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
          DROP TABLE IF EXISTS branches CASCADE;
@@ -6041,4 +6042,245 @@ async fn test_import_reports_bad_rows_and_refuses_a_total_failure() {
         1,
         "a refused import must not disturb the branch"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Attachments
+// ═══════════════════════════════════════════════════════════════════════
+
+/// GET returning the raw body, for a download that is not JSON.
+async fn get_bytes(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", "Bearer test-skip")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+fn upload_body(name: &str, data: &str) -> Value {
+    use base64::Engine;
+    json!({
+        "name": name,
+        "content_type": "text/plain",
+        "data": base64::engine::general_purpose::STANDARD.encode(data),
+        "created_by": "test",
+    })
+}
+
+#[tokio::test]
+async fn test_dataset_attachment_upload_list_and_download() {
+    let (app, _state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/attachments"),
+        upload_body("icon.png", "icon-bytes"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    assert_eq!(body["dataset_id"].as_str().unwrap(), dataset_id.to_string());
+    assert!(body["feature_id"].is_null());
+    assert!(body["branch_id"].is_null());
+    let attachment_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/datasets/{dataset_id}/attachments")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["name"].as_str().unwrap(), "icon.png");
+
+    let (status, bytes) = get_bytes(&app, &format!("/api/v1/attachments/{attachment_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"icon-bytes");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/attachments/{attachment_id}/meta")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dataset_id"].as_str().unwrap(), dataset_id.to_string());
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/attachments/{attachment_id}"))
+        .header("authorization", "Bearer test-skip")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/datasets/{dataset_id}/attachments")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_feature_attachment_still_works() {
+    let (app, _state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let feature_id = Uuid::now_v7();
+    commit_features(
+        &app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": feature_id,
+            "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
+            "properties": {},
+        }]),
+    )
+    .await;
+
+    let uri = format!("/api/v1/branches/{branch_id}/features/{feature_id}/attachments");
+    let (status, body) = post_json(&app, &uri, upload_body("photo.jpg", "photo-bytes")).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    assert_eq!(body["feature_id"].as_str().unwrap(), feature_id.to_string());
+    assert_eq!(body["branch_id"].as_str().unwrap(), branch_id.to_string());
+    assert!(body["dataset_id"].is_null());
+    let attachment_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    let (status, bytes) = get_bytes(&app, &format!("/api/v1/attachments/{attachment_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"photo-bytes");
+
+    // a dataset attachment listing must not pick up the feature's attachment
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/datasets/{dataset_id}/attachments")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_dataset_attachment_upload_requires_write() {
+    let app = setup_app_authed().await;
+    let editor = token_for(Role::Editor);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = dataset["id"].as_str().unwrap();
+    let uri = format!("/api/v1/datasets/{dataset_id}/attachments");
+
+    let (status, body) =
+        request_as(&app, "POST", &uri, None, Some(upload_body("i.png", "x"))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &uri,
+        Some(&token_for(Role::Viewer)),
+        Some(upload_body("i.png", "x")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &uri,
+        Some(&editor),
+        Some(upload_body("i.png", "x")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // listing stays an anonymous read, matching the feature-level route
+    let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Feature Valid Time
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_features_valid_at_query() {
+    let (app, _state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let inside = Uuid::now_v7();
+    let outside = Uuid::now_v7();
+    let untimed = Uuid::now_v7();
+    let hex = "0101000000000000000000f03f000000000000f03f";
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {
+                "type": "insert", "feature_id": inside, "geometry_wkb_hex": hex,
+                "properties": {}, "valid_from": "2020-01-01T00:00:00Z",
+                "valid_to": "2021-01-01T00:00:00Z",
+            },
+            {
+                "type": "insert", "feature_id": outside, "geometry_wkb_hex": hex,
+                "properties": {}, "valid_from": "2022-01-01T00:00:00Z",
+                "valid_to": "2023-01-01T00:00:00Z",
+            },
+            {
+                "type": "insert", "feature_id": untimed, "geometry_wkb_hex": hex,
+                "properties": {},
+            },
+        ]),
+    )
+    .await;
+
+    // the written valid time comes back on an unfiltered read
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features")).await;
+    assert_eq!(status, StatusCode::OK);
+    let all = body["features"].as_array().unwrap();
+    let find = |id: Uuid| {
+        all.iter()
+            .find(|f| f["id"].as_str().unwrap() == id.to_string())
+            .unwrap()
+    };
+    assert_eq!(
+        find(inside)["valid_from"].as_str().unwrap(),
+        "2020-01-01T00:00:00Z"
+    );
+    assert!(find(untimed)["valid_from"].is_null());
+    assert!(find(untimed)["valid_to"].is_null());
+
+    async fn ids_at(app: &axum::Router, branch_id: Uuid, t: &str) -> Vec<String> {
+        let uri = format!("/api/v1/branches/{branch_id}/features?valid_at={t}");
+        let (status, body) = get_json(app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "valid_at {t}: {body}");
+        body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    let ids = ids_at(&app, branch_id, "2020-06-01T00:00:00Z").await;
+    assert!(ids.contains(&inside.to_string()));
+    assert!(!ids.contains(&outside.to_string()));
+    assert!(ids.contains(&untimed.to_string()));
+
+    // the range end itself is excluded
+    let ids = ids_at(&app, branch_id, "2021-01-01T00:00:00Z").await;
+    assert!(!ids.contains(&inside.to_string()));
+
+    let (status, _) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features?valid_at=not-a-time"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
