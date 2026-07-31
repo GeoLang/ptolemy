@@ -15,7 +15,7 @@
 //!
 //! `applyEdits` is the one route here that writes. Every edit in one request
 //! becomes one commit through the same store path `/api/v1` commits take, so a
-//! batch either lands whole or does not land: see [`apply_edits`] for what that
+//! batch either lands whole or does not land: see `apply_edits` for what that
 //! costs a client that expects Esri's per-row results.
 //!
 //! Every route resolves its dataset through the same visibility rule the other

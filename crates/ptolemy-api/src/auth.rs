@@ -131,7 +131,7 @@ pub enum Access {
 /// The query form is there because the Geoservices protocol has no header for a
 /// credential: an Esri client sends `token` and nothing else, so a facade that
 /// only read the header could not be written to by the clients it exists for.
-/// See [`query_token`] for what that costs.
+/// See `query_token` for what that costs.
 pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
     let header_token = headers
         .get(header::AUTHORIZATION)
