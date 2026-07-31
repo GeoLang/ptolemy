@@ -7839,13 +7839,26 @@ fn mounted_mutating_routes() -> Vec<(String, String)> {
 
     let mut routes = Vec::new();
     for (module, prefix) in prefixes {
-        let file = src.join(format!("{module}.rs"));
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        for (template, methods) in route_table(&text) {
-            for method in methods {
-                routes.push((method, format!("{prefix}{template}")));
+        // the module's own file, and its child modules: a table split across
+        // `src/arcgis/*.rs` registers on the same mount, so the census has to
+        // read there too or a route could be added where nothing is looking
+        let mut files = vec![src.join(format!("{module}.rs"))];
+        if let Ok(children) = std::fs::read_dir(src.join(&module)) {
+            files.extend(
+                children
+                    .filter_map(Result::ok)
+                    .map(|child| child.path())
+                    .filter(|path| path.extension().is_some_and(|kind| kind == "rs")),
+            );
+        }
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (template, methods) in route_table(&text) {
+                for method in methods {
+                    routes.push((method, format!("{prefix}{template}")));
+                }
             }
         }
     }
@@ -7923,11 +7936,12 @@ fn calls(args: &str, name: &str) -> bool {
 /// entry is either a POST that only computes, or grant management, which
 /// rbac.rs gates harder. Adding a route to this list is the only way to opt out,
 /// and it cannot be done from a request.
-const UNGATED_TEMPLATES: [&str; 50] = [
-    // the FeatureServer query takes a POST body only because an object id list
-    // is too long for a URL. It is the only ungated POST on the facade:
-    // applyEdits writes, and is gated like any other write.
+const UNGATED_TEMPLATES: [&str; 51] = [
+    // the FeatureServer's two queries take a POST body only because an object id
+    // list is too long for a URL. They are the only ungated POSTs on the facade:
+    // applyEdits and the three attachment writes are gated like any other write.
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
+    "/arcgis/rest/services/{service}/FeatureServer/{layer}/queryAttachments",
     "/api/v1/attribute-rules/{id}/validate",
     "/api/v1/branches/{branch_id}/permissions/{user_id}",
     "/api/v1/branches/{id}/3d/extrude",
@@ -8500,7 +8514,10 @@ async fn test_arcgis_service_root_and_layer_metadata() {
         layer["advancedQueryCapabilities"]["supportsPagination"],
         true
     );
-    assert_eq!(layer["hasAttachments"], false);
+    // the attachment operations are served on every layer, whether or not this
+    // one holds an attachment yet. Editing them still needs an editable layer,
+    // which `capabilities` above says this one is not.
+    assert_eq!(layer["hasAttachments"], true);
     // computed from the seeded points, which run from (0,0) to (2,2)
     assert_eq!(layer["extent"]["xmin"], 0.0, "{layer}");
     assert_eq!(layer["extent"]["ymax"], 2.0, "{layer}");
@@ -10409,4 +10426,739 @@ async fn test_arcgis_apply_edits_accepts_the_token_parameter() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ArcGIS FeatureServer attachments
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The boundary the multipart helpers below use. Any token works, and this one
+/// makes a test body easy to read.
+const PART_BOUNDARY: &str = "ptolemyTestBoundary";
+
+/// Helper: a `multipart/form-data` body with one `attachment` file part and any
+/// number of text fields, which is what an Esri client sends `addAttachment`.
+/// Written out rather than built by a crate, because how the facade reads that
+/// wire format is the thing under test.
+fn upload_multipart(
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+    fields: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{PART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n\
+                 {value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{PART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"attachment\"; \
+             filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{PART_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// Helper: post a multipart body, with a bearer header when one is given.
+async fn post_multipart(
+    app: &axum::Router,
+    uri: &str,
+    body: Vec<u8>,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method("POST").uri(uri).header(
+        "content-type",
+        format!("multipart/form-data; boundary={PART_BOUNDARY}"),
+    );
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// Helper: GET keeping the headers, which is where a download says what it is.
+async fn get_download(
+    app: &axum::Router,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
+/// Helper: the attachment URLs of one object id on a service's layer 0.
+fn attachments_url(service: &str, oid: i64) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/{oid}/attachments")
+}
+
+fn add_attachment_url(service: &str, oid: i64) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/{oid}/addAttachment")
+}
+
+fn update_attachment_url(service: &str, oid: i64) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/{oid}/updateAttachment")
+}
+
+fn delete_attachments_url(service: &str, oid: i64) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/{oid}/deleteAttachments")
+}
+
+fn query_attachments_url(service: &str) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/queryAttachments")
+}
+
+/// Helper: an editable layer with two features, at OBJECTID 100 and 200.
+async fn layer_with_two_features(app: &axum::Router, prefix: &str) -> (String, Uuid) {
+    let (name, _ds, branch) = editable_layer(app, prefix, "point").await;
+    commit_features(
+        app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 200, "name": "second"}},
+        ]),
+    )
+    .await;
+    (name, branch)
+}
+
+/// The whole round trip an Esri client makes: upload the file, see it listed,
+/// fetch the bytes back, delete it.
+#[tokio::test]
+async fn test_arcgis_attachment_uploads_lists_downloads_and_deletes() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "attach").await;
+
+    let bytes = b"\x89PNG\r\n\x1a\n not really a png";
+    let (status, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 100),
+        upload_multipart("site.png", "image/png", bytes, &[("f", "json")]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let result = &out["addAttachmentResult"];
+    assert_eq!(result["success"], true, "{out}");
+    let id = result["objectId"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{out}"));
+    // a 48-bit derived id: a number a JSON client holds exactly
+    assert!(id > 0 && id < 1 << 48, "{out}");
+    let global = result["globalId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(global.starts_with('{') && global.ends_with('}'), "{out}");
+    let uuid = Uuid::parse_str(global.trim_matches(|c| c == '{' || c == '}')).unwrap();
+    assert_eq!(global, format!("{{{}}}", uuid.to_string().to_uppercase()));
+
+    // listed under the feature, with the name and type it was sent with
+    let (status, listing) =
+        get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    let infos = listing["attachmentInfos"].as_array().unwrap();
+    assert_eq!(infos.len(), 1, "{listing}");
+    assert_eq!(infos[0]["id"], id, "{listing}");
+    assert_eq!(infos[0]["globalId"], global, "{listing}");
+    assert_eq!(infos[0]["name"], "site.png", "{listing}");
+    assert_eq!(infos[0]["contentType"], "image/png", "{listing}");
+    assert_eq!(infos[0]["size"], bytes.len() as i64, "{listing}");
+
+    // the derived id is stable across a second listing
+    let (_, again) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(again["attachmentInfos"][0]["id"], id, "{again}");
+
+    // the bytes come back exactly, as the type they went in as
+    let (status, headers, body) =
+        get_download(&app, &format!("{}/{id}", attachments_url(&name, 100))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes.to_vec());
+    assert_eq!(headers.get("content-type").unwrap(), "image/png");
+    let disposition = headers
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(disposition.contains("site.png"), "{disposition}");
+    // never inline: the type is whatever the uploader said it was
+    assert!(disposition.starts_with("attachment"), "{disposition}");
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+
+    // and the delete takes it
+    let (status, out) = post_form(
+        &app,
+        &delete_attachments_url(&name, 100),
+        &form_body(&[("f", "json".into()), ("attachmentIds", id.to_string())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["deleteAttachmentResults"],
+        json!([{"objectId": id, "success": true}]),
+        "{out}"
+    );
+
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(listing["attachmentInfos"], json!([]), "{listing}");
+    // and the id names nothing now
+    let (status, _, _) = get_download(&app, &format!("{}/{id}", attachments_url(&name, 100))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a refusal is Esri-shaped, so still 200"
+    );
+    let (_, out) = get_json(
+        &app,
+        &format!("{}/{id}?f=json", attachments_url(&name, 100)),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+}
+
+/// One request for many features, grouped by the object id that owns each set.
+/// This is the shape verne's extractor reads.
+#[tokio::test]
+async fn test_arcgis_query_attachments_groups_by_parent_object_id() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "groups").await;
+
+    let mut ids = Vec::new();
+    for (oid, filename) in [(100, "a.txt"), (100, "b.txt"), (200, "c.txt")] {
+        let (status, out) = post_multipart(
+            &app,
+            &add_attachment_url(&name, oid),
+            upload_multipart(filename, "text/plain", filename.as_bytes(), &[]),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        ids.push(out["addAttachmentResult"]["objectId"].as_i64().unwrap());
+    }
+    // two uploads to one feature must not derive the same id, whatever the same
+    // millisecond does to their uuids
+    assert_ne!(ids[0], ids[1]);
+
+    for uri in [
+        format!("{}?f=json&objectIds=100,200", query_attachments_url(&name)),
+        format!("{}?f=json&objectIds=200,100", query_attachments_url(&name)),
+    ] {
+        let (status, out) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let groups = out["attachmentGroups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{out}");
+        for group in groups {
+            let parent = group["parentObjectId"].as_i64().unwrap();
+            let infos = group["attachmentInfos"].as_array().unwrap();
+            match parent {
+                100 => assert_eq!(infos.len(), 2, "{out}"),
+                200 => assert_eq!(infos.len(), 1, "{out}"),
+                other => panic!("unexpected parent {other}: {out}"),
+            }
+            assert!(infos.iter().all(|info| info["id"].is_i64()), "{out}");
+        }
+    }
+
+    // a form post says the same thing, which is how a long id list is sent
+    let (status, out) = post_form(
+        &app,
+        &query_attachments_url(&name),
+        &form_body(&[("f", "json".into()), ("objectIds", "200".into())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let groups = out["attachmentGroups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{out}");
+    assert_eq!(groups[0]["parentObjectId"], 200, "{out}");
+
+    // a feature with none is left out rather than answered as an empty group
+    let (_, out) = post_form(
+        &app,
+        &query_attachments_url(&name),
+        &form_body(&[("f", "json".into()), ("objectIds", "100".into())]),
+    )
+    .await;
+    assert_eq!(
+        out["attachmentGroups"].as_array().unwrap().len(),
+        1,
+        "{out}"
+    );
+    let (_, out) = get_json(
+        &app,
+        &format!("{}?f=json&objectIds=999", query_attachments_url(&name)),
+    )
+    .await;
+    assert_eq!(
+        out["error"]["code"], 400,
+        "an unknown oid is refused: {out}"
+    );
+}
+
+/// A filter that cannot be honored is refused by name, as everywhere else on the
+/// facade: a client that believes its filter applied reads the wrong answer.
+#[tokio::test]
+async fn test_arcgis_query_attachments_refuses_filters_it_cannot_honor() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "attfilters").await;
+
+    for parameter in [
+        "definitionExpression=att_name='a'",
+        "keywords=photo",
+        "gdbVersion=sde.DEFAULT",
+    ] {
+        let (status, out) = get_json(
+            &app,
+            &format!(
+                "{}?f=json&objectIds=100&{parameter}",
+                query_attachments_url(&name)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["error"]["code"], 400, "{parameter}: {out}");
+        let named = parameter.split('=').next().unwrap();
+        assert!(
+            out["error"]["message"].as_str().unwrap().contains(named),
+            "{parameter}: {out}"
+        );
+    }
+
+    // and the same on a write, which is refused for the parameters an
+    // applyEdits is refused for
+    let (status, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 100),
+        upload_multipart(
+            "versioned.txt",
+            "text/plain",
+            b"x",
+            &[("gdbVersion", "sde.DEFAULT")],
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("gdbVersion"),
+        "{out}"
+    );
+
+    // and objectIds is required rather than defaulted to every feature
+    let (_, out) = get_json(&app, &format!("{}?f=json", query_attachments_url(&name))).await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("objectIds"),
+        "{out}"
+    );
+}
+
+/// The store has no update for an attachment, so a replacement is a new row and
+/// therefore a new id. The result carries it, which is what an Esri client reads.
+#[tokio::test]
+async fn test_arcgis_update_attachment_replaces_the_file_and_reports_its_id() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "replace").await;
+
+    let (_, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 100),
+        upload_multipart("first.txt", "text/plain", b"before", &[]),
+        None,
+    )
+    .await;
+    let first = out["addAttachmentResult"]["objectId"].as_i64().unwrap();
+
+    let (status, out) = post_multipart(
+        &app,
+        &update_attachment_url(&name, 100),
+        upload_multipart(
+            "second.csv",
+            "text/csv",
+            b"after,after",
+            &[("f", "json"), ("attachmentId", &first.to_string())],
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let result = &out["updateAttachmentResult"];
+    assert_eq!(result["success"], true, "{out}");
+    let second = result["objectId"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{out}"));
+
+    // one attachment, the new one, under the id the result named
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    let infos = listing["attachmentInfos"].as_array().unwrap();
+    assert_eq!(infos.len(), 1, "{listing}");
+    assert_eq!(infos[0]["id"], second, "{listing}");
+    assert_eq!(infos[0]["name"], "second.csv", "{listing}");
+    assert_eq!(infos[0]["contentType"], "text/csv", "{listing}");
+
+    let (status, headers, body) =
+        get_download(&app, &format!("{}/{second}", attachments_url(&name, 100))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"after,after".to_vec());
+    assert_eq!(headers.get("content-type").unwrap(), "text/csv");
+
+    // the id it replaced names nothing now
+    let (_, out) = get_json(
+        &app,
+        &format!("{}/{first}?f=json", attachments_url(&name, 100)),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+
+    // and an attachmentId this feature does not carry replaces nothing
+    let (status, out) = post_multipart(
+        &app,
+        &update_attachment_url(&name, 100),
+        upload_multipart(
+            "third.txt",
+            "text/plain",
+            b"never",
+            &[("attachmentId", "424242")],
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(
+        listing["attachmentInfos"].as_array().unwrap().len(),
+        1,
+        "nothing was added by the refused replace: {listing}"
+    );
+}
+
+/// All or none, exactly as `applyEdits` is: an Esri client reports per row and
+/// this cannot, so a batch naming one unknown id must take nothing at all.
+#[tokio::test]
+async fn test_arcgis_delete_attachments_refuses_the_whole_batch_on_one_unknown_id() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "batch").await;
+
+    let mut ids = Vec::new();
+    for filename in ["one.txt", "two.txt"] {
+        let (_, out) = post_multipart(
+            &app,
+            &add_attachment_url(&name, 100),
+            upload_multipart(filename, "text/plain", filename.as_bytes(), &[]),
+            None,
+        )
+        .await;
+        ids.push(out["addAttachmentResult"]["objectId"].as_i64().unwrap());
+    }
+
+    let (status, out) = post_form(
+        &app,
+        &delete_attachments_url(&name, 100),
+        &form_body(&[
+            ("f", "json".into()),
+            ("attachmentIds", format!("{},{},999999", ids[0], ids[1])),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"].as_str().unwrap().contains("999999"),
+        "{out}"
+    );
+
+    // both are still there: the refusal happened before any delete
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(
+        listing["attachmentInfos"].as_array().unwrap().len(),
+        2,
+        "{listing}"
+    );
+
+    // an attachment of the other feature is not this feature's to delete either
+    let (_, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 200),
+        upload_multipart("elsewhere.txt", "text/plain", b"x", &[]),
+        None,
+    )
+    .await;
+    let elsewhere = out["addAttachmentResult"]["objectId"].as_i64().unwrap();
+    let (_, out) = post_form(
+        &app,
+        &delete_attachments_url(&name, 100),
+        &form_body(&[("attachmentIds", elsewhere.to_string())]),
+    )
+    .await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+
+    // and the pair of its own ids does go
+    let (status, out) = post_form(
+        &app,
+        &delete_attachments_url(&name, 100),
+        &form_body(&[("attachmentIds", format!("{},{}", ids[0], ids[1]))]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["deleteAttachmentResults"].as_array().unwrap().len(),
+        2,
+        "{out}"
+    );
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(listing["attachmentInfos"], json!([]), "{listing}");
+}
+
+/// An object id no feature carries names no feature to attach to, and is refused
+/// rather than answered as a feature with no attachments.
+#[tokio::test]
+async fn test_arcgis_attachments_refuse_an_unknown_object_id() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "unknownoid").await;
+
+    let (status, out) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 777))).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"].as_str().unwrap().contains("777"),
+        "{out}"
+    );
+
+    let (status, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 777),
+        upload_multipart("nowhere.txt", "text/plain", b"x", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+
+    // an object id that is not a number at all is a client bug, not a 404 page
+    let (_, out) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 0))).await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+}
+
+/// A layer whose object ids are row numbers takes no attachment writes, for the
+/// reason it takes no edits: such an id names a different feature after any
+/// delete, and a file aimed by one would land on that feature. Reads still work,
+/// because they answer about the same feature the query just named.
+#[tokio::test]
+async fn test_arcgis_attachment_writes_refuse_a_row_number_layer() {
+    let (app, _) = setup_app().await;
+    let plain = format!("rownum_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &plain, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+
+    let (status, out) = post_multipart(
+        &app,
+        &add_attachment_url(&plain, 1),
+        upload_multipart("shifted.txt", "text/plain", b"x", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("objectid"),
+        "{out}"
+    );
+
+    // the listing is a read and answers
+    let (status, out) = get_json(&app, &format!("{}?f=json", attachments_url(&plain, 1))).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["attachmentInfos"], json!([]), "{out}");
+}
+
+/// The cap is this facade's own, and a refusal has to name it or a client cannot
+/// tell an oversize file from a broken server.
+#[tokio::test]
+async fn test_arcgis_add_attachment_refuses_a_file_over_the_cap() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "toobig").await;
+
+    let oversize = vec![b'x'; 32 * 1024 * 1024 + 1];
+    let (status, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 100),
+        upload_multipart("huge.bin", "application/octet-stream", &oversize, &[]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 413, "{out}");
+    assert!(
+        out["error"]["message"].as_str().unwrap().contains("32 MiB"),
+        "{out}"
+    );
+
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(listing["attachmentInfos"], json!([]), "{listing}");
+
+    // a body with no file part at all says so rather than storing an empty file
+    let (_, out) = post_multipart(
+        &app,
+        &add_attachment_url(&name, 100),
+        upload_multipart("", "text/plain", b"x", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+}
+
+/// The gate, on all three writes: an anonymous caller cannot put a file on a
+/// feature, and the refusal is Geoservices-shaped because an Esri client reads
+/// the body and never the status. The reads stay anonymous.
+#[tokio::test]
+async fn test_arcgis_attachment_writes_refuse_anonymous_and_read_only_callers() {
+    let app = setup_app_authed().await;
+    let (name, carol, _branch) = owned_editable_layer(&app).await;
+    let file = || upload_multipart("intruder.txt", "text/plain", b"x", &[("f", "json")]);
+
+    let viewer = token_for_user("val", Role::Viewer);
+    let eve = token_for_user("eve", Role::Editor);
+    for (label, token, expected) in [
+        ("anonymous", None, vec![499]),
+        ("read-only", Some(viewer.as_str()), vec![403]),
+        ("no grant", Some(eve.as_str()), vec![403, 404]),
+    ] {
+        let (status, out) =
+            post_multipart(&app, &add_attachment_url(&name, 10), file(), token).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {out}");
+        let code = out["error"]["code"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{label}: {out}"));
+        assert!(expected.contains(&code), "{label}: {out}");
+
+        // and the same on the two that name an attachment
+        let (_, out) = post_multipart(
+            &app,
+            &update_attachment_url(&name, 10),
+            upload_multipart("x.txt", "text/plain", b"x", &[("attachmentId", "1")]),
+            token,
+        )
+        .await;
+        assert!(
+            expected.contains(&out["error"]["code"].as_i64().unwrap()),
+            "{label}: {out}"
+        );
+        let (_, out) = post_form_as(
+            &app,
+            &delete_attachments_url(&name, 10),
+            &form_body(&[("attachmentIds", "1".into())]),
+            token,
+        )
+        .await;
+        assert!(
+            expected.contains(&out["error"]["code"].as_i64().unwrap()),
+            "{label}: {out}"
+        );
+    }
+
+    // nothing any of them sent was stored, and the listing is a public read
+    let (status, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 10))).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["attachmentInfos"], json!([]), "{listing}");
+
+    // the owner's own upload lands
+    let (status, out) =
+        post_multipart(&app, &add_attachment_url(&name, 10), file(), Some(&carol)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["addAttachmentResult"]["success"], true, "{out}");
+}
+
+/// The Geoservices protocol has no header for a credential, so `token` in the
+/// URL is one on this facade, on an attachment write as on `applyEdits`.
+#[tokio::test]
+async fn test_arcgis_add_attachment_accepts_the_token_parameter() {
+    let app = setup_app_authed().await;
+    let (name, carol, _branch) = owned_editable_layer(&app).await;
+
+    let uri = format!("{}?token={carol}", add_attachment_url(&name, 10));
+    let (status, out) = post_multipart(
+        &app,
+        &uri,
+        upload_multipart("by-parameter.txt", "text/plain", b"ok", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let id = out["addAttachmentResult"]["objectId"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{out}"));
+
+    // a bad one in the same place is still refused
+    let uri = format!("{}?token=not.a.token", add_attachment_url(&name, 10));
+    let (status, out) = post_multipart(
+        &app,
+        &uri,
+        upload_multipart("forged.txt", "text/plain", b"no", &[]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 498, "{out}");
+
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 10))).await;
+    let infos = listing["attachmentInfos"].as_array().unwrap();
+    assert_eq!(infos.len(), 1, "{listing}");
+    assert_eq!(infos[0]["id"], id, "{listing}");
+}
+
+/// A client reads these two flags to decide whether to offer attachments at all,
+/// so they say what the service does rather than what this layer happens to hold.
+#[tokio::test]
+async fn test_arcgis_layer_metadata_declares_attachment_support() {
+    let (app, _) = setup_app().await;
+    let (name, _branch) = layer_with_two_features(&app, "attmeta").await;
+
+    let (status, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{layer}");
+    assert_eq!(layer["hasAttachments"], true, "{layer}");
+    assert_eq!(
+        layer["advancedQueryCapabilities"]["supportsQueryAttachments"], true,
+        "{layer}"
+    );
 }

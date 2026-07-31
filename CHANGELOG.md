@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: Attachments on the ArcGIS FeatureServer facade, reads and writes:
+  `GET 0/{oid}/attachments`, `GET 0/{oid}/attachments/{attachmentId}`,
+  `GET POST 0/queryAttachments`, and `POST 0/{oid}/addAttachment`,
+  `0/{oid}/updateAttachment` and `0/{oid}/deleteAttachments`. They serve the same
+  rows the native `/api/v1` attachment routes do, through the same store methods,
+  so a file an Esri client uploads is the one the native API downloads by uuid.
+  Esri's `attachmentId` is a JSON number and ptolemy's key is a uuid, so the
+  number is 48 bits of SHA-256 over the uuid: the same answer in every process
+  and after any number of deletes, inside the integer range a double holds
+  exactly, and never positional, so no renumbering can misdirect a delete. Every
+  lookup by that id lists the feature's attachments and matches on it. An id that
+  names none is refused by name and an id that names two is refused as a
+  collision naming the native API, rather than resolved to whichever row was
+  listed first. `globalId` carries the uuid in braces and upper case, which is
+  the key the native API takes. An upload is `multipart/form-data` with an
+  `attachment` file part, capped at 32 MiB with the cap named in the refusal, and
+  a download is always served as an attachment with `nosniff`, because the stored
+  content type is whatever the uploading client said it was. The store has no
+  update for an attachment, so `updateAttachment` writes the new row and then
+  deletes the old one, and the result carries the new derived id.
+  `deleteAttachments` is all or nothing like `applyEdits`: one unknown id refuses
+  the batch before anything is deleted. `queryAttachments` groups by
+  `parentObjectId`, leaves out a feature that carries none, refuses
+  `definitionExpression` and `keywords` by name, and refuses an object id no
+  feature carries rather than answering it as a feature with no attachments.
+  Reads are anonymous like the facade's other reads. The three writes take the
+  gate `applyEdits` takes: a token with write access, the same per-dataset
+  ladder, the `token` request parameter, Geoservices-shaped refusals, and no
+  writes at all on a layer whose object ids are row numbers, because such an id
+  names a different feature after any delete. A layer's metadata now declares
+  `hasAttachments` and `supportsQueryAttachments` true, whether or not it holds an
+  attachment yet.
+
 - 2026-07-31: `where` on the ArcGIS FeatureServer `/query` route, so an Esri
   client's own attribute filter runs instead of being refused. The SQL-92 subset
   those clients send: comparisons (`=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`) with

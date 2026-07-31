@@ -7,7 +7,8 @@ license.workspace = true
 [dependencies]
 ptolemy-core = { path = "../ptolemy-core" }
 ptolemy-storage = { path = "../ptolemy-storage" }
-axum.workspace = true
+# multipart: the ArcGIS facade's attachment uploads arrive as multipart/form-data
+axum = { workspace = true, features = ["multipart"] }
 axum-extra.workspace = true
 base64 = "0.22"
 futures = "0.3"

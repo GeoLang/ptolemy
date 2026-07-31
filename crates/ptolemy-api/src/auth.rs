@@ -30,7 +30,8 @@ pub const MIN_SECRET_LEN: usize = 32;
 pub const WS_PREFIX: &str = "/ws/";
 
 /// The ArcGIS FeatureServer frontend's root. Every route under it reads except
-/// `applyEdits`, which writes and is gated like any other write.
+/// `applyEdits` and the three attachment writes, which are gated like any other
+/// write.
 ///
 /// It is also the only prefix where a request parameter is a credential and
 /// where a refusal is answered in the Geoservices error shape. See
@@ -296,6 +297,13 @@ pub fn needs_write_grant(method: &Method, route: &str) -> bool {
     if route.contains("/trajectories/") && route.ends_with("/simplify") {
         return false;
     }
+    // the FeatureServer's attachment query lists attachments and takes a POST
+    // body for the same reason its feature query does: an object id list is too
+    // long for a URL. Uploading, replacing and deleting one all fall through and
+    // are gated.
+    if route.starts_with(ARCGIS_PREFIX) && route.ends_with("/queryAttachments") {
+        return false;
+    }
 
     true
 }
@@ -376,10 +384,14 @@ pub fn classify(method: &Method, route: &str) -> Access {
         return Access::Public;
     }
 
-    // the FeatureServer query reads features and takes a POST body only because
-    // an object id list is too long for a URL. It is the only public POST on the
-    // facade: applyEdits writes, and falls through to Access::Write below.
-    if route.starts_with(ARCGIS_PREFIX) && route.ends_with("/query") {
+    // the FeatureServer's two queries read and take a POST body only because an
+    // object id list is too long for a URL. They are the only public POSTs on
+    // the facade: applyEdits and the attachment writes fall through to
+    // Access::Write below. The listing and download are GETs, so the read rule
+    // above already answered them.
+    if route.starts_with(ARCGIS_PREFIX)
+        && (route.ends_with("/query") || route.ends_with("/queryAttachments"))
+    {
         return Access::Public;
     }
 
@@ -891,6 +903,52 @@ mod tests {
             classify(&Method::GET, "/arcgis/rest/services"),
             Access::Public
         );
+    }
+
+    /// The facade's attachment operations. The three that write have to be gated
+    /// exactly as `applyEdits` is, or an anonymous caller could put a file on any
+    /// feature in the instance or take one off it.
+    #[test]
+    fn classify_arcgis_attachment_writes_are_writes() {
+        const LAYER: &str = "/arcgis/rest/services/{service}/FeatureServer/{layer}";
+        for suffix in ["addAttachment", "updateAttachment", "deleteAttachments"] {
+            let route = format!("{LAYER}/{{oid}}/{suffix}");
+            assert_eq!(classify(&Method::POST, &route), Access::Write, "{route}");
+            assert!(needs_write_grant(&Method::POST, &route), "{route}");
+        }
+    }
+
+    /// The reads beside them. The listing and the download are GETs and must not
+    /// be caught by anything on the write side, and the attachment query is a
+    /// POST that only lists, like the feature query.
+    #[test]
+    fn classify_arcgis_attachment_reads_are_public() {
+        const LAYER: &str = "/arcgis/rest/services/{service}/FeatureServer/{layer}";
+        let listing = format!("{LAYER}/{{oid}}/attachments");
+        let download = format!("{LAYER}/{{oid}}/attachments/{{attachmentId}}");
+        for route in [&listing, &download] {
+            assert_eq!(classify(&Method::GET, route), Access::Public, "{route}");
+            assert!(!needs_write_grant(&Method::GET, route), "{route}");
+            // and nothing about the path makes a mutating method public
+            assert_eq!(classify(&Method::POST, route), Access::Write, "{route}");
+            assert!(needs_write_grant(&Method::POST, route), "{route}");
+        }
+
+        let query = format!("{LAYER}/queryAttachments");
+        assert_eq!(classify(&Method::POST, &query), Access::Public);
+        assert!(!needs_write_grant(&Method::POST, &query));
+        assert_eq!(classify(&Method::GET, &query), Access::Public);
+
+        // the exemption is scoped to the facade and to the whole segment, so it
+        // cannot travel to a route somewhere else that ends in the same word
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/branches/x/queryAttachments"),
+            Access::Write
+        );
+        assert!(needs_write_grant(
+            &Method::POST,
+            "/api/v1/branches/x/queryAttachments"
+        ));
     }
 
     /// The Geoservices protocol has no header for a credential, so `token` is

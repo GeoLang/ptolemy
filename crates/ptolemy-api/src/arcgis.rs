@@ -13,10 +13,14 @@
 //! Reads and writes always run on the dataset's `main` branch: nothing in the
 //! protocol can name a branch, so there is one answer and it is the obvious one.
 //!
-//! `applyEdits` is the one route here that writes. Every edit in one request
-//! becomes one commit through the same store path `/api/v1` commits take, so a
-//! batch either lands whole or does not land: see `apply_edits` for what that
-//! costs a client that expects Esri's per-row results.
+//! `applyEdits` and the three attachment operations are the routes here that
+//! write. Every edit in one `applyEdits` request becomes one commit through the
+//! same store path `/api/v1` commits take, so a batch either lands whole or does
+//! not land: see `apply_edits` for what that costs a client that expects Esri's
+//! per-row results.
+//!
+//! Attachments are the same rows the native routes serve, through the same store
+//! methods, and are gated the same way an edit is: see the `attachments` module.
 //!
 //! One further divergence there: Esri takes an add with no geometry, for a table
 //! or a shape the client fills in later, and this refuses it. A ptolemy feature
@@ -42,7 +46,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Form, Path, Query, State},
+    extract::{DefaultBodyLimit, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -55,6 +59,7 @@ use uuid::Uuid;
 
 use crate::{AppState, auth::Actor};
 
+mod attachments;
 mod where_clause;
 
 pub fn arcgis_routes() -> Router<AppState> {
@@ -75,6 +80,35 @@ pub fn arcgis_routes() -> Router<AppState> {
         .route(
             "/arcgis/rest/services/{service}/FeatureServer/{layer}/applyEdits",
             post(apply_edits),
+        )
+        // the attachment operations. The handlers are in the `attachments`
+        // module and the table stays here, which is where lib.rs says this
+        // facade's routes are and where the route census reads them from.
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/queryAttachments",
+            get(attachments::query_attachments_get).post(attachments::query_attachments_post),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/attachments",
+            get(attachments::list_attachments),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/attachments/{attachmentId}",
+            get(attachments::download_attachment),
+        )
+        // an upload's body holds the file, so these two carry their own limit
+        // rather than the 2 MiB axum gives a multipart body by default
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/addAttachment",
+            post(attachments::add_attachment).layer(DefaultBodyLimit::max(attachments::MAX_UPLOAD_BODY)),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/updateAttachment",
+            post(attachments::update_attachment).layer(DefaultBodyLimit::max(attachments::MAX_UPLOAD_BODY)),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/deleteAttachments",
+            post(attachments::delete_attachments),
         )
         // scoped to the facade, not the whole API: an org's web maps run on
         // their own origins, and the ArcGIS JS API refuses a server that
@@ -813,9 +847,12 @@ async fn layer_metadata(
             "supportsOrderBy": true,
             "supportsStatistics": false,
             "supportsDistinct": false,
-            "supportsQueryAttachments": false,
+            "supportsQueryAttachments": true,
         },
-        "hasAttachments": false,
+        // the operations are served whether or not this layer holds an
+        // attachment yet: a client reads these to decide whether to offer the
+        // buttons at all, so a layer with none would otherwise never get one
+        "hasAttachments": true,
         "hasZ": false,
         "hasM": false,
         "isDataVersioned": false,
