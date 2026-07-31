@@ -1918,6 +1918,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jung-esri"
+version = "0.1.0"
+source = "git+https://github.com/GeoLang/jung.git?branch=master#0f9cda5676faf2b77d4e665e705162a80fa7e69c"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2684,6 +2692,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "jsonwebtoken",
+ "jung-esri",
  "metrics",
  "metrics-exporter-prometheus",
  "openidconnect",

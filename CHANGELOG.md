@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: A migrated dataset's Esri symbology is served two ways. The ArcGIS
+  facade's layer metadata carries `drawingInfo` when the dataset has a symbology
+  rule whose symbol is tagged `{"format": "esri-drawing-info"}`, which is what
+  verne writes when it migrates a hosted feature layer. The stored document goes
+  back verbatim, so QGIS's ArcGIS REST provider and the ArcGIS JS API draw the
+  data the way the original service did. A dataset with no such rule has no
+  `drawingInfo` key, exactly as before. Rules are found by that format tag and
+  never by the rule name, because the name a writer picks is a convention and the
+  tag is what the document promises to be. `GET /api/v1/datasets/{id}/style`
+  translates the same document into Mapbox GL layers for everything that is not
+  an Esri client, through `jung-esri` from the sibling jung repo, and answers
+  `{source, sourceLayer, layers, losses}`. `source` defaults to `ptolemy` and
+  `sourceLayer` to the dataset name, both overridable by query parameter, and
+  the geometry the translator draws for comes from the dataset's
+  `geometry_type`. `losses` is part of the answer rather than a log line: a
+  client showing a migrated layer needs to know the renderer had a size ramp
+  nobody drew. A dataset with no stored Esri style answers 404, and one whose
+  stored document is missing its `drawingInfo` key, holds something other than an
+  object, or whose geometry has no single symbol kind to draw, answers 422 naming
+  what is wrong rather than 500. Both are reads and apply dataset visibility the
+  way the other read routes do.
 - 2026-07-31: Attachments on the ArcGIS FeatureServer facade, reads and writes:
   `GET 0/{oid}/attachments`, `GET 0/{oid}/attachments/{attachmentId}`,
   `GET POST 0/queryAttachments`, and `POST 0/{oid}/addAttachment`,

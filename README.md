@@ -270,6 +270,16 @@ Attachments are served and edited through the Esri routes (per-feature list and
 download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
 `deleteAttachments`), with the writes gated like `applyEdits`.
 
+Layer metadata carries `drawingInfo` when the dataset has a symbology rule whose
+symbol is tagged `{"format": "esri-drawing-info"}`, which is what verne writes
+when it migrates a hosted feature layer. The stored document is served back
+verbatim, so an Esri client draws migrated data the way the original service did.
+A dataset with no such rule has no `drawingInfo` key at all.
+`GET /api/v1/datasets/{id}/style` translates that same document into Mapbox GL
+layers for non-Esri clients, with `source` and `sourceLayer` overridable by query
+parameter and everything the translation could not carry over listed under
+`losses`.
+
 Not served: statistics, and datasets whose `geometry_type` is `geometry` or
 `geometry_collection`, which have no single Esri layer type.
 
@@ -546,6 +556,7 @@ client but any JSON structure will work.
 | **Cartography** | | |
 | GET | `/api/v1/datasets/{id}/symbology` | List symbology rules |
 | POST | `/api/v1/datasets/{id}/symbology` | Create symbology rule |
+| GET | `/api/v1/datasets/{id}/style` | Stored Esri style as Mapbox GL layers |
 | GET | `/api/v1/symbology/{id}` | Get symbology rule |
 | PUT | `/api/v1/symbology/{id}` | Update symbology |
 | DELETE | `/api/v1/symbology/{id}` | Delete symbology |

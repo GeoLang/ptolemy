@@ -3,10 +3,16 @@
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
 //! Cartographic representations — symbology and label rules per dataset.
+//!
+//! One symbol format is understood rather than merely stored: a rule tagged
+//! `esri-drawing-info` holds an Esri layer's `drawingInfo` verbatim, which is
+//! what verne writes when it migrates a hosted feature layer. The ArcGIS facade
+//! hands that document straight back to Esri clients, and `/style` translates it
+//! into Mapbox GL layers for everything else.
 
 use axum::{
     Extension, Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
@@ -19,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{AppState, auth::Actor};
 
 pub fn cartography_routes() -> Router<AppState> {
     Router::new()
@@ -27,6 +33,7 @@ pub fn cartography_routes() -> Router<AppState> {
             "/datasets/{id}/symbology",
             get(list_symbology).post(create_symbology),
         )
+        .route("/datasets/{id}/style", get(dataset_style))
         .route(
             "/symbology/{id}",
             get(get_symbology)
@@ -41,6 +48,34 @@ pub fn cartography_routes() -> Router<AppState> {
 }
 
 // ─── Symbology ──────────────────────────────────────────────────────
+
+/// The `format` tag on a symbol that holds an Esri layer's `drawingInfo`
+/// verbatim, which is how a migrated dataset keeps its original styling.
+///
+/// Rules are found by this tag and never by the rule name: the name a writer
+/// picks is a convention, the tag is what the document promises to be.
+pub(crate) const ESRI_DRAWING_INFO: &str = "esri-drawing-info";
+
+/// The dataset's stored Esri symbol document, when it has one. Lowest priority
+/// first, so one dataset carrying several answers with the same one everywhere.
+///
+/// The whole symbol comes back rather than its `drawingInfo`, so a caller can
+/// tell a dataset with no Esri style from one whose stored document is broken.
+pub(crate) async fn esri_symbol(
+    store: &AppState,
+    dataset_id: Uuid,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT symbol FROM symbology_rules
+          WHERE dataset_id = $1 AND symbol->>'format' = $2
+          ORDER BY priority, id LIMIT 1",
+    )
+    .bind(dataset_id)
+    .bind(ESRI_DRAWING_INFO)
+    .fetch_optional(store.read_pool())
+    .await?;
+    Ok(row.map(|r| r.get("symbol")))
+}
 
 #[derive(Serialize)]
 struct SymbologyRule {
@@ -168,6 +203,104 @@ async fn delete_symbology(
 ) -> Result<StatusCode, CartoError> {
     store.delete_symbology_rule(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Translated style ───────────────────────────────────────────────
+
+/// The source name emitted layers reference when the caller names none.
+const DEFAULT_SOURCE: &str = "ptolemy";
+
+#[derive(Deserialize)]
+struct StyleQuery {
+    /// source name in the caller's own style document
+    source: Option<String>,
+    #[serde(rename = "sourceLayer")]
+    source_layer: Option<String>,
+}
+
+/// The dataset's geometry as the translator names it, which is what decides
+/// whether symbols become circle, line or fill layers.
+fn style_geometry(stored: &str) -> Option<jung_esri::Geometry> {
+    match stored {
+        "point" | "multipoint" => Some(jung_esri::Geometry::Point),
+        "linestring" | "multilinestring" => Some(jung_esri::Geometry::Line),
+        "polygon" | "multipolygon" => Some(jung_esri::Geometry::Polygon),
+        _ => None,
+    }
+}
+
+/// What a JSON value is, for an error that has to say why a stored document
+/// could not be read.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The dataset's stored Esri style as Mapbox GL layers, with everything the
+/// translation dropped listed alongside them.
+///
+/// The losses are part of the answer rather than a log line: a client showing a
+/// migrated layer needs to know the renderer had a size ramp nobody drew.
+async fn dataset_style(
+    State(store): State<AppState>,
+    actor: Actor,
+    Path(dataset_id): Path<Uuid>,
+    Query(query): Query<StyleQuery>,
+) -> Result<Json<serde_json::Value>, CartoError> {
+    let reader = actor.reader();
+    let visible = ptolemy_storage::visible_datasets_sql("d", 2, 3);
+    let row = sqlx::query(&format!(
+        "SELECT d.name, d.geometry_type FROM datasets d WHERE d.id = $1 AND {visible}"
+    ))
+    .bind(dataset_id)
+    .bind(reader.bypass)
+    .bind(reader.id.as_deref())
+    .fetch_optional(store.read_pool())
+    .await?
+    .ok_or(CartoError::NotFound)?;
+    let name: String = row.get("name");
+    let stored_geometry: String = row.get("geometry_type");
+
+    let symbol = esri_symbol(&store, dataset_id)
+        .await?
+        .ok_or(CartoError::NoEsriStyle)?;
+    let drawing_info = symbol.get("drawingInfo").ok_or_else(|| {
+        CartoError::Unprocessable(format!(
+            "the stored {ESRI_DRAWING_INFO} symbol has no drawingInfo key"
+        ))
+    })?;
+    if !drawing_info.is_object() {
+        return Err(CartoError::Unprocessable(format!(
+            "the stored drawingInfo is {}, not a JSON object",
+            json_kind(drawing_info)
+        )));
+    }
+    let geometry = style_geometry(&stored_geometry).ok_or_else(|| {
+        CartoError::Unprocessable(format!(
+            "the dataset's geometry_type is {stored_geometry}, which has no single symbol \
+             kind to draw, so its style cannot be translated"
+        ))
+    })?;
+
+    let source = jung_esri::Source {
+        source: query.source.unwrap_or_else(|| DEFAULT_SOURCE.to_string()),
+        source_layer: query.source_layer.unwrap_or(name),
+    };
+    let translated = jung_esri::translate(drawing_info, &source, geometry);
+    Ok(Json(serde_json::json!({
+        "source": source.source,
+        "sourceLayer": source.source_layer,
+        "layers": translated.layers,
+        "losses": translated.losses.iter()
+            .map(|loss| serde_json::json!({"path": loss.path, "reason": loss.reason}))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 // ─── Labels ─────────────────────────────────────────────────────────
@@ -316,6 +449,10 @@ enum CartoError {
     Db(sqlx::Error),
     Store(ptolemy_storage::StoreError),
     NotFound,
+    /// the dataset is readable and simply carries no stored esri style
+    NoEsriStyle,
+    /// a stored document or a dataset the translator cannot work from
+    Unprocessable(String),
 }
 impl From<sqlx::Error> for CartoError {
     fn from(e: sqlx::Error) -> Self {
@@ -331,6 +468,13 @@ impl IntoResponse for CartoError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             CartoError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            CartoError::NoEsriStyle => (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "the dataset has no stored esri style: no symbology rule on it is tagged {ESRI_DRAWING_INFO}"
+                ),
+            ),
+            CartoError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             CartoError::Store(e) => crate::errors::store_error_status(&e),
             CartoError::Db(e) => {
                 tracing::error!("DB: {e}");

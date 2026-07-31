@@ -824,7 +824,15 @@ async fn layer_metadata(
         .find(|f| f.kind == Kind::Text)
         .unwrap_or(&layer.fields[0]);
 
-    Ok(Json(json!({
+    // an esri client reads drawingInfo off this document and renders with it, so a
+    // migrated dataset keeps the look it had in the service it came from. Served
+    // exactly as stored: nothing here understands what is in it.
+    let drawing_info = crate::cartography::esri_symbol(&store, layer.dataset_id)
+        .await?
+        .and_then(|symbol| symbol.get("drawingInfo").cloned())
+        .filter(|info| !info.is_null());
+
+    let mut metadata = json!({
         "currentVersion": CURRENT_VERSION,
         "id": 0,
         "name": layer.name,
@@ -863,7 +871,15 @@ async fn layer_metadata(
         "relationships": [],
         "types": [],
         "templates": [],
-    })))
+    });
+
+    // no stored esri style means no key at all, which is what a hosted layer the
+    // client draws with its own defaults looks like
+    if let Some(info) = drawing_info {
+        metadata["drawingInfo"] = info;
+    }
+
+    Ok(Json(metadata))
 }
 
 // ─── Query ──────────────────────────────────────────────────────────

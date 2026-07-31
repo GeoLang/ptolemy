@@ -1237,6 +1237,249 @@ async fn test_symbology_rule_create_and_read_back() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Esri drawingInfo: served verbatim by the facade, translated by /style
+// ═══════════════════════════════════════════════════════════════════════
+
+/// The drawingInfo verne stores when it migrates an esri point layer: a simple
+/// marker renderer, plus one thing no translator draws so the losses are real.
+fn esri_drawing_info() -> Value {
+    json!({
+        "renderer": {
+            "type": "simple",
+            "symbol": {
+                "type": "esriSMS",
+                "style": "esriSMSCircle",
+                "color": [255, 0, 0, 255],
+                "size": 12
+            },
+            "visualVariables": [{"type": "sizeInfo", "field": "pop"}]
+        }
+    })
+}
+
+/// Store an esri symbol the way verne does: one rule whose symbol carries the
+/// format tag. `symbol` is passed whole so a test can store a broken one.
+async fn store_esri_symbol(
+    app: &axum::Router,
+    dataset_id: Uuid,
+    token: Option<&str>,
+    symbol: Value,
+) {
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/symbology"),
+        token,
+        Some(json!({"name": "esri-drawing-info", "symbol": symbol, "priority": 0})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "store esri symbol: {body}");
+}
+
+/// The well formed case: the tag plus a drawingInfo document.
+async fn store_esri_style(app: &axum::Router, dataset_id: Uuid, token: Option<&str>) {
+    let symbol = json!({"format": "esri-drawing-info", "drawingInfo": esri_drawing_info()});
+    store_esri_symbol(app, dataset_id, token, symbol).await;
+}
+
+#[tokio::test]
+async fn test_facade_serves_stored_esri_drawing_info() {
+    let (app, _) = setup_app().await;
+    let name = format!("styled_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+    let uri = format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json");
+
+    // with nothing stored the key is absent, which is a layer drawn by client default
+    let (status, layer) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{layer}");
+    assert!(layer.get("drawingInfo").is_none(), "{layer}");
+
+    store_esri_style(&app, ds, None).await;
+    let (status, layer) = get_json(&app, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{layer}");
+    assert_eq!(
+        layer["drawingInfo"],
+        esri_drawing_info(),
+        "the stored document is served verbatim: {layer}"
+    );
+}
+
+#[tokio::test]
+async fn test_facade_ignores_symbology_in_other_formats() {
+    let (app, _) = setup_app().await;
+    let name = format!("native_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 1).await;
+
+    // a native rule is not an esri document, so the facade claims no drawing for it
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds}/symbology"),
+        json!({"name": "water", "symbol": {"type": "simple_fill", "color": [0, 0, 255, 255]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{layer}");
+    assert!(layer.get("drawingInfo").is_none(), "{layer}");
+}
+
+#[tokio::test]
+async fn test_dataset_style_translates_stored_drawing_info() {
+    let (app, _) = setup_app().await;
+    let name = format!("wells_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    store_esri_style(&app, ds, None).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds}/style")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["source"], "ptolemy", "{body}");
+    assert_eq!(body["sourceLayer"], name, "{body}");
+
+    let layers = body["layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1, "{body}");
+    assert_eq!(layers[0]["id"], format!("{name}-circle"), "{body}");
+    assert_eq!(layers[0]["type"], "circle", "{body}");
+    assert_eq!(layers[0]["source"], "ptolemy", "{body}");
+    assert_eq!(layers[0]["source-layer"], name, "{body}");
+    // a 12 point diameter is 8 css pixels of radius, and esri alpha is 0-255
+    assert_eq!(layers[0]["paint"]["circle-radius"], 8.0, "{body}");
+    assert_eq!(
+        layers[0]["paint"]["circle-color"], "rgba(255,0,0,1)",
+        "{body}"
+    );
+
+    // the size ramp nobody drew is reported rather than dropped in silence
+    let losses = body["losses"].as_array().unwrap();
+    assert_eq!(losses.len(), 1, "{body}");
+    assert_eq!(losses[0]["path"], "renderer.visualVariables", "{body}");
+    assert!(
+        losses[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("visual variables"),
+        "{body}"
+    );
+
+    // the caller's own style names its source and layer differently
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/datasets/{ds}/style?source=verne&sourceLayer=drilled"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["source"], "verne", "{body}");
+    assert_eq!(body["sourceLayer"], "drilled", "{body}");
+    assert_eq!(body["layers"][0]["id"], "drilled-circle", "{body}");
+    assert_eq!(body["layers"][0]["source"], "verne", "{body}");
+    assert_eq!(body["layers"][0]["source-layer"], "drilled", "{body}");
+}
+
+#[tokio::test]
+async fn test_dataset_style_404_without_a_stored_esri_style() {
+    let (app, _) = setup_app().await;
+    let ds = create_dataset(&app).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds}/style")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no stored esri style"),
+        "{body}"
+    );
+
+    // a rule in another format is not one either
+    let (status, created) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds}/symbology"),
+        json!({"name": "water", "symbol": {"type": "simple_fill"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds}/style")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn test_dataset_style_422_on_mixed_geometry() {
+    let (app, _) = setup_app().await;
+    let name = format!("mixed_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "geometry").await;
+    store_esri_style(&app, ds, None).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds}/style")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("geometry_type is geometry"),
+        "the error names the type: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_style_422_on_malformed_stored_document() {
+    let (app, _) = setup_app().await;
+
+    // tagged, but there is no document under the tag
+    let keyless = create_dataset(&app).await;
+    store_esri_symbol(&app, keyless, None, json!({"format": "esri-drawing-info"})).await;
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{keyless}/style")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("drawingInfo"),
+        "{body}"
+    );
+
+    // tagged, and the document is not an object
+    let scalar = create_dataset(&app).await;
+    store_esri_symbol(
+        &app,
+        scalar,
+        None,
+        json!({"format": "esri-drawing-info", "drawingInfo": "none"}),
+    )
+    .await;
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{scalar}/style")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("a string"),
+        "the error names what was stored instead: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_private_dataset_style_is_404_for_outsiders() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, carol) = seed_private_dataset(&app).await;
+    store_esri_style(&app, dataset_id, Some(&carol)).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/style");
+
+    let (status, body) = request_as(&app, "GET", &uri, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "anonymous: {body}");
+
+    let eve = token_for_user("eve", Role::Editor);
+    let (status, body) = request_as(&app, "GET", &uri, Some(&eve), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-granted editor: {body}");
+
+    // the owner reads the translation of their own style
+    let (status, body) = request_as(&app, "GET", &uri, Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "owner: {body}");
+    assert_eq!(body["layers"][0]["type"], "circle", "{body}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Relationship Tests
 // ═══════════════════════════════════════════════════════════════════════
 

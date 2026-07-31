@@ -20,6 +20,8 @@ description = "Tile server for vector and raster map tiles"
 rust-version = "1.88"
 
 [workspace.dependencies]
+# translates a migrated dataset's stored esri drawingInfo into mapbox gl layers
+jung-esri = { git = "https://github.com/GeoLang/jung.git", branch = "master" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }

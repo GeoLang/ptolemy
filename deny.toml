@@ -45,3 +45,7 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
 
+# sibling platform crates are built from their own repos, not published
+[sources.allow-org]
+github = ["GeoLang"]
+
