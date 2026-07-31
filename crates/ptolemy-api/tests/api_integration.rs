@@ -8657,15 +8657,61 @@ async fn test_arcgis_query_envelope_filter_and_refused_relations() {
     .await;
     assert_eq!(count["count"], 1, "{count}");
 
+    // a mercator envelope in metres, wide enough to cover (1, 1) and not (50, 50)
+    let mercator = "geometry=0,0,200000,200000&geometryType=esriGeometryEnvelope\
+                    &spatialRel=esriSpatialRelIntersects&inSR=102100&outFields=*";
+    let (_, from_mercator) = get_json(&app, &query_url(&name, mercator)).await;
+    let features = from_mercator["features"].as_array().unwrap();
+    assert_eq!(features.len(), 1, "{from_mercator}");
+    assert_eq!(features[0]["attributes"]["name"], "near", "{from_mercator}");
+
     for refused in [
         "geometry=0,0,10,10&geometryType=esriGeometryPolygon",
         "geometry=0,0,10,10&spatialRel=esriSpatialRelContains",
-        "geometry=0,0,10,10&inSR=3857",
+        "geometry=0,0,10,10&inSR=27700",
     ] {
         let (status, body) = get_json(&app, &query_url(&name, refused)).await;
         assert_eq!(status, StatusCode::OK, "{refused}: {body}");
         assert_eq!(body["error"]["code"], 400, "{refused}: {body}");
     }
+}
+
+/// A web map renders in Web Mercator and asks for it as Esri's 102100. The
+/// coordinates must come back transformed, in metres, under that name.
+#[tokio::test]
+async fn test_arcgis_query_serves_web_mercator_when_asked() {
+    let (app, _) = setup_app().await;
+    let name = format!("merc_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 0.0), "properties": {"name": "one-degree"}},
+        ]),
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &query_url(&name, "outSR=102100&outFields=*")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spatialReference"]["wkid"], 102100, "{body}");
+    assert_eq!(body["spatialReference"]["latestWkid"], 3857, "{body}");
+    let geometry = &body["features"][0]["geometry"];
+    // one degree of longitude on the mercator sphere, with slack for the
+    // transform rather than an exact float
+    let x = geometry["x"].as_f64().unwrap();
+    assert!((x - 111319.490793).abs() < 1.0, "{geometry}");
+    assert!(geometry["y"].as_f64().unwrap().abs() < 1.0, "{geometry}");
+
+    // geojson stays 4326 by its own spec, so mercator geojson is refused
+    let (_, refused) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0/query?f=geojson&outSR=102100"),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], 400, "{refused}");
 }
 
 #[tokio::test]
@@ -8833,7 +8879,7 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
     for refused in [
         "orderByFields=name",
         "orderByFields=objectid%20DESC",
-        "outSR=3857",
+        "outSR=27700",
         "outFields=nosuchfield",
         "returnZ=true",
         "outStatistics=%5B%5D",
@@ -8858,6 +8904,8 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
         "orderByFields=objectid%20ASC",
         "outSR=4326",
         "outSR=%7B%22wkid%22%3A4326%7D",
+        "outSR=3857",
+        "outSR=102100",
         "returnZ=false",
         "f=pjson",
     ] {

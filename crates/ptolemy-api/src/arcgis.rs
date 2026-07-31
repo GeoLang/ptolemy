@@ -52,6 +52,10 @@ pub fn arcgis_routes() -> Router<AppState> {
             "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
             get(query_get).post(query_post),
         )
+        // scoped to the facade, not the whole API: an org's web maps run on
+        // their own origins, and the ArcGIS JS API refuses a server that
+        // does not answer CORS, which real ArcGIS servers do
+        .layer(tower_http::cors::CorsLayer::permissive())
 }
 
 /// The REST version a client is told it is talking to. Clients gate features on
@@ -65,10 +69,35 @@ const MAX_RECORD_COUNT: i64 = 1000;
 /// The only layer id a dataset's service has.
 const LAYER_ID: &str = "0";
 
-/// Every geometry this service serves is in EPSG:4326, and it says so once per
-/// response rather than once per geometry.
+/// Every geometry this service stores is in EPSG:4326, and a response says its
+/// reference once rather than once per geometry.
 fn spatial_reference() -> Value {
     json!({"wkid": 4326, "latestWkid": 4326})
+}
+
+/// The reference a Web Mercator answer declares: Esri's own 102100 name first,
+/// because that is the id a web client asked with and compares against.
+fn mercator_reference() -> Value {
+    json!({"wkid": 102100, "latestWkid": 3857})
+}
+
+/// The srid a client-supplied spatial reference names, normalised to the two
+/// this service speaks: 4326 as stored, 3857 for 3857 or its 102100 alias.
+/// `None` is a reference this service will not guess at.
+fn known_srid(value: &str) -> Option<i32> {
+    let wkid = match value.parse::<i64>() {
+        Ok(code) => Some(code),
+        Err(_) => serde_json::from_str::<Value>(value).ok().and_then(|v| {
+            v.get("latestWkid")
+                .or_else(|| v.get("wkid"))
+                .and_then(Value::as_i64)
+        }),
+    }?;
+    match wkid {
+        4326 => Some(4326),
+        3857 | 102100 => Some(3857),
+        _ => None,
+    }
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────
@@ -817,7 +846,14 @@ async fn run_query(
         }
     }
 
-    check_sr(&params, "outSR")?;
+    let out_srid = sr_srid(&params, "outSR")?.unwrap_or(4326);
+    // RFC 7946 says GeoJSON is 4326, so a mercator FeatureCollection would be
+    // a lie whichever reference it claimed
+    if out_srid != 4326 && matches!(format, Format::GeoJson) {
+        return Err(EsriError::bad_request(
+            "f=geojson serves EPSG:4326 only; ask for f=json to get Web Mercator",
+        ));
+    }
 
     let return_geometry = match params.get("returnGeometry") {
         None => true,
@@ -846,14 +882,26 @@ async fn run_query(
         next += 1;
     }
 
-    if let Some(envelope) = envelope(&params)? {
-        filters.push(format!(
-            "geometry && ST_MakeEnvelope(${}, ${}, ${}, ${}, 4326)",
-            next,
-            next + 1,
-            next + 2,
-            next + 3
-        ));
+    if let Some((envelope, in_srid)) = envelope(&params)? {
+        // a mercator envelope is transformed to the stored reference instead
+        // of the other way round: it is four numbers against a whole column
+        filters.push(if in_srid == 4326 {
+            format!(
+                "geometry && ST_MakeEnvelope(${}, ${}, ${}, ${}, 4326)",
+                next,
+                next + 1,
+                next + 2,
+                next + 3
+            )
+        } else {
+            format!(
+                "geometry && ST_Transform(ST_MakeEnvelope(${}, ${}, ${}, ${}, {in_srid}), 4326)",
+                next,
+                next + 1,
+                next + 2,
+                next + 3
+            )
+        });
         binds.extend(envelope.into_iter().map(Bind::Coord));
         next += 4;
     }
@@ -933,8 +981,13 @@ async fn run_query(
 
     // one row past the page, which is what says whether there is another page.
     // Cheaper than counting the whole filtered set on every page.
+    let shape = if out_srid == 4326 {
+        "ST_AsGeoJSON(geometry)::jsonb".to_string()
+    } else {
+        format!("ST_AsGeoJSON(ST_Transform(geometry, {out_srid}))::jsonb")
+    };
     let sql = format!(
-        "{rows} SELECT oid, ST_AsGeoJSON(geometry)::jsonb AS geojson, properties
+        "{rows} SELECT oid, {shape} AS geojson, properties
            FROM numbered{predicate}
           ORDER BY oid NULLS LAST, id
           LIMIT ${} OFFSET ${}",
@@ -988,7 +1041,7 @@ async fn run_query(
             "objectIdFieldName": layer.oid.name(),
             "globalIdFieldName": "",
             "geometryType": layer.geometry,
-            "spatialReference": spatial_reference(),
+            "spatialReference": if out_srid == 4326 { spatial_reference() } else { mercator_reference() },
             "hasZ": false,
             "hasM": false,
             "fields": out_fields.iter().map(|f| f.declaration()).collect::<Vec<_>>(),
@@ -1024,27 +1077,19 @@ fn out_fields<'a>(layer: &'a Layer, asked: Option<&str>) -> Result<Vec<&'a Field
 }
 
 /// `inSR` and `outSR` may be a wkid or the whole spatial reference object.
-/// Nothing here reprojects, so 4326 is the only answer this service can give
-/// and the only one it accepts.
-fn check_sr(params: &Params, name: &str) -> Result<(), EsriError> {
+/// The store holds 4326 and PostGIS transforms to or from Web Mercator, which
+/// every web client renders in; any other reference is refused rather than
+/// guessed at.
+fn sr_srid(params: &Params, name: &str) -> Result<Option<i32>, EsriError> {
     let Some(value) = params.get(name).map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(());
+        return Ok(None);
     };
-    let wkid = match value.parse::<i64>() {
-        Ok(code) => Some(code),
-        Err(_) => serde_json::from_str::<Value>(value).ok().and_then(|v| {
-            v.get("latestWkid")
-                .or_else(|| v.get("wkid"))
-                .and_then(Value::as_i64)
-        }),
-    };
-    match wkid {
-        Some(4326) => Ok(()),
-        _ => Err(EsriError::bad_request(format!(
+    known_srid(value).map(Some).ok_or_else(|| {
+        EsriError::bad_request(format!(
             "{name} '{value}' is not supported in this version of the service, \
-             which serves and accepts EPSG:4326 only"
-        ))),
-    }
+             which serves and accepts EPSG:4326 and Web Mercator (3857/102100) only"
+        ))
+    })
 }
 
 /// The envelope a spatial filter names, as `[xmin, ymin, xmax, ymax]`.
@@ -1053,7 +1098,7 @@ fn check_sr(params: &Params, name: &str) -> Result<(), EsriError> {
 /// only one the store's own bbox read implements. Any other geometry type or
 /// relation is refused: running it as an envelope intersection would answer
 /// with rows the client did not ask for.
-fn envelope(params: &Params) -> Result<Option<[f64; 4]>, EsriError> {
+fn envelope(params: &Params) -> Result<Option<([f64; 4], i32)>, EsriError> {
     let Some(raw) = params
         .get("geometry")
         .map(str::trim)
@@ -1088,17 +1133,22 @@ fn envelope(params: &Params) -> Result<Option<[f64; 4]>, EsriError> {
             )));
         }
     }
-    check_sr(params, "inSR")?;
+    let mut in_srid = sr_srid(params, "inSR")?.unwrap_or(4326);
 
     // both forms a client may send: the comma list, and the envelope object
     let bounds = if raw.starts_with('{') {
         let value: Value = serde_json::from_str(raw)
             .map_err(|e| EsriError::bad_request(format!("geometry is not valid JSON: {e}")))?;
+        // a reference on the envelope itself wins over inSR, as it does on
+        // Esri's own services
         if let Some(reference) = value.get("spatialReference") {
-            check_sr(
-                &Params(vec![("inSR".into(), reference.to_string())]),
-                "inSR",
-            )?;
+            in_srid = known_srid(&reference.to_string()).ok_or_else(|| {
+                EsriError::bad_request(format!(
+                    "the envelope's spatialReference {reference} is not supported in this \
+                     version of the service, which accepts EPSG:4326 and Web Mercator \
+                     (3857/102100) only"
+                ))
+            })?;
         }
         let read = |key: &str| value.get(key).and_then(Value::as_f64);
         match (read("xmin"), read("ymin"), read("xmax"), read("ymax")) {
@@ -1123,7 +1173,7 @@ fn envelope(params: &Params) -> Result<Option<[f64; 4]>, EsriError> {
         }
         [parts[0], parts[1], parts[2], parts[3]]
     };
-    Ok(Some(bounds))
+    Ok(Some((bounds, in_srid)))
 }
 
 // ─── Geometry ───────────────────────────────────────────────────────
@@ -1322,25 +1372,33 @@ mod tests {
     }
 
     #[test]
-    fn sr_accepts_4326_as_a_code_or_an_object() {
+    fn sr_accepts_4326_and_mercator_as_a_code_or_an_object() {
         let object = Params(vec![("outSR".into(), r#"{"wkid":4326}"#.into())]);
-        assert!(check_sr(&object, "outSR").is_ok());
+        assert_eq!(sr_srid(&object, "outSR").unwrap(), Some(4326));
         let code = Params(vec![("outSR".into(), "4326".into())]);
-        assert!(check_sr(&code, "outSR").is_ok());
-        let other = Params(vec![("outSR".into(), "3857".into())]);
-        assert!(check_sr(&other, "outSR").is_err());
+        assert_eq!(sr_srid(&code, "outSR").unwrap(), Some(4326));
+        // both names a web client uses for mercator normalise to postgis's
+        let epsg = Params(vec![("outSR".into(), "3857".into())]);
+        assert_eq!(sr_srid(&epsg, "outSR").unwrap(), Some(3857));
+        let esri = Params(vec![("outSR".into(), "102100".into())]);
+        assert_eq!(sr_srid(&esri, "outSR").unwrap(), Some(3857));
+        let other = Params(vec![("outSR".into(), "27700".into())]);
+        assert!(sr_srid(&other, "outSR").is_err());
     }
 
     #[test]
     fn envelope_reads_both_forms_and_refuses_other_relations() {
         let list = Params(vec![("geometry".into(), "1,2,3,4".into())]);
-        assert_eq!(envelope(&list).unwrap(), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(envelope(&list).unwrap(), Some(([1.0, 2.0, 3.0, 4.0], 4326)));
 
         let object = Params(vec![(
             "geometry".into(),
-            r#"{"xmin":1,"ymin":2,"xmax":3,"ymax":4,"spatialReference":{"wkid":4326}}"#.into(),
+            r#"{"xmin":1,"ymin":2,"xmax":3,"ymax":4,"spatialReference":{"wkid":102100}}"#.into(),
         )]);
-        assert_eq!(envelope(&object).unwrap(), Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(
+            envelope(&object).unwrap(),
+            Some(([1.0, 2.0, 3.0, 4.0], 3857))
+        );
 
         let polygon = Params(vec![
             ("geometry".into(), "1,2,3,4".into()),
