@@ -162,9 +162,9 @@ pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str
 ///
 /// A JWT is base64url and dots, none of which percent-encoding touches, so the
 /// raw value is the token. The value is never logged from here. It is still in a
-/// URL, which anything that records URLs records: this crate's request span
-/// carries the URI at DEBUG level, so `tower_http` turned up to debug puts
-/// tokens in the log.
+/// URL, which anything upstream that records URLs records: this crate's own
+/// request span redacts the value (see `traced_uri` in lib.rs), but a proxy log
+/// does not.
 fn query_token(uri: &Uri) -> Option<&str> {
     uri.query()?.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;

@@ -97,7 +97,10 @@ fn traced_uri(uri: &Uri) -> String {
     let redacted = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((name, _)) if name.eq_ignore_ascii_case("token") => {
+            // token is the arcgis credential, code the oidc authorization code
+            Some((name, _))
+                if name.eq_ignore_ascii_case("token") || name.eq_ignore_ascii_case("code") =>
+            {
                 format!("{name}={REDACTED}")
             }
             _ => pair.to_string(),
@@ -221,6 +224,8 @@ mod tests {
             &format!("/arcgis/rest/services?TOKEN={secret}"),
             &format!("/arcgis/rest/services?token={secret}&token={secret}"),
             &format!("https://host/arcgis/rest/services?token={secret}"),
+            &format!("/auth/callback?code={secret}&state=xyz"),
+            &format!("/auth/callback?CODE={secret}"),
         ] {
             let out = traced(uri);
             assert!(!out.contains(secret), "{uri} traced as {out}");
