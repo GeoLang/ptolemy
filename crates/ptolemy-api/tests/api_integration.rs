@@ -7923,7 +7923,10 @@ fn calls(args: &str, name: &str) -> bool {
 /// entry is either a POST that only computes, or grant management, which
 /// rbac.rs gates harder. Adding a route to this list is the only way to opt out,
 /// and it cannot be done from a request.
-const UNGATED_TEMPLATES: [&str; 49] = [
+const UNGATED_TEMPLATES: [&str; 50] = [
+    // the FeatureServer query takes a POST body only because an object id list
+    // is too long for a URL; the whole /arcgis frontend is read-only
+    "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
     "/api/v1/attribute-rules/{id}/validate",
     "/api/v1/branches/{branch_id}/permissions/{user_id}",
     "/api/v1/branches/{id}/3d/extrude",
@@ -8298,4 +8301,740 @@ async fn test_native_geometry_srid_and_wkt_together_rejected() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ArcGIS FeatureServer facade
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: post a form body, which is how an Esri client sends a query whose
+/// object id list is too long for a URL.
+async fn post_form(app: &axum::Router, uri: &str, body: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// Helper: create a dataset under a name a URL can carry, return its id.
+async fn create_named_dataset(app: &axum::Router, name: &str, geometry_type: &str) -> Uuid {
+    let (status, body) = post_json(
+        app,
+        "/api/v1/datasets",
+        json!({"name": name, "geometry_type": geometry_type, "srid": 4326, "created_by": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create dataset: {body}");
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+fn wkb_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// Little-endian WKB for a 2D point, so a test can place a feature exactly.
+fn point_wkb(x: f64, y: f64) -> String {
+    let mut out = vec![1u8];
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    wkb_hex(&out)
+}
+
+/// Little-endian WKB for a 2D polygon, rings in the order given and wound
+/// however the test wound them: the facade decides the Esri winding itself.
+fn polygon_wkb(rings: &[Vec<(f64, f64)>]) -> String {
+    let mut out = vec![1u8];
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&(rings.len() as u32).to_le_bytes());
+    for ring in rings {
+        out.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+        for (x, y) in ring {
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+    }
+    wkb_hex(&out)
+}
+
+/// Twice the signed area, positive counter-clockwise, over an esriJSON ring.
+fn ring_winding(ring: &Value) -> f64 {
+    let points: Vec<(f64, f64)> = ring
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let pair = p.as_array().unwrap();
+            (pair[0].as_f64().unwrap(), pair[1].as_f64().unwrap())
+        })
+        .collect();
+    let mut sum = 0.0;
+    for pair in points.windows(2) {
+        sum += pair[0].0 * pair[1].1 - pair[1].0 * pair[0].1;
+    }
+    let (first, last) = (points[0], points[points.len() - 1]);
+    sum + last.0 * first.1 - first.0 * last.1
+}
+
+/// Helper: a service's layer 0 query URL.
+fn query_url(service: &str, params: &str) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/query?f=json&{params}")
+}
+
+/// Helper: seed `count` points along a line, one feature each.
+async fn seed_points(app: &axum::Router, branch_id: Uuid, count: usize) {
+    let ops: Vec<Value> = (0..count)
+        .map(|i| {
+            json!({
+                "type": "insert",
+                "feature_id": Uuid::now_v7().to_string(),
+                "geometry_wkb_hex": point_wkb(i as f64, i as f64),
+                "properties": {"name": format!("point-{i}")},
+            })
+        })
+        .collect();
+    commit_features(app, branch_id, json!(ops)).await;
+}
+
+#[tokio::test]
+async fn test_arcgis_catalog_lists_readable_datasets_and_skips_mixed_geometry() {
+    let (app, _) = setup_app().await;
+    let named = format!("roads_{}", Uuid::now_v7().simple());
+    let mixed = format!("mixed_{}", Uuid::now_v7().simple());
+    let roads = create_named_dataset(&app, &named, "linestring").await;
+    create_branch(&app, roads, "main").await;
+    let mixed_id = create_named_dataset(&app, &mixed, "geometry").await;
+    create_branch(&app, mixed_id, "main").await;
+
+    let (status, body) = get_json(&app, "/arcgis/rest/services?f=json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let services = body["services"].as_array().unwrap();
+    let listed = |name: &str| services.iter().any(|s| s["name"] == name);
+    assert!(listed(&named), "{body}");
+    assert!(
+        !listed(&mixed),
+        "a mixed-geometry dataset has no layer type: {body}"
+    );
+    let entry = services.iter().find(|s| s["name"] == named).unwrap();
+    assert_eq!(entry["type"], "FeatureServer");
+    assert!(
+        entry["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/arcgis/rest/services/{named}/FeatureServer")),
+        "{entry}"
+    );
+
+    // its own URL says why rather than faking a layer type
+    let (status, body) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{mixed}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("geometryType"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn test_arcgis_service_root_and_layer_metadata() {
+    let (app, _) = setup_app().await;
+    let name = format!("parks_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 3).await;
+
+    let (status, root) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{root}");
+    assert_eq!(root["currentVersion"], 11.2, "{root}");
+    assert_eq!(root["capabilities"], "Query", "{root}");
+    assert!(root["serviceDescription"].as_str().unwrap().contains(&name));
+    assert_eq!(root["tables"].as_array().unwrap().len(), 0, "{root}");
+    let layers = root["layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1, "{root}");
+    assert_eq!(layers[0]["id"], 0);
+    assert_eq!(layers[0]["name"], name);
+
+    // the same service resolved by dataset id rather than by name
+    let (status, by_id) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{ds}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{by_id}");
+    assert_eq!(by_id["layers"][0]["name"], name, "{by_id}");
+
+    let (status, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{layer}");
+    assert_eq!(layer["id"], 0);
+    assert_eq!(layer["name"], name);
+    assert_eq!(layer["type"], "Feature Layer");
+    assert_eq!(layer["geometryType"], "esriGeometryPoint");
+    assert_eq!(layer["objectIdField"], "objectid");
+    assert_eq!(layer["maxRecordCount"], 1000);
+    assert_eq!(layer["supportedQueryFormats"], "JSON,geoJSON");
+    assert_eq!(layer["capabilities"], "Query");
+    assert_eq!(
+        layer["advancedQueryCapabilities"]["supportsPagination"],
+        true
+    );
+    assert_eq!(layer["hasAttachments"], false);
+    // computed from the seeded points, which run from (0,0) to (2,2)
+    assert_eq!(layer["extent"]["xmin"], 0.0, "{layer}");
+    assert_eq!(layer["extent"]["ymax"], 2.0, "{layer}");
+    assert_eq!(layer["extent"]["spatialReference"]["wkid"], 4326, "{layer}");
+    let fields = layer["fields"].as_array().unwrap();
+    let oid = fields.iter().find(|f| f["name"] == "objectid").unwrap();
+    assert_eq!(oid["type"], "esriFieldTypeOID", "{layer}");
+    let name_field = fields.iter().find(|f| f["name"] == "name").unwrap();
+    assert_eq!(name_field["type"], "esriFieldTypeString", "{layer}");
+    assert_eq!(name_field["length"], 2048, "{layer}");
+
+    // the service has one layer, and asking for another is an error, not a 404
+    let (status, body) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/1?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+}
+
+#[tokio::test]
+async fn test_arcgis_query_pages_and_reports_exceeded_transfer_limit() {
+    let (app, _) = setup_app().await;
+    let name = format!("paged_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 5).await;
+
+    let (status, first) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "where=1=1&outFields=*&resultOffset=0&resultRecordCount=2",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["objectIdFieldName"], "objectid", "{first}");
+    assert_eq!(first["geometryType"], "esriGeometryPoint", "{first}");
+    assert_eq!(first["spatialReference"]["wkid"], 4326, "{first}");
+    assert!(first["fields"].as_array().unwrap().len() >= 2, "{first}");
+    assert_eq!(first["features"].as_array().unwrap().len(), 2, "{first}");
+    assert_eq!(first["exceededTransferLimit"], true, "{first}");
+    assert_eq!(first["features"][0]["attributes"]["objectid"], 1, "{first}");
+    assert_eq!(
+        first["features"][0]["attributes"]["name"], "point-0",
+        "{first}"
+    );
+    assert_eq!(first["features"][0]["geometry"]["x"], 0.0, "{first}");
+
+    let (_, middle) = get_json(
+        &app,
+        &query_url(&name, "resultOffset=2&resultRecordCount=2"),
+    )
+    .await;
+    assert_eq!(
+        middle["features"][0]["attributes"]["objectid"], 3,
+        "{middle}"
+    );
+    assert_eq!(middle["exceededTransferLimit"], true, "{middle}");
+
+    // the last page is short, so there is nothing past it
+    let (_, last) = get_json(
+        &app,
+        &query_url(&name, "resultOffset=4&resultRecordCount=2"),
+    )
+    .await;
+    assert_eq!(last["features"].as_array().unwrap().len(), 1, "{last}");
+    assert_eq!(last["exceededTransferLimit"], false, "{last}");
+
+    // a full page that happens to be the last one still says there is no more
+    let (_, exact) = get_json(
+        &app,
+        &query_url(&name, "resultOffset=0&resultRecordCount=5"),
+    )
+    .await;
+    assert_eq!(exact["features"].as_array().unwrap().len(), 5, "{exact}");
+    assert_eq!(exact["exceededTransferLimit"], false, "{exact}");
+}
+
+#[tokio::test]
+async fn test_arcgis_query_object_ids_count_only_and_ids_only() {
+    let (app, _) = setup_app().await;
+    let name = format!("ids_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 5).await;
+
+    let (status, ids) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    assert_eq!(status, StatusCode::OK, "{ids}");
+    assert_eq!(ids["objectIdFieldName"], "objectid", "{ids}");
+    assert_eq!(ids["objectIds"], json!([1, 2, 3, 4, 5]), "{ids}");
+
+    let (_, count) = get_json(&app, &query_url(&name, "returnCountOnly=true")).await;
+    assert_eq!(count["count"], 5, "{count}");
+
+    let (_, some) = get_json(&app, &query_url(&name, "objectIds=2,4&outFields=*")).await;
+    let features = some["features"].as_array().unwrap();
+    assert_eq!(features.len(), 2, "{some}");
+    assert_eq!(features[0]["attributes"]["objectid"], 2, "{some}");
+    assert_eq!(features[1]["attributes"]["objectid"], 4, "{some}");
+
+    let (_, filtered_count) = get_json(
+        &app,
+        &query_url(&name, "objectIds=2,4&returnCountOnly=true"),
+    )
+    .await;
+    assert_eq!(filtered_count["count"], 2, "{filtered_count}");
+
+    let (_, bad) = get_json(&app, &query_url(&name, "objectIds=two")).await;
+    assert_eq!(bad["error"]["code"], 400, "{bad}");
+}
+
+#[tokio::test]
+async fn test_arcgis_query_envelope_filter_and_refused_relations() {
+    let (app, _) = setup_app().await;
+    let name = format!("env_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0), "properties": {"name": "near"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(50.0, 50.0), "properties": {"name": "far"}},
+        ]),
+    )
+    .await;
+
+    let inside = "geometry=0,0,10,10&geometryType=esriGeometryEnvelope\
+                  &spatialRel=esriSpatialRelIntersects&inSR=4326&outFields=*";
+    let (status, body) = get_json(&app, &query_url(&name, inside)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 1, "{body}");
+    assert_eq!(features[0]["attributes"]["name"], "near", "{body}");
+
+    // the envelope object form, which is what an ArcGIS JS map sends
+    let object =
+        "geometry=%7B%22xmin%22%3A0%2C%22ymin%22%3A0%2C%22xmax%22%3A10%2C%22ymax%22%3A10%7D";
+    let (_, from_object) = get_json(&app, &query_url(&name, object)).await;
+    assert_eq!(
+        from_object["features"].as_array().unwrap().len(),
+        1,
+        "{from_object}"
+    );
+
+    let (_, count) = get_json(
+        &app,
+        &query_url(&name, "geometry=0,0,10,10&returnCountOnly=true"),
+    )
+    .await;
+    assert_eq!(count["count"], 1, "{count}");
+
+    for refused in [
+        "geometry=0,0,10,10&geometryType=esriGeometryPolygon",
+        "geometry=0,0,10,10&spatialRel=esriSpatialRelContains",
+        "geometry=0,0,10,10&inSR=3857",
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, refused)).await;
+        assert_eq!(status, StatusCode::OK, "{refused}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{refused}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_arcgis_polygon_exterior_ring_comes_out_clockwise() {
+    let (app, _) = setup_app().await;
+    let name = format!("poly_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "polygon").await;
+    let branch = create_branch(&app, ds, "main").await;
+
+    // stored the GeoJSON way round: exterior counter-clockwise, hole clockwise
+    let exterior = vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0), (0.0, 0.0)];
+    let hole = vec![(1.0, 1.0), (1.0, 2.0), (2.0, 2.0), (2.0, 1.0), (1.0, 1.0)];
+    commit_features(
+        &app,
+        branch,
+        json!([{
+            "type": "insert", "feature_id": Uuid::now_v7().to_string(),
+            "geometry_wkb_hex": polygon_wkb(&[exterior, hole]), "properties": {},
+        }]),
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["geometryType"], "esriGeometryPolygon", "{body}");
+    let rings = body["features"][0]["geometry"]["rings"].as_array().unwrap();
+    assert_eq!(rings.len(), 2, "{body}");
+    assert!(
+        ring_winding(&rings[0]) < 0.0,
+        "exterior must be clockwise: {body}"
+    );
+    assert!(
+        ring_winding(&rings[1]) > 0.0,
+        "hole must be counter-clockwise: {body}"
+    );
+    // reversed, not reordered: the same vertices, walked the other way
+    assert_eq!(rings[0][0], json!([0.0, 0.0]), "{body}");
+    assert_eq!(rings[0][1], json!([0.0, 4.0]), "{body}");
+}
+
+#[tokio::test]
+async fn test_arcgis_uses_a_real_objectid_field_when_the_schema_declares_one() {
+    let (app, _) = setup_app().await;
+    let name = format!("migrated_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(json!({"fields": [
+            {"name": "OBJECTID", "field_type": "integer", "required": true},
+            {"name": "name", "field_type": "string", "required": false},
+            {"name": "open", "field_type": "boolean", "required": false},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "a", "open": true}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 200, "name": "b", "open": false}},
+        ]),
+    )
+    .await;
+
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(layer["objectIdField"], "OBJECTID", "{layer}");
+    let fields = layer["fields"].as_array().unwrap();
+    let oid = fields.iter().find(|f| f["name"] == "OBJECTID").unwrap();
+    assert_eq!(oid["type"], "esriFieldTypeOID", "{layer}");
+    assert_eq!(
+        fields.iter().filter(|f| f["name"] == "OBJECTID").count(),
+        1,
+        "the id is declared once: {layer}"
+    );
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    assert_eq!(body["objectIdFieldName"], "OBJECTID", "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features[0]["attributes"]["OBJECTID"], 100, "{body}");
+    assert_eq!(features[1]["attributes"]["OBJECTID"], 200, "{body}");
+    // Esri has no boolean field type, so it travels as its text
+    assert_eq!(features[0]["attributes"]["open"], "true", "{body}");
+    assert_eq!(features[1]["attributes"]["open"], "false", "{body}");
+
+    let (_, ids) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    assert_eq!(ids["objectIds"], json!([100, 200]), "{ids}");
+
+    let (_, one) = get_json(&app, &query_url(&name, "objectIds=200&outFields=*")).await;
+    assert_eq!(one["features"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["features"][0]["attributes"]["name"], "b", "{one}");
+}
+
+#[tokio::test]
+async fn test_arcgis_synthesizes_objectid_when_no_schema_declares_one() {
+    let (app, _) = setup_app().await;
+    let name = format!("plain_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 3).await;
+
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(layer["objectIdField"], "objectid", "{layer}");
+    // the field list is derived from the property keys the features carry
+    let names: Vec<&str> = layer["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["objectid", "name"], "{layer}");
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 3, "{body}");
+    let ids: Vec<i64> = features
+        .iter()
+        .map(|f| f["attributes"]["objectid"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3], "{body}");
+}
+
+#[tokio::test]
+async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
+    let (app, _) = setup_app().await;
+    let name = format!("wheres_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+
+    for allowed in ["where=1=1", "where=", "outFields=*"] {
+        let (status, body) = get_json(&app, &query_url(&name, allowed)).await;
+        assert_eq!(status, StatusCode::OK, "{allowed}: {body}");
+        assert!(body["error"].is_null(), "{allowed}: {body}");
+        assert_eq!(body["features"].as_array().unwrap().len(), 2, "{allowed}");
+    }
+
+    let (status, body) = get_json(&app, &query_url(&name, "where=name%3D%27point-0%27")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("where"),
+        "{body}"
+    );
+
+    // a filter that silently did not apply would be worse than a refusal
+    for refused in [
+        "orderByFields=name",
+        "orderByFields=objectid%20DESC",
+        "outSR=3857",
+        "outFields=nosuchfield",
+        "returnZ=true",
+        "outStatistics=%5B%5D",
+        "gdbVersion=SDE.DEFAULT",
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, refused)).await;
+        assert_eq!(status, StatusCode::OK, "{refused}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{refused}: {body}");
+    }
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0/query?f=html"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+
+    // the orders and references it can honor
+    for allowed in [
+        "orderByFields=objectid",
+        "orderByFields=objectid%20ASC",
+        "outSR=4326",
+        "outSR=%7B%22wkid%22%3A4326%7D",
+        "returnZ=false",
+        "f=pjson",
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, allowed)).await;
+        assert_eq!(status, StatusCode::OK, "{allowed}: {body}");
+        assert!(body["error"].is_null(), "{allowed}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_arcgis_errors_are_http_200_with_an_error_object() {
+    let (app, _) = setup_app().await;
+
+    for uri in [
+        "/arcgis/rest/services/nosuchservice/FeatureServer?f=json",
+        "/arcgis/rest/services/nosuchservice/FeatureServer/0?f=json",
+        "/arcgis/rest/services/nosuchservice/FeatureServer/0/query?f=json",
+    ] {
+        let (status, body) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{uri}: {body}");
+        assert!(body["error"]["message"].is_string(), "{uri}: {body}");
+        assert_eq!(body["error"]["details"], json!([]), "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_arcgis_refuses_a_dataset_with_no_main_branch() {
+    let (app, _) = setup_app().await;
+    let name = format!("branchless_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    create_branch(&app, ds, "draft").await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("main"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn test_arcgis_query_accepts_a_form_post_and_drops_geometry_on_request() {
+    let (app, _) = setup_app().await;
+    let name = format!("posted_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 3).await;
+
+    let (status, body) = post_form(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0/query"),
+        "f=json&objectIds=1,3&outFields=objectid&returnGeometry=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 2, "{body}");
+    assert_eq!(features[0]["attributes"]["objectid"], 1, "{body}");
+    assert!(features[0]["geometry"]["x"].is_f64(), "{body}");
+    // outFields named only the id, so nothing else came back
+    assert_eq!(
+        features[0]["attributes"].as_object().unwrap().len(),
+        1,
+        "{body}"
+    );
+
+    let (_, bare) = get_json(&app, &query_url(&name, "returnGeometry=false")).await;
+    assert!(bare["features"][0]["geometry"].is_null(), "{bare}");
+    assert!(
+        bare["features"][0]["attributes"]["objectid"].is_i64(),
+        "{bare}"
+    );
+}
+
+#[tokio::test]
+async fn test_arcgis_answers_geojson_when_asked() {
+    let (app, _) = setup_app().await;
+    let name = format!("geojson_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/arcgis/rest/services/{name}/FeatureServer/0/query?f=geojson&where=1=1&outFields=*"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], "FeatureCollection", "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 2, "{body}");
+    assert_eq!(features[0]["type"], "Feature", "{body}");
+    assert_eq!(features[0]["geometry"]["type"], "Point", "{body}");
+    assert_eq!(features[0]["properties"]["name"], "point-0", "{body}");
+}
+
+#[tokio::test]
+async fn test_arcgis_does_not_widen_anonymous_reads_of_a_private_dataset() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let name = format!("secret_{}", Uuid::now_v7().simple());
+    let admin = token_for(Role::Admin);
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&admin),
+        Some(json!({"name": name, "geometry_type": "point", "srid": 4326,
+                    "created_by": "admin", "visibility": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ds = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{ds}/branches"),
+        Some(&admin),
+        Some(json!({"name": "main", "created_by": "admin"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(state.get_dataset(ds).await.is_ok());
+
+    // anonymous: the dataset is simply not there, exactly as in every other listing
+    let (status, catalog) = get_json(&app, "/arcgis/rest/services?f=json").await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert!(
+        !catalog["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == name),
+        "{catalog}"
+    );
+    for uri in [
+        format!("/arcgis/rest/services/{name}/FeatureServer?f=json"),
+        format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+        format!("/arcgis/rest/services/{name}/FeatureServer/0/query?f=json"),
+    ] {
+        let (status, body) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{uri}: {body}");
+    }
+
+    // named by dataset id instead, the visibility layer sees the uuid and
+    // answers its own 404 before this frontend runs. Refused either way.
+    let (status, body) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{ds}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // the admin sees it through the same routes
+    let (status, catalog) = request_as(
+        &app,
+        "GET",
+        "/arcgis/rest/services?f=json",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert!(
+        catalog["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == name),
+        "{catalog}"
+    );
 }

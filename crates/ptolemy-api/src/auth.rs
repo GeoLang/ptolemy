@@ -29,6 +29,10 @@ pub const MIN_SECRET_LEN: usize = 32;
 /// Path prefix of the websocket endpoints (`/ws/branches/{id}`, `/ws/rooms/{id}`).
 pub const WS_PREFIX: &str = "/ws/";
 
+/// The ArcGIS FeatureServer frontend's root. It is read-only, so every route
+/// under it is a read whatever method it takes.
+const ARCGIS_PREFIX: &str = "/arcgis/rest/services";
+
 /// Subprotocol name that marks a WebSocket handshake as carrying a bearer token.
 /// See [`request_token`] for the full contract.
 pub const BEARER_SUBPROTOCOL: &str = "bearer";
@@ -333,6 +337,12 @@ pub fn classify(method: &Method, route: &str) -> Access {
     }
 
     if PUBLIC_QUERY_SUFFIXES.iter().any(|s| route.ends_with(s)) {
+        return Access::Public;
+    }
+
+    // the FeatureServer query reads features and takes a POST body only because
+    // an object id list is too long for a URL. Nothing under /arcgis writes.
+    if route.starts_with(ARCGIS_PREFIX) && route.ends_with("/query") {
         return Access::Public;
     }
 

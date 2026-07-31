@@ -33,6 +33,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
 - **OGC API - Features** — Part 1 & 2 compliant
+- **ArcGIS Geoservices REST** — read-only FeatureServer, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)
 
@@ -243,6 +244,26 @@ are taken from the token subject and the value in the request body is ignored.
 With `PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is
 recorded as-is.
 
+## ArcGIS FeatureServer
+
+Point an Esri client at `/arcgis/rest/services` and it sees a read-only
+FeatureServer. Each dataset is one single-layer service, `{service}` is the
+dataset name or its uuid, the layer is always id 0, and reads come from the
+dataset's `main` branch. Dataset visibility applies exactly as it does to the
+other read routes.
+
+Query supports `where=1=1`, `objectIds`, `outFields`, `returnGeometry`,
+`returnCountOnly`, `returnIdsOnly`, `resultOffset`/`resultRecordCount` paging with
+`exceededTransferLimit`, `orderByFields` on the object id, an
+`esriGeometryEnvelope` + `esriSpatialRelIntersects` filter, `outSR=4326`, and
+`f=json`, `f=pjson` or `f=geojson`. Anything else it cannot honor is refused
+rather than ignored. Refusals follow the Geoservices convention: HTTP 200 with an
+`{"error": {...}}` body.
+
+Not served: writes, reprojection, statistics, attachments, arbitrary `where`
+clauses, and datasets whose `geometry_type` is `geometry` or
+`geometry_collection`, which have no single Esri layer type.
+
 ## Access control
 
 Two layers. The token's `role` claim decides what kind of request you may make
@@ -426,6 +447,10 @@ client but any JSON structure will work.
 | GET | `/api/v1/ogc/collections` | OGC collections |
 | GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items |
 | GET | `/api/v1/ogc/collections/{id}/items/{fid}` | OGC single feature |
+| GET | `/arcgis/rest/services` | ArcGIS service catalog |
+| GET | `/arcgis/rest/services/{service}/FeatureServer` | ArcGIS service root |
+| GET | `/arcgis/rest/services/{service}/FeatureServer/0` | ArcGIS layer metadata |
+| GET POST | `/arcgis/rest/services/{service}/FeatureServer/0/query` | ArcGIS feature query |
 | GET | `/api/v1/audit` | Audit log |
 | GET | `/api/v1/branches/{id}/locks` | List feature locks |
 | POST | `/api/v1/branches/{id}/locks` | Lock a feature |

@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: A read-only ArcGIS FeatureServer (Geoservices REST) frontend at
+  `/arcgis/rest/services`, so an Esri client connects to ptolemy unchanged. One
+  dataset is one single-layer service, layer id 0, read from the dataset's `main`
+  branch. Serves the catalog, the service root, the layer definition and
+  `/query` (GET and form POST) with `objectIds`, `outFields`, `returnGeometry`,
+  `returnCountOnly`, `returnIdsOnly`, `resultOffset`/`resultRecordCount` paging
+  with `exceededTransferLimit`, an `esriGeometryEnvelope` intersects filter, and
+  `f=json`, `f=pjson` or `f=geojson`. OBJECTID comes from an integer `objectid`
+  field when the dataset's schema declares one and is otherwise synthesized from
+  feature order. A parameter it cannot honor is refused rather than ignored, and
+  refusals follow the Geoservices convention of HTTP 200 with an `error` object.
+  Datasets whose `geometry_type` is `geometry` or `geometry_collection` are
+  excluded: an Esri layer declares exactly one geometry type. Dataset visibility
+  is enforced exactly as on the other read routes. Verified against verne's
+  extractor: `verne inspect` and `verne extract` both run clean.
+
 - `geometry_type: "geometry"` on a dataset, for a source container whose features
   differ from each other. Distinct from `geometry_collection`, which is one
   feature whose geometry is a collection.

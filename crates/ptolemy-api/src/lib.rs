@@ -3,6 +3,7 @@
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
 pub mod analytics;
+pub mod arcgis;
 pub mod attachments;
 pub mod auth;
 pub mod cartography;
@@ -130,6 +131,9 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/api/v1", verticals::vertical_routes())
         .nest("/api/v1", compaction::compaction_routes())
         .nest("/api/v1", sse::sse_routes(sse_broadcast))
+        // not under /api/v1: an Esri client builds every URL from
+        // /arcgis/rest/services, which is where it expects to find it
+        .merge(arcgis::arcgis_routes())
         .merge(oidc::oidc_routes())
         .nest("/ws", ws::ws_routes(event_bus))
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
