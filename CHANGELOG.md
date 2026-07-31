@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: `POST /arcgis/rest/services/{service}/FeatureServer/0/applyEdits`,
+  so an Esri client edits ptolemy rather than only reading it. Form-encoded
+  `adds`, `updates` and `deletes`, esriJSON geometry in EPSG:4326 or Web Mercator
+  (3857/102100, converted in-process), and every edit in one request becomes one
+  commit on the dataset's `main` branch through the same store path `/api/v1`
+  commits take. Deliberate divergence from Esri: because the batch is one commit,
+  any failure refuses the whole batch as an `error` object naming the cause
+  instead of reporting per-row results. Object ids on an add are assigned by the
+  service as max + 1 and a client-supplied one is ignored. An update merges the
+  attributes it carries over the ones the feature holds and keeps its geometry
+  when it sends none. A layer whose ids are row numbers rather than a real
+  `objectid` column refuses every edit, because a delete renumbers the rest. An
+  editable layer's metadata now says `Query,Create,Update,Delete` with
+  `allowGeometryUpdates` and per-field `editable` true, and a row-number layer
+  still says `Query`. Writes need a token with write access and the same
+  per-dataset ladder as `/api/v1`, and reads stay anonymous. Esri clients have no
+  header for a credential, so a `token` request parameter is accepted on
+  `/arcgis` paths only, from the query string and not from a form body: putting a
+  token in a URL means anything that records URLs records it, so prefer
+  `Authorization: Bearer`, which still wins when both are sent. Auth refusals on
+  the facade are Geoservices-shaped, HTTP 200 with error code 499 (token
+  required), 498 (invalid token) or 403 (role or grant insufficient).
+
 - 2026-07-31: A read-only ArcGIS FeatureServer (Geoservices REST) frontend at
   `/arcgis/rest/services`, so an Esri client connects to ptolemy unchanged. One
   dataset is one single-layer service, layer id 0, read from the dataset's `main`

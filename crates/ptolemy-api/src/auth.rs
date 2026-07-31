@@ -29,8 +29,12 @@ pub const MIN_SECRET_LEN: usize = 32;
 /// Path prefix of the websocket endpoints (`/ws/branches/{id}`, `/ws/rooms/{id}`).
 pub const WS_PREFIX: &str = "/ws/";
 
-/// The ArcGIS FeatureServer frontend's root. It is read-only, so every route
-/// under it is a read whatever method it takes.
+/// The ArcGIS FeatureServer frontend's root. Every route under it reads except
+/// `applyEdits`, which writes and is gated like any other write.
+///
+/// It is also the only prefix where a request parameter is a credential and
+/// where a refusal is answered in the Geoservices error shape. See
+/// [`query_token`] and [`refuse`].
 const ARCGIS_PREFIX: &str = "/arcgis/rest/services";
 
 /// Subprotocol name that marks a WebSocket handshake as carrying a bearer token.
@@ -114,14 +118,20 @@ pub enum Access {
     Admin,
 }
 
-/// Bearer token for a request: the `Authorization` header, or on a websocket
-/// path a `Sec-WebSocket-Protocol: bearer, <jwt>` offer.
+/// Bearer token for a request: the `Authorization` header, on a websocket path a
+/// `Sec-WebSocket-Protocol: bearer, <jwt>` offer, and on the ArcGIS facade a
+/// `token` query parameter.
 ///
 /// The subprotocol form is there because a browser cannot set the Authorization
 /// header on a WebSocket handshake. It is preferred over a query parameter
 /// because proxies do not log request headers. It is scoped to [`WS_PREFIX`], so
 /// nowhere else does a subprotocol act as a credential. Mirrors tiletopia's
 /// contract so one platform token works against both services.
+///
+/// The query form is there because the Geoservices protocol has no header for a
+/// credential: an Esri client sends `token` and nothing else, so a facade that
+/// only read the header could not be written to by the clients it exists for.
+/// See [`query_token`] for what that costs.
 pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
     let header_token = headers
         .get(header::AUTHORIZATION)
@@ -131,9 +141,35 @@ pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str
     let token = match header_token {
         Some(token) => Some(token),
         None if uri.path().starts_with(WS_PREFIX) => subprotocol_token(headers),
+        None if uri.path().starts_with(ARCGIS_PREFIX) => query_token(uri),
         None => None,
     };
     token.filter(|t| !t.is_empty())
+}
+
+/// Token out of a `token` request parameter. Scoped to [`ARCGIS_PREFIX`] exactly
+/// as the subprotocol form is scoped to the websocket paths, so a query
+/// parameter is a credential nowhere else in this service.
+///
+/// Only the query string is read, not a form body: reading a body here would
+/// mean buffering every request's body in the outermost layer, which every route
+/// would pay for. An Esri client can put the token in the URL of a form post,
+/// and this version asks it to.
+///
+/// It is read on every route under the prefix and not only on the write, so a
+/// client that has no way to send a header can also read a private dataset it
+/// holds a grant on. That is the same grant the header would have carried.
+///
+/// A JWT is base64url and dots, none of which percent-encoding touches, so the
+/// raw value is the token. The value is never logged from here. It is still in a
+/// URL, which anything that records URLs records: this crate's request span
+/// carries the URI at DEBUG level, so `tower_http` turned up to debug puts
+/// tokens in the log.
+fn query_token(uri: &Uri) -> Option<&str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        name.eq_ignore_ascii_case("token").then_some(value)
+    })
 }
 
 /// Token out of a `Sec-WebSocket-Protocol: bearer, <jwt>` offer. Order is fixed:
@@ -341,7 +377,8 @@ pub fn classify(method: &Method, route: &str) -> Access {
     }
 
     // the FeatureServer query reads features and takes a POST body only because
-    // an object id list is too long for a URL. Nothing under /arcgis writes.
+    // an object id list is too long for a URL. It is the only public POST on the
+    // facade: applyEdits writes, and falls through to Access::Write below.
     if route.starts_with(ARCGIS_PREFIX) && route.ends_with("/query") {
         return Access::Public;
     }
@@ -449,6 +486,23 @@ fn deny(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error": message}))).into_response()
 }
 
+/// The refusal a caller sees. On the ArcGIS facade it has to be the Geoservices
+/// error shape, which is HTTP 200 with an `error` object: an Esri client reads
+/// the body and never the status, so a 401 reads as a broken server and the
+/// client never asks its user for credentials. `esri_code` is Esri's own: 499 for
+/// a request with no token, 498 for a token it will not accept, 403 for a token
+/// whose role is not enough.
+///
+/// Note for anything that counts refusals off the status line: a denied
+/// applyEdits answers 200. The body says which refusal it was.
+fn refuse(esri: bool, status: StatusCode, esri_code: u16, message: &str) -> Response {
+    if esri {
+        crate::arcgis::error_response(esri_code, message)
+    } else {
+        deny(status, message)
+    }
+}
+
 /// Middleware that validates the `Authorization: Bearer <jwt>` header and
 /// enforces the role [`classify`] asks for. Claims are put in the request
 /// extensions for handlers that want the caller identity.
@@ -492,13 +546,22 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // the refusal shape follows the path, so the Esri facade is refused in the
+    // shape its clients read, and nothing about the decision itself changes
+    let esri = request.uri().path().starts_with(ARCGIS_PREFIX);
+
     if token.is_none() {
-        return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
+        return refuse(esri, StatusCode::UNAUTHORIZED, 499, "missing bearer token");
     }
     // the decode error is not echoed back: it distinguishes "expired" from
     // "bad signature", which helps an attacker more than a caller
     let Some(claims) = claims else {
-        return deny(StatusCode::UNAUTHORIZED, "invalid or expired token");
+        return refuse(
+            esri,
+            StatusCode::UNAUTHORIZED,
+            498,
+            "invalid or expired token",
+        );
     };
 
     let allowed = match access {
@@ -509,8 +572,10 @@ pub async fn auth_middleware(
         Access::Admin => claims.can_admin(),
     };
     if !allowed {
-        return deny(
+        return refuse(
+            esri,
             StatusCode::FORBIDDEN,
+            403,
             match access {
                 Access::Admin => "admin role required",
                 Access::Authenticated => "unknown role",
@@ -807,6 +872,61 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// The facade's own write. The `/query` exception above must not reach it,
+    /// and the write ladder must want it, or an anonymous caller could edit any
+    /// dataset in the instance.
+    #[test]
+    fn classify_arcgis_apply_edits_is_a_write() {
+        const APPLY: &str = "/arcgis/rest/services/{service}/FeatureServer/{layer}/applyEdits";
+        assert_eq!(classify(&Method::POST, APPLY), Access::Write);
+        assert!(needs_write_grant(&Method::POST, APPLY));
+
+        // and the read routes are untouched
+        const QUERY: &str = "/arcgis/rest/services/{service}/FeatureServer/{layer}/query";
+        assert_eq!(classify(&Method::POST, QUERY), Access::Public);
+        assert!(!needs_write_grant(&Method::POST, QUERY));
+        assert_eq!(
+            classify(&Method::GET, "/arcgis/rest/services"),
+            Access::Public
+        );
+    }
+
+    /// The Geoservices protocol has no header for a credential, so `token` is
+    /// one. Only on the facade: anywhere else a URL parameter must not be able
+    /// to enter a route, because URLs are logged, cached and shared.
+    #[test]
+    fn request_token_reads_the_token_parameter_on_arcgis_paths_only() {
+        let headers = HeaderMap::new();
+        let uri: Uri =
+            "/arcgis/rest/services/roads/FeatureServer/0/applyEdits?f=json&token=abc.def.ghi"
+                .parse()
+                .unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
+
+        // Esri clients match parameter names without regard to case
+        let cased: Uri = "/arcgis/rest/services?Token=abc.def.ghi".parse().unwrap();
+        assert_eq!(request_token(&headers, &cased), Some("abc.def.ghi"));
+
+        let elsewhere: Uri = "/api/v1/datasets?token=abc.def.ghi".parse().unwrap();
+        assert_eq!(request_token(&headers, &elsewhere), None);
+        let ws: Uri = "/ws/rooms/r1?token=abc.def.ghi".parse().unwrap();
+        assert_eq!(request_token(&headers, &ws), None);
+
+        let empty: Uri = "/arcgis/rest/services?token=".parse().unwrap();
+        assert_eq!(request_token(&headers, &empty), None);
+        let none: Uri = "/arcgis/rest/services?f=json".parse().unwrap();
+        assert_eq!(request_token(&headers, &none), None);
+    }
+
+    /// A real header wins, so a client that can send one is never downgraded to
+    /// the parameter.
+    #[test]
+    fn authorization_header_wins_over_the_token_parameter() {
+        let headers = headers_with("authorization", "Bearer real.token");
+        let uri: Uri = "/arcgis/rest/services?token=other.token".parse().unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("real.token"));
     }
 
     #[test]

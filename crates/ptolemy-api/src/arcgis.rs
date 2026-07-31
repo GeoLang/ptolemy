@@ -2,16 +2,21 @@
 // License, v. 3.0. If a copy of the AGPL was not distributed with this
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
-//! A read-only ArcGIS FeatureServer (Geoservices REST) frontend, so an Esri
-//! client — an ArcGIS JS API web map, QGIS's ArcGIS REST connector, verne's
-//! extractor — can point at ptolemy without knowing what it is talking to.
+//! An ArcGIS FeatureServer (Geoservices REST) frontend, so an Esri client — an
+//! ArcGIS JS API web map, QGIS's ArcGIS REST connector, verne's extractor — can
+//! point at ptolemy without knowing what it is talking to.
 //!
 //! One dataset is one single-layer service and the layer is always id 0. That
 //! is the shape a hosted feature layer has, and it leaves no layer id that
 //! could move when datasets come and go.
 //!
-//! Reads always come from the dataset's `main` branch: nothing in the protocol
-//! can name a branch, so there is one answer and it is the obvious one.
+//! Reads and writes always run on the dataset's `main` branch: nothing in the
+//! protocol can name a branch, so there is one answer and it is the obvious one.
+//!
+//! `applyEdits` is the one route here that writes. Every edit in one request
+//! becomes one commit through the same store path `/api/v1` commits take, so a
+//! batch either lands whole or does not land: see [`apply_edits`] for what that
+//! costs a client that expects Esri's per-row results.
 //!
 //! Every route resolves its dataset through the same visibility rule the other
 //! read frontends use, so this widens nothing. A URL that names a dataset by
@@ -28,8 +33,9 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use ptolemy_core::diff::DiffOp;
 use ptolemy_core::schema::{FieldDef, FieldType};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -51,6 +57,10 @@ pub fn arcgis_routes() -> Router<AppState> {
         .route(
             "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
             get(query_get).post(query_post),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/{layer}/applyEdits",
+            post(apply_edits),
         )
         // scoped to the facade, not the whole API: an org's web maps run on
         // their own origins, and the ArcGIS JS API refuses a server that
@@ -129,6 +139,38 @@ impl EsriError {
             message: "internal error".into(),
         }
     }
+
+    /// A store refusal as the code the rest of the API answers it with, so a
+    /// denial reads as a denial rather than as an internal error. Used on the
+    /// write path, where a refusal is the caller's answer. A read's store error
+    /// is a bug here and stays a 500 through [`From`].
+    fn refused(error: ptolemy_storage::StoreError) -> Self {
+        let (status, message) = crate::errors::store_error_status(&error);
+        EsriError {
+            code: status.as_u16(),
+            message,
+        }
+    }
+}
+
+/// A Geoservices `error` body, as the response it is served in.
+///
+/// Shared with the auth layer, which has to refuse a request on this facade in
+/// this shape: an Esri client reads the body and never the status, so a 401 with
+/// a different body reads as a broken server and the client never asks its user
+/// for credentials.
+pub(crate) fn error_response(code: u16, message: &str) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "details": [],
+            }
+        })),
+    )
+        .into_response()
 }
 
 impl From<sqlx::Error> for EsriError {
@@ -145,17 +187,7 @@ impl From<ptolemy_storage::StoreError> for EsriError {
 
 impl IntoResponse for EsriError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "error": {
-                    "code": self.code,
-                    "message": self.message,
-                    "details": [],
-                }
-            })),
-        )
-            .into_response()
+        error_response(self.code, &self.message)
     }
 }
 
@@ -303,13 +335,16 @@ struct Field {
 }
 
 impl Field {
-    fn declaration(&self) -> Value {
+    /// `editable` is the layer's answer, not the field's: an editable layer
+    /// declares every field but the object id editable, and the id never is,
+    /// because it is the key a client holds the feature by.
+    fn declaration(&self, editable: bool) -> Value {
         let mut out = json!({
             "name": self.name,
             "type": self.kind.esri(),
             "alias": self.alias,
             "nullable": self.kind != Kind::Oid,
-            "editable": false,
+            "editable": editable && self.kind != Kind::Oid,
             "domain": Value::Null,
             "defaultValue": Value::Null,
         });
@@ -398,6 +433,7 @@ struct Layer {
     name: String,
     /// `esriGeometry*`.
     geometry: &'static str,
+    dataset_id: Uuid,
     branch_id: Uuid,
     /// The object id field first, then the dataset's own.
     fields: Vec<Field>,
@@ -409,6 +445,21 @@ impl Layer {
         self.fields
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether this layer takes edits, which is whether its object ids name a
+    /// feature for longer than one delete. The metadata says so too, and a client
+    /// hides its edit tools when it says no. See [`Oid::RowNumber`].
+    fn editable(&self) -> bool {
+        matches!(self.oid, Oid::Property(_))
+    }
+
+    fn capabilities(&self) -> &'static str {
+        if self.editable() {
+            "Query,Create,Update,Delete"
+        } else {
+            "Query"
+        }
     }
 }
 
@@ -491,6 +542,7 @@ async fn resolve(
     Ok(Layer {
         name,
         geometry,
+        dataset_id,
         branch_id,
         fields,
         oid,
@@ -652,11 +704,11 @@ async fn service_root(
         "supportsDisconnectedEditing": false,
         "syncEnabled": false,
         "hasStaticData": false,
-        "allowGeometryUpdates": false,
+        "allowGeometryUpdates": layer.editable(),
         "units": "esriDecimalDegrees",
         "maxRecordCount": MAX_RECORD_COUNT,
         "supportedQueryFormats": "JSON,geoJSON",
-        "capabilities": "Query",
+        "capabilities": layer.capabilities(),
         "spatialReference": spatial_reference(),
         "layers": [{
             "id": 0,
@@ -727,12 +779,12 @@ async fn layer_metadata(
         "objectIdField": layer.oid.name(),
         "globalIdField": "",
         "displayField": display.name,
-        "fields": layer.fields.iter().map(Field::declaration).collect::<Vec<_>>(),
+        "fields": layer.fields.iter().map(|f| f.declaration(layer.editable())).collect::<Vec<_>>(),
         "extent": extent,
         "maxRecordCount": MAX_RECORD_COUNT,
         "standardMaxRecordCount": MAX_RECORD_COUNT,
         "supportedQueryFormats": "JSON,geoJSON",
-        "capabilities": "Query",
+        "capabilities": layer.capabilities(),
         "advancedQueryCapabilities": {
             "supportsPagination": true,
             "supportsOrderBy": true,
@@ -744,7 +796,7 @@ async fn layer_metadata(
         "hasZ": false,
         "hasM": false,
         "isDataVersioned": false,
-        "allowGeometryUpdates": false,
+        "allowGeometryUpdates": layer.editable(),
         "defaultVisibility": true,
         "minScale": 0,
         "maxScale": 0,
@@ -1044,7 +1096,7 @@ async fn run_query(
             "spatialReference": if out_srid == 4326 { spatial_reference() } else { mercator_reference() },
             "hasZ": false,
             "hasM": false,
-            "fields": out_fields.iter().map(|f| f.declaration()).collect::<Vec<_>>(),
+            "fields": out_fields.iter().map(|f| f.declaration(layer.editable())).collect::<Vec<_>>(),
             "features": features,
             "exceededTransferLimit": exceeded,
         }),
@@ -1263,6 +1315,599 @@ fn shoelace(ring: &[[f64; 2]]) -> f64 {
     sum
 }
 
+// ─── Edits ──────────────────────────────────────────────────────────
+
+/// Parameters an edit request may carry that change what the edit means. Neither
+/// can be honored, and a client that sent one believes something about the write
+/// that is not true, so each is refused by name.
+const UNSUPPORTED_EDITS: [&str; 2] = ["gdbVersion", "sessionId"];
+
+/// The message a layer with no real object id column is refused with. Row
+/// numbers shift when a feature is deleted, so an id a client wrote down does
+/// not name the same feature afterwards and an edit aimed by one would land on
+/// whatever moved into its place. See [`Oid::RowNumber`].
+const NEEDS_A_REAL_OID: &str = "has no objectid column, so its object ids are row numbers over \
+     feature order: a delete renumbers every feature after it, and an edit aimed by such an id \
+     would land on a different feature. Declare an integer 'objectid' field on the dataset's \
+     schema to make the layer editable.";
+
+async fn apply_edits(
+    State(store): State<AppState>,
+    actor: Actor,
+    Path((service, layer_id)): Path<(String, String)>,
+    Form(params): Form<Vec<(String, String)>>,
+) -> Result<Json<Value>, EsriError> {
+    let params = Params(params);
+    require_esri_json(&params)?;
+    for name in UNSUPPORTED_EDITS {
+        if params.asks_for(name) {
+            return Err(EsriError::bad_request(format!(
+                "{name} is not supported in this version of the service"
+            )));
+        }
+    }
+    // every edit in one request is one commit, so the whole batch already
+    // succeeds or fails together and there is nothing to ask for here
+    if params
+        .get("rollbackOnFailure")
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty())
+        && !params.flag("rollbackOnFailure")?
+    {
+        return Err(EsriError::bad_request(
+            "rollbackOnFailure=false is not supported: every edit in one request is one commit, \
+             so a failure refuses all of them",
+        ));
+    }
+    if params.flag("useGlobalIds")? {
+        return Err(EsriError::bad_request(
+            "useGlobalIds is not supported: this layer has no global id field",
+        ));
+    }
+
+    let layer = resolve(&store, &actor, &service, &layer_id).await?;
+    let Oid::Property(oid_field) = &layer.oid else {
+        return Err(EsriError::bad_request(format!(
+            "'{}' {NEEDS_A_REAL_OID}",
+            layer.name
+        )));
+    };
+
+    // the same ladder every /api/v1 write runs. The write layer cannot run it
+    // for this route: the target arrives as a service name, and the layer
+    // resolves a target by reading a uuid out of the path. store.commit runs the
+    // ladder again on the way in, so neither is the only guard.
+    crate::visibility::ensure_writable(&store, &actor, layer.dataset_id)
+        .await
+        .map_err(EsriError::refused)?;
+
+    let adds = features_param(&params, "adds")?;
+    let updates = features_param(&params, "updates")?;
+    let deletes = delete_ids(&params)?;
+    if adds.is_empty() && updates.is_empty() && deletes.is_empty() {
+        // an empty batch is answered rather than refused, but it is not
+        // committed: a changeset with no operations is history that says nothing
+        return Ok(Json(json!({
+            "addResults": [],
+            "updateResults": [],
+            "deleteResults": [],
+        })));
+    }
+
+    // an update names its feature by the object id in its own attributes
+    let update_ids: Vec<i64> = updates
+        .iter()
+        .map(|feature| oid_of(feature, oid_field))
+        .collect::<Result<_, _>>()?;
+    let mut named: Vec<i64> = update_ids.clone();
+    named.extend(deletes.iter().copied());
+    let held = features_by_oid(&store, &layer, &named).await?;
+
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut add_ids: Vec<i64> = Vec::new();
+
+    if !adds.is_empty() {
+        let mut next = max_oid(&store, &layer).await? + 1;
+        for feature in &adds {
+            let mut properties = attributes_of(feature)?;
+            // the service assigns the id: a client-supplied one on an add would
+            // either collide with a feature that exists or renumber the layer
+            properties.retain(|key, _| !key.eq_ignore_ascii_case(oid_field));
+            properties.insert(oid_field.clone(), json!(next));
+            let shape = geometry_of(feature)
+                .ok_or_else(|| EsriError::bad_request("an added feature needs a geometry"))?;
+            ops.push(DiffOp::Insert {
+                feature_id: Uuid::now_v7(),
+                geometry_wkb: wkb_of(shape, layer.geometry)?,
+                properties: Value::Object(properties),
+                native: None,
+                valid_from: None,
+                valid_to: None,
+            });
+            add_ids.push(next);
+            next += 1;
+        }
+    }
+
+    for (feature, oid) in updates.iter().zip(&update_ids) {
+        let (feature_id, stored) = held.get(oid).ok_or_else(|| unknown_oid(&layer, *oid))?;
+        // an Esri update carries the attributes the client edited and no others,
+        // while the store replaces the whole properties object, so the edit is
+        // merged over what the feature holds now
+        let mut properties = stored.as_object().cloned().unwrap_or_default();
+        for (key, value) in attributes_of(feature)? {
+            // the id stays as stored: it is the key a client holds the feature
+            // by, and an update that changed it would rename the feature
+            if key.eq_ignore_ascii_case(oid_field) {
+                continue;
+            }
+            properties.insert(key, value);
+        }
+        // no geometry means the client edited attributes only, and `None` is how
+        // the store is told to carry the previous version's geometry across
+        let geometry_wkb = match geometry_of(feature) {
+            Some(shape) => Some(wkb_of(shape, layer.geometry)?),
+            None => None,
+        };
+        ops.push(DiffOp::Update {
+            feature_id: *feature_id,
+            geometry_wkb,
+            properties: Some(Value::Object(properties)),
+            native: None,
+            valid_from: None,
+            valid_to: None,
+        });
+    }
+
+    for oid in &deletes {
+        let (feature_id, _) = held.get(oid).ok_or_else(|| unknown_oid(&layer, *oid))?;
+        ops.push(DiffOp::Delete {
+            feature_id: *feature_id,
+        });
+    }
+
+    let errors = store.validate_commit(layer.dataset_id, &ops).await?;
+    if !errors.is_empty() {
+        return Err(EsriError::bad_request(format!(
+            "schema validation failed: {} error(s): {}",
+            errors.len(),
+            errors
+                .iter()
+                .take(5)
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+
+    store
+        .commit(
+            layer.branch_id,
+            "arcgis applyEdits",
+            actor.or_body("arcgis"),
+            &ops,
+            &actor.writer(),
+        )
+        .await
+        .map_err(EsriError::refused)?;
+
+    Ok(Json(json!({
+        "addResults": results(&add_ids),
+        "updateResults": results(&update_ids),
+        "deleteResults": results(&deletes),
+    })))
+}
+
+/// One result per input edit, in input order.
+///
+/// Esri reports an edit per row, so a batch of three can come back with two
+/// successes and one failure. Here it cannot: the batch is one commit, so any
+/// failure refuses all of it and is answered as an `error` object naming the
+/// cause instead of as a per-row outcome. A client that reads results rather
+/// than the error sees every row succeed or no results at all, which is what the
+/// store actually did.
+fn results(ids: &[i64]) -> Vec<Value> {
+    ids.iter()
+        .map(|oid| json!({"objectId": oid, "success": true}))
+        .collect()
+}
+
+fn unknown_oid(layer: &Layer, oid: i64) -> EsriError {
+    EsriError::bad_request(format!(
+        "'{}' has no feature with {} {oid}",
+        layer.name,
+        layer.oid.name()
+    ))
+}
+
+/// The features an `adds` or `updates` parameter names. Absent or empty is no
+/// features rather than an error: a request may carry any one of the three lists.
+fn features_param(params: &Params, name: &str) -> Result<Vec<Value>, EsriError> {
+    let Some(raw) = params.get(name).map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| EsriError::bad_request(format!("{name} is not valid JSON: {e}")))?;
+    match value {
+        Value::Array(features) => Ok(features),
+        // a bare feature rather than a list of one, which clients do send
+        Value::Object(_) => Ok(vec![value]),
+        other => Err(EsriError::bad_request(format!(
+            "{name} must be a JSON array of features, not {other}"
+        ))),
+    }
+}
+
+/// The object ids `deletes` names, as the comma list a client sends in a URL or
+/// the JSON array it sends in a body.
+fn delete_ids(params: &Params) -> Result<Vec<i64>, EsriError> {
+    let Some(raw) = params
+        .get("deletes")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let bad = || {
+        EsriError::bad_request(format!(
+            "deletes must be a comma-separated list of object ids or a JSON array of them: '{raw}'"
+        ))
+    };
+    let parts: Vec<String> = if raw.starts_with('[') {
+        let value: Value = serde_json::from_str(raw)
+            .map_err(|e| EsriError::bad_request(format!("deletes is not valid JSON: {e}")))?;
+        match value {
+            Value::Array(items) => items.iter().map(text_of).collect(),
+            _ => return Err(bad()),
+        }
+    } else {
+        raw.split(',').map(|s| s.trim().to_string()).collect()
+    };
+    parts
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<i64>().map_err(|_| bad()))
+        .collect()
+}
+
+/// A feature's attributes as the properties they become. Absent is no
+/// attributes: a dataset whose schema requires nothing takes a feature that
+/// carries only a geometry.
+fn attributes_of(feature: &Value) -> Result<serde_json::Map<String, Value>, EsriError> {
+    match feature.get("attributes") {
+        None | Some(Value::Null) => Ok(serde_json::Map::new()),
+        Some(Value::Object(attributes)) => Ok(attributes.clone()),
+        Some(other) => Err(EsriError::bad_request(format!(
+            "a feature's attributes must be an object, not {other}"
+        ))),
+    }
+}
+
+fn geometry_of(feature: &Value) -> Option<&Value> {
+    feature.get("geometry").filter(|shape| !shape.is_null())
+}
+
+/// The object id an update names, out of its own attributes. An update that
+/// names no feature is refused rather than guessed at from its geometry.
+fn oid_of(feature: &Value, field: &str) -> Result<i64, EsriError> {
+    let attributes = attributes_of(feature)?;
+    let held = attributes
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(field))
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            EsriError::bad_request(format!(
+                "an updated feature needs its '{field}' in attributes, to say which feature it is"
+            ))
+        })?;
+    match held {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        EsriError::bad_request(format!(
+            "'{field}' must be an integer object id, not {held}"
+        ))
+    })
+}
+
+/// The highest object id on the branch, or 0 when nothing carries one, so the
+/// next add is 1.
+///
+/// This is read before the commit rather than inside it, so two edit requests
+/// racing each other can pick the same next id. A duplicate id can never make a
+/// later edit hit the wrong feature: [`features_by_oid`] refuses an id that
+/// names more than one feature. A layer whose ids must be unique under
+/// concurrent writes needs a sequence, which the store does not have.
+async fn max_oid(store: &AppState, layer: &Layer) -> Result<i64, EsriError> {
+    let (external, source) = store.features_source_at(layer.branch_id, "$1").await?;
+    let sql = format!(
+        "WITH numbered AS (SELECT {} AS oid FROM {source} f)
+         SELECT max(oid) AS top FROM numbered",
+        layer.oid.sql()
+    );
+    let top: Option<i64> = sqlx::query(&sql)
+        .bind(layer.branch_id)
+        .fetch_one(store.source_pool(external.as_ref()).await?)
+        .await?
+        .get("top");
+    Ok(top.unwrap_or(0))
+}
+
+/// Every feature the batch names, by object id: the feature id to edit and the
+/// properties it holds now, which is what a partial update is merged over.
+///
+/// The id comes from the same numbered read the query answers with, so a client
+/// edits the feature it saw.
+async fn features_by_oid(
+    store: &AppState,
+    layer: &Layer,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, (Uuid, Value)>, EsriError> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let (external, source) = store.features_source_at(layer.branch_id, "$1").await?;
+    let sql = format!(
+        "WITH numbered AS (
+             SELECT f.id, f.properties, {} AS oid FROM {source} f
+         )
+         SELECT id, oid, properties FROM numbered WHERE oid = ANY($2::bigint[])",
+        layer.oid.sql()
+    );
+    let rows = sqlx::query(&sql)
+        .bind(layer.branch_id)
+        .bind(ids)
+        .fetch_all(store.source_pool(external.as_ref()).await?)
+        .await?;
+    for row in rows {
+        let oid: i64 = row.get("oid");
+        let feature_id: Uuid = row.get("id");
+        let properties: Value = row.get("properties");
+        // nothing makes an objectid column unique, and an id that names two
+        // features names neither: there is no feature for the edit to be aimed at
+        if out.insert(oid, (feature_id, properties)).is_some() {
+            return Err(EsriError::bad_request(format!(
+                "{} {oid} names more than one feature in '{}', so it cannot name one to edit",
+                layer.oid.name(),
+                layer.name
+            )));
+        }
+    }
+    Ok(out)
+}
+
+// ─── Geometry input ─────────────────────────────────────────────────
+
+/// esriJSON as the WKB the store is committed in.
+fn wkb_of(shape: &Value, family: &str) -> Result<Vec<u8>, EsriError> {
+    let geojson = geojson_of(shape, family)?;
+    ptolemy_core::geoconvert::geojson_to_wkb(&geojson)
+        .map_err(|e| EsriError::bad_request(format!("the geometry cannot be read: {e}")))
+}
+
+/// esriJSON as GeoJSON in EPSG:4326, the reference the store holds.
+///
+/// Which of the four shapes a value is, is which key it carries: esriJSON names
+/// the geometry type on the layer and on a feature set, never on the geometry
+/// itself. A shape from another family than the layer's is refused, because a
+/// feature layer draws every feature as the one type it declares.
+fn geojson_of(shape: &Value, family: &str) -> Result<Value, EsriError> {
+    let object = shape
+        .as_object()
+        .ok_or_else(|| EsriError::bad_request(format!("a geometry is an object, not {shape}")))?;
+
+    // absent means the reference the layer is in, which is what a client that
+    // read the layer definition is sending
+    let srid = match object.get("spatialReference") {
+        None | Some(Value::Null) => 4326,
+        Some(reference) => known_srid(&reference.to_string()).ok_or_else(|| {
+            EsriError::bad_request(format!(
+                "the geometry's spatialReference {reference} is not supported in this version of \
+                 the service, which accepts EPSG:4326 and Web Mercator (3857/102100) only"
+            ))
+        })?,
+    };
+
+    if object.contains_key("x") || object.contains_key("y") {
+        require_family(family, "esriGeometryPoint", "a point")?;
+        let read = |key: &str| object.get(key).and_then(Value::as_f64);
+        let (Some(x), Some(y)) = (read("x"), read("y")) else {
+            return Err(EsriError::bad_request("a point needs numeric x and y"));
+        };
+        let [x, y] = to_4326([x, y], srid);
+        return Ok(json!({"type": "Point", "coordinates": [x, y]}));
+    }
+
+    if let Some(points) = object.get("points") {
+        require_family(family, "esriGeometryMultipoint", "a multipoint")?;
+        let points = vertices(points, srid, "a multipoint's points")?;
+        if points.is_empty() {
+            return Err(EsriError::bad_request(
+                "a multipoint needs at least one point",
+            ));
+        }
+        return Ok(json!({"type": "MultiPoint", "coordinates": points}));
+    }
+
+    if let Some(paths) = object.get("paths") {
+        require_family(family, "esriGeometryPolyline", "a polyline")?;
+        let mut parts = Vec::new();
+        for path in as_parts(paths, "a polyline's paths")? {
+            let path = vertices(path, srid, "a path")?;
+            if path.len() < 2 {
+                return Err(EsriError::bad_request("a path needs at least two vertices"));
+            }
+            parts.push(path);
+        }
+        return match parts.len() {
+            0 => Err(EsriError::bad_request("a polyline needs at least one path")),
+            1 => Ok(json!({"type": "LineString", "coordinates": parts.swap_remove(0)})),
+            _ => Ok(json!({"type": "MultiLineString", "coordinates": parts})),
+        };
+    }
+
+    if let Some(rings) = object.get("rings") {
+        require_family(family, "esriGeometryPolygon", "a polygon")?;
+        let mut all = Vec::new();
+        for ring in as_parts(rings, "a polygon's rings")? {
+            let ring = vertices(ring, srid, "a ring")?;
+            if ring.len() < 3 {
+                return Err(EsriError::bad_request(
+                    "a ring needs at least three vertices",
+                ));
+            }
+            all.push(ring);
+        }
+        if all.is_empty() {
+            return Err(EsriError::bad_request("a polygon needs at least one ring"));
+        }
+        let mut parts: Vec<Vec<Vec<[f64; 2]>>> = assemble(all)
+            .into_iter()
+            .map(|polygon| {
+                polygon
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, ring)| geojson_ring(ring, index == 0))
+                    .collect()
+            })
+            .collect();
+        return if parts.len() == 1 {
+            Ok(json!({"type": "Polygon", "coordinates": parts.swap_remove(0)}))
+        } else {
+            Ok(json!({"type": "MultiPolygon", "coordinates": parts}))
+        };
+    }
+
+    Err(EsriError::bad_request(
+        "a geometry is {x,y}, {points}, {paths} or {rings}",
+    ))
+}
+
+fn require_family(family: &str, wanted: &str, sent: &str) -> Result<(), EsriError> {
+    if family == wanted {
+        return Ok(());
+    }
+    Err(EsriError::bad_request(format!(
+        "the layer is {family} and the geometry sent is {sent}: a feature layer holds one \
+         geometry type, so the feature cannot go in it"
+    )))
+}
+
+fn as_parts<'a>(value: &'a Value, what: &str) -> Result<&'a Vec<Value>, EsriError> {
+    value
+        .as_array()
+        .ok_or_else(|| EsriError::bad_request(format!("{what} must be an array")))
+}
+
+/// A vertex list in the reference it was sent in, as 4326 positions. A third or
+/// fourth ordinate is dropped: the layer declares hasZ and hasM false, so a
+/// client is told what the service keeps.
+fn vertices(value: &Value, srid: i32, what: &str) -> Result<Vec<[f64; 2]>, EsriError> {
+    as_parts(value, what)?
+        .iter()
+        .map(|vertex| {
+            let pair = vertex.as_array().filter(|pair| pair.len() >= 2);
+            let read = |at: usize| pair.and_then(|pair| pair.get(at)).and_then(Value::as_f64);
+            match (read(0), read(1)) {
+                (Some(x), Some(y)) => Ok(to_4326([x, y], srid)),
+                _ => Err(EsriError::bad_request(format!(
+                    "{what} holds {vertex}, and a vertex is at least two numbers"
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// Web Mercator metres as degrees, closed form on the sphere the projection is
+/// defined on, so accepting what a web client sends needs no PROJ here. Anything
+/// but mercator is already 4326: [`known_srid`] admits nothing else.
+fn to_4326([x, y]: [f64; 2], srid: i32) -> [f64; 2] {
+    if srid == 4326 {
+        return [x, y];
+    }
+    /// The sphere Web Mercator is defined on.
+    const RADIUS: f64 = 6378137.0;
+    let degrees = 180.0 / std::f64::consts::PI;
+    [x / RADIUS * degrees, (y / RADIUS).sinh().atan() * degrees]
+}
+
+/// The flat esriJSON ring list as polygons: each exterior ring with the holes
+/// that fall inside it.
+///
+/// esriJSON winds an exterior ring clockwise and a hole counter-clockwise and
+/// says nothing about which exterior a hole belongs to, so a hole goes in the
+/// exterior ring that contains its first vertex. A hole no exterior contains is
+/// kept as an exterior rather than dropped: a wrong winding is more often sloppy
+/// data than a hole. Ported from verne's reader, which solved this first.
+fn assemble(rings: Vec<Vec<[f64; 2]>>) -> Vec<Vec<Vec<[f64; 2]>>> {
+    let mut exteriors: Vec<Vec<Vec<[f64; 2]>>> = Vec::new();
+    let mut holes: Vec<Vec<[f64; 2]>> = Vec::new();
+    for ring in rings {
+        // clockwise is a negative shoelace sum, and clockwise is Esri's exterior
+        if shoelace(&ring) <= 0.0 {
+            exteriors.push(vec![ring]);
+        } else {
+            holes.push(ring);
+        }
+    }
+    // every ring wound like a hole, so there is no exterior to put them in and
+    // they are taken as they are
+    if exteriors.is_empty() {
+        return holes.into_iter().map(|ring| vec![ring]).collect();
+    }
+    for hole in holes {
+        let Some(first) = hole.first().copied() else {
+            continue;
+        };
+        match exteriors
+            .iter_mut()
+            .find(|polygon| contains(&polygon[0], first))
+        {
+            Some(polygon) => polygon.push(hole),
+            None => exteriors.push(vec![hole]),
+        }
+    }
+    exteriors
+}
+
+/// Ray cast along x: an odd number of crossings means inside.
+fn contains(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
+    let Some(mut previous) = ring.last() else {
+        return false;
+    };
+    let mut inside = false;
+    for held in ring {
+        if (held[1] > point[1]) != (previous[1] > point[1]) {
+            let cross =
+                (previous[0] - held[0]) * (point[1] - held[1]) / (previous[1] - held[1]) + held[0];
+            if point[0] < cross {
+                inside = !inside;
+            }
+        }
+        previous = held;
+    }
+    inside
+}
+
+/// A ring the way GeoJSON asks for it: closed, exterior counter-clockwise and a
+/// hole clockwise. The read side computes the winding it emits rather than
+/// trusting what is stored, so this is hygiene rather than something a client
+/// depends on.
+fn geojson_ring(mut ring: Vec<[f64; 2]>, exterior: bool) -> Vec<[f64; 2]> {
+    if (shoelace(&ring) > 0.0) != exterior {
+        ring.reverse();
+    }
+    if let (Some(first), Some(last)) = (ring.first().copied(), ring.last().copied())
+        && first != last
+    {
+        ring.push(first);
+    }
+    ring
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,6 +2056,251 @@ mod tests {
             ("spatialRel".into(), "esriSpatialRelContains".into()),
         ]);
         assert!(envelope(&contains).is_err());
+    }
+
+    // ─── Geometry input ─────────────────────────────────────────────
+
+    /// The forward spherical mercator, so a test can project a coordinate the
+    /// way a web client does and ask for it back.
+    fn to_mercator(lon: f64, lat: f64) -> (f64, f64) {
+        const RADIUS: f64 = 6378137.0;
+        let radians = std::f64::consts::PI / 180.0;
+        (
+            lon * radians * RADIUS,
+            ((lat * radians / 2.0 + std::f64::consts::FRAC_PI_4).tan()).ln() * RADIUS,
+        )
+    }
+
+    #[test]
+    fn a_point_becomes_geojson_in_4326() {
+        let shape = json!({"x": 1.5, "y": -2.5});
+        assert_eq!(
+            geojson_of(&shape, "esriGeometryPoint").unwrap(),
+            json!({"type": "Point", "coordinates": [1.5, -2.5]})
+        );
+        // a point with no numbers is a client bug, not an empty geometry
+        assert!(geojson_of(&json!({"x": "NaN", "y": "NaN"}), "esriGeometryPoint").is_err());
+    }
+
+    /// Mercator in, degrees out: the closed form, so the crate needs no PROJ to
+    /// take what a web client sends.
+    #[test]
+    fn a_mercator_point_comes_back_as_the_degrees_it_was_projected_from() {
+        let (x, y) = to_mercator(-71.06, 42.36);
+        let shape = json!({"x": x, "y": y, "spatialReference": {"wkid": 102100}});
+        let geojson = geojson_of(&shape, "esriGeometryPoint").unwrap();
+        let held = geojson["coordinates"].as_array().unwrap();
+        assert!(
+            (held[0].as_f64().unwrap() - -71.06).abs() < 1e-9,
+            "{geojson}"
+        );
+        assert!(
+            (held[1].as_f64().unwrap() - 42.36).abs() < 1e-9,
+            "{geojson}"
+        );
+    }
+
+    #[test]
+    fn a_reference_this_service_cannot_speak_is_refused() {
+        let shape = json!({"x": 1.0, "y": 2.0, "spatialReference": {"wkid": 27700}});
+        assert!(geojson_of(&shape, "esriGeometryPoint").is_err());
+    }
+
+    #[test]
+    fn one_path_is_a_linestring_and_two_are_a_multilinestring() {
+        let one = json!({"paths": [[[0, 0], [1, 1]]]});
+        assert_eq!(
+            geojson_of(&one, "esriGeometryPolyline").unwrap(),
+            json!({"type": "LineString", "coordinates": [[0.0, 0.0], [1.0, 1.0]]})
+        );
+        let two = json!({"paths": [[[0, 0], [1, 1]], [[5, 5], [6, 6]]]});
+        let shape = geojson_of(&two, "esriGeometryPolyline").unwrap();
+        assert_eq!(shape["type"], "MultiLineString", "{shape}");
+        assert_eq!(shape["coordinates"].as_array().unwrap().len(), 2, "{shape}");
+        // a path of one vertex is not a line
+        assert!(geojson_of(&json!({"paths": [[[0, 0]]]}), "esriGeometryPolyline").is_err());
+    }
+
+    #[test]
+    fn points_become_a_multipoint() {
+        let shape = json!({"points": [[0, 1], [2, 3]]});
+        assert_eq!(
+            geojson_of(&shape, "esriGeometryMultipoint").unwrap(),
+            json!({"type": "MultiPoint", "coordinates": [[0.0, 1.0], [2.0, 3.0]]})
+        );
+    }
+
+    /// esriJSON winds an exterior clockwise, but real data arrives both ways
+    /// round, so the winding is classified rather than assumed and either input
+    /// gives the same polygon.
+    #[test]
+    fn a_polygon_is_read_in_either_winding() {
+        let clockwise = json!({"rings": [[[0, 0], [0, 4], [4, 4], [4, 0], [0, 0]]]});
+        let counter_clockwise = json!({"rings": [[[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]]]});
+        for shape in [clockwise, counter_clockwise] {
+            let geojson = geojson_of(&shape, "esriGeometryPolygon").unwrap();
+            assert_eq!(geojson["type"], "Polygon", "{geojson}");
+            let rings = geojson["coordinates"].as_array().unwrap();
+            assert_eq!(rings.len(), 1, "{geojson}");
+            // GeoJSON winds an exterior counter-clockwise
+            assert!(shoelace(&positions(&rings[0]).unwrap()) > 0.0, "{geojson}");
+        }
+    }
+
+    /// One flat ring list, and the parts come back out of it: a hole lands in
+    /// the exterior that contains it, and a second exterior is a second part.
+    #[test]
+    fn rings_are_assembled_into_parts_by_containment() {
+        let with_hole = json!({"rings": [
+            [[0, 0], [0, 10], [10, 10], [10, 0], [0, 0]],
+            [[2, 2], [8, 2], [8, 8], [2, 8], [2, 2]]
+        ]});
+        let geojson = geojson_of(&with_hole, "esriGeometryPolygon").unwrap();
+        assert_eq!(geojson["type"], "Polygon", "{geojson}");
+        let rings = geojson["coordinates"].as_array().unwrap();
+        assert_eq!(rings.len(), 2, "{geojson}");
+        assert!(shoelace(&positions(&rings[0]).unwrap()) > 0.0, "exterior");
+        assert!(shoelace(&positions(&rings[1]).unwrap()) < 0.0, "hole");
+
+        let two_parts = json!({"rings": [
+            [[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]],
+            [[5, 5], [5, 6], [6, 6], [6, 5], [5, 5]]
+        ]});
+        let geojson = geojson_of(&two_parts, "esriGeometryPolygon").unwrap();
+        assert_eq!(geojson["type"], "MultiPolygon", "{geojson}");
+        assert_eq!(
+            geojson["coordinates"].as_array().unwrap().len(),
+            2,
+            "{geojson}"
+        );
+    }
+
+    /// An unclosed ring is closed on the way in, because a polygon ring has to
+    /// end where it started.
+    #[test]
+    fn an_unclosed_ring_is_closed() {
+        let open = json!({"rings": [[[0, 0], [0, 4], [4, 4], [4, 0]]]});
+        let geojson = geojson_of(&open, "esriGeometryPolygon").unwrap();
+        let ring = geojson["coordinates"][0].as_array().unwrap();
+        assert_eq!(ring.len(), 5, "{geojson}");
+        assert_eq!(ring[0], ring[4], "{geojson}");
+    }
+
+    /// A layer declares one geometry type and draws every feature with it, so a
+    /// shape from another family cannot go in.
+    #[test]
+    fn a_geometry_of_the_wrong_family_is_refused() {
+        assert!(geojson_of(&json!({"x": 1, "y": 2}), "esriGeometryPolygon").is_err());
+        assert!(
+            geojson_of(
+                &json!({"rings": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}),
+                "esriGeometryPoint"
+            )
+            .is_err()
+        );
+        assert!(geojson_of(&json!({"paths": [[[0, 0], [1, 1]]]}), "esriGeometryPolygon").is_err());
+        // no key names a shape at all
+        assert!(geojson_of(&json!({"curveRings": []}), "esriGeometryPolygon").is_err());
+    }
+
+    #[test]
+    fn a_geometry_becomes_wkb_the_store_can_take() {
+        let wkb = wkb_of(&json!({"x": 1.0, "y": 2.0}), "esriGeometryPoint").unwrap();
+        // little endian, type 1 (point), then two doubles
+        assert_eq!(wkb.len(), 1 + 4 + 16, "{wkb:?}");
+        assert_eq!(wkb[0], 1);
+        assert_eq!(wkb[1], 1);
+    }
+
+    // ─── Edit parameters ────────────────────────────────────────────
+
+    #[test]
+    fn adds_and_updates_read_a_list_or_a_bare_feature() {
+        let list = Params(vec![(
+            "adds".into(),
+            r#"[{"attributes":{"name":"a"}},{"attributes":{"name":"b"}}]"#.into(),
+        )]);
+        assert_eq!(features_param(&list, "adds").unwrap().len(), 2);
+
+        let bare = Params(vec![(
+            "adds".into(),
+            r#"{"attributes":{"name":"a"}}"#.into(),
+        )]);
+        assert_eq!(features_param(&bare, "adds").unwrap().len(), 1);
+
+        // absent and empty are no features, not an error: a request may carry
+        // any one of the three lists
+        assert!(features_param(&Params(vec![]), "adds").unwrap().is_empty());
+        let empty = Params(vec![("adds".into(), "  ".into())]);
+        assert!(features_param(&empty, "adds").unwrap().is_empty());
+
+        let broken = Params(vec![("adds".into(), "[{".into())]);
+        assert!(features_param(&broken, "adds").is_err());
+        let wrong = Params(vec![("adds".into(), "7".into())]);
+        assert!(features_param(&wrong, "adds").is_err());
+    }
+
+    #[test]
+    fn deletes_read_a_comma_list_or_a_json_array() {
+        let list = Params(vec![("deletes".into(), "1, 2,3".into())]);
+        assert_eq!(delete_ids(&list).unwrap(), vec![1, 2, 3]);
+        let array = Params(vec![("deletes".into(), "[4,5]".into())]);
+        assert_eq!(delete_ids(&array).unwrap(), vec![4, 5]);
+        assert!(delete_ids(&Params(vec![])).unwrap().is_empty());
+        let words = Params(vec![("deletes".into(), "two".into())]);
+        assert!(delete_ids(&words).is_err());
+    }
+
+    #[test]
+    fn an_update_names_its_feature_by_the_object_id_in_its_attributes() {
+        let numeric = json!({"attributes": {"OBJECTID": 12, "name": "a"}});
+        assert_eq!(oid_of(&numeric, "OBJECTID").unwrap(), 12);
+        // the field is matched without regard to case, as every parameter is
+        let cased = json!({"attributes": {"objectid": 12}});
+        assert_eq!(oid_of(&cased, "OBJECTID").unwrap(), 12);
+        // a form-encoded client may send it as text
+        let text = json!({"attributes": {"OBJECTID": "12"}});
+        assert_eq!(oid_of(&text, "OBJECTID").unwrap(), 12);
+
+        assert!(oid_of(&json!({"attributes": {"name": "a"}}), "OBJECTID").is_err());
+        assert!(oid_of(&json!({"geometry": {"x": 1, "y": 2}}), "OBJECTID").is_err());
+        assert!(oid_of(&json!({"attributes": {"OBJECTID": "x"}}), "OBJECTID").is_err());
+    }
+
+    #[test]
+    fn attributes_are_optional_and_have_to_be_an_object() {
+        assert!(attributes_of(&json!({})).unwrap().is_empty());
+        assert!(
+            attributes_of(&json!({"attributes": Value::Null}))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            attributes_of(&json!({"attributes": {"a": 1}}))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(attributes_of(&json!({"attributes": [1, 2]})).is_err());
+    }
+
+    /// The id field is not editable even on an editable layer: it is the key a
+    /// client holds the feature by.
+    #[test]
+    fn only_a_non_id_field_of_an_editable_layer_is_declared_editable() {
+        let oid = Field {
+            name: "objectid".into(),
+            alias: "objectid".into(),
+            kind: Kind::Oid,
+        };
+        let name = Field {
+            name: "name".into(),
+            alias: "name".into(),
+            kind: Kind::Text,
+        };
+        assert_eq!(oid.declaration(true)["editable"], false);
+        assert_eq!(name.declaration(true)["editable"], true);
+        assert_eq!(name.declaration(false)["editable"], false);
     }
 
     #[test]

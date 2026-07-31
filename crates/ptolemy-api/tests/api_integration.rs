@@ -7925,7 +7925,8 @@ fn calls(args: &str, name: &str) -> bool {
 /// and it cannot be done from a request.
 const UNGATED_TEMPLATES: [&str; 50] = [
     // the FeatureServer query takes a POST body only because an object id list
-    // is too long for a URL; the whole /arcgis frontend is read-only
+    // is too long for a URL. It is the only ungated POST on the facade:
+    // applyEdits writes, and is gated like any other write.
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
     "/api/v1/attribute-rules/{id}/validate",
     "/api/v1/branches/{branch_id}/permissions/{user_id}",
@@ -9085,4 +9086,779 @@ async fn test_arcgis_does_not_widen_anonymous_reads_of_a_private_dataset() {
             .any(|s| s["name"] == name),
         "{catalog}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ArcGIS FeatureServer applyEdits
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: the applyEdits URL of a service's layer 0.
+fn apply_edits_url(service: &str) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/0/applyEdits")
+}
+
+/// Helper: form-encode a parameter list, which is how an Esri client sends an
+/// edit whose feature JSON cannot go in a URL.
+fn form_body(pairs: &[(&str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={}", urlencoding::encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Helper: post a form body with a bearer header, for the auth-enabled tests.
+async fn post_form_as(
+    app: &axum::Router,
+    uri: &str,
+    body: &str,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// The fields that make a layer editable: a real integer OBJECTID, plus two
+/// attributes to merge over.
+fn editable_schema() -> Value {
+    json!({"fields": [
+        {"name": "OBJECTID", "field_type": "integer", "required": false},
+        {"name": "name", "field_type": "string", "required": false},
+        {"name": "kind", "field_type": "string", "required": false},
+    ]})
+}
+
+/// Helper: a dataset whose schema declares a real OBJECTID, which is what makes
+/// its layer editable, with a `main` branch. Returns the service name, the
+/// dataset id and the branch id.
+async fn editable_layer(
+    app: &axum::Router,
+    prefix: &str,
+    geometry_type: &str,
+) -> (String, Uuid, Uuid) {
+    let name = format!("{prefix}_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(app, &name, geometry_type).await;
+    let (status, body) = request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(editable_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let branch = create_branch(app, ds, "main").await;
+    (name, ds, branch)
+}
+
+/// Helper: how many changesets the branch's history holds, which is what says a
+/// batch became exactly one commit.
+async fn history_len(app: &axum::Router, branch: Uuid) -> usize {
+    let (status, body) = get_json(app, &format!("/api/v1/branches/{branch}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body.as_array().unwrap().len()
+}
+
+/// Helper: how many features the facade sees on a layer.
+async fn facade_count(app: &axum::Router, service: &str) -> i64 {
+    let (status, body) = get_json(app, &query_url(service, "returnCountOnly=true")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["count"].as_i64().unwrap_or_else(|| panic!("{body}"))
+}
+
+/// The forward spherical mercator a web client projects with, so a test can send
+/// metres and ask for the degrees back.
+fn to_mercator(lon: f64, lat: f64) -> (f64, f64) {
+    const RADIUS: f64 = 6378137.0;
+    let radians = std::f64::consts::PI / 180.0;
+    (
+        lon * radians * RADIUS,
+        (lat * radians / 2.0 + std::f64::consts::FRAC_PI_4)
+            .tan()
+            .ln()
+            * RADIUS,
+    )
+}
+
+#[tokio::test]
+async fn test_arcgis_apply_edits_adds_updates_and_deletes_in_one_commit() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "edits", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first", "kind": "seed"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 200, "name": "second", "kind": "seed"}},
+        ]),
+    )
+    .await;
+    let before = history_len(&app, branch).await;
+
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "third", "kind": "added"},
+                    "geometry": {"x": 3.0, "y": 3.0}}])
+            .to_string(),
+        ),
+        (
+            "updates",
+            json!([{"attributes": {"OBJECTID": 100, "name": "renamed"}}]).to_string(),
+        ),
+        ("deletes", "200".into()),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+    // the next id after the highest that exists
+    assert_eq!(
+        out["addResults"],
+        json!([{"objectId": 201, "success": true}]),
+        "{out}"
+    );
+    assert_eq!(
+        out["updateResults"],
+        json!([{"objectId": 100, "success": true}]),
+        "{out}"
+    );
+    assert_eq!(
+        out["deleteResults"],
+        json!([{"objectId": 200, "success": true}]),
+        "{out}"
+    );
+
+    // three edits, one commit
+    assert_eq!(history_len(&app, branch).await, before + 1);
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let held = body["features"].as_array().unwrap();
+    assert_eq!(held.len(), 2, "{body}");
+    assert_eq!(held[0]["attributes"]["OBJECTID"], 100, "{body}");
+    assert_eq!(held[0]["attributes"]["name"], "renamed", "{body}");
+    // the attribute the update did not carry is still what it was
+    assert_eq!(held[0]["attributes"]["kind"], "seed", "{body}");
+    // and so is the geometry, because the update carried none
+    assert_eq!(held[0]["geometry"]["x"], 1.0, "{body}");
+    assert_eq!(held[1]["attributes"]["OBJECTID"], 201, "{body}");
+    assert_eq!(held[1]["attributes"]["name"], "third", "{body}");
+    assert_eq!(held[1]["geometry"]["x"], 3.0, "{body}");
+    assert_eq!(held[1]["geometry"]["y"], 3.0, "{body}");
+}
+
+/// An empty layer starts at 1, and adds in one batch get consecutive ids rather
+/// than the same one.
+#[tokio::test]
+async fn test_arcgis_apply_edits_assigns_consecutive_object_ids() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "ids", "point").await;
+
+    let adds: Vec<Value> = (0..3)
+        .map(|i| {
+            json!({"attributes": {"name": format!("p{i}")},
+                   "geometry": {"x": i as f64, "y": 0.0}})
+        })
+        .collect();
+    let body = form_body(&[("f", "json".into()), ("adds", json!(adds).to_string())]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["addResults"],
+        json!([
+            {"objectId": 1, "success": true},
+            {"objectId": 2, "success": true},
+            {"objectId": 3, "success": true},
+        ]),
+        "{out}"
+    );
+
+    let (_, ids) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    assert_eq!(ids["objectIds"], json!([1, 2, 3]), "{ids}");
+
+    // and the next batch carries on from there rather than starting over
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "p3"}, "geometry": {"x": 9.0, "y": 9.0}}]).to_string(),
+        ),
+    ]);
+    let (_, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(
+        out["addResults"],
+        json!([{"objectId": 4, "success": true}]),
+        "{out}"
+    );
+}
+
+/// A client-supplied objectid on an add is ignored: the service assigns the id,
+/// or a client could collide with a feature that exists.
+#[tokio::test]
+async fn test_arcgis_apply_edits_ignores_a_client_object_id_on_an_add() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "claimed", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([{"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                "geometry_wkb_hex": point_wkb(1.0, 1.0),
+                "properties": {"OBJECTID": 7, "name": "held"}}]),
+    )
+    .await;
+
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"OBJECTID": 7, "name": "claimant"},
+                    "geometry": {"x": 2.0, "y": 2.0}}])
+            .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["addResults"],
+        json!([{"objectId": 8, "success": true}]),
+        "{out}"
+    );
+
+    let (_, ids) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    assert_eq!(ids["objectIds"], json!([7, 8]), "{ids}");
+}
+
+/// An update carrying a geometry replaces it, and one carrying none keeps it.
+#[tokio::test]
+async fn test_arcgis_apply_edits_updates_geometry_only_when_one_is_sent() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "moved", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([{"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+                "geometry_wkb_hex": point_wkb(1.0, 1.0),
+                "properties": {"OBJECTID": 5, "name": "a", "kind": "seed"}}]),
+    )
+    .await;
+
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "updates",
+            json!([{"attributes": {"OBJECTID": 5},
+                    "geometry": {"x": 6.0, "y": 7.0}}])
+            .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let held = &body["features"][0];
+    assert_eq!(held["geometry"]["x"], 6.0, "{body}");
+    assert_eq!(held["geometry"]["y"], 7.0, "{body}");
+    // the update named no attributes, so every one of them is untouched
+    assert_eq!(held["attributes"]["name"], "a", "{body}");
+    assert_eq!(held["attributes"]["kind"], "seed", "{body}");
+    assert_eq!(held["attributes"]["OBJECTID"], 5, "{body}");
+}
+
+/// The deliberate divergence from Esri: a batch is one commit, so one bad edit
+/// refuses all of them rather than coming back as a failed row beside two
+/// successes.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_the_whole_batch_on_one_bad_edit() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "atomic", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0), "properties": {"OBJECTID": 1, "name": "a"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0), "properties": {"OBJECTID": 2, "name": "b"}},
+        ]),
+    )
+    .await;
+    let commits = history_len(&app, branch).await;
+    assert_eq!(facade_count(&app, &name).await, 2);
+
+    // a good add, an update of a feature that is not there, and a good delete
+    let batch = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "c"}, "geometry": {"x": 3.0, "y": 3.0}}]).to_string(),
+        ),
+        (
+            "updates",
+            json!([{"attributes": {"OBJECTID": 999, "name": "ghost"}}]).to_string(),
+        ),
+        ("deletes", "1".into()),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &batch).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"].as_str().unwrap().contains("999"),
+        "the error names the cause: {out}"
+    );
+    assert!(out["addResults"].is_null(), "{out}");
+
+    // nothing happened: not the add, not the delete, not a commit
+    assert_eq!(facade_count(&app, &name).await, 2);
+    assert_eq!(history_len(&app, branch).await, commits);
+
+    // and the same for a delete of an id that is not there
+    let batch = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "c"}, "geometry": {"x": 3.0, "y": 3.0}}]).to_string(),
+        ),
+        ("deletes", "1,999".into()),
+    ]);
+    let (_, out) = post_form(&app, &apply_edits_url(&name), &batch).await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert_eq!(facade_count(&app, &name).await, 2);
+    assert_eq!(history_len(&app, branch).await, commits);
+}
+
+/// Row numbers shift when a feature is deleted, so an id aimed by one names a
+/// different feature afterwards. Such a layer takes no edits at all.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_a_row_number_layer() {
+    let (app, _) = setup_app().await;
+    let name = format!("rownum_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+    let commits = history_len(&app, branch).await;
+
+    for body in [
+        form_body(&[
+            ("f", "json".into()),
+            (
+                "adds",
+                json!([{"attributes": {"name": "c"}, "geometry": {"x": 3.0, "y": 3.0}}])
+                    .to_string(),
+            ),
+        ]),
+        form_body(&[("f", "json".into()), ("deletes", "1".into())]),
+    ] {
+        let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert_eq!(out["error"]["code"], 400, "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("objectid"),
+            "the error says what the layer needs: {out}"
+        );
+    }
+    assert_eq!(facade_count(&app, &name).await, 2);
+    assert_eq!(history_len(&app, branch).await, commits);
+}
+
+/// A feature layer declares one geometry type and draws every feature with it.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_a_geometry_of_the_wrong_family() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "family", "polygon").await;
+    let commits = history_len(&app, branch).await;
+
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "a"}, "geometry": {"x": 1.0, "y": 1.0}}]).to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("esriGeometryPolygon"),
+        "{out}"
+    );
+    assert_eq!(facade_count(&app, &name).await, 0);
+    assert_eq!(history_len(&app, branch).await, commits);
+}
+
+/// Esri winds an exterior clockwise, but real data arrives both ways round, so
+/// the winding is classified rather than assumed.
+#[tokio::test]
+async fn test_arcgis_apply_edits_accepts_a_polygon_in_either_winding() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "winding", "polygon").await;
+
+    let clockwise = json!({"rings": [[[0, 0], [0, 4], [4, 4], [4, 0], [0, 0]]]});
+    let counter_clockwise = json!({"rings": [[[10, 0], [14, 0], [14, 4], [10, 4], [10, 0]]]});
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([
+                {"attributes": {"name": "cw"}, "geometry": clockwise},
+                {"attributes": {"name": "ccw"}, "geometry": counter_clockwise},
+            ])
+            .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let held = body["features"].as_array().unwrap();
+    assert_eq!(held.len(), 2, "{body}");
+    for feature in held {
+        let rings = feature["geometry"]["rings"].as_array().unwrap();
+        assert_eq!(rings.len(), 1, "{feature}");
+        // whichever way it came in, it comes back out Esri's way round
+        assert!(ring_winding(&rings[0]) < 0.0, "{feature}");
+        // and it is the square that was sent, not its mirror
+        assert_eq!(rings[0].as_array().unwrap().len(), 5, "{feature}");
+    }
+}
+
+/// A web client sends what it drew, which is Web Mercator metres. The transform
+/// is closed form here, so the test asserts the round trip rather than a
+/// hard-coded coordinate.
+#[tokio::test]
+async fn test_arcgis_apply_edits_round_trips_a_mercator_point() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "merc", "point").await;
+
+    let (lon, lat) = (-71.06, 42.36);
+    let (x, y) = to_mercator(lon, lat);
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "boston"},
+                    "geometry": {"x": x, "y": y, "spatialReference": {"wkid": 102100}}}])
+            .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let geometry = &body["features"][0]["geometry"];
+    let held_x = geometry["x"].as_f64().unwrap();
+    let held_y = geometry["y"].as_f64().unwrap();
+    assert!((held_x - lon).abs() < 1e-6, "{geometry}");
+    assert!((held_y - lat).abs() < 1e-6, "{geometry}");
+
+    // a reference the service does not speak is refused rather than guessed at
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "elsewhere"},
+                    "geometry": {"x": 1.0, "y": 2.0, "spatialReference": {"wkid": 27700}}}])
+            .to_string(),
+        ),
+    ]);
+    let (_, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(out["error"]["code"], 400, "{out}");
+}
+
+/// Parameters that change what the edit means are refused by name rather than
+/// ignored, and the empty batch is answered rather than committed.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_parameters_it_cannot_honor() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "params", "point").await;
+    let commits = history_len(&app, branch).await;
+    let add = json!([{"attributes": {"name": "a"}, "geometry": {"x": 1.0, "y": 1.0}}]).to_string();
+
+    for (name_of, value) in [
+        ("gdbVersion", "SDE.DEFAULT"),
+        ("sessionId", "{ABC}"),
+        ("rollbackOnFailure", "false"),
+        ("useGlobalIds", "true"),
+        // a feature set is not what an edit answers with, so geoJSON is refused
+        // here as it is on the metadata routes
+        ("f", "geojson"),
+    ] {
+        let mut pairs = vec![(name_of, value.to_string()), ("adds", add.clone())];
+        if name_of != "f" {
+            pairs.push(("f", "json".into()));
+        }
+        let body = form_body(&pairs);
+        let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+        assert_eq!(status, StatusCode::OK, "{name_of}: {out}");
+        assert_eq!(out["error"]["code"], 400, "{name_of}: {out}");
+    }
+    assert_eq!(facade_count(&app, &name).await, 0);
+    assert_eq!(history_len(&app, branch).await, commits);
+
+    // rollbackOnFailure=true is what already happens, so it is not a refusal
+    let body = form_body(&[
+        ("f", "json".into()),
+        ("adds", add),
+        ("rollbackOnFailure", "true".into()),
+    ]);
+    let (_, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert!(out["error"].is_null(), "{out}");
+    assert_eq!(facade_count(&app, &name).await, 1);
+    let after_the_add = history_len(&app, branch).await;
+    assert_eq!(after_the_add, commits + 1);
+
+    // an empty batch is answered, not committed: a changeset with no operations
+    // is history that says nothing
+    let (_, out) = post_form(&app, &apply_edits_url(&name), "f=json").await;
+    assert_eq!(out["addResults"], json!([]), "{out}");
+    assert_eq!(out["updateResults"], json!([]), "{out}");
+    assert_eq!(out["deleteResults"], json!([]), "{out}");
+    assert_eq!(history_len(&app, branch).await, after_the_add);
+}
+
+/// Once a layer takes edits its metadata has to say so, or a client hides its
+/// edit tools. A row-number layer keeps saying no.
+#[tokio::test]
+async fn test_arcgis_metadata_says_which_layers_are_editable() {
+    let (app, _) = setup_app().await;
+    let (editable, _ds, _branch) = editable_layer(&app, "flips", "point").await;
+    let plain = format!("plain_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &plain, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+
+    let (_, root) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{editable}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(root["capabilities"], "Query,Create,Update,Delete", "{root}");
+    assert_eq!(root["allowGeometryUpdates"], true, "{root}");
+
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{editable}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(
+        layer["capabilities"], "Query,Create,Update,Delete",
+        "{layer}"
+    );
+    assert_eq!(layer["allowGeometryUpdates"], true, "{layer}");
+    let fields = layer["fields"].as_array().unwrap();
+    let oid = fields.iter().find(|f| f["name"] == "OBJECTID").unwrap();
+    assert_eq!(
+        oid["editable"], false,
+        "the id is the key a client holds the feature by: {layer}"
+    );
+    let named = fields.iter().find(|f| f["name"] == "name").unwrap();
+    assert_eq!(named["editable"], true, "{layer}");
+
+    let (_, root) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{plain}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(root["capabilities"], "Query", "{root}");
+    assert_eq!(root["allowGeometryUpdates"], false, "{root}");
+
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{plain}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(layer["capabilities"], "Query", "{layer}");
+    assert_eq!(layer["allowGeometryUpdates"], false, "{layer}");
+    assert!(
+        layer["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["editable"] == false),
+        "{layer}"
+    );
+}
+
+/// Helper: an editable layer under enforced auth, created by `carol`, an editor,
+/// who therefore holds a grant on it. Returns the service name, carol's token
+/// and the branch id.
+async fn owned_editable_layer(app: &axum::Router) -> (String, String, Uuid) {
+    let carol = token_for_user("carol", Role::Editor);
+    let name = format!("owned_{}", Uuid::now_v7().simple());
+    let (status, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(json!({"name": name, "geometry_type": "point", "srid": 4326,
+                    "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let ds = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        Some(&carol),
+        Some(editable_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{ds}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&carol),
+        Some(json!({"message": "seed", "author": "carol", "operations": [
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 10, "name": "seeded"}}
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    (name, carol, branch_id)
+}
+
+/// The whole point of the gate: a write on the facade needs a token with write
+/// access, exactly as `/api/v1` does. The refusal is Geoservices-shaped, because
+/// an Esri client reads the body and never the status.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_anonymous_and_read_only_callers() {
+    let app = setup_app_authed().await;
+    let (name, carol, branch) = owned_editable_layer(&app).await;
+    let commits = history_len(&app, branch).await;
+    let add =
+        json!([{"attributes": {"name": "intruder"}, "geometry": {"x": 5.0, "y": 5.0}}]).to_string();
+    let body = form_body(&[("f", "json".into()), ("adds", add.clone())]);
+
+    // anonymous: 499 is Esri's "a token is required"
+    let (status, out) = post_form_as(&app, &apply_edits_url(&name), &body, None).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 499, "{out}");
+
+    // a token this service did not mint: 498 is Esri's "invalid token"
+    let forged = generate_token(
+        "not-the-platform-secret-0123456789",
+        "eve",
+        Role::Admin,
+        3600,
+    );
+    let (status, out) = post_form_as(&app, &apply_edits_url(&name), &body, Some(&forged)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 498, "{out}");
+
+    // a valid token whose role cannot write
+    let viewer = token_for_user("val", Role::Viewer);
+    let (status, out) = post_form_as(&app, &apply_edits_url(&name), &body, Some(&viewer)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 403, "{out}");
+
+    // an editor with no grant on this dataset: the per-dataset ladder, not the role
+    let eve = token_for_user("eve", Role::Editor);
+    let (status, out) = post_form_as(&app, &apply_edits_url(&name), &body, Some(&eve)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(
+        out["error"]["code"] == 403 || out["error"]["code"] == 404,
+        "{out}"
+    );
+
+    // nothing any of them sent was committed
+    assert_eq!(history_len(&app, branch).await, commits);
+
+    // and the owner's own edit lands
+    let (status, out) = post_form_as(&app, &apply_edits_url(&name), &body, Some(&carol)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["addResults"],
+        json!([{"objectId": 11, "success": true}]),
+        "{out}"
+    );
+    assert_eq!(history_len(&app, branch).await, commits + 1);
+}
+
+/// An Esri client has no header to put a credential in, so `token` is one on
+/// this facade. Reads stay anonymous.
+#[tokio::test]
+async fn test_arcgis_apply_edits_accepts_the_token_parameter() {
+    let app = setup_app_authed().await;
+    let (name, carol, branch) = owned_editable_layer(&app).await;
+    let commits = history_len(&app, branch).await;
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "by-parameter"}, "geometry": {"x": 4.0, "y": 4.0}}])
+                .to_string(),
+        ),
+    ]);
+
+    let uri = format!("{}?token={carol}", apply_edits_url(&name));
+    let (status, out) = post_form_as(&app, &uri, &body, None).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["addResults"],
+        json!([{"objectId": 11, "success": true}]),
+        "{out}"
+    );
+    assert_eq!(history_len(&app, branch).await, commits + 1);
+
+    // a bad one in the same place is still refused
+    let uri = format!("{}?token=not.a.token", apply_edits_url(&name));
+    let (status, out) = post_form_as(&app, &uri, &body, None).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 498, "{out}");
+    assert_eq!(history_len(&app, branch).await, commits + 1);
+
+    // and the parameter is a credential only here: it must not enter /api/v1
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/audit?token={carol}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
