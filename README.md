@@ -33,7 +33,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
 - **OGC API - Features** — Part 1 & 2 compliant
-- **ArcGIS Geoservices REST** — read-only FeatureServer, so Esri clients connect unchanged
+- **ArcGIS Geoservices REST** — FeatureServer reads and `applyEdits` writes, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)
 
@@ -246,23 +246,28 @@ recorded as-is.
 
 ## ArcGIS FeatureServer
 
-Point an Esri client at `/arcgis/rest/services` and it sees a read-only
-FeatureServer. Each dataset is one single-layer service, `{service}` is the
-dataset name or its uuid, the layer is always id 0, and reads come from the
-dataset's `main` branch. Dataset visibility applies exactly as it does to the
-other read routes.
+Point an Esri client at `/arcgis/rest/services` and it sees a FeatureServer.
+Each dataset is one single-layer service, `{service}` is the dataset name or its
+uuid, the layer is always id 0, and everything runs on the dataset's `main`
+branch. Dataset visibility applies exactly as it does to the other read routes.
 
-Query supports `where=1=1`, `objectIds`, `outFields`, `returnGeometry`,
-`returnCountOnly`, `returnIdsOnly`, `resultOffset`/`resultRecordCount` paging with
-`exceededTransferLimit`, `orderByFields` on the object id, an
-`esriGeometryEnvelope` + `esriSpatialRelIntersects` filter, `outSR=4326`, and
-`f=json`, `f=pjson` or `f=geojson`. Anything else it cannot honor is refused
-rather than ignored. Refusals follow the Geoservices convention: HTTP 200 with an
-`{"error": {...}}` body.
+Query supports `where` (the SQL-92 subset Esri clients send: comparisons, `IN`,
+`LIKE`, `BETWEEN`, `IS NULL`, boolean logic and `DATE` literals), `objectIds`,
+`outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`,
+`resultOffset`/`resultRecordCount` paging with `exceededTransferLimit`,
+`orderByFields` on the object id, an `esriGeometryEnvelope` +
+`esriSpatialRelIntersects` filter, `outSR` and `inSR` as 4326 or Web Mercator
+(3857/102100), and `f=json`, `f=pjson` or `f=geojson`. Anything else it cannot
+honor is refused rather than ignored. Refusals follow the Geoservices
+convention: HTTP 200 with an `{"error": {...}}` body.
 
-Not served: writes, reprojection, statistics, attachments, arbitrary `where`
-clauses, and datasets whose `geometry_type` is `geometry` or
-`geometry_collection`, which have no single Esri layer type.
+`applyEdits` writes: the whole batch becomes one commit on `main` and any
+failure refuses all of it. Layers need a real integer `objectid` field to be
+editable; a `token` request parameter is accepted as the bearer on these routes
+because Esri clients cannot send a header.
+
+Not served: statistics, attachments, and datasets whose `geometry_type` is
+`geometry` or `geometry_collection`, which have no single Esri layer type.
 
 ## Access control
 

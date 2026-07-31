@@ -715,6 +715,7 @@ async fn service_root(
         "units": "esriDecimalDegrees",
         "maxRecordCount": MAX_RECORD_COUNT,
         "supportedQueryFormats": "JSON,geoJSON",
+        "useStandardizedQueries": true,
         "capabilities": layer.capabilities(),
         "spatialReference": spatial_reference(),
         "layers": [{
@@ -791,6 +792,7 @@ async fn layer_metadata(
         "maxRecordCount": MAX_RECORD_COUNT,
         "standardMaxRecordCount": MAX_RECORD_COUNT,
         "supportedQueryFormats": "JSON,geoJSON",
+        "useStandardizedQueries": true,
         "capabilities": layer.capabilities(),
         "advancedQueryCapabilities": {
             "supportsPagination": true,
