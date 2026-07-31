@@ -8,9 +8,10 @@
 //! Two steps, and the split is what makes this safe: [`parse`] turns request
 //! text into a tree whose only field references are fields the layer declared
 //! and whose only values are Rust values, and [`Predicate::sql`] renders that
-//! tree with every value as a bound parameter. No request text is ever rendered
-//! into SQL, so a quote has nothing to break out of: the clause
-//! `name = 'x''; delete everything'` is one string literal and compares as one.
+//! tree with every value and every field name as a bound parameter. Nothing but
+//! fixed text is ever rendered into SQL, so a quote has nothing to break out of:
+//! the clause `name = 'x''; delete everything'` is one string literal and
+//! compares as one.
 //!
 //! What this does not accept is refused by name rather than dropped, as
 //! everywhere else on this facade: a filter that silently did not apply hands
@@ -98,8 +99,9 @@ pub(super) enum Predicate {
 }
 
 /// A column to compare, as the layer declared it. The name is the layer's own
-/// text and never the client's, which is what keeps it out of harm's way; the
-/// kind is what decides whether the comparison runs on numbers or on text.
+/// text and never the client's, and it is bound rather than rendered like every
+/// other value here; the kind is what decides whether the comparison runs on
+/// numbers or on text.
 #[derive(Clone)]
 pub(super) struct Column {
     name: String,
@@ -129,34 +131,38 @@ impl Column {
     /// one, so a dataset whose values disagree with its declared type answers no
     /// rows rather than failing the whole query: a schema can be declared after
     /// the rows were written.
-    fn sql(&self, numeric: bool) -> String {
+    fn sql(&self, numeric: bool, next: &mut i32, binds: &mut Vec<Bind>) -> String {
         match (self.kind, numeric) {
             // the object id is already a bigint in the CTE. float8 holds every
             // id below 2^53 exactly, which is every id anything here assigns
             (Kind::Oid, true) => "oid::float8".to_string(),
             (Kind::Oid, false) => "oid::text".to_string(),
             (_, true) => {
-                let text = self.text();
+                // one bind for the key, named twice: a placeholder can be
+                // referenced as often as the statement needs it
+                let text = self.text(next, binds);
                 format!("(CASE WHEN {text} ~ '{NUMBER}' THEN ({text})::float8 END)")
             }
-            (_, false) => self.text(),
+            (_, false) => self.text(next, binds),
         }
     }
 
-    /// The property as text, escaped the way [`super::Oid::sql`] escapes it. The
-    /// name came out of the layer's fields, so this is hygiene rather than the
-    /// thing that keeps the clause safe.
-    fn text(&self) -> String {
-        format!("(properties->>'{}')", self.name.replace('\'', "''"))
+    /// The property as text, with the key bound the way [`super::Oid::sql`] binds
+    /// it. A property key is a layer's own text rather than a client's, but
+    /// binding it means no key can be quoted wrongly whatever it holds, and the
+    /// clause no longer needs `standard_conforming_strings` to be on.
+    fn text(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
+        let place = placeholder(next, binds, Bind::Text(Some(self.name.clone())));
+        format!("(properties->>{place}::text)")
     }
 }
 
 impl Predicate {
     /// The predicate as SQL over the `numbered` CTE, appending one bind per
-    /// literal in the order the placeholders are numbered.
+    /// literal and per property key, in the order the placeholders are numbered.
     ///
-    /// Every value is a placeholder. Nothing a client wrote is rendered here,
-    /// which is the whole point of parsing it first.
+    /// Every value and every key is a placeholder. Nothing a client wrote is
+    /// rendered here, which is the whole point of parsing it first.
     pub(super) fn sql(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
         match self {
             Predicate::Const(None) => "NULL".to_string(),
@@ -170,25 +176,31 @@ impl Predicate {
                     Value::Number(v) => (true, Bind::Number(*v), "float8"),
                     Value::Text(v) => (false, Bind::Text(v.clone()), "text"),
                 };
+                // the column first, so the placeholders read left to right
+                let held = column.sql(numeric, next, binds);
                 let place = placeholder(next, binds, bind);
-                format!("({} {op} {place}::{cast})", column.sql(numeric))
+                format!("({held} {op} {place}::{cast})")
             }
             Predicate::In { column, values } => {
                 let (numeric, bind, cast) = match values {
                     List::Numbers(v) => (true, Bind::Numbers(v.clone()), "float8[]"),
                     List::Texts(v) => (false, Bind::Texts(v.clone()), "text[]"),
                 };
+                let held = column.sql(numeric, next, binds);
                 let place = placeholder(next, binds, bind);
-                format!("({} = ANY({place}::{cast}))", column.sql(numeric))
+                format!("({held} = ANY({place}::{cast}))")
             }
             Predicate::Like { column, pattern } => {
+                let held = column.sql(false, next, binds);
                 let place = placeholder(next, binds, Bind::Text(Some(pattern.clone())));
                 // ESCAPE '' turns off PostgreSQL's backslash escape, which
                 // SQL-92 LIKE does not have: a backslash a client sent is a
                 // backslash to match, not an escape for what follows it
-                format!("({} LIKE {place}::text ESCAPE '')", column.sql(false))
+                format!("({held} LIKE {place}::text ESCAPE '')")
             }
-            Predicate::IsNull { column } => format!("({} IS NULL)", column.sql(false)),
+            Predicate::IsNull { column } => {
+                format!("({} IS NULL)", column.sql(false, next, binds))
+            }
         }
     }
 }
@@ -995,11 +1007,19 @@ mod tests {
         }
     }
 
+    /// The key it reads and the value it compares are both binds, in that order.
+    fn text_binds(key: &str, value: &str) -> Vec<Bind> {
+        vec![
+            Bind::Text(Some(key.to_string())),
+            Bind::Text(Some(value.to_string())),
+        ]
+    }
+
     #[test]
     fn a_text_comparison_binds_the_string_and_renders_a_placeholder() {
         let (sql, binds) = rendered("name = 'Boston'");
-        assert_eq!(sql, "((properties->>'name') = $2::text)");
-        assert_eq!(binds, vec![Bind::Text(Some("Boston".to_string()))]);
+        assert_eq!(sql, "((properties->>$2::text) = $3::text)");
+        assert_eq!(binds, text_binds("name", "Boston"));
     }
 
     /// The clause that would be an injection if any of it were rendered. It is
@@ -1009,11 +1029,8 @@ mod tests {
         // the DROP form of this is in the integration tests, which run it
         // against a real database and then prove the table is still there
         let (sql, binds) = rendered("name = 'x''; delete everything;--'");
-        assert_eq!(sql, "((properties->>'name') = $2::text)");
-        assert_eq!(
-            binds,
-            vec![Bind::Text(Some("x'; delete everything;--".to_string()))]
-        );
+        assert_eq!(sql, "((properties->>$2::text) = $3::text)");
+        assert_eq!(binds, text_binds("name", "x'; delete everything;--"));
         assert!(!sql.contains("delete"), "{sql}");
     }
 
@@ -1021,12 +1038,18 @@ mod tests {
     fn a_declared_number_compares_as_a_number() {
         let (sql, binds) = rendered("pop >= 1000");
         assert!(sql.contains("::float8"), "{sql}");
-        assert!(sql.contains("(properties->>'pop')"), "{sql}");
-        assert!(sql.ends_with(">= $2::float8)"), "{sql}");
-        assert_eq!(binds, vec![Bind::Number(1000.0)]);
+        assert!(sql.contains("(properties->>$2::text)"), "{sql}");
+        assert!(sql.ends_with(">= $3::float8)"), "{sql}");
+        assert_eq!(
+            binds,
+            vec![Bind::Text(Some("pop".to_string())), Bind::Number(1000.0)]
+        );
         // a decimal against a double, and a negative one
         assert!(sql_of("score < -1.5").contains("::float8"));
-        assert_eq!(rendered("score < -1.5").1, vec![Bind::Number(-1.5)]);
+        assert_eq!(
+            rendered("score < -1.5").1,
+            vec![Bind::Text(Some("score".to_string())), Bind::Number(-1.5)]
+        );
     }
 
     /// A number against a field that holds text compares as text, as the
@@ -1034,11 +1057,15 @@ mod tests {
     #[test]
     fn a_number_against_a_text_field_compares_as_text() {
         let (sql, binds) = rendered("name = 007");
-        assert_eq!(sql, "((properties->>'name') = $2::text)");
-        assert_eq!(binds, vec![Bind::Text(Some("007".to_string()))]);
-        // and so do the two kinds that are text with a declared shape
-        assert_eq!(sql_of("open = 1"), "((properties->>'open') = $2::text)");
-        assert_eq!(sql_of("tags = 1"), "((properties->>'tags') = $2::text)");
+        assert_eq!(sql, "((properties->>$2::text) = $3::text)");
+        assert_eq!(binds, text_binds("name", "007"));
+        // and so do the two kinds that are text with a declared shape. The field
+        // is in the binds rather than in the SQL, so that is where a test reads
+        // which one was compared
+        assert_eq!(sql_of("open = 1"), "((properties->>$2::text) = $3::text)");
+        assert_eq!(rendered("open = 1").1, text_binds("open", "1"));
+        assert_eq!(sql_of("tags = 1"), "((properties->>$2::text) = $3::text)");
+        assert_eq!(rendered("tags = 1").1, text_binds("tags", "1"));
     }
 
     #[test]
@@ -1054,11 +1081,20 @@ mod tests {
     /// failing the query.
     #[test]
     fn a_numeric_comparison_guards_the_cast() {
-        let sql = sql_of("pop = 1");
-        assert!(sql.contains("CASE WHEN (properties->>'pop') ~ "), "{sql}");
+        let (sql, binds) = rendered("pop = 1");
         assert!(
-            sql.contains("THEN ((properties->>'pop'))::float8 END"),
+            sql.contains("CASE WHEN (properties->>$2::text) ~ "),
             "{sql}"
+        );
+        assert!(
+            sql.contains("THEN ((properties->>$2::text))::float8 END"),
+            "{sql}"
+        );
+        // the key is named twice and bound once
+        assert_eq!(sql.matches("$2::text").count(), 2, "{sql}");
+        assert_eq!(
+            binds,
+            vec![Bind::Text(Some("pop".to_string())), Bind::Number(1.0)]
         );
     }
 
@@ -1075,7 +1111,7 @@ mod tests {
         ] {
             let sql = sql_of(clause);
             assert!(
-                sql.contains(&format!(" {op} $2::float8)")),
+                sql.contains(&format!(" {op} $3::float8)")),
                 "{clause}: {sql}"
             );
         }
@@ -1086,12 +1122,12 @@ mod tests {
     #[test]
     fn a_literal_on_the_left_flips_the_operator() {
         assert!(
-            sql_of("1000 < pop").ends_with("> $2::float8)"),
+            sql_of("1000 < pop").ends_with("> $3::float8)"),
             "{}",
             sql_of("1000 < pop")
         );
-        assert!(sql_of("1000 >= pop").ends_with("<= $2::float8)"));
-        assert!(sql_of("'a' = name").ends_with("= $2::text)"));
+        assert!(sql_of("1000 >= pop").ends_with("<= $3::float8)"));
+        assert!(sql_of("'a' = name").ends_with("= $3::text)"));
     }
 
     /// `1=1` is what an Esri client sends for "no filter", and it is a
@@ -1113,78 +1149,96 @@ mod tests {
     #[test]
     fn comparing_a_field_with_null_is_a_null_bind() {
         let (sql, binds) = rendered("name = NULL");
-        assert_eq!(sql, "((properties->>'name') = $2::text)");
-        assert_eq!(binds, vec![Bind::Text(None)]);
+        assert_eq!(sql, "((properties->>$2::text) = $3::text)");
+        assert_eq!(
+            binds,
+            vec![Bind::Text(Some("name".to_string())), Bind::Text(None)]
+        );
     }
 
     #[test]
     fn is_null_and_is_not_null() {
-        assert_eq!(sql_of("name IS NULL"), "((properties->>'name') IS NULL)");
+        assert_eq!(sql_of("name IS NULL"), "((properties->>$2::text) IS NULL)");
         assert_eq!(
             sql_of("name IS NOT NULL"),
-            "(NOT ((properties->>'name') IS NULL))"
+            "(NOT ((properties->>$2::text) IS NULL))"
         );
-        assert_eq!(sql_of("name is null"), "((properties->>'name') IS NULL)");
+        assert_eq!(sql_of("name is null"), "((properties->>$2::text) IS NULL)");
+        assert_eq!(
+            rendered("name IS NULL").1,
+            vec![Bind::Text(Some("name".to_string()))]
+        );
     }
 
     #[test]
     fn in_takes_one_shape_for_the_whole_list() {
         let (sql, binds) = rendered("pop IN (1, 2, 3)");
-        assert!(sql.ends_with("= ANY($2::float8[]))"), "{sql}");
-        assert_eq!(binds, vec![Bind::Numbers(vec![1.0, 2.0, 3.0])]);
-
-        let (sql, binds) = rendered("name IN ('a', 'b')");
-        assert_eq!(sql, "((properties->>'name') = ANY($2::text[]))");
+        assert!(sql.ends_with("= ANY($3::float8[]))"), "{sql}");
         assert_eq!(
             binds,
-            vec![Bind::Texts(vec![
-                Some("a".to_string()),
-                Some("b".to_string())
-            ])]
+            vec![
+                Bind::Text(Some("pop".to_string())),
+                Bind::Numbers(vec![1.0, 2.0, 3.0])
+            ]
+        );
+
+        let (sql, binds) = rendered("name IN ('a', 'b')");
+        assert_eq!(sql, "((properties->>$2::text) = ANY($3::text[]))");
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Text(Some("name".to_string())),
+                Bind::Texts(vec![Some("a".to_string()), Some("b".to_string())])
+            ]
         );
 
         // one value that is not a number makes the whole list text, and a NULL
         // in a list stays a NULL so that NOT IN behaves as SQL says
         let (sql, binds) = rendered("pop IN (1, 'x', NULL)");
-        assert_eq!(sql, "((properties->>'pop') = ANY($2::text[]))");
+        assert_eq!(sql, "((properties->>$2::text) = ANY($3::text[]))");
         assert_eq!(
             binds,
-            vec![Bind::Texts(vec![
-                Some("1".to_string()),
-                Some("x".to_string()),
-                None
-            ])]
+            vec![
+                Bind::Text(Some("pop".to_string())),
+                Bind::Texts(vec![Some("1".to_string()), Some("x".to_string()), None])
+            ]
         );
 
         assert_eq!(
             sql_of("name NOT IN ('a')"),
-            "(NOT ((properties->>'name') = ANY($2::text[])))"
+            "(NOT ((properties->>$2::text) = ANY($3::text[])))"
         );
     }
 
     #[test]
     fn like_keeps_the_wildcards_and_turns_off_the_escape_character() {
         let (sql, binds) = rendered("name LIKE 'a%b_c'");
-        assert_eq!(sql, "((properties->>'name') LIKE $2::text ESCAPE '')");
-        assert_eq!(binds, vec![Bind::Text(Some("a%b_c".to_string()))]);
+        assert_eq!(sql, "((properties->>$2::text) LIKE $3::text ESCAPE '')");
+        assert_eq!(binds, text_binds("name", "a%b_c"));
         assert_eq!(
             sql_of("name NOT LIKE 'a%'"),
-            "(NOT ((properties->>'name') LIKE $2::text ESCAPE ''))"
+            "(NOT ((properties->>$2::text) LIKE $3::text ESCAPE ''))"
         );
         // a backslash is a character to match, not an escape
-        assert_eq!(
-            rendered(r"name LIKE 'a\%'").1,
-            vec![Bind::Text(Some(r"a\%".to_string()))]
-        );
+        assert_eq!(rendered(r"name LIKE 'a\%'").1, text_binds("name", r"a\%"));
     }
 
     #[test]
     fn between_is_two_comparisons() {
+        // two comparisons over one field, so the key is bound once for each
         let (sql, binds) = rendered("pop BETWEEN 10 AND 20");
-        assert!(sql.contains(" >= $2::float8)"), "{sql}");
-        assert!(sql.contains(" <= $3::float8)"), "{sql}");
+        assert!(sql.contains(" >= $3::float8)"), "{sql}");
+        assert!(sql.contains(" <= $5::float8)"), "{sql}");
         assert!(sql.contains(" AND "), "{sql}");
-        assert_eq!(binds, vec![Bind::Number(10.0), Bind::Number(20.0)]);
+        assert_eq!(
+            binds,
+            vec![
+                Bind::Text(Some("pop".to_string())),
+                Bind::Number(10.0),
+                Bind::Text(Some("pop".to_string())),
+                Bind::Number(20.0)
+            ]
+        );
 
         let negated = sql_of("pop NOT BETWEEN 10 AND 20");
         assert!(negated.starts_with("(NOT ("), "{negated}");
@@ -1196,27 +1250,27 @@ mod tests {
         let sql = sql_of("NOT pop = 1 AND name = 'a'");
         assert!(sql.starts_with("((NOT ("), "{sql}");
         assert!(
-            sql.ends_with("AND ((properties->>'name') = $3::text))"),
+            sql.ends_with("AND ((properties->>$4::text) = $5::text))"),
             "{sql}"
         );
         // AND groups inside OR
         let sql = sql_of("name = 'a' OR name = 'b' AND name = 'c'");
         assert_eq!(
             sql,
-            "(((properties->>'name') = $2::text) OR (((properties->>'name') = $3::text) AND ((properties->>'name') = $4::text)))"
+            "(((properties->>$2::text) = $3::text) OR (((properties->>$4::text) = $5::text) AND ((properties->>$6::text) = $7::text)))"
         );
         // and parentheses override it
         let sql = sql_of("(name = 'a' OR name = 'b') AND name = 'c'");
         assert_eq!(
             sql,
-            "((((properties->>'name') = $2::text) OR ((properties->>'name') = $3::text)) AND ((properties->>'name') = $4::text))"
+            "((((properties->>$2::text) = $3::text) OR ((properties->>$4::text) = $5::text)) AND ((properties->>$6::text) = $7::text))"
         );
         // a chain of one operator is one flat list, in the order it was written
         let (sql, binds) = rendered("name='a' AND name='b' AND name='c'");
         assert_eq!(sql.matches(" AND ").count(), 2, "{sql}");
-        assert_eq!(binds.len(), 3);
-        assert_eq!(binds[0], Bind::Text(Some("a".to_string())));
-        assert_eq!(binds[2], Bind::Text(Some("c".to_string())));
+        assert_eq!(binds.len(), 6);
+        assert_eq!(binds[1], Bind::Text(Some("a".to_string())));
+        assert_eq!(binds[5], Bind::Text(Some("c".to_string())));
     }
 
     #[test]
@@ -1235,28 +1289,31 @@ mod tests {
 
     #[test]
     fn a_field_name_matches_without_regard_to_case() {
-        // the name in the SQL is the layer's, not the spelling the client sent
-        assert_eq!(sql_of("NaMe IS NULL"), "((properties->>'name') IS NULL)");
+        // the key that is bound is the layer's own, not the spelling the client
+        // sent, which is what makes the comparison read the right property
+        let (sql, binds) = rendered("NaMe IS NULL");
+        assert_eq!(sql, "((properties->>$2::text) IS NULL)");
+        assert_eq!(binds, vec![Bind::Text(Some("name".to_string()))]);
     }
 
     #[test]
     fn a_date_literal_becomes_the_utc_text_the_store_holds() {
         assert_eq!(
             rendered("seen >= DATE '2024-03-01'").1,
-            vec![Bind::Text(Some("2024-03-01T00:00:00Z".to_string()))]
+            text_binds("seen", "2024-03-01T00:00:00Z")
         );
         assert_eq!(
             rendered("seen < TIMESTAMP '2024-03-01 12:30:00'").1,
-            vec![Bind::Text(Some("2024-03-01T12:30:00Z".to_string()))]
+            text_binds("seen", "2024-03-01T12:30:00Z")
         );
         assert_eq!(
             rendered("seen < timestamp '2024-03-01T12:30:00Z'").1,
-            vec![Bind::Text(Some("2024-03-01T12:30:00Z".to_string()))]
+            text_binds("seen", "2024-03-01T12:30:00Z")
         );
         // a date compares as text even against a field declared numeric
         assert_eq!(
             sql_of("pop > DATE '2024-03-01'"),
-            "((properties->>'pop') > $2::text)"
+            "((properties->>$2::text) > $3::text)"
         );
         // what it will not guess at
         for clause in [
@@ -1281,26 +1338,48 @@ mod tests {
         let mut binds = Vec::new();
         assert_eq!(
             predicate.sql(&mut next, &mut binds),
-            "((properties->>'date') = $2::text)"
+            "((properties->>$2::text) = $3::text)"
         );
+        assert_eq!(binds, text_binds("date", "2024-03-01"));
     }
 
-    /// A property whose name carries a quote cannot break the SQL it is
-    /// rendered into: the name is escaped the way the object id column is.
+    /// A property key that carries a quote and a backslash cannot break the SQL
+    /// it is read with, because it is not in the SQL: it is a bind like any
+    /// value, so no escaping has to be right and nothing depends on
+    /// `standard_conforming_strings`.
+    ///
+    /// A derived-fields layer takes its field names from the property keys the
+    /// features carry, so a key can hold anything at all.
     #[test]
-    fn a_field_name_with_a_quote_is_escaped() {
+    fn a_field_name_with_a_quote_is_bound_rather_than_escaped() {
+        let hostile = r"it's\ a ' key";
         let mut layer = layer();
-        layer.fields.push(field("it's", Kind::Text));
-        let predicate = parse("it's IS NULL", &layer);
+        layer.fields.push(field(hostile, Kind::Text));
         // the tokenizer reads `it` and then an unterminated string, which is
-        // what a client sending that name gets: there is no way to write it
-        assert!(predicate.is_err());
-        // reached the other way, through a comparison the parser does build
+        // what a client naming that field gets: there is no way to write it
+        assert!(parse("it's IS NULL", &layer).is_err());
+        // reached the other way, as the renderer sees it
         let column = Column {
-            name: "it's".to_string(),
+            name: hostile.to_string(),
             kind: Kind::Text,
         };
-        assert_eq!(column.text(), "(properties->>'it''s')");
+        let mut next = 2;
+        let mut binds = Vec::new();
+        assert_eq!(
+            column.text(&mut next, &mut binds),
+            "(properties->>$2::text)"
+        );
+        assert_eq!(binds, vec![Bind::Text(Some(hostile.to_string()))]);
+        // and the numeric shape names the one bind twice rather than rendering
+        // the key twice
+        let mut next = 2;
+        let mut binds = Vec::new();
+        let sql = column.sql(true, &mut next, &mut binds);
+        // the only quoted text left in it is this crate's own number pattern
+        assert!(!sql.contains("it's"), "{sql}");
+        assert!(!sql.contains('\\'), "{sql}");
+        assert_eq!(sql.matches("$2::text").count(), 2, "{sql}");
+        assert_eq!(binds.len(), 1);
     }
 
     #[test]
@@ -1377,7 +1456,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" AND ");
         let (sql, binds) = rendered(&clause);
-        assert_eq!(binds.len(), 2000);
+        // a key and a value for each term
+        assert_eq!(binds.len(), 4000);
         assert_eq!(sql.matches(" AND ").count(), 1999);
     }
 
@@ -1390,20 +1470,23 @@ mod tests {
     #[test]
     fn a_huge_number_is_a_number() {
         let (_, binds) = rendered(&format!("pop > {}", "9".repeat(400)));
-        assert_eq!(binds, vec![Bind::Number(f64::INFINITY)]);
-        // and against a text field it is the text the client wrote
-        let (_, binds) = rendered("name > 99999999999999999999999999");
         assert_eq!(
             binds,
-            vec![Bind::Text(Some("99999999999999999999999999".to_string()))]
+            vec![
+                Bind::Text(Some("pop".to_string())),
+                Bind::Number(f64::INFINITY)
+            ]
         );
+        // and against a text field it is the text the client wrote
+        let (_, binds) = rendered("name > 99999999999999999999999999");
+        assert_eq!(binds, text_binds("name", "99999999999999999999999999"));
     }
 
     #[test]
     fn unicode_is_a_literal_like_any_other() {
         let (sql, binds) = rendered("name = 'Köln 東京 🗺'");
-        assert_eq!(sql, "((properties->>'name') = $2::text)");
-        assert_eq!(binds, vec![Bind::Text(Some("Köln 東京 🗺".to_string()))]);
+        assert_eq!(sql, "((properties->>$2::text) = $3::text)");
+        assert_eq!(binds, text_binds("name", "Köln 東京 🗺"));
         // a unicode field name is a field name, since a property key can be one
         let mut layer = layer();
         layer.fields.push(field("café", Kind::Text));

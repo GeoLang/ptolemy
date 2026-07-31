@@ -51,6 +51,8 @@ pub mod visibility;
 pub mod webhook;
 pub mod ws;
 
+use axum::extract::Request;
+use axum::http::Uri;
 use axum::response::Html;
 use axum::routing::get;
 use axum::{Router, middleware};
@@ -72,6 +74,38 @@ pub use telemetry::init_telemetry;
 pub use ws::EventBus;
 
 pub type AppState = Arc<PgStore>;
+
+/// What a redacted `token` value reads as in a trace.
+const REDACTED: &str = "REDACTED";
+
+/// The uri as the request span records it, with any `token` value taken out.
+///
+/// The ArcGIS facade takes its credential in the query string, because the
+/// Geoservices protocol has no header for one (see `auth::request_token`), and
+/// the request span carries the uri, so `tower_http` at debug level would
+/// otherwise put live tokens in the log. Redacted here rather than in the
+/// facade: this span is what records the uri, and it records it for every route.
+///
+/// `token` is the name the auth layer reads a credential from, so it is the name
+/// taken out here, matched without regard to case and only as the whole name.
+/// Everything else in the uri is left alone, so a trace is still worth reading.
+fn traced_uri(uri: &Uri) -> String {
+    let whole = uri.to_string();
+    let Some((before, query)) = whole.split_once('?') else {
+        return whole;
+    };
+    let redacted = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) if name.eq_ignore_ascii_case("token") => {
+                format!("{name}={REDACTED}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{before}?{redacted}")
+}
 
 /// The embedded review UI HTML.
 const REVIEW_UI_HTML: &str = include_str!("../../../docs/review.html");
@@ -152,6 +186,70 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
             visibility::visibility_middleware,
         ))
         .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))
-        .layer(TraceLayer::new_for_http())
+        // the default span records the uri as it arrived, which on the arcgis
+        // facade carries the caller's token: see traced_uri
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %traced_uri(request.uri()),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn traced(uri: &str) -> String {
+        traced_uri(&uri.parse::<Uri>().unwrap())
+    }
+
+    /// The one thing a trace must not carry. A token is a bearer credential, so
+    /// a log line holding one is a log line anyone who reads it can write with.
+    #[test]
+    fn the_token_value_never_reaches_the_span() {
+        let secret = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.sig";
+        for uri in [
+            &format!("/arcgis/rest/services/x/FeatureServer/0/query?token={secret}"),
+            &format!("/arcgis/rest/services?f=json&token={secret}"),
+            &format!("/arcgis/rest/services?token={secret}&f=json"),
+            &format!("/arcgis/rest/services?TOKEN={secret}"),
+            &format!("/arcgis/rest/services?token={secret}&token={secret}"),
+            &format!("https://host/arcgis/rest/services?token={secret}"),
+        ] {
+            let out = traced(uri);
+            assert!(!out.contains(secret), "{uri} traced as {out}");
+            assert!(out.contains(REDACTED), "{uri} traced as {out}");
+        }
+    }
+
+    /// Everything else in the uri is untouched: a trace nobody can read a route
+    /// off is a trace that costs more than it is worth.
+    #[test]
+    fn the_rest_of_the_uri_is_left_alone() {
+        assert_eq!(traced("/api/v1/datasets"), "/api/v1/datasets");
+        assert_eq!(
+            traced("/arcgis/rest/services/x/FeatureServer/0/query?f=json&where=pop%3D1&token=abc"),
+            "/arcgis/rest/services/x/FeatureServer/0/query?f=json&where=pop%3D1&token=REDACTED"
+        );
+        assert_eq!(
+            traced("https://host:8080/api/v1/datasets?limit=5"),
+            "https://host:8080/api/v1/datasets?limit=5"
+        );
+        // a parameter that only ends in the word is not the credential, and the
+        // auth layer does not read it as one either
+        assert_eq!(
+            traced("/api/v1/datasets?sessiontoken=abc"),
+            "/api/v1/datasets?sessiontoken=abc"
+        );
+        // nothing to redact, and nothing to break on
+        assert_eq!(traced("/x?token"), "/x?token");
+        assert_eq!(traced("/x?"), "/x?");
+        assert_eq!(traced("/x?token="), "/x?token=REDACTED");
+    }
 }

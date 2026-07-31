@@ -9242,6 +9242,114 @@ async fn test_arcgis_query_where_treats_injection_as_data() {
     );
 }
 
+/// A property key can hold anything, a quote and a backslash included, and both
+/// the object id read and every where clause name their key as a bind rather than
+/// quoting it into the SQL. So a layer with such a key answers correctly, and
+/// nothing about it depends on how the server escapes a quote.
+///
+/// Naming that field in a clause is a refusal, not a broken query: a field
+/// reference is a bare word to the tokenizer, so there is no way to write one.
+/// That is the reason this is as end to end as it gets.
+#[tokio::test]
+async fn test_arcgis_query_reads_a_layer_whose_property_key_carries_a_quote() {
+    let (app, _) = setup_app().await;
+    let name = format!("hostilekey_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    let hostile = r"it's\ a ' key";
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(json!({"fields": [
+            {"name": "OBJECTID", "field_type": "integer", "required": false},
+            {"name": "name", "field_type": "string", "required": false},
+            {"name": hostile, "field_type": "string", "required": false},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let feature = |oid: i64, label: &str, held: &str, x: f64| {
+        let mut properties = serde_json::Map::new();
+        properties.insert("OBJECTID".to_string(), json!(oid));
+        properties.insert("name".to_string(), json!(label));
+        properties.insert(hostile.to_string(), json!(held));
+        json!({"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+               "geometry_wkb_hex": point_wkb(x, 1.0), "properties": properties})
+    };
+    commit_features(
+        &app,
+        branch,
+        json!([
+            feature(10, "alpha", "first", 1.0),
+            feature(20, "beta", "second", 2.0),
+        ]),
+    )
+    .await;
+
+    // the id read binds its own key, so the ids are the ones the features carry
+    let (_, ids) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    assert_eq!(ids["objectIds"], json!([10, 20]), "{ids}");
+    assert_eq!(facade_count(&app, &name).await, 2);
+
+    // the layer declares the field, and its value comes back under that name
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    let declared: Vec<&str> = layer["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(declared, vec!["OBJECTID", "name", hostile], "{layer}");
+
+    // a clause filters correctly against a real database with that key in the
+    // data, and the whole feature still reads back
+    let (status, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{}&outFields=*", where_param("name = 'beta'")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let features = body["features"].as_array().unwrap();
+    assert_eq!(features.len(), 1, "{body}");
+    assert_eq!(features[0]["attributes"]["OBJECTID"], 20, "{body}");
+    assert_eq!(features[0]["attributes"][hostile], "second", "{body}");
+
+    // and the id compares as the id, over the same bound key
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{}&outFields=*", where_param("OBJECTID >= 20")),
+        ),
+    )
+    .await;
+    assert_eq!(body["features"].as_array().unwrap().len(), 1, "{body}");
+
+    // naming the field itself is a refusal rather than a query that breaks
+    let (status, body) = get_json(
+        &app,
+        &query_url(&name, &where_param(&format!("{hostile} IS NULL"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+
+    // nothing was harmed: the layer still answers both features
+    assert_eq!(facade_count(&app, &name).await, 2);
+}
+
 /// What the clause parser will not read is refused by name, because a filter
 /// that silently did not apply hands back rows the client did not ask for.
 #[tokio::test]
@@ -9667,6 +9775,87 @@ async fn test_arcgis_apply_edits_assigns_consecutive_object_ids() {
         json!([{"objectId": 4, "success": true}]),
         "{out}"
     );
+}
+
+/// Two batches of adds racing each other on one layer cannot be given the same
+/// object id. The id is an ordinary property with no unique constraint behind it,
+/// so nothing downstream would refuse a duplicate: the assignment itself is what
+/// has to be serialized, and it is, on the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_arcgis_apply_edits_racing_adds_get_distinct_object_ids() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "race", "point").await;
+    let url = apply_edits_url(&name);
+    let before = history_len(&app, branch).await;
+
+    let batch = |tag: &str| {
+        let adds: Vec<Value> = (0..3)
+            .map(|i| {
+                json!({"attributes": {"name": format!("{tag}{i}")},
+                       "geometry": {"x": i as f64, "y": 0.0}})
+            })
+            .collect();
+        form_body(&[("f", "json".into()), ("adds", json!(adds).to_string())])
+    };
+    let (one, two) = (batch("a"), batch("b"));
+    let (first, second) = tokio::join!(post_form(&app, &url, &one), post_form(&app, &url, &two));
+
+    let assigned = |(status, out): (StatusCode, Value)| -> Vec<i64> {
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(out["error"].is_null(), "{out}");
+        out["addResults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["objectId"].as_i64().unwrap())
+            .collect()
+    };
+    let mut ids = assigned(first);
+    ids.extend(assigned(second));
+    let mut distinct = ids.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 6, "two batches were given one id: {ids:?}");
+
+    // and the layer holds exactly the six it handed out, one feature each
+    let (_, held) = get_json(&app, &query_url(&name, "returnIdsOnly=true")).await;
+    let stored: Vec<i64> = held["objectIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect();
+    assert_eq!(stored, distinct, "{held}");
+    // one commit per batch: the lock serializes them, it does not merge them
+    assert_eq!(history_len(&app, branch).await, before + 2);
+}
+
+/// Esri takes an add with no geometry, for a table or a shape a client fills in
+/// later. A feature here is a geometry and its attributes, so an attribute-only
+/// add is refused by name rather than written as something with nothing to draw.
+#[tokio::test]
+async fn test_arcgis_apply_edits_refuses_an_attribute_only_add() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "noshape", "point").await;
+    let before = history_len(&app, branch).await;
+
+    for adds in [
+        json!([{"attributes": {"name": "shapeless"}}]),
+        json!([{"attributes": {"name": "shapeless"}, "geometry": Value::Null}]),
+        // a good add alongside it: the batch is one commit, so neither lands
+        json!([{"attributes": {"name": "fine"}, "geometry": {"x": 1.0, "y": 1.0}},
+               {"attributes": {"name": "shapeless"}}]),
+    ] {
+        let body = form_body(&[("f", "json".into()), ("adds", adds.to_string())]);
+        let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+        assert_eq!(status, StatusCode::OK, "{adds}: {out}");
+        assert_eq!(out["error"]["code"], 400, "{adds}: {out}");
+        let why = out["error"]["message"].as_str().unwrap();
+        assert!(why.contains("requires a geometry"), "{adds}: {out}");
+        assert!(why.contains(&name), "the refusal names the layer: {out}");
+    }
+    assert_eq!(facade_count(&app, &name).await, 0);
+    assert_eq!(history_len(&app, branch).await, before);
 }
 
 /// A client-supplied objectid on an add is ignored: the service assigns the id,

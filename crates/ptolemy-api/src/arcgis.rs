@@ -18,6 +18,13 @@
 //! batch either lands whole or does not land: see `apply_edits` for what that
 //! costs a client that expects Esri's per-row results.
 //!
+//! One further divergence there: Esri takes an add with no geometry, for a table
+//! or a shape the client fills in later, and this refuses it. A ptolemy feature
+//! is a geometry and its attributes, and the store's insert takes the geometry
+//! rather than an optional one, so an attribute-only add has nothing to write.
+//! Every layer served here is a feature layer, never a table. See
+//! `NEEDS_A_GEOMETRY`.
+//!
 //! Every route resolves its dataset through the same visibility rule the other
 //! read frontends use, so this widens nothing. A URL that names a dataset by
 //! uuid is also caught by the visibility layer, which answers its own 404 before
@@ -421,11 +428,18 @@ impl Oid {
         }
     }
 
-    /// SQL for the id, over the alias `f`.
-    fn sql(&self) -> String {
+    /// SQL for the id, over the alias `f`, with the property key bound rather
+    /// than rendered: a key is the layer's own text, but binding it means no key
+    /// can be quoted wrongly whatever it holds, and the query no longer needs
+    /// `standard_conforming_strings` to be on. Numbered before every filter, so
+    /// this is `$2` when there is a key to bind.
+    fn sql(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
         match self {
             Oid::Property(name) => {
-                format!("(f.properties->>'{}')::bigint", name.replace('\'', "''"))
+                let at = *next;
+                *next += 1;
+                binds.push(Bind::Text(Some(name.clone())));
+                format!("(f.properties->>${at}::text)::bigint")
             }
             Oid::RowNumber => "ROW_NUMBER() OVER (ORDER BY f.id)".to_string(),
         }
@@ -928,6 +942,9 @@ async fn run_query(
     let mut filters: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
     let mut next = 2;
+    // the id's own key is bound first, so a filter's placeholders carry on from
+    // wherever it left off
+    let oid_sql = layer.oid.sql(&mut next, &mut binds);
 
     // the clause is parsed against the layer's own fields and rendered with
     // every literal bound, so nothing a client wrote reaches the SQL
@@ -989,9 +1006,8 @@ async fn run_query(
     // query and an unfiltered one name the same feature by the same id
     let rows = format!(
         "WITH numbered AS (
-             SELECT f.id, f.geometry, f.properties, {} AS oid FROM {source} f
-         )",
-        layer.oid.sql()
+             SELECT f.id, f.geometry, f.properties, {oid_sql} AS oid FROM {source} f
+         )"
     );
     let predicate = if filters.is_empty() {
         String::new()
@@ -1356,6 +1372,14 @@ const NEEDS_A_REAL_OID: &str = "has no objectid column, so its object ids are ro
      would land on a different feature. Declare an integer 'objectid' field on the dataset's \
      schema to make the layer editable.";
 
+/// The message an attribute-only add is refused with. Esri allows one, for a
+/// table or a shape a client fills in later; the store's insert takes a geometry
+/// rather than an optional one, so there is nothing here to write. An update may
+/// still carry attributes only: that keeps the geometry the feature already has.
+const NEEDS_A_GEOMETRY: &str = "requires a geometry on an added feature: every feature this service stores is a geometry and \
+     its attributes, so an attribute-only add has nothing to store. An update may carry attributes \
+     alone, and keeps the geometry the feature already has.";
+
 async fn apply_edits(
     State(store): State<AppState>,
     actor: Actor,
@@ -1431,7 +1455,12 @@ async fn apply_edits(
     let mut ops: Vec<DiffOp> = Vec::new();
     let mut add_ids: Vec<i64> = Vec::new();
 
+    // held past the commit, so no second batch reads the highest id this one is
+    // about to raise. Nothing but an add reads it, so nothing else waits.
+    let mut oid_lock: Option<OidLock> = None;
+
     if !adds.is_empty() {
+        oid_lock = Some(lock_oids(&store, layer.branch_id).await?);
         let mut next = max_oid(&store, &layer).await? + 1;
         for feature in &adds {
             let mut properties = attributes_of(feature)?;
@@ -1439,8 +1468,9 @@ async fn apply_edits(
             // either collide with a feature that exists or renumber the layer
             properties.retain(|key, _| !key.eq_ignore_ascii_case(oid_field));
             properties.insert(oid_field.clone(), json!(next));
-            let shape = geometry_of(feature)
-                .ok_or_else(|| EsriError::bad_request("an added feature needs a geometry"))?;
+            let shape = geometry_of(feature).ok_or_else(|| {
+                EsriError::bad_request(format!("'{}' {NEEDS_A_GEOMETRY}", layer.name))
+            })?;
             ops.push(DiffOp::Insert {
                 feature_id: Uuid::now_v7(),
                 geometry_wkb: wkb_of(shape, layer.geometry)?,
@@ -1515,6 +1545,13 @@ async fn apply_edits(
         )
         .await
         .map_err(EsriError::refused)?;
+
+    // the ids this batch assigned are visible now, so the next batch can read
+    // them. A rollback that fails broke the connection, which releases the lock
+    // too, so there is nothing to do about it.
+    if let Some(lock) = oid_lock {
+        let _ = lock.rollback().await;
+    }
 
     Ok(Json(json!({
         "addResults": results(&add_ids),
@@ -1640,24 +1677,89 @@ fn oid_of(feature: &Value, field: &str) -> Result<i64, EsriError> {
 /// The highest object id on the branch, or 0 when nothing carries one, so the
 /// next add is 1.
 ///
-/// This is read before the commit rather than inside it, so two edit requests
-/// racing each other can pick the same next id. A duplicate id can never make a
-/// later edit hit the wrong feature: [`features_by_oid`] refuses an id that
-/// names more than one feature. A layer whose ids must be unique under
-/// concurrent writes needs a sequence, which the store does not have.
+/// Read under [`lock_oids`], which is what makes the answer good enough to
+/// assign from: the read happens before the commit that uses it rather than
+/// inside it, so without the lock two batches racing each other would pick the
+/// same next id.
 async fn max_oid(store: &AppState, layer: &Layer) -> Result<i64, EsriError> {
     let (external, source) = store.features_source_at(layer.branch_id, "$1").await?;
+    let mut next = 2;
+    let mut binds: Vec<Bind> = Vec::new();
+    let oid_sql = layer.oid.sql(&mut next, &mut binds);
     let sql = format!(
-        "WITH numbered AS (SELECT {} AS oid FROM {source} f)
-         SELECT max(oid) AS top FROM numbered",
-        layer.oid.sql()
+        "WITH numbered AS (SELECT {oid_sql} AS oid FROM {source} f)
+         SELECT max(oid) AS top FROM numbered"
     );
-    let top: Option<i64> = sqlx::query(&sql)
-        .bind(layer.branch_id)
+    let top: Option<i64> = bound(&sql, layer.branch_id, &binds)
         .fetch_one(store.source_pool(external.as_ref()).await?)
         .await?
         .get("top");
     Ok(top.unwrap_or(0))
+}
+
+/// The advisory lock space the object id lock is taken in, so a lock taken
+/// anywhere else against this database cannot collide with it. Arbitrary, fixed,
+/// and the only advisory lock this service takes.
+const OID_LOCK_SPACE: i32 = 0x0A_C6_15_ED;
+
+/// How long a batch waits for the layer's object id lock before it is refused as
+/// busy. The lock is held across a commit, which takes a second connection from
+/// the same pool, so a pool with every connection waiting here would deadlock:
+/// bounding the wait turns that into a retry rather than a hang.
+const OID_LOCK_WAIT: &str = "5s";
+
+/// A transaction whose only job is to hold one layer's object id lock.
+type OidLock = sqlx::Transaction<'static, sqlx::Postgres>;
+
+/// The lock over one branch's object id assignment, held from before the highest
+/// id is read until after the commit that uses those ids lands. Two batches of
+/// adds on one layer therefore cannot read the same highest id and mint the same
+/// object ids, which nothing in the store would refuse: an objectid column is an
+/// ordinary property with no unique constraint behind it.
+///
+/// It is an xact-scoped advisory lock in a transaction that does nothing else,
+/// so the database releases it when that transaction ends, and it ends whatever
+/// becomes of this request: dropped future, panic, or lost connection. Nothing
+/// can leak it into the connection pool. It also takes no row lock, so it cannot
+/// deadlock against the branch row [`ptolemy_storage::PgStore::commit`] locks.
+///
+/// Keyed on the branch, so edits to other layers and every read run untouched.
+async fn lock_oids(store: &AppState, branch_id: Uuid) -> Result<OidLock, EsriError> {
+    let mut lock = store.read_pool().begin().await?;
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(OID_LOCK_WAIT)
+        .fetch_one(&mut *lock)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(OID_LOCK_SPACE)
+        .bind(oid_lock_key(branch_id))
+        .fetch_one(&mut *lock)
+        .await
+        .map_err(busy_or_internal)?;
+    Ok(lock)
+}
+
+/// The branch as a lock key. Folded rather than hashed with anything whose seed
+/// can differ between processes: two servers have to agree on the key or they
+/// are not taking the same lock. A collision costs two branches one shared lock,
+/// which is slower and never wrong.
+fn oid_lock_key(branch_id: Uuid) -> i32 {
+    let bits = branch_id.as_u128();
+    ((bits >> 96) as u32 ^ (bits >> 64) as u32 ^ (bits >> 32) as u32 ^ bits as u32) as i32
+}
+
+/// A wait that ran out is the client's answer rather than a server fault: the
+/// layer is busy and the same request will work on a retry.
+fn busy_or_internal(error: sqlx::Error) -> EsriError {
+    if let sqlx::Error::Database(db) = &error
+        && db.code().as_deref() == Some("55P03")
+    {
+        return EsriError {
+            code: 503,
+            message: "another edit on this layer is still committing; retry the request".into(),
+        };
+    }
+    EsriError::internal("objectid lock", error)
 }
 
 /// Every feature the batch names, by object id: the feature id to edit and the
@@ -1675,16 +1777,17 @@ async fn features_by_oid(
         return Ok(out);
     }
     let (external, source) = store.features_source_at(layer.branch_id, "$1").await?;
+    let mut next = 2;
+    let mut binds: Vec<Bind> = Vec::new();
+    let oid_sql = layer.oid.sql(&mut next, &mut binds);
     let sql = format!(
         "WITH numbered AS (
-             SELECT f.id, f.properties, {} AS oid FROM {source} f
+             SELECT f.id, f.properties, {oid_sql} AS oid FROM {source} f
          )
-         SELECT id, oid, properties FROM numbered WHERE oid = ANY($2::bigint[])",
-        layer.oid.sql()
+         SELECT id, oid, properties FROM numbered WHERE oid = ANY(${next}::bigint[])"
     );
-    let rows = sqlx::query(&sql)
-        .bind(layer.branch_id)
-        .bind(ids)
+    binds.push(Bind::Ids(ids.to_vec()));
+    let rows = bound(&sql, layer.branch_id, &binds)
         .fetch_all(store.source_pool(external.as_ref()).await?)
         .await?;
     for row in rows {

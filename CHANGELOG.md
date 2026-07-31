@@ -96,6 +96,36 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-07-31: two `applyEdits` batches of adds racing on one layer could be given
+  the same object ids. The highest id is read before the commit that raises it, so
+  both batches read the same one; nothing downstream refuses a duplicate, because
+  an objectid column is an ordinary property with no unique constraint behind it.
+  The read and the commit now run under a transaction-scoped Postgres advisory
+  lock keyed on the branch, so the assignment is serialized per layer while reads
+  and edits to other layers run untouched. The lock cannot outlive the request:
+  the database releases it when the transaction ends. A batch that waits more than
+  five seconds for it is refused with code 503 and succeeds on a retry, which is
+  also what keeps a pool whose connections are all waiting from deadlocking.
+
+- 2026-07-31: `RUST_LOG` with `tower_http=debug` logged the `token` query
+  parameter, which is a live credential on the ArcGIS facade because the
+  Geoservices protocol has no header for one. The request span now records the uri
+  with the token value replaced by `REDACTED` and everything else in it intact.
+
+- 2026-07-31: the ArcGIS `where` clause and the object id read rendered the
+  property key into the SQL as a quoted literal, which is safe only while
+  `standard_conforming_strings` is on. Both now bind the key as a parameter, so no
+  property key can be quoted wrongly whatever it holds. A derived-fields layer
+  takes its field names from the keys its features carry, so those keys are
+  arbitrary text.
+
+- 2026-07-31: `applyEdits` refused an add with no geometry as "an added feature
+  needs a geometry", which read as a bug rather than a limit. It now names the
+  layer and says why: every feature here is a geometry and its attributes, so
+  Esri's attribute-only add, for a table or a shape filled in later, has nothing
+  to store. An update may still carry attributes alone and keeps the geometry the
+  feature has.
+
 - `POST /branches/{id}/import/geojson` and `/import/csv` imported nothing: every
   row failed on the `feature_versions` primary key and the missing `dataset_id`,
   and the endpoint still answered 200 with `imported: 0`. Both now build the
