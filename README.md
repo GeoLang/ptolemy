@@ -33,7 +33,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
 - **OGC API - Features** — Part 1 & 2 compliant
-- **ArcGIS Geoservices REST** — FeatureServer reads and `applyEdits` writes, so Esri clients connect unchanged
+- **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes and attachments, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)
 
@@ -266,8 +266,12 @@ failure refuses all of it. Layers need a real integer `objectid` field to be
 editable; a `token` request parameter is accepted as the bearer on these routes
 because Esri clients cannot send a header.
 
-Not served: statistics, attachments, and datasets whose `geometry_type` is
-`geometry` or `geometry_collection`, which have no single Esri layer type.
+Attachments are served and edited through the Esri routes (per-feature list and
+download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
+`deleteAttachments`), with the writes gated like `applyEdits`.
+
+Not served: statistics, and datasets whose `geometry_type` is `geometry` or
+`geometry_collection`, which have no single Esri layer type.
 
 ## Access control
 
@@ -456,6 +460,10 @@ client but any JSON structure will work.
 | GET | `/arcgis/rest/services/{service}/FeatureServer` | ArcGIS service root |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/0` | ArcGIS layer metadata |
 | GET POST | `/arcgis/rest/services/{service}/FeatureServer/0/query` | ArcGIS feature query |
+| POST | `/arcgis/rest/services/{service}/FeatureServer/0/applyEdits` | ArcGIS batch edits |
+| GET POST | `/arcgis/rest/services/{service}/FeatureServer/0/queryAttachments` | ArcGIS attachment listing |
+| GET | `/arcgis/rest/services/{service}/FeatureServer/0/{oid}/attachments` | ArcGIS feature attachments |
+| POST | `.../0/{oid}/addAttachment`, `updateAttachment`, `deleteAttachments` | ArcGIS attachment edits |
 | GET | `/api/v1/audit` | Audit log |
 | GET | `/api/v1/branches/{id}/locks` | List feature locks |
 | POST | `/api/v1/branches/{id}/locks` | Lock a feature |
