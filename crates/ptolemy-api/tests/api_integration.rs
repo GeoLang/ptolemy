@@ -8868,13 +8868,11 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
         assert_eq!(body["features"].as_array().unwrap().len(), 2, "{allowed}");
     }
 
+    // a clause the parser reads is a filter now, not a refusal
     let (status, body) = get_json(&app, &query_url(&name, "where=name%3D%27point-0%27")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["error"]["code"], 400, "{body}");
-    assert!(
-        body["error"]["message"].as_str().unwrap().contains("where"),
-        "{body}"
-    );
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(body["features"].as_array().unwrap().len(), 1, "{body}");
 
     // a filter that silently did not apply would be worse than a refusal
     for refused in [
@@ -8913,6 +8911,367 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
         let (status, body) = get_json(&app, &query_url(&name, allowed)).await;
         assert_eq!(status, StatusCode::OK, "{allowed}: {body}");
         assert!(body["error"].is_null(), "{allowed}: {body}");
+    }
+}
+
+/// Helper: a where clause as a query parameter, encoded so the URL carries the
+/// clause the test wrote and nothing else.
+fn where_param(clause: &str) -> String {
+    format!("where={}", urlencoding::encode(clause))
+}
+
+/// Helper: a layer whose schema declares the types a where clause compares
+/// against, so a number is stored as a number and a string as a string.
+///
+/// Three features: two inside the envelope (0,0,10,10) and one far outside,
+/// `ward` present on one of them only, and `code` a string field that holds
+/// number-looking text.
+async fn seed_where_layer(app: &axum::Router, name: &str) -> Uuid {
+    let ds = create_named_dataset(app, name, "point").await;
+    let branch = create_branch(app, ds, "main").await;
+
+    let (status, body) = request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(json!({"fields": [
+            {"name": "OBJECTID", "field_type": "integer", "required": true},
+            {"name": "name", "field_type": "string", "required": false},
+            {"name": "pop", "field_type": "integer", "required": false},
+            {"name": "score", "field_type": "float", "required": false},
+            {"name": "seen", "field_type": "string", "required": false},
+            {"name": "ward", "field_type": "string", "required": false},
+            {"name": "code", "field_type": "string", "required": false},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    commit_features(
+        app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 10, "name": "alpha", "pop": 100, "score": 1.5,
+                            "seen": "2024-01-01T00:00:00Z", "ward": "north", "code": "007"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 20, "name": "beta", "pop": 200, "score": 2.5,
+                            "seen": "2024-06-01T12:00:00Z", "code": "20"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(50.0, 50.0),
+             "properties": {"OBJECTID": 30, "name": "gamma", "pop": 300, "score": 3.5,
+                            "seen": "2025-01-01T00:00:00Z", "code": "100"}},
+        ]),
+    )
+    .await;
+    ds
+}
+
+#[tokio::test]
+async fn test_arcgis_query_where_filters_rows() {
+    let (app, _) = setup_app().await;
+    let name = format!("filter_{}", Uuid::now_v7().simple());
+    seed_where_layer(&app, &name).await;
+
+    // the object ids each clause should answer with, in id order
+    let cases: [(&str, Vec<i64>); 24] = [
+        ("1=1", vec![10, 20, 30]),
+        ("pop = 200", vec![20]),
+        ("pop=200", vec![20]),
+        ("pop <> 200", vec![10, 30]),
+        ("pop != 200", vec![10, 30]),
+        ("pop > 150", vec![20, 30]),
+        ("pop >= 200 AND pop < 300", vec![20]),
+        ("200 > pop", vec![10]),
+        ("score <= 2.5", vec![10, 20]),
+        ("name = 'alpha'", vec![10]),
+        ("name <> 'alpha'", vec![20, 30]),
+        ("name > 'b'", vec![20, 30]),
+        ("name LIKE 'a%'", vec![10]),
+        ("name LIKE '%a'", vec![10, 20, 30]),
+        ("name LIKE 'bet_'", vec![20]),
+        ("name NOT LIKE '%a'", vec![]),
+        ("pop IN (100, 300)", vec![10, 30]),
+        ("name IN ('alpha', 'gamma')", vec![10, 30]),
+        ("pop NOT IN (100)", vec![20, 30]),
+        ("pop BETWEEN 150 AND 300", vec![20, 30]),
+        ("name BETWEEN 'a' AND 'b'", vec![10]),
+        ("ward IS NULL", vec![20, 30]),
+        ("ward IS NOT NULL", vec![10]),
+        ("NOT pop = 100", vec![20, 30]),
+    ];
+    for (clause, wanted) in cases {
+        let (status, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(clause))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+        assert!(body["error"].is_null(), "{clause}: {body}");
+        let ids: Vec<i64> = body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["attributes"]["OBJECTID"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, wanted, "{clause}: {body}");
+    }
+
+    // the object id compares against the id column rather than a property read
+    for (clause, wanted) in [
+        ("OBJECTID = 20", vec![20]),
+        ("objectid IN (10, 30)", vec![10, 30]),
+        ("objectid >= 20", vec![20, 30]),
+    ] {
+        let (_, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(clause))),
+        )
+        .await;
+        let ids: Vec<i64> = body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["attributes"]["OBJECTID"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, wanted, "{clause}: {body}");
+    }
+}
+
+/// AND binds tighter than OR, parentheses override it, and a where clause
+/// combines with the other filters by AND.
+#[tokio::test]
+async fn test_arcgis_query_where_precedence_and_other_filters() {
+    let (app, _) = setup_app().await;
+    let name = format!("prec_{}", Uuid::now_v7().simple());
+    seed_where_layer(&app, &name).await;
+
+    let ids = |body: &Value| -> Vec<i64> {
+        body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["attributes"]["OBJECTID"].as_i64().unwrap())
+            .collect()
+    };
+
+    // AND first: only pop=100 can match, because name='nothing' matches nothing
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{}&outFields=*",
+                where_param("pop = 100 OR pop = 300 AND name = 'nothing'")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(ids(&body), vec![10], "{body}");
+
+    // and the same clause with parentheses answers the other way
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{}&outFields=*",
+                where_param("(pop = 100 OR pop = 300) AND name = 'gamma'")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(ids(&body), vec![30], "{body}");
+
+    // a date literal against the RFC 3339 text the store holds
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{}&outFields=*", where_param("seen >= DATE '2024-06-01'")),
+        ),
+    )
+    .await;
+    assert_eq!(ids(&body), vec![20, 30], "{body}");
+
+    // a number against a field declared string compares as the text the client
+    // wrote: '007' is not '7', and '20' is '20'
+    for (clause, wanted) in [
+        ("code = 7", vec![]),
+        ("code = '007'", vec![10]),
+        ("code = 20", vec![20]),
+        // and a string against a field declared integer compares as text too
+        ("pop = '200'", vec![20]),
+    ] {
+        let (_, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(clause))),
+        )
+        .await;
+        assert_eq!(ids(&body), wanted, "{clause}: {body}");
+    }
+
+    // = NULL never matches: that is what IS NULL is for
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{}&outFields=*", where_param("ward = NULL")),
+        ),
+    )
+    .await;
+    assert!(ids(&body).is_empty(), "{body}");
+
+    // the envelope holds the two near points, and the clause holds two of the
+    // three, so together they hold one
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "geometry=0,0,10,10&outFields=*&{}",
+                where_param("pop > 150")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(ids(&body), vec![20], "{body}");
+
+    // and with the objectIds list, which is a third filter
+    let (_, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("objectIds=10,20&outFields=*&{}", where_param("pop > 150")),
+        ),
+    )
+    .await;
+    assert_eq!(ids(&body), vec![20], "{body}");
+
+    // every mode the query answers in takes the clause
+    let (_, count) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("returnCountOnly=true&{}", where_param("pop > 150")),
+        ),
+    )
+    .await;
+    assert_eq!(count["count"], 2, "{count}");
+
+    let (_, only) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("returnIdsOnly=true&{}", where_param("pop > 150")),
+        ),
+    )
+    .await;
+    assert_eq!(only["objectIds"], json!([20, 30]), "{only}");
+
+    let (_, geojson) = get_json(
+        &app,
+        &format!(
+            "/arcgis/rest/services/{name}/FeatureServer/0/query?f=geojson&outFields=*&{}",
+            where_param("name = 'beta'")
+        ),
+    )
+    .await;
+    assert_eq!(
+        geojson["features"].as_array().unwrap().len(),
+        1,
+        "{geojson}"
+    );
+    assert_eq!(geojson["features"][0]["properties"]["name"], "beta");
+}
+
+/// Every literal is bound, so a clause that reads like an injection is a string
+/// comparison that matches nothing, and the database is still there afterwards.
+#[tokio::test]
+async fn test_arcgis_query_where_treats_injection_as_data() {
+    let (app, _) = setup_app().await;
+    let name = format!("inject_{}", Uuid::now_v7().simple());
+    seed_where_layer(&app, &name).await;
+
+    for clause in [
+        "name='x''; DROP TABLE datasets;--'",
+        "name = 'x'' OR ''1''=''1'",
+        "name = '%' AND name = 'x'' UNION SELECT 1'",
+        "code = '1; TRUNCATE TABLE features'",
+    ] {
+        let (status, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(clause))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+        assert!(body["error"].is_null(), "{clause}: {body}");
+        assert!(
+            body["features"].as_array().unwrap().is_empty(),
+            "{clause}: {body}"
+        );
+    }
+
+    // a quote that does not close is refused rather than guessed at
+    for refused in ["name = 'x", "name = x'", "name = '''''"] {
+        let (status, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(refused))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{refused}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{refused}: {body}");
+    }
+
+    // nothing was dropped: the same layer answers the same three features, and
+    // the catalog still lists it
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    assert_eq!(body["features"].as_array().unwrap().len(), 3, "{body}");
+    let (status, catalog) = get_json(&app, "/arcgis/rest/services?f=json").await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert!(
+        catalog["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == name),
+        "{catalog}"
+    );
+}
+
+/// What the clause parser will not read is refused by name, because a filter
+/// that silently did not apply hands back rows the client did not ask for.
+#[tokio::test]
+async fn test_arcgis_query_where_refuses_what_it_cannot_honor_by_name() {
+    let (app, _) = setup_app().await;
+    let name = format!("norefuse_{}", Uuid::now_v7().simple());
+    seed_where_layer(&app, &name).await;
+
+    for (clause, names) in [
+        ("nosuchfield = 1", "nosuchfield"),
+        ("upper(name) = 'ALPHA'", "upper"),
+        ("EXTRACT(year FROM seen) = 2024", "EXTRACT"),
+        ("pop + 1 = 101", "arithmetic"),
+        ("pop IN (SELECT pop FROM datasets)", "subquery"),
+        ("name LIKE 'a%' ESCAPE '!'", "ESCAPE"),
+        ("\"name\" = 'alpha'", "quoted identifier"),
+        ("name = 'alpha'; SELECT 1", "';'"),
+        ("name = 'alpha' -- and the rest", "comment"),
+        ("seen > DATE '01/06/2024'", "date literal"),
+        ("name", "nothing to compare"),
+    ] {
+        let (status, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{}&outFields=*", where_param(clause))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{clause}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(names), "'{clause}' answered '{message}'");
     }
 }
 

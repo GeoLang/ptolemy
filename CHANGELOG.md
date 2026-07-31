@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: `where` on the ArcGIS FeatureServer `/query` route, so an Esri
+  client's own attribute filter runs instead of being refused. The SQL-92 subset
+  those clients send: comparisons (`=`, `<>`, `!=`, `<`, `>`, `<=`, `>=`) with
+  the field on either side, `IN` and `NOT IN`, `LIKE` and `NOT LIKE` with `%` and
+  `_`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`, `NOT` and parentheses
+  with SQL precedence, integer and decimal numbers, single-quoted strings with
+  `''` for a quote, `NULL`, and `DATE` or `TIMESTAMP 'yyyy-mm-dd hh:mm:ss'`
+  literals. The clause applies to rows, `returnCountOnly` and `returnIdsOnly`,
+  and combines with `objectIds` and the envelope filter by AND. It is a
+  recursive-descent parser in the crate rather than a SQL-parsing dependency: a
+  clause parses to a tree over the layer's declared fields and then renders SQL
+  with every literal bound, so no request text reaches the SQL and
+  `where=name='x''; DROP TABLE datasets;--'` is one string literal that matches
+  nothing. Field names are matched without regard to case against the layer's
+  fields and an unknown one is refused by name. The object id compares against
+  the layer's own id, a field declared integer or float compares as a number,
+  everything else compares as text, and a number against a text field compares as
+  the spelling the client sent. A `DATE` or `TIMESTAMP` literal is normalised to
+  RFC 3339 UTC text and compared as text, which assumes stored dates are written
+  that way, as verne writes them. Everything else, functions, arithmetic,
+  subqueries, `CASE`, `EXTRACT`, `LIKE ... ESCAPE`, quoted identifiers, a
+  comment, a `;`, is refused by name as an Esri-shaped error rather than
+  silently dropped, and so is a clause longer than 32768 characters or nested
+  deeper than 32.
+
 - 2026-07-31: `POST /arcgis/rest/services/{service}/FeatureServer/0/applyEdits`,
   so an Esri client edits ptolemy rather than only reading it. Form-encoded
   `adds`, `updates` and `deletes`, esriJSON geometry in EPSG:4326 or Web Mercator

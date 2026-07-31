@@ -27,6 +27,11 @@
 //! Query parameters that carry meaning and cannot be honored are refused rather
 //! than ignored: a filter that silently did not apply is worse than an error,
 //! because the client believes the rows it got back are the rows it asked for.
+//!
+//! `where` is the one parameter with a grammar behind it rather than a value.
+//! The `where_clause` module parses the SQL-92 subset Esri clients send and
+//! renders it as SQL with every literal bound, and refuses the rest by name for
+//! the reason above.
 
 use axum::{
     Json, Router,
@@ -42,6 +47,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{AppState, auth::Actor};
+
+mod where_clause;
 
 pub fn arcgis_routes() -> Router<AppState> {
     Router::new()
@@ -826,11 +833,17 @@ async fn query_post(
     run_query(store, actor, service, layer_id, Params(params)).await
 }
 
-/// A filter's bind value. Only these two shapes occur, so a filter is SQL plus a
-/// bind rather than interpolated request data.
+/// A filter's bind value, so a filter is SQL plus a bind rather than
+/// interpolated request data. Every value a `where` clause compares against is
+/// one of these: see [`where_clause`].
+#[derive(Debug, PartialEq)]
 enum Bind {
     Ids(Vec<i64>),
-    Coord(f64),
+    Number(f64),
+    /// `None` is a `NULL` a client wrote, which every comparison answers unknown.
+    Text(Option<String>),
+    Numbers(Vec<f64>),
+    Texts(Vec<Option<String>>),
 }
 
 /// The branch as `$1` and then each filter's value in the order the filters were
@@ -844,7 +857,10 @@ fn bound<'q>(
     for bind in binds {
         query = match bind {
             Bind::Ids(ids) => query.bind(ids.clone()),
-            Bind::Coord(v) => query.bind(*v),
+            Bind::Number(v) => query.bind(*v),
+            Bind::Text(v) => query.bind(v.clone()),
+            Bind::Numbers(v) => query.bind(v.clone()),
+            Bind::Texts(v) => query.bind(v.clone()),
         };
     }
     query
@@ -866,15 +882,6 @@ async fn run_query(
         }
     }
     let layer = resolve(&store, &actor, &service, &layer_id).await?;
-
-    match params.get("where").map(str::trim) {
-        None | Some("") | Some("1=1") | Some("1 = 1") => {}
-        Some(clause) => {
-            return Err(EsriError::bad_request(format!(
-                "where is not supported in this version of the service, except as 1=1: '{clause}'"
-            )));
-        }
-    }
 
     // the id field is the only order the store can promise, and it is the order
     // paging already runs in, so asking for it changes nothing and asking for
@@ -920,6 +927,22 @@ async fn run_query(
     let mut binds: Vec<Bind> = Vec::new();
     let mut next = 2;
 
+    // the clause is parsed against the layer's own fields and rendered with
+    // every literal bound, so nothing a client wrote reaches the SQL
+    if let Some(clause) = params
+        .get("where")
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+    {
+        let predicate = where_clause::parse(clause, &layer).map_err(|why| {
+            EsriError::bad_request(format!(
+                "where '{}' is not supported in this version of the service: {why}",
+                where_clause::shown(clause)
+            ))
+        })?;
+        filters.push(predicate.sql(&mut next, &mut binds));
+    }
+
     if let Some(list) = params.get("objectIds").map(str::trim)
         && !list.is_empty()
     {
@@ -954,7 +977,7 @@ async fn run_query(
                 next + 3
             )
         });
-        binds.extend(envelope.into_iter().map(Bind::Coord));
+        binds.extend(envelope.into_iter().map(Bind::Number));
         next += 4;
     }
 
