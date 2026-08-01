@@ -119,6 +119,19 @@ struct UserInfo {
     email: Option<String>,
 }
 
+/// A session token is minted only for a subject the provider named. There is no
+/// fallback subject: one would log every failed lookup in as the same user, and
+/// hand whoever holds a grant on that name to all of them. The reason is logged
+/// and not returned, since the caller is a browser mid-login.
+fn userinfo_failed(detail: &str) -> Response {
+    tracing::error!("OIDC userinfo lookup failed: {detail}");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({"error": "identity lookup failed"})),
+    )
+        .into_response()
+}
+
 async fn oidc_callback(Query(params): Query<CallbackParams>) -> Response {
     let config = OidcConfig::from_env();
     if !config.enabled {
@@ -206,16 +219,13 @@ async fn oidc_callback(Query(params): Query<CallbackParams>) -> Response {
         .await;
 
     let user_info: UserInfo = match userinfo_resp {
-        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or(UserInfo {
-            sub: "unknown".into(),
-            name: None,
-            email: None,
-        }),
-        _ => UserInfo {
-            sub: "unknown".into(),
-            name: None,
-            email: None,
+        Ok(resp) if resp.status().is_success() => match resp.json::<UserInfo>().await {
+            Ok(info) if !info.sub.trim().is_empty() => info,
+            Ok(_) => return userinfo_failed("userinfo named no subject"),
+            Err(e) => return userinfo_failed(&format!("unreadable userinfo: {e}")),
         },
+        Ok(resp) => return userinfo_failed(&format!("userinfo returned {}", resp.status())),
+        Err(e) => return userinfo_failed(&format!("userinfo request failed: {e}")),
     };
 
     // Generate a Ptolemy JWT for the user

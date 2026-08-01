@@ -5808,6 +5808,51 @@ async fn test_dataset_admin_delegates_on_its_own_dataset() {
     );
 }
 
+/// A blank subject is nobody, on either scope: the row would sit there waiting
+/// for a token whose `sub` is empty.
+#[tokio::test]
+async fn test_grant_rejects_a_blank_user_id() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_private_dataset(&app).await;
+
+    for blank in ["", "   "] {
+        let (status, body) = grant_as(&app, &carol, "datasets", dataset_id, blank, "write").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "dataset grant to {blank:?}: {body}"
+        );
+        let (status, body) = grant_as(&app, &carol, "branches", branch_id, blank, "write").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "branch grant to {blank:?}: {body}"
+        );
+    }
+
+    // and nothing was written on either scope
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 1, "{body}");
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/permissions"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.as_array().unwrap().is_empty(), "{body}");
+}
+
 /// A dataset admin's reach stops at its own dataset.
 #[tokio::test]
 async fn test_dataset_admin_cannot_touch_another_dataset() {

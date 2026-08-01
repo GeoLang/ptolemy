@@ -17,12 +17,20 @@ All notable changes to this project will be documented in this file.
   dataset with no rows an admin grant for its `created_by`. A `created_by` that
   is blank or a machine label (`unknown`, `system`, `cli`, a connector name) is
   skipped: with auth off that column is free text from the request rather than a
-  verified subject, and `unknown` in particular is the fallback the OIDC callback
-  mints tokens under, so granting to it would hand one owner to several people.
+  verified subject, and `unknown` in particular is the subject the OIDC callback
+  used to mint tokens under, so granting to it would hand one owner to several
+  people.
   Those datasets stay writable by instance admins only until one of them grants.
   Revoking a dataset's last `admin` row is still refused. Revoking its last row
   of any other kind is now allowed, because it closes the dataset instead of
-  reopening it. the
+  reopening it. Two things the review of that ladder turned up are fixed with it.
+  The OIDC callback no longer falls back to `sub: "unknown"` when the userinfo
+  lookup fails, returns a non-2xx or names no subject: it answers `502` and mints
+  nothing, because a fallback subject logs every failed lookup in as one shared
+  user. And a grant with a blank `user_id` is now `400` on both scopes, since it
+  only ever laid down a row waiting for a token whose `sub` is empty.
+
+- 2026-08-01: A layer's ArcGIS generation is a point on its own event clock, the
   epoch milliseconds of the latest change on `main`, instead of the depth of the
   changeset chain. Depth could not see an attachment, because uploading one commits
   no changeset: a client that loaded features in one commit and then uploaded the

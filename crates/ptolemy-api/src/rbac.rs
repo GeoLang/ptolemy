@@ -117,7 +117,7 @@ async fn grant_dataset_permission(
     Json(req): Json<GrantRequest>,
 ) -> Result<(StatusCode, Json<DatasetPermission>), RbacError> {
     require_dataset_admin(&store, &actor, dataset_id).await?;
-    validate_permission(&req.permission)?;
+    validate_grant(&req)?;
     let perm = store
         .grant_dataset_permission(
             dataset_id,
@@ -208,7 +208,7 @@ async fn grant_branch_permission(
     Json(req): Json<GrantRequest>,
 ) -> Result<(StatusCode, Json<BranchPermission>), RbacError> {
     require_branch_dataset_admin(&store, &actor, branch_id).await?;
-    validate_permission(&req.permission)?;
+    validate_grant(&req)?;
     let perm = store
         .grant_branch_permission(
             branch_id,
@@ -249,6 +249,16 @@ async fn check_branch_permission(
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
+
+/// A grant names a token subject and a level. Identity is external to this
+/// service so there is nothing to validate a subject against, but a blank one is
+/// nobody: it would sit there as a row a token whose `sub` is empty matches.
+fn validate_grant(req: &GrantRequest) -> Result<(), RbacError> {
+    if req.user_id.trim().is_empty() {
+        return Err(RbacError::BadRequest("user_id must not be blank".into()));
+    }
+    validate_permission(&req.permission)
+}
 
 fn validate_permission(perm: &str) -> Result<(), RbacError> {
     match perm {

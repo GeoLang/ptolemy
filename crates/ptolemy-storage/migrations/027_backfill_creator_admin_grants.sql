@@ -10,8 +10,8 @@
 -- CLI flag said, and the connectors write a machine label there. Those are not
 -- identities anyone can present a token for, so they are skipped: such a
 -- dataset stays writable by instance admins only until one of them grants.
--- Skipping is also what keeps 'unknown', the subject the OIDC callback falls
--- back to, from becoming an owner shared by several people.
+-- 'unknown' is in the list because logins have been recorded under it, so an
+-- owner by that name would be shared by whoever they were.
 --
 -- Only the dataset scope is filled in. A branch that already has its own rows
 -- keeps deciding its own writes, so this cannot widen access to one.
