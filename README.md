@@ -410,16 +410,14 @@ grantee widen their own scope.
 A dataset with no rows has no dataset admin, so only an instance admin can make
 the first grant. Normally the creator auto-grant supplies one.
 
-Revoking is refused in two cases, for everyone including instance admins:
+Revoking the dataset's last `admin` row is refused, for everyone including
+instance admins, because it would leave nobody able to manage its grants. Grant
+a replacement first, then revoke. Stepping down as owner is grant-then-revoke,
+in that order.
 
-- removing the dataset's last `admin` row, which would leave nobody able to
-  manage its grants;
-- removing its last row of any kind, which would drop the dataset back to "no
-  rows means open" and quietly hand write access to every editor.
-
-Grant a replacement first, then revoke. Stepping down as owner is
-grant-then-revoke, in that order. Branch rows have no such rule: removing them
-all just falls back to the dataset scope, which is still enforced.
+Revoking the last row of any other kind is allowed: it leaves the dataset with
+no rows, which denies every write rather than opening one. Branch rows have no
+rule of their own either, removing them all falls back to the dataset scope.
 
 ### Writes
 
@@ -431,15 +429,18 @@ branch creation, reproject, repair and compaction:
 2. Otherwise, if the target **branch** has any permission rows, the caller needs
    `write` or `admin` **on that branch**. A dataset-level grant does not reach
    into a branch that has its own rows.
-3. Otherwise, if the **dataset** has any permission rows, the caller needs
-   `write` or `admin` on the dataset.
-4. Otherwise the dataset has no rows anywhere and any editor may write, so
-   datasets that predate enforcement keep working.
+3. Otherwise the caller needs `write` or `admin` on the **dataset**.
 
-Denial is `403`. The first grant on a dataset flips it from step 4 to step 3, so
-granting is what turns enforcement on. Creating a dataset with auth on inserts an
-`admin` row for the creator, which means a new dataset is enforced immediately and
-its creator owns it.
+Denial is `403`. A write needs a grant: a dataset with no rows anywhere denies
+everyone except an `admin` role token, which is who makes its first grant.
+Creating a dataset with auth on inserts an `admin` row for the creator, so a new
+dataset is owned from the moment it exists.
+
+Datasets created before that auto-grant, or with auth off, have no rows. The
+`027` migration gives each of them an admin grant for its `created_by`. It skips
+a `created_by` that is blank or a machine label (`unknown`, `system`, `cli`, a
+connector name), because those are not identities anyone holds a token for:
+those datasets are writable by instance admins only until one of them grants.
 
 Organization membership (`org_members`) is deliberately *not* part of this
 ladder: only an explicit grant lets you write. The `/permissions/{user}/check`

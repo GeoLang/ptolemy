@@ -6,7 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- 2026-08-01: A layer's ArcGIS generation is a point on its own event clock, the
+- 2026-08-01: A write needs a grant. A dataset with no permission rows anywhere
+  used to accept writes from any editor the role gate let through, which was a
+  compatibility rule for datasets that predate enforcement, and it meant one
+  forgotten grant left a dataset open to every account on the instance. The
+  ladder now fails closed: with neither the branch nor the dataset holding rows,
+  an enforced caller is denied. An `admin` role token still bypasses the ladder,
+  and auth-off mode is unchanged, so an instance admin is who makes the first
+  grant on such a dataset. Migration `027` backfills one instead, giving every
+  dataset with no rows an admin grant for its `created_by`. A `created_by` that
+  is blank or a machine label (`unknown`, `system`, `cli`, a connector name) is
+  skipped: with auth off that column is free text from the request rather than a
+  verified subject, and `unknown` in particular is the fallback the OIDC callback
+  mints tokens under, so granting to it would hand one owner to several people.
+  Those datasets stay writable by instance admins only until one of them grants.
+  Revoking a dataset's last `admin` row is still refused. Revoking its last row
+  of any other kind is now allowed, because it closes the dataset instead of
+  reopening it. the
   epoch milliseconds of the latest change on `main`, instead of the depth of the
   changeset chain. Depth could not see an attachment, because uploading one commits
   no changeset: a client that loaded features in one commit and then uploaded the

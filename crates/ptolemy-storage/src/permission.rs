@@ -4,9 +4,9 @@
 
 //! The rule that turns permission rows into a write decision.
 //!
-//! Compatibility rule: a scope with no permission rows at all does not enforce,
-//! so a dataset that never had a grant keeps accepting writes from any editor
-//! the role gate let through. The first grant flips it to enforced.
+//! A write needs a grant. No rows anywhere is not permission to write: an
+//! enforced caller is denied, and only the instance admin role gets through,
+//! which is who makes the first grant on such a dataset.
 //!
 //! The branch scope wins over the dataset scope: once a branch has rows, those
 //! rows decide, and a dataset-level grant does not reach into it.
@@ -107,22 +107,19 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// A scope with no rows, which never denies.
-    pub fn open() -> Self {
+    /// A scope with no rows, which grants nothing.
+    pub fn empty() -> Self {
         Scope::default()
     }
 }
 
 /// Whether a writer subject to enforcement may write, given the branch scope and
-/// the dataset scope of the target.
+/// the dataset scope of the target. Fails closed: no grant, no write.
 pub fn write_allowed(branch: &Scope, dataset: &Scope) -> bool {
     if branch.enforced {
         return can_write(branch.mine.as_deref());
     }
-    if dataset.enforced {
-        return can_write(dataset.mine.as_deref());
-    }
-    true
+    can_write(dataset.mine.as_deref())
 }
 
 fn can_write(perm: Option<&str>) -> bool {
@@ -149,16 +146,16 @@ mod tests {
     }
 
     #[test]
-    fn no_rows_anywhere_stays_open() {
-        assert!(write_allowed(&Scope::open(), &Scope::open()));
+    fn no_rows_anywhere_denies() {
+        assert!(!write_allowed(&Scope::empty(), &Scope::empty()));
     }
 
     #[test]
     fn dataset_grant_decides_when_the_branch_has_no_rows() {
-        assert!(write_allowed(&Scope::open(), &granted("write")));
-        assert!(write_allowed(&Scope::open(), &granted("admin")));
-        assert!(!write_allowed(&Scope::open(), &granted("read")));
-        assert!(!write_allowed(&Scope::open(), &enforced_without_me()));
+        assert!(write_allowed(&Scope::empty(), &granted("write")));
+        assert!(write_allowed(&Scope::empty(), &granted("admin")));
+        assert!(!write_allowed(&Scope::empty(), &granted("read")));
+        assert!(!write_allowed(&Scope::empty(), &enforced_without_me()));
     }
 
     #[test]
@@ -172,9 +169,16 @@ mod tests {
 
     #[test]
     fn unknown_permission_strings_grant_nothing() {
-        assert!(!write_allowed(&Scope::open(), &granted("Write")));
-        assert!(!write_allowed(&Scope::open(), &granted("owner")));
+        assert!(!write_allowed(&Scope::empty(), &granted("Write")));
+        assert!(!write_allowed(&Scope::empty(), &granted("owner")));
         assert_eq!(permission_level("nonsense"), 0);
+    }
+
+    /// A branch grant does not need the dataset to have rows of its own.
+    #[test]
+    fn branch_grant_stands_without_a_dataset_row() {
+        assert!(write_allowed(&granted("write"), &Scope::empty()));
+        assert!(!write_allowed(&enforced_without_me(), &Scope::empty()));
     }
 
     #[test]

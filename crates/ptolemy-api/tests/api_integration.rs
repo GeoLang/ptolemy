@@ -3914,20 +3914,21 @@ async fn grant(
     status
 }
 
-/// The compatibility rule: a dataset that never had a grant keeps accepting
-/// writes from any editor.
+/// No rows is not permission to write: a dataset that never had a grant denies
+/// every enforced editor, whatever the role gate said.
 #[tokio::test]
-async fn test_dataset_without_permission_rows_accepts_any_editor() {
+async fn test_dataset_without_permission_rows_denies_every_editor() {
     let (app, state) = setup_app_authed_with_state().await;
     let (_, branch_id) = seed_unowned_dataset(&state).await;
 
     let (status, body) = commit_as(&app, branch_id, &token_for_user("eve", Role::Editor)).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
-/// ... and the first grant flips it to enforced.
+/// ... and an instance admin, who is the only one who can grant on such a
+/// dataset, unlocks it for the user they grant to and nobody else.
 #[tokio::test]
-async fn test_first_grant_locks_out_other_editors() {
+async fn test_instance_admin_grant_unlocks_an_unowned_dataset() {
     let (app, state) = setup_app_authed_with_state().await;
     let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
 
@@ -5769,6 +5770,42 @@ async fn test_dataset_admin_delegates_on_its_own_dataset() {
         StatusCode::FORBIDDEN,
         "write grantee delegating: {body}"
     );
+
+    // dave holds admin on the branch, and that reaches nothing: the branch
+    // endpoints resolve to the dataset, whose admin he is not
+    let dave = token_for_user("dave", Role::Editor);
+    let (status, body) = grant_as(&app, &dave, "branches", branch_id, "eve", "write").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "branch admin granting: {body}"
+    );
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/branches/{branch_id}/permissions/dave"),
+        Some(&dave),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "branch admin revoking: {body}"
+    );
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/permissions"),
+        Some(&dave),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "branch admin reading the acl: {body}"
+    );
 }
 
 /// A dataset admin's reach stops at its own dataset.
@@ -5892,8 +5929,8 @@ async fn test_instance_admin_still_grants_anywhere() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
-/// Revoking may not strand a dataset: not its last admin row, and not its last
-/// row of any kind, which would drop it back to any-editor-writable.
+/// Revoking may not take away a dataset's last admin row, which would leave
+/// nobody able to manage its grants.
 #[tokio::test]
 async fn test_revoke_cannot_strand_a_dataset() {
     let app = setup_app_authed().await;
@@ -5924,7 +5961,7 @@ async fn test_revoke_cannot_strand_a_dataset() {
         "last admin with a write row: {body}"
     );
 
-    // dave is removable, but then he is the last row again once carol goes
+    // dave is removable, he is not the admin the rule protects
     let (status, body) = revoke(carol.clone(), "dave").await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
@@ -5944,6 +5981,36 @@ async fn test_revoke_cannot_strand_a_dataset() {
     // revoking a user who has no row is a no-op, not a lockout error
     let (status, body) = revoke(token_for_user("dave", Role::Editor), "nobody").await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// The last non-admin row is removable: taking it away leaves the dataset with
+/// no rows, which denies every enforced writer instead of opening it.
+#[tokio::test]
+async fn test_revoking_the_last_write_row_closes_the_dataset() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    let alice = token_for_user("alice", Role::Editor);
+    grant(&app, "datasets", dataset_id, "alice", "write").await;
+
+    let (status, body) = commit_as(&app, branch_id, &alice).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/datasets/{dataset_id}/permissions/alice"),
+        Some(&token_for_user("root", Role::Admin)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &alice).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "after the last row went: {body}"
+    );
 }
 
 /// Branch rows carry no such rule: removing them all falls back to the dataset

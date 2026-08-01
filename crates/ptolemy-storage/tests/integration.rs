@@ -126,6 +126,74 @@ async fn test_get_nonexistent_dataset() {
     assert!(result.is_err());
 }
 
+/// The backfill runs the real migration file, not a copy of its SQL, inside a
+/// transaction that is rolled back so it cannot grant on another test's rows.
+/// It is written to be re-runnable, which is what makes that possible.
+#[tokio::test]
+async fn test_backfill_grants_admin_to_the_creator_but_not_to_a_placeholder() {
+    let store = setup().await;
+    let owned = create_test_dataset(&store).await;
+    store
+        .grant_dataset_permission(owned.id, "someone-else", "write", "root")
+        .await
+        .unwrap();
+
+    let mut tx = store.unguarded_pool().begin().await.unwrap();
+    let mut ids = Vec::new();
+    for creator in ["carol", "unknown", "  "] {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO datasets (id, name, srid, geometry_type, created_by)
+             VALUES ($1, $2, 4326, 'point', $3)",
+        )
+        .bind(id)
+        .bind(format!("backfill_{id}"))
+        .bind(creator)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/027_backfill_creator_admin_grants.sql"
+    ))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let grants = |dataset_id: Uuid| {
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT user_id, permission, granted_by FROM dataset_permissions
+              WHERE dataset_id = $1",
+        )
+        .bind(dataset_id)
+    };
+
+    let carol = grants(ids[0]).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(
+        carol,
+        vec![("carol".into(), "admin".into(), "carol".into())],
+        "the creator did not become admin"
+    );
+    for (id, who) in [(ids[1], "unknown"), (ids[2], "blank")] {
+        assert!(
+            grants(id).fetch_all(&mut *tx).await.unwrap().is_empty(),
+            "backfilled a grant to {who}"
+        );
+    }
+
+    // a dataset that already had a row keeps exactly that row
+    let untouched = grants(owned.id).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(
+        untouched,
+        vec![("someone-else".into(), "write".into(), "root".into())],
+        "the backfill added an owner to a dataset that had rows"
+    );
+
+    tx.rollback().await.unwrap();
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Branch Tests
 // ═══════════════════════════════════════════════════════════════════════

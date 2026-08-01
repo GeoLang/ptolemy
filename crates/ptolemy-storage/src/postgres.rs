@@ -201,7 +201,8 @@ impl PgStore {
     /// Create a dataset. `grant_admin_to` is the verified creator identity when
     /// auth is on: it gets an admin permission row in the same transaction, so a
     /// dataset is never left with content but no owner. `None` (auth off) leaves
-    /// the dataset with no rows, which keeps it open to any editor.
+    /// the dataset with no rows, and with auth on later such a dataset is
+    /// writable by instance admins only until one of them grants.
     pub async fn create_dataset(
         &self,
         ds: &Dataset,
@@ -418,8 +419,8 @@ impl PgStore {
         dataset_id: Uuid,
         writer: &Writer,
     ) -> Result<(), StoreError> {
-        // a missing dataset has no permission rows, so the ladder below would
-        // read it as unenforced and pass the write on to fail on the foreign key
+        // resolving the dataset first means a missing one is a 404, not the 403
+        // the ladder below would answer for it
         let external: Option<String> =
             sqlx::query_scalar("SELECT external_table FROM datasets WHERE id = $1")
                 .bind(dataset_id)
@@ -436,7 +437,7 @@ impl PgStore {
             Check::Ladder(id) => id,
         };
         let dataset = dataset_scope(&self.pool, dataset_id, user_id).await?;
-        if write_allowed(&Scope::open(), &dataset) {
+        if write_allowed(&Scope::empty(), &dataset) {
             Ok(())
         } else {
             Err(denied_dataset(dataset_id))
@@ -3220,12 +3221,13 @@ impl PgStore {
         })
     }
 
-    /// Revoking is refused when it would strand the dataset: removing its last
-    /// `admin` row leaves nobody able to manage grants, and removing its last row
-    /// of any kind drops it back to "no rows means open", quietly handing write
-    /// access to every editor. Grant a replacement first. The rule binds instance
-    /// admins too, because the second case is a downgrade of the dataset's
-    /// protection rather than a question of who is asking.
+    /// Revoking the dataset's last `admin` row is refused: it leaves nobody able
+    /// to manage grants. Grant a replacement first. The rule binds instance
+    /// admins too, so stepping down is always grant-then-revoke.
+    ///
+    /// Removing the last row of any other kind is allowed. It leaves the dataset
+    /// with no rows, which now denies every enforced writer rather than opening
+    /// it, so it is a tightening and an instance admin can still grant.
     pub async fn revoke_dataset_permission(
         &self,
         dataset_id: Uuid,
@@ -3242,22 +3244,13 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await?;
 
-        let target_exists = rows.iter().any(|(u, _)| u == user_id);
-        if target_exists {
-            if rows.len() == 1 {
-                return Err(StoreError::Forbidden(format!(
-                    "{user_id} holds the only permission row on dataset {dataset_id}: revoking it \
-                     would reopen the dataset to every editor. Grant someone else first."
-                )));
-            }
-            let admins = rows.iter().filter(|(_, p)| p == "admin").count();
-            let target_is_admin = rows.iter().any(|(u, p)| u == user_id && p == "admin");
-            if target_is_admin && admins == 1 {
-                return Err(StoreError::Forbidden(format!(
-                    "{user_id} is the only admin of dataset {dataset_id}: revoking it would leave \
-                     nobody able to manage its permissions. Grant another admin first."
-                )));
-            }
+        let admins = rows.iter().filter(|(_, p)| p == "admin").count();
+        let target_is_admin = rows.iter().any(|(u, p)| u == user_id && p == "admin");
+        if target_is_admin && admins == 1 {
+            return Err(StoreError::Forbidden(format!(
+                "{user_id} is the only admin of dataset {dataset_id}: revoking it would leave \
+                 nobody able to manage its permissions. Grant another admin first."
+            )));
         }
 
         sqlx::query("DELETE FROM dataset_permissions WHERE dataset_id = $1 AND user_id = $2")
