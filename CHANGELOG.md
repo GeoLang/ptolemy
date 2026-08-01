@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: The ArcGIS facade accepts `X-Esri-Authorization: Bearer <jwt>`,
+  the header an Esri-ecosystem client puts its token in. verne sends exactly that
+  and no `Authorization` header at all, so it could reach public datasets only.
+  Read on `/arcgis/rest/services` paths and nowhere else, exactly as the `token`
+  request parameter is: the precedence is `Authorization`, then this header, then
+  the parameter, so a client that can send the standard header is never downgraded
+  and the parameter is never preferred to a header. It is a credential and not a
+  promotion: the token still has to carry the role and the grant for what it is
+  asking, so a viewer's token opens a private layer's metadata and is refused for
+  a write. A value in any other shape than `Bearer <token>`, or an empty one,
+  carries no credential.
+
+- 2026-07-31: `having` on the ArcGIS facade's query, over the grouped answer
+  `outStatistics` and `groupByFieldsForStatistics` produce. The grammar is the
+  where clause's, through the same parser, but an identifier names a column of the
+  aggregated answer rather than a field of the layer: a grouped field's name or an
+  `outStatisticFieldName`. The predicate filters whole groups after the
+  aggregation, and ordering and paging compose after it. Nothing a client sends
+  reaches the SQL: the answer's columns are renamed to this crate's own `c1`..`cN`
+  by a wrapping subquery and the predicate is rendered over those, so an alias
+  never becomes an identifier, and every literal is bound. The where clause's
+  type rules apply to the aggregated columns, from the SQL type each one already
+  holds: a count compares as a whole number, `sum`, `avg`, `stddev` and `var` as
+  doubles, and a `min`, a `max` or a grouped field by the kind of the field it
+  read. It needs both parameters to have something to filter, and the missing one
+  is named: an ungrouped statistics query is one row, which a predicate could only
+  keep or drop whole. A column the answer does not carry is refused by name with
+  the columns it could have named listed, so a field of the layer that the answer
+  left out cannot be reached back to. A layer's `advancedQueryCapabilities` now
+  declares `supportsHavingClause`, and `having` is no longer refused by name.
+
 - 2026-07-31: The ArcGIS facade tracks changes, so a client that read a service
   once can ask what moved since. A layer's generation is the depth of `main`'s
   head, the number of changesets from the root to it: the service root states
@@ -57,8 +88,7 @@ All notable changes to this project will be documented in this file.
   query. Two divergences from Esri: `returnDistinctValues` needs `outFields` to
   name its fields, because Esri's answer for `*` is the whole table back under a
   different name, and a distinct or grouped row carries an object id only when the
-  client asked for that field, because no one feature is behind it. `having` stays
-  refused by name.
+  client asked for that field, because no one feature is behind it.
 
 - 2026-07-31: A migrated dataset's Esri symbology is served two ways. The ArcGIS
   facade's layer metadata carries `drawingInfo` when the dataset has a symbology

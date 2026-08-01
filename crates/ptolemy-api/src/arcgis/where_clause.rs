@@ -2,16 +2,23 @@
 // License, v. 3.0. If a copy of the AGPL was not distributed with this
 // file, You can obtain one at https://gnu.org/licenses/agpl-3.0.html.
 
-//! The `where` parameter of an ArcGIS query, as the SQL-92 subset Esri clients
-//! send.
+//! The `where` and `having` parameters of an ArcGIS query, as the SQL-92 subset
+//! Esri clients send.
 //!
 //! Two steps, and the split is what makes this safe: [`parse`] turns request
-//! text into a tree whose only field references are fields the layer declared
+//! text into a tree whose only field references are columns the query answers
 //! and whose only values are Rust values, and [`Predicate::sql`] renders that
 //! tree with every value and every field name as a bound parameter. Nothing but
 //! fixed text is ever rendered into SQL, so a quote has nothing to break out of:
 //! the clause `name = 'x''; delete everything'` is one string literal and
 //! compares as one.
+//!
+//! One grammar, two things to resolve an identifier against: [`Columns`] is that
+//! seam. A `where` clause resolves against the layer's own fields, and a `having`
+//! clause against the columns of the aggregated answer, which is what the
+//! `statistics` module implements. Neither can name anything the other holds. A
+//! refusal names the where clause in both cases, because that is the grammar
+//! both of them are.
 //!
 //! What this does not accept is refused by name rather than dropped, as
 //! everywhere else on this facade: a filter that silently did not apply hands
@@ -25,7 +32,7 @@
 //! dataset whose dates are written any other way will not compare the way a
 //! client expects, and nothing here can tell that it is happening.
 
-use super::column::{Column, placeholder};
+use super::column::{Cell, Column, placeholder};
 use super::{Bind, Layer, shown};
 
 /// The longest clause this parser will look at. Long enough for the object id
@@ -58,9 +65,39 @@ const RESERVED: [(&str, &str); 12] = [
 /// Words this grammar reads as operators, so none of them can name a value.
 const OPERATORS: [&str; 7] = ["and", "or", "not", "is", "in", "like", "between"];
 
+// ─── What an identifier names ───────────────────────────────────────
+
+/// What a bare word in a clause resolves to, and what a refusal says when it
+/// resolves to nothing.
+///
+/// The grammar is the same either way. What differs is the answer being filtered:
+/// a `where` clause runs before the aggregation and names the layer's fields, a
+/// `having` clause runs after it and names the columns that answer carries.
+/// Resolving through here is what keeps a client's text out of the SQL in both
+/// cases: whatever it named, the renderer is handed a [`Cell`] this crate built.
+pub(super) trait Columns {
+    /// The cell an identifier names, or `None` when this answer carries none of
+    /// that name.
+    fn cell(&self, name: &str) -> Option<Cell>;
+
+    /// The refusal for a name it does not carry, naming it: a filter that
+    /// silently did not apply hands the client rows it did not ask for.
+    fn missing(&self, name: &str) -> String;
+}
+
+impl Columns for Layer {
+    fn cell(&self, name: &str) -> Option<Cell> {
+        self.field(name).map(|field| Cell::Field(Column::of(field)))
+    }
+
+    fn missing(&self, name: &str) -> String {
+        format!("the layer has no field '{}'", shown(name))
+    }
+}
+
 // ─── The tree ───────────────────────────────────────────────────────
 
-/// A parsed clause: a tree over the layer's own fields and Rust values.
+/// A parsed clause: a tree over resolved columns and Rust values.
 ///
 /// `BETWEEN`, `NOT IN`, `NOT LIKE` and `IS NOT NULL` are not here. Each is
 /// exactly what SQL defines it as, so [`Parser::condition`] builds that instead
@@ -76,22 +113,22 @@ pub(super) enum Predicate {
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
     Compare {
-        column: Column,
+        column: Cell,
         /// One of the six SQL spellings, from [`Parser`] and never from a
         /// client's text.
         op: &'static str,
         value: Value,
     },
     In {
-        column: Column,
+        column: Cell,
         values: List,
     },
     Like {
-        column: Column,
+        column: Cell,
         pattern: String,
     },
     IsNull {
-        column: Column,
+        column: Cell,
     },
 }
 
@@ -110,8 +147,9 @@ pub(super) enum List {
 }
 
 impl Predicate {
-    /// The predicate as SQL over the `numbered` CTE, appending one bind per
-    /// literal and per property key, in the order the placeholders are numbered.
+    /// The predicate as SQL over whatever the columns were resolved against,
+    /// appending one bind per literal and per property key, in the order the
+    /// placeholders are numbered.
     ///
     /// Every value and every key is a placeholder. Nothing a client wrote is
     /// rendered here, which is the whole point of parsing it first.
@@ -370,7 +408,7 @@ fn number_at(chars: &[char], at: usize) -> (String, usize) {
 /// One side of a comparison.
 #[derive(Clone)]
 enum Operand {
-    Column(Column),
+    Column(Cell),
     Lit(Lit),
 }
 
@@ -398,7 +436,7 @@ impl Lit {
 
 /// A literal as the value a column is compared against, in the shape that
 /// column compares in.
-fn value_of(column: &Column, lit: &Lit) -> Value {
+fn value_of(column: &Cell, lit: &Lit) -> Value {
     match lit {
         Lit::Number(value, _) if column.numeric() => Value::Number(*value),
         other => Value::Text(other.text()),
@@ -515,9 +553,9 @@ fn digits<const N: usize>(bytes: &[u8], at: [usize; N]) -> bool {
         .all(|index| bytes.get(*index).is_some_and(u8::is_ascii_digit))
 }
 
-/// The clause as a predicate over `layer`'s fields, or a refusal naming what
-/// could not be read.
-pub(super) fn parse(clause: &str, layer: &Layer) -> Result<Predicate, String> {
+/// The clause as a predicate over whatever `columns` resolves an identifier
+/// against, or a refusal naming what could not be read.
+pub(super) fn parse(clause: &str, columns: &dyn Columns) -> Result<Predicate, String> {
     if clause.len() > MAX_LENGTH {
         return Err(format!(
             "a where clause longer than {MAX_LENGTH} characters"
@@ -530,7 +568,7 @@ pub(super) fn parse(clause: &str, layer: &Layer) -> Result<Predicate, String> {
     let mut parser = Parser {
         tokens,
         at: 0,
-        layer,
+        columns,
         depth: 0,
     };
     let predicate = parser.or_expr()?;
@@ -548,7 +586,7 @@ pub(super) fn parse(clause: &str, layer: &Layer) -> Result<Predicate, String> {
 struct Parser<'a> {
     tokens: Vec<Token>,
     at: usize,
-    layer: &'a Layer,
+    columns: &'a dyn Columns,
     depth: usize,
 }
 
@@ -812,7 +850,7 @@ impl Parser<'_> {
     }
 
     /// A word where a value was expected: a function call, `NULL`, a date
-    /// literal, something this parser does not implement, or a field.
+    /// literal, something this parser does not implement, or a column.
     fn word_operand(&mut self, word: &str) -> Result<Operand, String> {
         if matches!(self.after(), Some(Token::Open)) {
             return Err(format!(
@@ -842,12 +880,12 @@ impl Parser<'_> {
         if OPERATORS.iter().any(|held| word.eq_ignore_ascii_case(held)) {
             return Err(format!("'{word}' where a value was expected"));
         }
-        let field = self
-            .layer
-            .field(word)
-            .ok_or_else(|| format!("the layer has no field '{}'", shown(word)))?;
+        let cell = self
+            .columns
+            .cell(word)
+            .ok_or_else(|| self.columns.missing(word))?;
         self.at += 1;
-        Ok(Operand::Column(Column::of(field)))
+        Ok(Operand::Column(cell))
     }
 }
 

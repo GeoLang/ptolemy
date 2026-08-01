@@ -13,11 +13,15 @@
 //! client that sent something that could not be a field name is told rather than
 //! answered under a name it will not recognise.
 //!
-//! `having` is not implemented, and stays refused by name in [`super::UNSUPPORTED`].
+//! `having` filters the rows this answer already holds, so it resolves against
+//! them rather than against the layer: see [`Statistics::aliases`] and the
+//! [`Columns`] implementation below. It needs a grouping to filter, and the query
+//! refuses it by name without one.
 
 use serde_json::Value;
 
-use super::column::{Column, Out, Read};
+use super::column::{Cell, Column, Out, Read, alias_at};
+use super::where_clause::Columns;
 use super::{Bind, Field, Kind, Layer, shown};
 
 /// The most statistics one request may ask for. A dashboard asks for a handful;
@@ -190,6 +194,39 @@ impl Statistics {
     /// grouped fields: one row per distinct combination of them.
     pub(super) fn unique(&self) -> usize {
         self.groups.len()
+    }
+
+    /// The names the wrapping subquery gives this answer's columns when a `having`
+    /// clause filters it: `c1`..`cN`, in select order.
+    ///
+    /// Crate-generated on purpose. A `having` clause names a grouped field or a
+    /// client's own `outStatisticFieldName`, and it is these that the predicate is
+    /// rendered over, so neither of those names ever becomes an identifier in the
+    /// statement.
+    pub(super) fn aliases(&self) -> Vec<String> {
+        (0..self.outputs.len()).map(alias_at).collect()
+    }
+}
+
+/// A `having` clause resolves against the answer, not the layer: the rows it
+/// filters are already aggregated and hold no properties. A name it carries is a
+/// grouped field or a statistic's alias, and it resolves to that column's own
+/// position and SQL type, which is what decides the shape a literal compares in.
+impl Columns for Statistics {
+    fn cell(&self, name: &str) -> Option<Cell> {
+        let at = self
+            .outputs
+            .iter()
+            .position(|out| out.field.name.eq_ignore_ascii_case(name))?;
+        Some(Cell::aggregate(at, self.outputs[at].read))
+    }
+
+    fn missing(&self, name: &str) -> String {
+        format!(
+            "'{}' is not one of the columns this query answers with ({})",
+            shown(name),
+            self.columns().join(", ")
+        )
     }
 }
 
@@ -588,6 +625,259 @@ mod tests {
             Err(why) => why,
         };
         assert!(why.contains(&format!("more than {MAX_GROUPS}")), "{why}");
+    }
+
+    /// The aliases the wrapping subquery gives an answer, and the SQL a `having`
+    /// clause over it renders to, numbered from `$2` the way a query numbers them.
+    fn having(raw: &str, groups: Option<&str>, clause: &str) -> (String, Vec<Bind>) {
+        let held = parse(raw, groups, &layer()).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        assert_eq!(held.aliases().len(), held.outputs.len());
+        let predicate = super::super::where_clause::parse(clause, &held)
+            .unwrap_or_else(|e| panic!("{clause}: {e}"));
+        let mut next = 2;
+        let mut binds = Vec::new();
+        let sql = predicate.sql(&mut next, &mut binds);
+        assert_eq!(next as usize, 2 + binds.len(), "{clause}: {sql}");
+        (sql, binds)
+    }
+
+    fn having_refusal(raw: &str, groups: Option<&str>, clause: &str) -> String {
+        let held = parse(raw, groups, &layer()).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        match super::super::where_clause::parse(clause, &held) {
+            Ok(_) => panic!("'{clause}' was accepted"),
+            Err(why) => why,
+        }
+    }
+
+    /// Four statistics over one group, which is the answer every `having` test
+    /// below filters: `ward`, `count_pop`, `sum_pop`, `min_name`, `max_score`.
+    fn grouped() -> String {
+        r#"[{"statisticType":"count","onStatisticField":"pop"},
+            {"statisticType":"sum","onStatisticField":"pop"},
+            {"statisticType":"min","onStatisticField":"name"},
+            {"statisticType":"max","onStatisticField":"score"}]"#
+            .to_string()
+    }
+
+    #[test]
+    fn the_aliases_are_this_crate_s_own_names_in_select_order() {
+        let held = parse(&grouped(), Some("ward"), &layer()).unwrap();
+        assert_eq!(held.aliases(), vec!["c1", "c2", "c3", "c4", "c5"]);
+        assert_eq!(
+            held.columns(),
+            vec!["ward", "count_pop", "sum_pop", "min_name", "max_score"]
+        );
+    }
+
+    /// A `having` clause names a column of the answer and renders as the alias the
+    /// subquery gave it, cast the way the where clause casts: a count and the
+    /// numeric aggregates compare as numbers, and a min over text or a text group
+    /// field compares as text.
+    #[test]
+    fn a_having_column_renders_as_its_alias_cast_by_what_it_holds() {
+        let stats = grouped();
+        for (clause, sql) in [
+            // the group field, which is text
+            ("ward = 'north'", "(c1 = $2::text)"),
+            // a count is a whole number of rows
+            ("count_pop > 1", "(c2::float8 > $2::float8)"),
+            // sum is a double
+            ("sum_pop >= 30", "(c3::float8 >= $2::float8)"),
+            // a min over text keeps that field's type
+            ("min_name < 'm'", "(c4 < $2::text)"),
+            // a max over a double keeps that field's type
+            ("max_score > 1.5", "(c5::float8 > $2::float8)"),
+        ] {
+            let (rendered, _) = having(&stats, Some("ward"), clause);
+            assert!(rendered.ends_with(sql), "{clause}: {rendered}");
+        }
+
+        // an aggregated column costs no bind: the alias is fixed text, so only
+        // the literal is bound and it takes the first placeholder
+        let (_, binds) = having(&stats, Some("ward"), "count_pop > 1");
+        assert_eq!(binds, vec![Bind::Number(1.0)]);
+
+        // and a group field's own kind decides its cast, exactly as in a where
+        // clause: a declared number groups and compares as one
+        let (sql, binds) = having(&stats, Some("pop"), "pop > 15");
+        assert_eq!(sql, "(c1::float8 > $2::float8)");
+        assert_eq!(binds, vec![Bind::Number(15.0)]);
+        // the object id is a number too, and it is the CTE's bigint underneath
+        let (sql, _) = having(&stats, Some("objectid"), "objectid = 3");
+        assert_eq!(sql, "(c1::float8 = $2::float8)");
+    }
+
+    /// The where clause's own rules for a literal whose shape disagrees with its
+    /// column, applied to an aggregated column: a number against text compares as
+    /// the spelling the client wrote, and text against a number compares as text.
+    #[test]
+    fn a_literal_takes_the_shape_of_the_column_it_is_compared_with() {
+        let stats = grouped();
+        let (sql, binds) = having(&stats, Some("ward"), "ward = 7");
+        assert_eq!(sql, "(c1 = $2::text)");
+        assert_eq!(binds, vec![Bind::Text(Some("7".to_string()))]);
+
+        let (sql, binds) = having(&stats, Some("ward"), "count_pop = 'x'");
+        assert_eq!(sql, "(c2::text = $2::text)");
+        assert_eq!(binds, vec![Bind::Text(Some("x".to_string()))]);
+    }
+
+    /// The whole grammar is the where clause's, over the answer's columns.
+    #[test]
+    fn the_grammar_is_the_where_clause_s() {
+        let stats = grouped();
+        let held = |clause: &str| having(&stats, Some("ward"), clause).0;
+        assert_eq!(held("sum_pop IS NULL"), "(c3::text IS NULL)");
+        assert_eq!(
+            held("count_pop IN (1, 2)"),
+            "(c2::float8 = ANY($2::float8[]))"
+        );
+        assert_eq!(held("ward LIKE 'n%'"), "(c1 LIKE $2::text ESCAPE '')");
+        assert_eq!(
+            held("count_pop > 1 AND sum_pop < 100"),
+            "((c2::float8 > $2::float8) AND (c3::float8 < $3::float8))"
+        );
+        assert!(held("NOT ward = 'north'").starts_with("(NOT "));
+        assert!(held("sum_pop BETWEEN 10 AND 20").contains(" AND "));
+        // a literal on the left turns the comparison round, as it does anywhere
+        assert_eq!(held("30 <= sum_pop"), "(c3::float8 >= $2::float8)");
+    }
+
+    /// The clause is request text, and none of it is rendered: a hostile string
+    /// literal is one bound value, and the alias it compares against is this
+    /// crate's own.
+    #[test]
+    fn a_hostile_literal_is_bound_rather_than_rendered() {
+        // the DROP form of this is in the integration tests, which run it against
+        // a real database and then prove the layer is still there
+        let (sql, binds) = having(
+            &grouped(),
+            Some("ward"),
+            "ward = 'x''; delete everything;--'",
+        );
+        assert_eq!(sql, "(c1 = $2::text)");
+        assert_eq!(
+            binds,
+            vec![Bind::Text(Some("x'; delete everything;--".to_string()))]
+        );
+        assert!(!sql.contains("delete"), "{sql}");
+    }
+
+    /// A client alias that looks like one of this crate's own names is still
+    /// resolved by position, so it names the column the client is reading and
+    /// cannot be confused with the alias of another one.
+    #[test]
+    fn a_client_alias_that_looks_like_an_internal_one_still_resolves_by_position() {
+        let stats = r#"[{"statisticType":"count","onStatisticField":"pop",
+                         "outStatisticFieldName":"c1"}]"#;
+        let held = parse(stats, Some("ward"), &layer()).unwrap();
+        assert_eq!(held.columns(), vec!["ward", "c1"]);
+        // the client's "c1" is the second column, so it renders as c2 and the
+        // group field keeps c1
+        let (sql, _) = having(stats, Some("ward"), "c1 > 1");
+        assert_eq!(sql, "(c2::float8 > $2::float8)");
+        let (sql, _) = having(stats, Some("ward"), "ward = 'north'");
+        assert_eq!(sql, "(c1 = $2::text)");
+    }
+
+    /// A `having` clause resolves against the answer and nothing else. A field the
+    /// layer has but this answer does not carry is refused by name, with the
+    /// columns it could have named listed.
+    #[test]
+    fn what_the_answer_does_not_carry_is_refused_by_name() {
+        let stats = grouped();
+        for (clause, names) in [
+            ("nosuchcolumn = 1", "nosuchcolumn"),
+            // a real field of the layer, which this answer does not carry
+            ("score > 1", "score"),
+            ("name = 'a'", "name"),
+            // the field a statistic read, rather than the statistic
+            ("pop > 1", "pop"),
+        ] {
+            let why = having_refusal(&stats, Some("ward"), clause);
+            assert!(
+                why.contains(names),
+                "'{clause}' was refused as '{why}', which does not name {names}"
+            );
+            assert!(why.contains("sum_pop"), "{clause}: {why}");
+        }
+        // and the grammar's own refusals still apply
+        assert!(
+            having_refusal(&stats, Some("ward"), "upper(ward) = 'A'").contains("upper"),
+            "a function was accepted"
+        );
+    }
+
+    /// A `having` clause is request text like any other, so parsing it against an
+    /// answer has to be total: every input is a predicate or a refusal, and never a
+    /// panic. The same sweep the where clause runs, over the columns an answer
+    /// carries rather than a layer's fields.
+    #[test]
+    fn nothing_panics_whatever_a_having_clause_holds() {
+        let held = parse(&grouped(), Some("ward"), &layer()).unwrap();
+        let check = |clause: &str| {
+            if let Ok(predicate) = super::super::where_clause::parse(clause, &held) {
+                let mut next = 2;
+                let mut binds = Vec::new();
+                let sql = predicate.sql(&mut next, &mut binds);
+                assert_eq!(next as usize, 2 + binds.len(), "{clause}: {sql}");
+                // no column of the answer is named in the statement, whatever the
+                // clause asked for: only this crate's own aliases are
+                for name in held.columns() {
+                    assert!(!sql.contains(&name), "{clause}: {sql} names {name}");
+                }
+            }
+        };
+
+        // every prefix of a clause that uses the whole grammar over this answer
+        let whole = "NOT (count_pop BETWEEN 1 AND 3) AND ward IN ('north','south') OR sum_pop >= \
+                     30 AND min_name LIKE '%x_' AND max_score IS NOT NULL";
+        for end in whole.char_indices().map(|(at, _)| at).chain([whole.len()]) {
+            check(&whole[..end]);
+        }
+
+        for clause in [
+            "",
+            " ",
+            "c1",
+            "c1 = 1",
+            "c99 = 1",
+            "count_pop",
+            "count_pop =",
+            "'count_pop' = 1",
+            "count_pop = count_pop",
+            "((((",
+            "sum_pop IN ()",
+            "sum_pop IN (1,,2)",
+            "ward = '\0'",
+            "\u{202e}",
+            "ward = 'unterminated",
+            "count_pop + 1 = 2",
+            "COUNT(pop) > 1",
+            "sum_pop > 1; DELETE",
+            "ward = 'a' -- rest",
+        ] {
+            check(clause);
+        }
+
+        let alphabet: Vec<char> =
+            "ab019 '()=<>!,-+*/%._ANDORNOTISNULLIKEBETWEENwardcount_popsum_popmin_namec1\";\\|é"
+                .chars()
+                .collect();
+        let mut seed: u64 = 0x51ed_2701_a3f4_9c6b;
+        let mut roll = |bound: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % bound
+        };
+        for _ in 0..4000 {
+            let length = roll(28);
+            let clause: String = (0..length)
+                .map(|_| alphabet[roll(alphabet.len())])
+                .collect();
+            check(&clause);
+        }
     }
 
     /// A name of exactly 64 characters is a name, and 65 is not: the rule is one

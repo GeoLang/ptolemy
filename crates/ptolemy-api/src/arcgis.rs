@@ -43,12 +43,15 @@
 //! than ignored: a filter that silently did not apply is worse than an error,
 //! because the client believes the rows it got back are the rows it asked for.
 //!
-//! `where` is the one parameter with a grammar behind it rather than a value.
-//! The `where_clause` module parses the SQL-92 subset Esri clients send and
-//! renders it as SQL with every literal bound, and refuses the rest by name for
-//! the reason above. `orderByFields` and `outStatistics` are read the same way,
-//! by the `order_by` and `statistics` modules, and every one of them renders a
-//! field through `column`, which is the single place a property becomes SQL.
+//! `where` and `having` are the parameters with a grammar behind them rather
+//! than a value. The `where_clause` module parses the SQL-92 subset Esri clients
+//! send and renders it as SQL with every literal bound, and refuses the rest by
+//! name for the reason above. Both use that one parser: a `where` clause names
+//! the layer's fields and filters the rows, and a `having` clause names the
+//! columns of a grouped answer and filters the groups. `orderByFields` and
+//! `outStatistics` are read the same way, by the `order_by` and `statistics`
+//! modules, and every one of them renders a field through `column`, which is the
+//! single place a property becomes SQL.
 //!
 //! A query answers in one of three shapes, and a request that asks for two of
 //! them is refused rather than served one of the two: the layer's own rows,
@@ -327,8 +330,7 @@ impl Params {
 /// of them can be honored here, and answering as though the parameter were
 /// absent would hand back the wrong rows under the client's own filter, so each
 /// is refused by name.
-const UNSUPPORTED: [&str; 12] = [
-    "having",
+const UNSUPPORTED: [&str; 11] = [
     "returnExtentOnly",
     "returnZ",
     "returnM",
@@ -919,6 +921,9 @@ async fn layer_metadata(
             "supportsStatistics": true,
             "supportsDistinct": true,
             "supportsQueryAttachments": true,
+            // over the grouped answer, which is the only thing there is to have:
+            // see the `having` refusals in run_query
+            "supportsHavingClause": true,
         },
         // the operations are served whether or not this layer holds an
         // attachment yet: a client reads these to decide whether to offer the
@@ -1086,6 +1091,34 @@ async fn run_query(
         ));
     }
 
+    // `having` filters the aggregated rows, so it needs both the statistics that
+    // make those rows and the grouping that makes more than one of them. Each
+    // missing parameter is named rather than the clause being dropped, which
+    // would answer every group under the client's own filter.
+    let asked_having = params
+        .get("having")
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    if asked_having.is_some() {
+        if asked_stats.is_none() {
+            return Err(EsriError::bad_request(
+                "having filters the statistics outStatistics asks for, and this request asks for \
+                 none",
+            ));
+        }
+        if params
+            .get("groupByFieldsForStatistics")
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err(EsriError::bad_request(
+                "having filters the groups groupByFieldsForStatistics makes, and this request \
+                 names none. An ungrouped statistics query is one row, which a filter can only \
+                 keep or drop whole.",
+            ));
+        }
+    }
+
     let mut filters: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
     let mut next = 2;
@@ -1210,16 +1243,46 @@ async fn run_query(
     if let Some(raw) = asked_stats {
         let held = statistics::parse(raw, params.get("groupByFieldsForStatistics"), &layer)
             .map_err(EsriError::bad_request)?;
+        // the clause resolves against the answer's own columns rather than the
+        // layer's fields, because that is what a group holds: see `statistics`
+        let having = asked_having
+            .map(|clause| {
+                where_clause::parse(clause, &held).map_err(|why| {
+                    EsriError::bad_request(format!(
+                        "having '{}' is not supported in this version of the service: {why}",
+                        shown(clause)
+                    ))
+                })
+            })
+            .transpose()?;
         let select = held.select_list(&mut next, &mut binds);
         let sorted = order_by::columns_sql(&order, &held.columns(), held.unique())
             .map_err(|why| refused_order(raw_order, why))?;
-        let sql = format!(
-            "{rows} SELECT {select} FROM numbered{predicate}{}{} LIMIT ${} OFFSET ${}",
-            held.group_by(),
-            order_clause(&sorted),
-            next,
-            next + 1
-        );
+        let sql = match having {
+            None => format!(
+                "{rows} SELECT {select} FROM numbered{predicate}{}{} LIMIT ${} OFFSET ${}",
+                held.group_by(),
+                order_clause(&sorted),
+                next,
+                next + 1
+            ),
+            // the groups are made first and filtered after, which is what a
+            // HAVING is, and the subquery is what gives the client's columns this
+            // crate's own names to be filtered under. The ordinals the order and
+            // the tiebreaker run on name the same columns in either shape.
+            Some(having) => {
+                let filter = having.sql(&mut next, &mut binds);
+                let aliases = held.aliases().join(", ");
+                format!(
+                    "{rows} SELECT {aliases} FROM (SELECT {select} FROM numbered{predicate}{}) \
+                     AS grouped ({aliases}) WHERE {filter}{} LIMIT ${} OFFSET ${}",
+                    held.group_by(),
+                    order_clause(&sorted),
+                    next,
+                    next + 1
+                )
+            }
+        };
         let (page, exceeded) =
             fetch_page(&sql, layer.branch_id, &binds, pool, limit, offset).await?;
         return Ok(Json(columns_response(&held.outputs, &page, exceeded)));

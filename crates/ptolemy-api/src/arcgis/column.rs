@@ -11,6 +11,11 @@
 //! rendered, and a numeric read is guarded by the pattern below so data that
 //! disagrees with its declared type reads as no value instead of failing the
 //! whole query.
+//!
+//! A `having` clause compares no property at all: its rows are already
+//! aggregated, so it reads the columns of that answer under the aliases this
+//! crate gave them. [`Cell`] is the two of them together, which is what lets one
+//! parser render both.
 
 use serde_json::Value;
 use sqlx::Row;
@@ -93,6 +98,67 @@ impl Column {
         let place = placeholder(next, binds, Bind::Text(Some(self.name.clone())));
         format!("(properties->>{place}::text)")
     }
+}
+
+/// Something a predicate compares: a property of the layer's own rows, or a
+/// column of an aggregated answer.
+///
+/// The aggregated arm is what `having` filters on. Those rows hold no properties
+/// any more, only the columns the statistics query answers with, and the wrapping
+/// subquery renames every one of them to this crate's own `c1`..`cN`: a client's
+/// `outStatisticFieldName` maps to one of those and never becomes an identifier.
+#[derive(Clone)]
+pub(super) enum Cell {
+    Field(Column),
+    Aggregate {
+        /// `c1`..`cN`, this crate's own text.
+        alias: String,
+        /// The SQL type the column already holds, which is what decides whether a
+        /// comparison runs on numbers or on text.
+        read: Read,
+    },
+}
+
+impl Cell {
+    /// The aggregated column at `at`, counting from zero, reading as `read`.
+    pub(super) fn aggregate(at: usize, read: Read) -> Cell {
+        Cell::Aggregate {
+            alias: alias_at(at),
+            read,
+        }
+    }
+
+    /// Whether a numeric read is the right one, which decides the shape a literal
+    /// is compared in. An aggregate answers this from its own SQL type rather than
+    /// from an Esri type: a count is a whole number and the numeric aggregates are
+    /// doubles, whatever the field they read declares.
+    pub(super) fn numeric(&self) -> bool {
+        match self {
+            Cell::Field(column) => column.numeric(),
+            Cell::Aggregate { read, .. } => !matches!(read, Read::Text),
+        }
+    }
+
+    /// The cell as SQL, in the shape it is read in. An aggregate needs no bind and
+    /// no guarded cast: the alias is fixed text and the column already holds a
+    /// value of its own type, so a plain cast is all a comparison needs.
+    pub(super) fn sql(&self, numeric: bool, next: &mut i32, binds: &mut Vec<Bind>) -> String {
+        match self {
+            Cell::Field(column) => column.sql(numeric, next, binds),
+            Cell::Aggregate { alias, read } => match (read, numeric) {
+                (Read::Text, _) => alias.clone(),
+                (_, true) => format!("{alias}::float8"),
+                (_, false) => format!("{alias}::text"),
+            },
+        }
+    }
+}
+
+/// The name the wrapping subquery gives the aggregated column at `at`, counting
+/// from `c1`. Generated here, so the answer's own column names stay out of the
+/// statement whatever a client called them.
+pub(super) fn alias_at(at: usize) -> String {
+    format!("c{}", at + 1)
 }
 
 /// The next placeholder, with its value bound. Every literal in a query goes

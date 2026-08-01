@@ -9156,6 +9156,7 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
         "returnZ=true",
         // asking for statistics and naming none
         "outStatistics=%5B%5D",
+        // filtering groups when nothing asked for any
         "having=count(*)%3E1",
         "gdbVersion=SDE.DEFAULT",
     ] {
@@ -10043,6 +10044,306 @@ async fn test_arcgis_query_statistics_refuse_what_they_cannot_answer() {
     assert_eq!(facade_count(&app, &name).await, 4);
 }
 
+/// Helper: a `having` clause as a query parameter, encoded so the URL carries
+/// the clause the test wrote and nothing else.
+fn having_param(clause: &str) -> String {
+    format!("having={}", urlencoding::encode(clause))
+}
+
+/// `having` filters the aggregated rows: the groups are made first and the
+/// predicate keeps or drops each whole group. The grammar is the where clause's,
+/// but it names the columns the answer carries rather than the layer's fields.
+#[tokio::test]
+async fn test_arcgis_query_having_filters_the_groups() {
+    let (app, _) = setup_app().await;
+    let name = format!("having_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    // north is pop 10 and 20, south is 30 and 40
+    let counted = stats_param(json!([
+        {"statisticType": "count", "onStatisticField": "pop"},
+        {"statisticType": "sum", "onStatisticField": "pop"},
+    ]));
+    let grouped = format!("{counted}&groupByFieldsForStatistics=ward&orderByFields=ward");
+
+    // a sum over the threshold keeps south alone
+    let (status, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("sum_pop > 50")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(
+        attributes(&body),
+        vec![json!({"ward": "south", "count_pop": 2, "sum_pop": 70.0})],
+        "{body}"
+    );
+
+    // a threshold both groups clear keeps both, in the order asked for
+    let (_, both) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("sum_pop >= 30")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&both),
+        vec![
+            json!({"ward": "north", "count_pop": 2, "sum_pop": 30.0}),
+            json!({"ward": "south", "count_pop": 2, "sum_pop": 70.0}),
+        ],
+        "{both}"
+    );
+
+    // and one neither clears keeps none: an empty answer, not an error
+    let (_, none) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("sum_pop > 100")),
+        ),
+    )
+    .await;
+    assert!(none["error"].is_null(), "{none}");
+    assert_eq!(attributes(&none), Vec::<Value>::new(), "{none}");
+
+    // over a count, grouping by the text field: "7" is on two features and the
+    // other two codes on one each
+    let by_code = format!("{counted}&groupByFieldsForStatistics=code&orderByFields=code");
+    let (_, repeated) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{by_code}&{}", having_param("count_pop > 1")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&repeated),
+        vec![json!({"code": "7", "count_pop": 2, "sum_pop": 30.0})],
+        "{repeated}"
+    );
+
+    // the group field itself is a column the clause can name, and text compares
+    // as text
+    let (_, named) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("ward LIKE 'nor%'")),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&named).len(), 1, "{named}");
+    assert_eq!(attributes(&named)[0]["ward"], "north", "{named}");
+
+    // the whole grammar is there, and a client's own alias is one of the columns
+    let aliased = stats_param(json!([
+        {"statisticType": "sum", "onStatisticField": "pop", "outStatisticFieldName": "total"},
+        {"statisticType": "avg", "onStatisticField": "pop", "outStatisticFieldName": "mean"},
+    ]));
+    let (_, complex) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{aliased}&groupByFieldsForStatistics=ward&orderByFields=ward&{}",
+                having_param("total >= 30 AND NOT mean IN (35) AND ward IS NOT NULL")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&complex),
+        vec![json!({"ward": "north", "total": 30.0, "mean": 15.0})],
+        "{complex}"
+    );
+
+    // the where clause narrows what is aggregated and having filters what came
+    // out of it, in that order: pop > 15 leaves north a sum of 20, which the
+    // having then drops
+    let (_, composed) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{grouped}&{}&{}",
+                where_param("pop > 15"),
+                having_param("sum_pop > 50")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&composed),
+        vec![json!({"ward": "south", "count_pop": 2, "sum_pop": 70.0})],
+        "{composed}"
+    );
+
+    // paging and ordering compose after the filter: two groups survive, one page
+    // each, and the order is the one asked for
+    let surviving = format!("{grouped}&{}", having_param("sum_pop >= 30"));
+    let (_, first) = get_json(
+        &app,
+        &query_url(&name, &format!("{surviving}&resultRecordCount=1")),
+    )
+    .await;
+    assert_eq!(attributes(&first).len(), 1, "{first}");
+    assert_eq!(attributes(&first)[0]["ward"], "north", "{first}");
+    assert_eq!(first["exceededTransferLimit"], true, "{first}");
+    let (_, second) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{surviving}&resultRecordCount=1&resultOffset=1"),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&second)[0]["ward"], "south", "{second}");
+    assert_eq!(second["exceededTransferLimit"], false, "{second}");
+
+    // a statistic's alias orders the surviving groups like any other column
+    let (_, biggest) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{counted}&groupByFieldsForStatistics=ward&orderByFields=sum_pop%20DESC&{}",
+                having_param("count_pop = 2")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&biggest)[0]["ward"], "south", "{biggest}");
+
+    // and the layer declares that it answers one
+    let (_, metadata) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(
+        metadata["advancedQueryCapabilities"]["supportsHavingClause"], true,
+        "{metadata}"
+    );
+}
+
+/// What `having` will not read is refused by name, and nothing it carries reaches
+/// the SQL: a clause is parsed against the answer's columns and rendered with
+/// every literal bound, so an injection-shaped literal is one string to compare.
+#[tokio::test]
+async fn test_arcgis_query_having_refuses_what_it_cannot_honor() {
+    let (app, _) = setup_app().await;
+    let name = format!("nohaving_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    let counted = stats_param(json!([
+        {"statisticType": "count", "onStatisticField": "pop"},
+        {"statisticType": "sum", "onStatisticField": "pop"},
+    ]));
+    let grouped = format!("{counted}&groupByFieldsForStatistics=ward");
+
+    for (params, names) in [
+        // a column the answer does not carry, named in the refusal
+        (
+            format!("{grouped}&{}", having_param("nosuchcolumn > 1")),
+            "nosuchcolumn",
+        ),
+        // a field of the layer that this answer does not carry: having filters
+        // the groups, so it cannot reach back to the rows
+        (format!("{grouped}&{}", having_param("score > 1")), "score"),
+        (format!("{grouped}&{}", having_param("pop > 1")), "pop"),
+        // the grammar's own refusals
+        (
+            format!("{grouped}&{}", having_param("upper(ward) = 'A'")),
+            "upper",
+        ),
+        (
+            format!("{grouped}&{}", having_param("sum_pop + 1 = 31")),
+            "arithmetic",
+        ),
+        (
+            format!("{grouped}&{}", having_param("sum_pop = 30; SELECT 1")),
+            "';'",
+        ),
+        (
+            format!("{grouped}&{}", having_param("sum_pop IN (SELECT 1)")),
+            "subquery",
+        ),
+        (
+            format!("{grouped}&{}", having_param("\"sum_pop\" = 30")),
+            "quoted identifier",
+        ),
+        // no grouping to filter, and the missing parameter is named
+        (
+            format!("{counted}&{}", having_param("sum_pop > 1")),
+            "groupByFieldsForStatistics",
+        ),
+        // no statistics at all, and that parameter is named instead
+        (
+            format!(
+                "groupByFieldsForStatistics=ward&{}",
+                having_param("sum_pop > 1")
+            ),
+            "outStatistics",
+        ),
+        (
+            format!("outFields=*&{}", having_param("pop > 1")),
+            "outStatistics",
+        ),
+        // and it is no use on the other aggregated shape either
+        (
+            format!(
+                "returnDistinctValues=true&outFields=ward&{}",
+                having_param("ward = 'north'")
+            ),
+            "outStatistics",
+        ),
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, &params)).await;
+        assert_eq!(status, StatusCode::OK, "{params}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{params}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(names), "'{params}' answered '{message}'");
+    }
+
+    // an injection-shaped literal is data: it parses as one string, compares as
+    // one string and matches no group
+    for hostile in [
+        "ward = 'north'; DROP TABLE features; --'",
+        "ward = 'x'' OR ''1''=''1'",
+        "ward = 'north'' UNION SELECT 1 --'",
+    ] {
+        let (status, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{grouped}&{}", having_param(hostile))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{hostile}: {body}");
+        // either one string that matches nothing, or a refusal: never a group
+        if body["error"].is_null() {
+            assert_eq!(attributes(&body), Vec::<Value>::new(), "{hostile}: {body}");
+        } else {
+            assert_eq!(body["error"]["code"], 400, "{hostile}: {body}");
+        }
+    }
+
+    // nothing any of them sent was run: the layer still answers all four features
+    assert_eq!(facade_count(&app, &name).await, 4);
+    let (_, still) = get_json(
+        &app,
+        &query_url(&name, &format!("{grouped}&orderByFields=ward")),
+    )
+    .await;
+    assert_eq!(attributes(&still).len(), 2, "{still}");
+}
+
 #[tokio::test]
 async fn test_arcgis_query_returns_distinct_values() {
     let (app, _) = setup_app().await;
@@ -10572,6 +10873,20 @@ async fn editable_layer(
 /// batch became exactly one commit.
 async fn history_len(app: &axum::Router, branch: Uuid) -> usize {
     let (status, body) = get_json(app, &format!("/api/v1/branches/{branch}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body.as_array().unwrap().len()
+}
+
+/// Same, on a private dataset, whose history has to be asked for with a token.
+async fn history_len_as(app: &axum::Router, branch: Uuid, token: &str) -> usize {
+    let (status, body) = request_as(
+        app,
+        "GET",
+        &format!("/api/v1/branches/{branch}/history"),
+        Some(token),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body.as_array().unwrap().len()
 }
@@ -11350,6 +11665,133 @@ async fn test_arcgis_apply_edits_accepts_the_token_parameter() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+/// Helper: a request carrying the credential header an Esri-ecosystem client
+/// sends, in the exact shape verne's own client attaches it
+/// (`verne-arcgis/src/client.rs`). No `Authorization` header at all, which is
+/// the case under test.
+async fn esri_authorized(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    form: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Esri-Authorization", format!("Bearer {token}"));
+    let body = match form {
+        None => Body::empty(),
+        Some(form) => {
+            req = req.header("content-type", "application/x-www-form-urlencoded");
+            Body::from(form.to_string())
+        }
+    };
+    let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// verne and the rest of the Esri ecosystem put their bearer token in
+/// `X-Esri-Authorization` and send no `Authorization` header at all, so the
+/// facade reads it: without this such a client can only reach public datasets.
+///
+/// It is a credential and not a promotion. The same token that opens a private
+/// layer's metadata for a viewer is refused for a write, and it opens nothing the
+/// caller holds no grant on.
+#[tokio::test]
+async fn test_arcgis_accepts_the_esri_authorization_header() {
+    let app = setup_app_authed().await;
+    let name = format!("esrihdr_{}", Uuid::now_v7().simple());
+    let admin = token_for_user("root", Role::Admin);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&admin),
+        Some(json!({"name": name, "geometry_type": "point", "srid": 4326,
+                    "created_by": "root", "visibility": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let ds = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        Some(&admin),
+        Some(editable_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{ds}/branches"),
+        Some(&admin),
+        Some(json!({"name": "main", "created_by": "root"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    // a viewer who holds a read grant on the private dataset, and one who does not
+    grant(&app, "datasets", ds, "vera", "read").await;
+    let vera = token_for_user("vera", Role::Viewer);
+    let nobody = token_for_user("nobody", Role::Viewer);
+
+    let metadata = format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json");
+
+    // anonymous, the dataset is simply not there
+    let (status, body) = get_json(&app, &metadata).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+
+    // with the header, the granted viewer reads the private layer's definition
+    let (status, body) = esri_authorized(&app, "GET", &metadata, &vera, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(body["name"], name, "{body}");
+    assert_eq!(body["id"], 0, "{body}");
+    assert_eq!(body["objectIdField"], "OBJECTID", "{body}");
+
+    // and it is the grant that opened it, not the header: the same header with a
+    // token holding no grant sees nothing
+    let (status, body) = esri_authorized(&app, "GET", &metadata, &nobody, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+
+    // the same viewer token in the same header is refused for a write, and 403 is
+    // the role refusal: 499 would mean the header had not been read at all
+    let commits = history_len_as(&app, branch_id, &admin).await;
+    let add = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "by-header"}, "geometry": {"x": 6.0, "y": 6.0}}])
+                .to_string(),
+        ),
+    ]);
+    let (status, out) =
+        esri_authorized(&app, "POST", &apply_edits_url(&name), &vera, Some(&add)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 403, "{out}");
+    assert_eq!(history_len_as(&app, branch_id, &admin).await, commits);
+
+    // the write path reads the header too, so the refusal above is about the role
+    let (status, out) =
+        esri_authorized(&app, "POST", &apply_edits_url(&name), &admin, Some(&add)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["addResults"][0]["success"], true, "{out}");
+    assert_eq!(history_len_as(&app, branch_id, &admin).await, commits + 1);
+
+    // the header is a credential on the facade alone: it must not enter /api/v1
+    let (status, body) = esri_authorized(&app, "GET", "/api/v1/audit", &admin, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 

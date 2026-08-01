@@ -262,9 +262,12 @@ as 4326 or Web Mercator (3857/102100), and `f=json`, `f=pjson` or `f=geojson`.
 names, and `outStatistics` with `groupByFieldsForStatistics` answers `count`,
 `sum`, `min`, `max`, `avg`, `stddev` and `var`. Both of those answer attributes
 and no geometry, page the way rows do, and take an `orderByFields` over the
-columns they return. Anything else it cannot honor is refused rather than
-ignored, `having` included. Refusals follow the Geoservices convention: HTTP 200
-with an `{"error": {...}}` body.
+columns they return. `having` filters the grouped answer, in the same grammar as
+`where` but naming the columns that answer carries: a grouped field's name or an
+`outStatisticFieldName`. It needs both `outStatistics` and
+`groupByFieldsForStatistics`, and ordering and paging apply after it. Anything
+else it cannot honor is refused rather than ignored. Refusals follow the
+Geoservices convention: HTTP 200 with an `{"error": {...}}` body.
 
 Two divergences worth knowing on the aggregated shapes: `returnDistinctValues`
 needs `outFields` to name its fields, because Esri's answer for `*` is the whole
@@ -274,8 +277,15 @@ behind it.
 
 `applyEdits` writes: the whole batch becomes one commit on `main` and any
 failure refuses all of it. Layers need a real integer `objectid` field to be
-editable; a `token` request parameter is accepted as the bearer on these routes
-because Esri clients cannot send a header.
+editable.
+
+Credentials on these routes: `Authorization: Bearer <jwt>` as everywhere else,
+then `X-Esri-Authorization: Bearer <jwt>`, which is where an Esri-ecosystem
+client such as verne puts its token, then a `token` request parameter, for a
+browser-hosted client that can send no header at all. The first one present wins.
+Both of the extra forms are read under `/arcgis/rest/services` and nowhere else,
+and neither grants anything the standard header would not: the token still needs
+the role and the grant for what it is asking.
 
 Attachments are served and edited through the Esri routes (per-feature list and
 download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
@@ -314,7 +324,7 @@ layers for non-Esri clients, with `source` and `sourceLayer` overridable by quer
 parameter and everything the translation could not carry over listed under
 `losses`.
 
-Not served: `having`, and datasets whose `geometry_type` is `geometry` or
+Not served: datasets whose `geometry_type` is `geometry` or
 `geometry_collection`, which have no single Esri layer type.
 
 ## Access control

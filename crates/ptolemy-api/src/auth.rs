@@ -34,14 +34,21 @@ pub const WS_PREFIX: &str = "/ws/";
 /// write. `extractChanges` and its two job routes read the branch's changesets,
 /// so they are reads like the query is.
 ///
-/// It is also the only prefix where a request parameter is a credential and
-/// where a refusal is answered in the Geoservices error shape. See
-/// [`query_token`] and [`refuse`].
+/// It is also the only prefix where a request parameter and the Esri
+/// ecosystem's own header are credentials, and where a refusal is answered in
+/// the Geoservices error shape. See [`ESRI_AUTHORIZATION`], [`query_token`] and
+/// [`refuse`].
 const ARCGIS_PREFIX: &str = "/arcgis/rest/services";
 
 /// Subprotocol name that marks a WebSocket handshake as carrying a bearer token.
 /// See [`request_token`] for the full contract.
 pub const BEARER_SUBPROTOCOL: &str = "bearer";
+
+/// The header an Esri-ecosystem client puts its bearer token in. verne sends
+/// exactly this and no `Authorization` of its own, which is what it is here for:
+/// see `verne-arcgis`'s client. It is a credential on the `ARCGIS_PREFIX` paths
+/// and nowhere else. See [`request_token`] for the full contract.
+pub const ESRI_AUTHORIZATION: &str = "X-Esri-Authorization";
 
 /// JWT claims structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +128,8 @@ pub enum Access {
 }
 
 /// Bearer token for a request: the `Authorization` header, on a websocket path a
-/// `Sec-WebSocket-Protocol: bearer, <jwt>` offer, and on the ArcGIS facade a
-/// `token` query parameter.
+/// `Sec-WebSocket-Protocol: bearer, <jwt>` offer, and on the ArcGIS facade an
+/// [`ESRI_AUTHORIZATION`] header or a `token` query parameter.
 ///
 /// The subprotocol form is there because a browser cannot set the Authorization
 /// header on a WebSocket handshake. It is preferred over a query parameter
@@ -130,28 +137,49 @@ pub enum Access {
 /// nowhere else does a subprotocol act as a credential. Mirrors tiletopia's
 /// contract so one platform token works against both services.
 ///
-/// The query form is there because the Geoservices protocol has no header for a
-/// credential: an Esri client sends `token` and nothing else, so a facade that
-/// only read the header could not be written to by the clients it exists for.
-/// See `query_token` for what that costs.
+/// The facade takes two more forms, in this order after `Authorization`:
+///
+///   - `X-Esri-Authorization: Bearer <jwt>`, the header an Esri-ecosystem client
+///     puts a token in. verne sends this and no `Authorization` of its own, so a
+///     facade that only read `Authorization` could reach public datasets alone.
+///   - the `token` request parameter, because the Geoservices protocol has no
+///     header at all for a credential: a browser-hosted Esri client sends
+///     `token` and nothing else, so a facade that only read a header could not
+///     be written to by the clients it exists for. See `query_token` for what
+///     that costs.
+///
+/// `Authorization` wins wherever it is present, so a client that can send the
+/// standard header is never downgraded to either of these. Both are scoped to
+/// the `ARCGIS_PREFIX` paths exactly as the subprotocol is scoped to the
+/// websocket paths: nowhere else in this service is a request parameter or this
+/// header a credential.
 pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
-    let header_token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    let token = match header_token {
+    let token = match bearer(headers, header::AUTHORIZATION.as_str()) {
         Some(token) => Some(token),
         None if uri.path().starts_with(WS_PREFIX) => subprotocol_token(headers),
-        None if uri.path().starts_with(ARCGIS_PREFIX) => query_token(uri),
+        None if uri.path().starts_with(ARCGIS_PREFIX) => {
+            bearer(headers, ESRI_AUTHORIZATION).or_else(|| query_token(uri))
+        }
         None => None,
     };
     token.filter(|t| !t.is_empty())
 }
 
+/// The bearer token a header carries. The scheme is matched exactly as the
+/// standard spells it, which is what every client here sends: a value in any
+/// other shape carries no token rather than being read as one.
+fn bearer<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
 /// Token out of a `token` request parameter. Scoped to [`ARCGIS_PREFIX`] exactly
 /// as the subprotocol form is scoped to the websocket paths, so a query
-/// parameter is a credential nowhere else in this service.
+/// parameter is a credential nowhere else in this service. Read only when
+/// neither `Authorization` nor [`ESRI_AUTHORIZATION`] carried one, because a
+/// header is not written down by anything the way a URL is.
 ///
 /// Only the query string is read, not a form body: reading a body here would
 /// mean buffering every request's body in the outermost layer, which every route
@@ -1028,6 +1056,106 @@ mod tests {
         let headers = headers_with("authorization", "Bearer real.token");
         let uri: Uri = "/arcgis/rest/services?token=other.token".parse().unwrap();
         assert_eq!(request_token(&headers, &uri), Some("real.token"));
+    }
+
+    /// The header verne and the rest of the Esri ecosystem send. Only on the
+    /// facade: anywhere else a header this crate invented must not be able to
+    /// enter a route, because the one credential header off the facade is the
+    /// standard one.
+    #[test]
+    fn request_token_reads_the_esri_header_on_arcgis_paths_only() {
+        let headers = headers_with(ESRI_AUTHORIZATION, "Bearer abc.def.ghi");
+        let uri: Uri = "/arcgis/rest/services/roads/FeatureServer/0/query?f=json"
+            .parse()
+            .unwrap();
+        assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
+        // the write route reads it the same way, which is the point of it
+        let write: Uri = "/arcgis/rest/services/roads/FeatureServer/0/applyEdits"
+            .parse()
+            .unwrap();
+        assert_eq!(request_token(&headers, &write), Some("abc.def.ghi"));
+
+        // a header name matches without regard to case, as HTTP says
+        let lowered = headers_with("x-esri-authorization", "Bearer abc.def.ghi");
+        assert_eq!(request_token(&lowered, &uri), Some("abc.def.ghi"));
+
+        for elsewhere in [
+            "/api/v1/datasets",
+            "/api/v1/audit",
+            "/ws/rooms/r1",
+            "/metrics",
+            "/arcgis/rest",
+        ] {
+            let path: Uri = elsewhere.parse().unwrap();
+            assert_eq!(request_token(&headers, &path), None, "{elsewhere}");
+        }
+    }
+
+    /// The scheme and a non-empty token, exactly as the standard header is held
+    /// to: anything else carries no credential rather than being read as one.
+    #[test]
+    fn the_esri_header_needs_the_bearer_scheme_and_a_token() {
+        let uri: Uri = "/arcgis/rest/services".parse().unwrap();
+        for value in [
+            "abc.def.ghi",
+            "bearer abc.def.ghi",
+            "Bearer",
+            "Bearer ",
+            "Basic abc.def.ghi",
+            "",
+        ] {
+            let headers = headers_with(ESRI_AUTHORIZATION, value);
+            assert_eq!(request_token(&headers, &uri), None, "'{value}'");
+        }
+    }
+
+    /// The order the three facade credentials are read in: `Authorization`, then
+    /// the Esri header, then the parameter. Every pairing, so a client that can
+    /// send a header is never downgraded and the parameter is never preferred to
+    /// either header.
+    #[test]
+    fn the_facade_credentials_have_a_fixed_precedence() {
+        let uri: Uri = "/arcgis/rest/services/roads/FeatureServer/0/query?token=param.token"
+            .parse()
+            .unwrap();
+        let bare: Uri = "/arcgis/rest/services/roads/FeatureServer/0/query"
+            .parse()
+            .unwrap();
+
+        // Authorization over the Esri header
+        let mut headers = headers_with("authorization", "Bearer standard.token");
+        headers.insert(
+            axum::http::HeaderName::from_static("x-esri-authorization"),
+            "Bearer esri.token".parse().unwrap(),
+        );
+        assert_eq!(request_token(&headers, &bare), Some("standard.token"));
+        // ... and over both of the others at once
+        assert_eq!(request_token(&headers, &uri), Some("standard.token"));
+
+        // the Esri header over the parameter
+        let esri = headers_with(ESRI_AUTHORIZATION, "Bearer esri.token");
+        assert_eq!(request_token(&esri, &uri), Some("esri.token"));
+
+        // Authorization over the parameter
+        let standard = headers_with("authorization", "Bearer standard.token");
+        assert_eq!(request_token(&standard, &uri), Some("standard.token"));
+
+        // and with no header at all the parameter is what is left
+        assert_eq!(request_token(&HeaderMap::new(), &uri), Some("param.token"));
+    }
+
+    /// An empty credential is no credential, and it does not fall through to the
+    /// next channel either: a client that sent an empty header meant to send a
+    /// token and is told it has none, rather than being authenticated as whoever
+    /// the URL names.
+    #[test]
+    fn an_empty_esri_header_is_no_token_and_does_not_fall_through() {
+        let uri: Uri = "/arcgis/rest/services?token=param.token".parse().unwrap();
+        let headers = headers_with(ESRI_AUTHORIZATION, "Bearer ");
+        assert_eq!(request_token(&headers, &uri), None);
+        // the standard header behaves the same way, which is what this follows
+        let headers = headers_with("authorization", "Bearer ");
+        assert_eq!(request_token(&headers, &uri), None);
     }
 
     #[test]
