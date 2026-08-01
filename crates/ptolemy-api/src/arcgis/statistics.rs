@@ -13,10 +13,16 @@
 //! client that sent something that could not be a field name is told rather than
 //! answered under a name it will not recognise.
 //!
-//! `having` filters the rows this answer already holds, so it resolves against
-//! them rather than against the layer: see [`Statistics::aliases`] and the
-//! [`Columns`] implementation below. It needs a grouping to filter, and the query
-//! refuses it by name without one.
+//! `having` filters the groups this answer holds rather than the rows behind
+//! them, so it resolves against the answer and the layer together: see [`Having`],
+//! which is the [`Columns`] a having clause parses through. Its primary form is
+//! Esri's documented one, an aggregate function over a field, `COUNT(houses) >
+//! 1000`; naming a projected column by its own alias is an extension. An
+//! aggregate the clause names that `outStatistics` did not ask for is computed for
+//! the filter and never projected, which is what the docs require of it. It needs
+//! a grouping to filter, and the query refuses it by name without one.
+
+use std::cell::RefCell;
 
 use serde_json::Value;
 
@@ -121,6 +127,17 @@ impl Stat {
         format!("{}({held})", self.statistic.function())
     }
 
+    /// How the statistic's column arrives from PostgreSQL. Read by a `having`
+    /// clause too, which compares a column the answer does not project and so has
+    /// no [`Out`] to read it off.
+    fn read(&self) -> Read {
+        match self.statistic {
+            Statistic::Count => Read::Int8,
+            Statistic::Min | Statistic::Max => Read::of(self.column.kind),
+            _ => Read::Float8,
+        }
+    }
+
     /// The column the statistic answers as: a count is a whole number of rows, the
     /// numeric aggregates are doubles whatever they read, and a min or max is a
     /// value of the field it read so it keeps that field's type.
@@ -130,20 +147,31 @@ impl Stat {
             Statistic::Min | Statistic::Max => self.column.kind,
             _ => Kind::Double,
         };
-        let read = match self.statistic {
-            Statistic::Count => Read::Int8,
-            Statistic::Min | Statistic::Max => Read::of(self.column.kind),
-            _ => Read::Float8,
-        };
         Out {
             field: Field {
                 alias: name.clone(),
                 name,
                 kind,
             },
-            read,
+            read: self.read(),
         }
     }
+}
+
+/// A statistic over a field of the layer, or the refusal that field's declared
+/// type earns it. Shared by `outStatistics` and a `having` clause's function form,
+/// so a text field is held to one rule whichever parameter named it.
+fn stat_of(statistic: Statistic, field: &Field) -> Result<Stat, String> {
+    let column = Column::of(field);
+    if statistic.needs_numbers() && !column.numeric() {
+        return Err(format!(
+            "{} is not supported on '{}', which this layer declares as text: count, min and \
+             max read a field of any type",
+            statistic.label(),
+            field.name
+        ));
+    }
+    Ok(Stat { column, statistic })
 }
 
 /// A statistics query: the fields it groups by and the aggregates it answers,
@@ -199,21 +227,15 @@ impl Statistics {
     /// The names the wrapping subquery gives this answer's columns when a `having`
     /// clause filters it: `c1`..`cN`, in select order.
     ///
-    /// Crate-generated on purpose. A `having` clause names a grouped field or a
-    /// client's own `outStatisticFieldName`, and it is these that the predicate is
-    /// rendered over, so neither of those names ever becomes an identifier in the
-    /// statement.
+    /// Crate-generated on purpose. A `having` clause names a field, a statistic's
+    /// alias or an aggregate function, and it is these that the predicate is
+    /// rendered over, so none of what a client wrote becomes an identifier.
     pub(super) fn aliases(&self) -> Vec<String> {
         (0..self.outputs.len()).map(alias_at).collect()
     }
-}
 
-/// A `having` clause resolves against the answer, not the layer: the rows it
-/// filters are already aggregated and hold no properties. A name it carries is a
-/// grouped field or a statistic's alias, and it resolves to that column's own
-/// position and SQL type, which is what decides the shape a literal compares in.
-impl Columns for Statistics {
-    fn cell(&self, name: &str) -> Option<Cell> {
+    /// The answer's own column of this name, as the cell a clause compares it as.
+    fn projected(&self, name: &str) -> Option<Cell> {
         let at = self
             .outputs
             .iter()
@@ -221,12 +243,193 @@ impl Columns for Statistics {
         Some(Cell::aggregate(at, self.outputs[at].read))
     }
 
+    /// Where this answer already projects `statistic` over `field`, so a `having`
+    /// clause naming that aggregate filters on the column the client is reading
+    /// rather than computing the same thing twice. `field` is the layer's own
+    /// spelling, which is what a resolved [`Column`] holds.
+    fn projects(&self, statistic: Statistic, field: &str) -> Option<usize> {
+        self.stats
+            .iter()
+            .position(|stat| stat.statistic == statistic && stat.column.name == field)
+            .map(|at| self.groups.len() + at)
+    }
+
+    /// The columns a `having` clause over this answer may name.
+    pub(super) fn having<'a>(&'a self, layer: &'a Layer) -> Having<'a> {
+        Having {
+            answer: self,
+            layer,
+            extra: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+/// An aggregate a `having` clause named that the answer does not project. It is
+/// one more column of the subquery and reaches no further: the response is read
+/// off the projected columns alone.
+enum Extra {
+    /// `count(*)`, which is the rows in the group: what `COUNT(*)` and `COUNT(1)`
+    /// ask for, and the one aggregate here that reads no field.
+    Rows,
+    /// The same shape a projected statistic renders in.
+    Of(Stat),
+}
+
+impl Extra {
+    fn sql(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
+        match self {
+            Extra::Rows => "count(*)".to_string(),
+            Extra::Of(stat) => stat.sql(next, binds),
+        }
+    }
+
+    fn read(&self) -> Read {
+        match self {
+            Extra::Rows => Read::Int8,
+            Extra::Of(stat) => stat.read(),
+        }
+    }
+
+    /// Whether two calls ask for the same aggregate, so a clause naming one twice
+    /// computes it once. A resolved column holds the layer's own field name, so
+    /// this compares canonical spellings.
+    fn same(&self, other: &Extra) -> bool {
+        match (self, other) {
+            (Extra::Rows, Extra::Rows) => true,
+            (Extra::Of(a), Extra::Of(b)) => {
+                a.statistic == b.statistic && a.column.name == b.column.name
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What an identifier in a `having` clause resolves against: the aggregated
+/// answer, and the layer behind it.
+///
+/// Two forms, and the first is the one Esri's REST reference documents:
+///
+///   - an aggregate function over a field of the layer, `COUNT(houses) > 1000`.
+///     The docs are explicit that these need not appear in `outStatistics`, so one
+///     that does not is computed for the filter and never projected. `COUNT(*)`
+///     and `COUNT(1)` count the rows in a group; `COUNT(field)` counts the values
+///     that are there, which is both what SQL does and what Esri documents.
+///   - a column the answer projects, by the name the client reads it under: a
+///     grouped field's name or an `outStatisticFieldName`. Esri's docs say the
+///     parameter does not take an `outStatisticFieldName`, so this is an extension
+///     rather than the contract. It costs nothing to accept and a client that
+///     writes it means exactly one thing.
+///
+/// Resolving is `&self` because it happens while the clause is parsed, so the
+/// aggregates a clause asks for are collected in a [`RefCell`] as they are named.
+pub(super) struct Having<'a> {
+    answer: &'a Statistics,
+    layer: &'a Layer,
+    /// The aggregates named that the answer does not project, in the order they
+    /// were first named.
+    extra: RefCell<Vec<Extra>>,
+}
+
+impl Having<'_> {
+    /// The cell for an aggregate the answer does not project, computing it once
+    /// however often the clause names it.
+    fn extra(&self, held: Extra) -> Result<Cell, String> {
+        let mut extra = self.extra.borrow_mut();
+        let at = match extra.iter().position(|kept| kept.same(&held)) {
+            Some(at) => at,
+            None => {
+                // one clause cannot make the subquery arbitrarily wide, the same
+                // reason outStatistics is capped
+                if extra.len() == MAX_STATISTICS {
+                    return Err(format!(
+                        "more than {MAX_STATISTICS} aggregates that outStatistics does not \
+                         already ask for"
+                    ));
+                }
+                extra.push(held);
+                extra.len() - 1
+            }
+        };
+        Ok(Cell::aggregate(
+            self.answer.outputs.len() + at,
+            extra[at].read(),
+        ))
+    }
+
+    /// The extra aggregates as select list entries, in the order their aliases
+    /// number them. Appended after the answer's own columns, so the projected
+    /// columns keep the positions the response reads them at.
+    pub(super) fn extra_sql(&self, next: &mut i32, binds: &mut Vec<Bind>) -> Vec<String> {
+        self.extra
+            .borrow()
+            .iter()
+            .map(|held| held.sql(next, binds))
+            .collect()
+    }
+
+    /// Every column of the subquery, projected and extra alike, under the names it
+    /// gives them.
+    pub(super) fn aliases(&self) -> Vec<String> {
+        (0..self.answer.outputs.len() + self.extra.borrow().len())
+            .map(alias_at)
+            .collect()
+    }
+}
+
+impl Columns for Having<'_> {
+    fn cell(&self, name: &str) -> Option<Cell> {
+        self.answer.projected(name)
+    }
+
     fn missing(&self, name: &str) -> String {
-        format!(
+        let held = format!(
             "'{}' is not one of the columns this query answers with ({})",
             shown(name),
-            self.columns().join(", ")
-        )
+            self.answer.columns().join(", ")
+        );
+        match self.layer.field(name) {
+            // a field of the layer, which a grouped answer holds only as an
+            // aggregate: naming that aggregate is what filters on it
+            Some(field) => format!(
+                "{held}; '{}' is a field of the layer, which a group holds only as an aggregate, \
+                 so name one: count({})",
+                field.name, field.name
+            ),
+            None => held,
+        }
+    }
+
+    fn call(&self, func: &str, arg: Option<&str>) -> Result<Option<Cell>, String> {
+        let Some(statistic) = Statistic::of(func) else {
+            return Ok(None);
+        };
+        let Some(arg) = arg else {
+            return Err(match statistic {
+                Statistic::Count => format!(
+                    "{} takes one field name, or '*' for the rows in a group",
+                    statistic.label()
+                ),
+                _ => format!("{} takes one field name", statistic.label()),
+            });
+        };
+        // the two spellings of a count of rows. A layer whose fields come from
+        // property keys could hold a key of either name, and this reads them as
+        // the count every client means by them rather than as that field
+        if statistic == Statistic::Count && (arg == "*" || arg == "1") {
+            return self.extra(Extra::Rows).map(Some);
+        }
+        let field = self.layer.field(arg).ok_or_else(|| {
+            format!(
+                "{}('{}') names no field of this layer",
+                statistic.label(),
+                shown(arg)
+            )
+        })?;
+        if let Some(at) = self.answer.projects(statistic, &field.name) {
+            return Ok(self.answer.projected(&self.answer.outputs[at].field.name));
+        }
+        self.extra(stat_of(statistic, field).map(Extra::Of)?)
+            .map(Some)
     }
 }
 
@@ -301,16 +504,7 @@ pub(super) fn parse(raw: &str, groups: Option<&str>, layer: &Layer) -> Result<St
                 shown(on)
             )
         })?;
-        let column = Column::of(field);
-        if statistic.needs_numbers() && !column.numeric() {
-            return Err(format!(
-                "{} is not supported on '{}', which this layer declares as text: count, min and \
-                 max read a field of any type",
-                statistic.label(),
-                field.name
-            ));
-        }
-        let stat = Stat { column, statistic };
+        let stat = stat_of(statistic, field)?;
 
         // absent, null or empty all mean "name it for me". The default is built
         // from the layer's own field name rather than the spelling the client
@@ -630,20 +824,42 @@ mod tests {
     /// The aliases the wrapping subquery gives an answer, and the SQL a `having`
     /// clause over it renders to, numbered from `$2` the way a query numbers them.
     fn having(raw: &str, groups: Option<&str>, clause: &str) -> (String, Vec<Bind>) {
-        let held = parse(raw, groups, &layer()).unwrap_or_else(|e| panic!("{raw}: {e}"));
-        assert_eq!(held.aliases().len(), held.outputs.len());
-        let predicate = super::super::where_clause::parse(clause, &held)
-            .unwrap_or_else(|e| panic!("{clause}: {e}"));
-        let mut next = 2;
-        let mut binds = Vec::new();
-        let sql = predicate.sql(&mut next, &mut binds);
-        assert_eq!(next as usize, 2 + binds.len(), "{clause}: {sql}");
+        let (sql, binds, _) = having_with_extra(raw, groups, clause);
         (sql, binds)
     }
 
+    /// The same, and the extra aggregates the clause made the subquery compute:
+    /// the ones it named that `outStatistics` did not ask for.
+    fn having_with_extra(
+        raw: &str,
+        groups: Option<&str>,
+        clause: &str,
+    ) -> (String, Vec<Bind>, Vec<String>) {
+        let layer = layer();
+        let held = parse(raw, groups, &layer).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        assert_eq!(held.aliases().len(), held.outputs.len());
+        let columns = held.having(&layer);
+        let predicate = super::super::where_clause::parse(clause, &columns)
+            .unwrap_or_else(|e| panic!("{clause}: {e}"));
+        let mut next = 2;
+        let mut binds = Vec::new();
+        // the order a query renders them in: the answer's own columns, then the
+        // extra aggregates, then the predicate
+        let extra = columns.extra_sql(&mut next, &mut binds);
+        let sql = predicate.sql(&mut next, &mut binds);
+        assert_eq!(next as usize, 2 + binds.len(), "{clause}: {sql}");
+        assert_eq!(
+            columns.aliases().len(),
+            held.outputs.len() + extra.len(),
+            "{clause}"
+        );
+        (sql, binds, extra)
+    }
+
     fn having_refusal(raw: &str, groups: Option<&str>, clause: &str) -> String {
-        let held = parse(raw, groups, &layer()).unwrap_or_else(|e| panic!("{raw}: {e}"));
-        match super::super::where_clause::parse(clause, &held) {
+        let layer = layer();
+        let held = parse(raw, groups, &layer).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        match super::super::where_clause::parse(clause, &held.having(&layer)) {
             Ok(_) => panic!("'{clause}' was accepted"),
             Err(why) => why,
         }
@@ -808,20 +1024,187 @@ mod tests {
         );
     }
 
+    /// The form Esri's REST reference documents: an aggregate function over a
+    /// field of the layer. One the answer already projects filters on that column
+    /// rather than being computed twice, and the whole call is gone from the SQL
+    /// either way.
+    #[test]
+    fn an_aggregate_function_names_the_column_it_computes() {
+        let stats = grouped();
+        for (clause, sql) in [
+            ("COUNT(pop) > 1", "(c2::float8 > $2::float8)"),
+            ("SUM(pop) >= 30", "(c3::float8 >= $2::float8)"),
+            ("MIN(name) < 'm'", "(c4 < $2::text)"),
+            ("MAX(score) > 1.5", "(c5::float8 > $2::float8)"),
+            // matched without regard to case, as every keyword here is
+            ("sum(POP) >= 30", "(c3::float8 >= $2::float8)"),
+        ] {
+            let (rendered, _, extra) = having_with_extra(&stats, Some("ward"), clause);
+            assert_eq!(rendered, sql, "{clause}");
+            assert!(
+                extra.is_empty(),
+                "{clause} recomputed an aggregate the answer already carries: {extra:?}"
+            );
+        }
+    }
+
+    /// An aggregate the answer does not project is computed for the filter alone.
+    /// Esri's own example does this: its `having` names `COUNT(houses)` and its
+    /// `outStatistics` does not ask for it.
+    #[test]
+    fn an_aggregate_the_answer_does_not_carry_is_computed_for_the_filter() {
+        let stats = grouped();
+        // avg is not one of the four this answer projects, so it becomes the sixth
+        // column of the subquery and the fifth of the answer stays the last served
+        let (sql, binds, extra) = having_with_extra(&stats, Some("ward"), "AVG(pop) > 5");
+        assert_eq!(sql, "(c6::float8 > $3::float8)");
+        assert_eq!(extra.len(), 1, "{extra:?}");
+        assert!(extra[0].starts_with("avg((CASE WHEN "), "{extra:?}");
+        // the key the aggregate reads is bound, and the literal after it
+        assert_eq!(
+            binds,
+            vec![Bind::Text(Some("pop".to_string())), Bind::Number(5.0)]
+        );
+
+        // a count over a field the answer counts nothing of is its own column
+        let (sql, _, extra) = having_with_extra(&stats, Some("ward"), "COUNT(score) > 1");
+        assert_eq!(sql, "(c6::float8 > $3::float8)");
+        assert_eq!(extra.len(), 1, "{extra:?}");
+
+        // one named twice is computed once, under one alias, with the key it reads
+        // bound once: only the two literals are left to bind
+        let (sql, _, extra) =
+            having_with_extra(&stats, Some("ward"), "AVG(pop) > 5 AND AVG(pop) < 50");
+        assert_eq!(
+            sql,
+            "((c6::float8 > $3::float8) AND (c6::float8 < $4::float8))"
+        );
+        assert_eq!(extra.len(), 1, "{extra:?}");
+
+        // two different ones take a column each, in the order they were named
+        let (sql, _, extra) =
+            having_with_extra(&stats, Some("ward"), "AVG(pop) > 5 AND STDDEV(pop) < 50");
+        assert_eq!(
+            sql,
+            "((c6::float8 > $4::float8) AND (c7::float8 < $5::float8))"
+        );
+        assert_eq!(extra.len(), 2, "{extra:?}");
+        assert!(extra[1].starts_with("stddev_samp("), "{extra:?}");
+    }
+
+    /// `COUNT(*)` and `COUNT(1)` count the rows in a group, which is the one
+    /// aggregate here that reads no field. `COUNT(field)` counts the values that
+    /// are there, so a group of rows missing that field counts fewer: that is what
+    /// SQL does and what Esri documents.
+    #[test]
+    fn a_count_of_rows_is_written_star_or_one() {
+        let stats = grouped();
+        for clause in ["COUNT(*) > 1", "COUNT(1) > 1", "count( * ) > 1"] {
+            let (sql, _, extra) = having_with_extra(&stats, Some("ward"), clause);
+            assert_eq!(sql, "(c6::float8 > $2::float8)", "{clause}");
+            assert_eq!(extra, vec!["count(*)".to_string()], "{clause}");
+        }
+
+        // the two spellings are one aggregate, and a count of a field is another
+        let (_, _, extra) =
+            having_with_extra(&stats, Some("ward"), "COUNT(*) > 1 AND COUNT(1) > 1");
+        assert_eq!(extra.len(), 1, "{extra:?}");
+        let (_, _, extra) =
+            having_with_extra(&stats, Some("ward"), "COUNT(*) > 1 AND COUNT(score) > 1");
+        assert_eq!(extra.len(), 2, "{extra:?}");
+        assert_eq!(extra[0], "count(*)", "{extra:?}");
+        assert!(extra[1].starts_with("count((properties->>"), "{extra:?}");
+    }
+
+    /// A function form is held to the same rules `outStatistics` is: the same
+    /// closed set of aggregates, resolved against the layer, and a numeric one
+    /// refused on a field the layer declares as text.
+    #[test]
+    fn a_function_form_is_refused_by_name_on_the_same_rules() {
+        let stats = grouped();
+        for (clause, names) in [
+            // the type rule, in the same words outStatistics refuses it with
+            ("AVG(name) > 1", "avg is not supported on 'name'"),
+            ("SUM(ward) > 1", "sum is not supported on 'ward'"),
+            // a field the layer has not got
+            ("COUNT(nosuchfield) > 1", "nosuchfield"),
+            ("AVG(nosuchfield) > 1", "nosuchfield"),
+            // a function this service has no aggregate for
+            ("MEDIAN(pop) > 1", "MEDIAN"),
+            ("upper(ward) = 'A'", "upper"),
+            ("EXTRACT(year FROM pop) = 2024", "EXTRACT"),
+            // an aggregate with anything but one bare argument
+            ("AVG(pop, score) > 1", "avg takes one field name"),
+            ("AVG() > 1", "avg takes one field name"),
+            ("COUNT() > 1", "'*' for the rows in a group"),
+            ("SUM(sum_pop) > 1", "sum_pop"),
+        ] {
+            let why = having_refusal(&stats, Some("ward"), clause);
+            assert!(
+                why.contains(names),
+                "'{clause}' was refused as '{why}', which does not name {names}"
+            );
+        }
+    }
+
+    /// A clause cannot make the subquery arbitrarily wide, the same reason
+    /// `outStatistics` is capped.
+    #[test]
+    fn the_aggregates_one_clause_may_add_are_capped() {
+        let mut wide = layer();
+        let names: Vec<String> = (0..=MAX_STATISTICS).map(|at| format!("n{at}")).collect();
+        for name in &names {
+            wide.fields.push(field(name, Kind::Integer));
+        }
+        let held = parse(&grouped(), Some("ward"), &wide).unwrap();
+        let columns = held.having(&wide);
+        let clause = names
+            .iter()
+            .map(|name| format!("AVG({name}) > 0"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let why = match super::super::where_clause::parse(&clause, &columns) {
+            Ok(_) => panic!("{} aggregates were accepted", names.len()),
+            Err(why) => why,
+        };
+        assert!(
+            why.contains(&format!("more than {MAX_STATISTICS}")),
+            "{why}"
+        );
+    }
+
+    /// A field of the layer names no column of a grouped answer, and the refusal
+    /// says what to write instead: a group holds a field only as an aggregate.
+    #[test]
+    fn a_bare_field_of_the_layer_is_told_which_aggregate_to_name() {
+        let why = having_refusal(&grouped(), Some("ward"), "score > 1");
+        assert!(why.contains("score"), "{why}");
+        assert!(why.contains("count(score)"), "{why}");
+        // a name that is no field of the layer gets no such hint to give
+        let why = having_refusal(&grouped(), Some("ward"), "nosuchcolumn > 1");
+        assert!(why.contains("nosuchcolumn"), "{why}");
+        assert!(!why.contains("count(nosuchcolumn)"), "{why}");
+    }
+
     /// A `having` clause is request text like any other, so parsing it against an
     /// answer has to be total: every input is a predicate or a refusal, and never a
     /// panic. The same sweep the where clause runs, over the columns an answer
     /// carries rather than a layer's fields.
     #[test]
     fn nothing_panics_whatever_a_having_clause_holds() {
-        let held = parse(&grouped(), Some("ward"), &layer()).unwrap();
+        let layer = layer();
+        let held = parse(&grouped(), Some("ward"), &layer).unwrap();
         let check = |clause: &str| {
-            if let Ok(predicate) = super::super::where_clause::parse(clause, &held) {
+            // one resolver per clause, as a query builds one per request
+            let columns = held.having(&layer);
+            if let Ok(predicate) = super::super::where_clause::parse(clause, &columns) {
                 let mut next = 2;
                 let mut binds = Vec::new();
+                let extra = columns.extra_sql(&mut next, &mut binds);
                 let sql = predicate.sql(&mut next, &mut binds);
                 assert_eq!(next as usize, 2 + binds.len(), "{clause}: {sql}");
-                // no column of the answer is named in the statement, whatever the
+                assert!(extra.len() <= MAX_STATISTICS, "{clause}");
+                // no column of the answer is named in the predicate, whatever the
                 // clause asked for: only this crate's own aliases are
                 for name in held.columns() {
                     assert!(!sql.contains(&name), "{clause}: {sql} names {name}");

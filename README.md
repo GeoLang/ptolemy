@@ -262,12 +262,18 @@ as 4326 or Web Mercator (3857/102100), and `f=json`, `f=pjson` or `f=geojson`.
 names, and `outStatistics` with `groupByFieldsForStatistics` answers `count`,
 `sum`, `min`, `max`, `avg`, `stddev` and `var`. Both of those answer attributes
 and no geometry, page the way rows do, and take an `orderByFields` over the
-columns they return. `having` filters the grouped answer, in the same grammar as
-`where` but naming the columns that answer carries: a grouped field's name or an
-`outStatisticFieldName`. It needs both `outStatistics` and
-`groupByFieldsForStatistics`, and ordering and paging apply after it. Anything
-else it cannot honor is refused rather than ignored. Refusals follow the
-Geoservices convention: HTTP 200 with an `{"error": {...}}` body.
+columns they return. `having` (or `havingClause`, the two names Esri's own
+docs and JS API use) filters the grouped answer, in the same grammar as `where`.
+It names aggregates rather than rows: `COUNT(houses) > 1000`,
+`AVG(pop) >= 20 AND MIN(score) >= 5`, over the same seven functions
+`outStatistics` offers. An aggregate it names need not be in `outStatistics`, and
+one that is not is computed to filter the groups and not served back.
+`COUNT(*)` and `COUNT(1)` count rows, `COUNT(field)` counts the values that are
+there. Naming a projected column instead, by its grouped field name or its
+`outStatisticFieldName`, also works as an extension. It needs both
+`outStatistics` and `groupByFieldsForStatistics`, and ordering and paging apply
+after it. Anything else it cannot honor is refused rather than ignored. Refusals
+follow the Geoservices convention: HTTP 200 with an `{"error": {...}}` body.
 
 Two divergences worth knowing on the aggregated shapes: `returnDistinctValues`
 needs `outFields` to name its fields, because Esri's answer for `*` is the whole

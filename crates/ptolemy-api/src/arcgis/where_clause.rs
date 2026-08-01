@@ -15,10 +15,11 @@
 //!
 //! One grammar, two things to resolve an identifier against: [`Columns`] is that
 //! seam. A `where` clause resolves against the layer's own fields, and a `having`
-//! clause against the columns of the aggregated answer, which is what the
-//! `statistics` module implements. Neither can name anything the other holds. A
-//! refusal names the where clause in both cases, because that is the grammar
-//! both of them are.
+//! clause against the aggregated answer, which is what the `statistics` module
+//! implements. Neither can name anything the other holds, and only a `having`
+//! clause has a function form: `COUNT(houses)` is an aggregate there and refused
+//! by name in a where clause. A refusal names the where clause in both cases,
+//! because that is the grammar both of them are.
 //!
 //! What this does not accept is refused by name rather than dropped, as
 //! everywhere else on this facade: a filter that silently did not apply hands
@@ -83,6 +84,20 @@ pub(super) trait Columns {
     /// The refusal for a name it does not carry, naming it: a filter that
     /// silently did not apply hands the client rows it did not ask for.
     fn missing(&self, name: &str) -> String;
+
+    /// The cell a `FUNC(arg)` names in this context, if it has such a form.
+    ///
+    /// `Ok(None)` means this context has no function of that name, which the
+    /// parser refuses as unsupported. `arg` is `None` when the call was not
+    /// `FUNC(one bare argument)`, the only call shape this grammar reads: a
+    /// context that does have the function then answers a refusal for the shape
+    /// rather than a cell.
+    ///
+    /// A `where` clause has no function form at all and takes this default, so
+    /// every call in one is refused by name exactly as before.
+    fn call(&self, _func: &str, _arg: Option<&str>) -> Result<Option<Cell>, String> {
+        Ok(None)
+    }
 }
 
 impl Columns for Layer {
@@ -853,10 +868,7 @@ impl Parser<'_> {
     /// literal, something this parser does not implement, or a column.
     fn word_operand(&mut self, word: &str) -> Result<Operand, String> {
         if matches!(self.after(), Some(Token::Open)) {
-            return Err(format!(
-                "the function '{}(...)' is not supported in a where clause",
-                shown(word)
-            ));
+            return self.call_operand(word);
         }
         if word.eq_ignore_ascii_case("null") {
             self.at += 1;
@@ -886,6 +898,34 @@ impl Parser<'_> {
             .ok_or_else(|| self.columns.missing(word))?;
         self.at += 1;
         Ok(Operand::Column(cell))
+    }
+
+    /// A `FUNC(...)` where a value was expected, resolved through the seam: a
+    /// `having` clause's aggregates are functions, and a `where` clause has none.
+    ///
+    /// `FUNC(one bare argument)` is the only shape read, which is all an aggregate
+    /// takes. `*` and a number are among the arguments because a count of rows is
+    /// written `COUNT(*)` by hand and `COUNT(1)` by code generators.
+    fn call_operand(&mut self, word: &str) -> Result<Operand, String> {
+        let arg = match (self.tokens.get(self.at + 2), self.tokens.get(self.at + 3)) {
+            (Some(Token::Word(arg)), Some(Token::Close)) => Some(arg.clone()),
+            (Some(Token::Number(arg)), Some(Token::Close)) => Some(arg.clone()),
+            (Some(Token::Sign('*')), Some(Token::Close)) => Some("*".to_string()),
+            _ => None,
+        };
+        match self.columns.call(word, arg.as_deref())? {
+            // a cell is only ever answered for the one-argument shape above, so
+            // the four tokens read are exactly this call. Refusing otherwise keeps
+            // the parser in step with the tokens whatever a resolver does.
+            Some(cell) if arg.is_some() => {
+                self.at += 4;
+                Ok(Operand::Column(cell))
+            }
+            _ => Err(format!(
+                "the function '{}(...)' is not supported in a where clause",
+                shown(word)
+            )),
+        }
     }
 }
 
@@ -1390,6 +1430,28 @@ mod tests {
                 why.contains(names),
                 "'{clause}' was refused as '{why}', which does not name {names}"
             );
+        }
+    }
+
+    /// A `where` clause has no function form at all, so every call in one is
+    /// refused by name. The aggregates a `having` clause resolves are functions,
+    /// and the seam is what keeps them out of here: a clause over the layer's rows
+    /// cannot name one, whatever the layer's fields are called.
+    #[test]
+    fn a_where_clause_has_no_function_form() {
+        for clause in [
+            "count(pop) > 1",
+            "COUNT(*) > 1",
+            "COUNT(1) > 1",
+            "sum(pop) > 1",
+            "avg(pop) > 1",
+            "min(name) = 'a'",
+        ] {
+            let why = refusal(clause);
+            assert!(why.contains("is not supported in a where clause"), "{why}");
+            // and the refusal names the function the client wrote
+            let named = clause.split('(').next().unwrap();
+            assert!(why.contains(named), "'{clause}' was refused as '{why}'");
         }
     }
 

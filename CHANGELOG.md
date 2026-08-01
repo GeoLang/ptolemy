@@ -19,23 +19,38 @@ All notable changes to this project will be documented in this file.
   carries no credential.
 
 - 2026-07-31: `having` on the ArcGIS facade's query, over the grouped answer
-  `outStatistics` and `groupByFieldsForStatistics` produce. The grammar is the
-  where clause's, through the same parser, but an identifier names a column of the
-  aggregated answer rather than a field of the layer: a grouped field's name or an
-  `outStatisticFieldName`. The predicate filters whole groups after the
-  aggregation, and ordering and paging compose after it. Nothing a client sends
-  reaches the SQL: the answer's columns are renamed to this crate's own `c1`..`cN`
-  by a wrapping subquery and the predicate is rendered over those, so an alias
-  never becomes an identifier, and every literal is bound. The where clause's
-  type rules apply to the aggregated columns, from the SQL type each one already
+  `outStatistics` and `groupByFieldsForStatistics` produce. Accepted under both of
+  the parameter's names, `having` and `havingClause`, because Esri's REST reference
+  uses the second and the ArcGIS JS API's own property is the first; one clause
+  under both names is answered and two different ones are refused. The grammar is
+  the where clause's, through the same parser, and the primary form is the one the
+  REST reference documents: an aggregate function over a field of the layer,
+  `COUNT(houses) > 1000` or `AVG(pop) >= 20 AND MIN(score) >= 5`. The docs are
+  explicit that those aggregates need not appear in `outStatistics`, so one that
+  does not is computed to filter the groups and is never projected into the
+  response. `COUNT(*)` and `COUNT(1)` count the rows in a group and `COUNT(field)`
+  counts the values that are there, which is both what SQL does and what Esri
+  documents. Naming a column the answer projects, by its grouped field name or its
+  `outStatisticFieldName`, also works: the REST reference says the parameter does
+  not take an `outStatisticFieldName`, so that form is an extension rather than
+  the contract. The seven aggregates are the same closed set `outStatistics` has,
+  a field resolves through the layer, and a numeric aggregate over a field the
+  layer declares as text is refused in the same words `outStatistics` refuses it
+  in. The predicate filters whole groups after the aggregation, and ordering and
+  paging compose after it. Nothing a client sends reaches the SQL: every column of
+  the subquery is renamed to this crate's own `c1`..`cN` and the predicate is
+  rendered over those, so neither an alias nor a function a client wrote becomes
+  an identifier, and every literal and every property key is bound. The where
+  clause's type rules apply, from the SQL type each aggregated column already
   holds: a count compares as a whole number, `sum`, `avg`, `stddev` and `var` as
   doubles, and a `min`, a `max` or a grouped field by the kind of the field it
-  read. It needs both parameters to have something to filter, and the missing one
-  is named: an ungrouped statistics query is one row, which a predicate could only
-  keep or drop whole. A column the answer does not carry is refused by name with
-  the columns it could have named listed, so a field of the layer that the answer
-  left out cannot be reached back to. A layer's `advancedQueryCapabilities` now
-  declares `supportsHavingClause`, and `having` is no longer refused by name.
+  read. One clause may add at most 32 aggregates the answer does not already
+  carry, the same cap `outStatistics` has. It needs both parameters to have
+  something to filter, and the missing one is named: an ungrouped statistics query
+  is one row, which a predicate could only keep or drop whole. A bare field of the
+  layer names no column of a grouped answer and is refused by name, with the
+  aggregate to write instead. A layer's `advancedQueryCapabilities` now declares
+  `supportsHavingClause`, and `having` is no longer refused by name.
 
 - 2026-07-31: The ArcGIS facade tracks changes, so a client that read a service
   once can ask what moved since. A layer's generation is the depth of `main`'s

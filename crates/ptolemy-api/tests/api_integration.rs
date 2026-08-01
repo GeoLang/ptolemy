@@ -10047,7 +10047,211 @@ async fn test_arcgis_query_statistics_refuse_what_they_cannot_answer() {
 /// Helper: a `having` clause as a query parameter, encoded so the URL carries
 /// the clause the test wrote and nothing else.
 fn having_param(clause: &str) -> String {
-    format!("having={}", urlencoding::encode(clause))
+    having_named("having", clause)
+}
+
+/// The same under either of the parameter's two names: Esri's REST reference
+/// calls it `havingClause` and the JS API's property is `having`.
+fn having_named(name: &str, clause: &str) -> String {
+    format!("{name}={}", urlencoding::encode(clause))
+}
+
+/// The form Esri's REST reference documents: an aggregate function over a field of
+/// the layer, which the docs say need not appear in `outStatistics`. Such an
+/// aggregate is computed to filter the groups and is not served back.
+#[tokio::test]
+async fn test_arcgis_query_having_takes_aggregate_functions() {
+    let (app, _) = setup_app().await;
+    let name = format!("havingfn_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    // north holds two scores and south one, so a count of the values that are
+    // there tells the two groups apart while a count of rows does not
+    let summed = stats_param(json!([{"statisticType": "sum", "onStatisticField": "pop"}]));
+    let grouped = format!("{summed}&groupByFieldsForStatistics=ward&orderByFields=ward");
+
+    // the docs' own shape: the aggregate the clause filters by is absent from
+    // outStatistics, so it is computed for the filter and never projected
+    let (status, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("COUNT(score) > 1")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    assert_eq!(
+        attributes(&body),
+        vec![json!({"ward": "north", "sum_pop": 30.0})],
+        "{body}"
+    );
+    // and the answer carries the two columns it asked for and no third one
+    assert_eq!(body["fields"].as_array().unwrap().len(), 2, "{body}");
+
+    // COUNT(*) counts the rows in a group, so both wards clear it: this is the
+    // difference between counting rows and counting the values that are there
+    let (_, rows) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("COUNT(*) = 2")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&rows),
+        vec![
+            json!({"ward": "north", "sum_pop": 30.0}),
+            json!({"ward": "south", "sum_pop": 70.0}),
+        ],
+        "{rows}"
+    );
+    // COUNT(1) is the same count written the way a code generator writes it
+    let (_, ones) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("COUNT(1) = 2")),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&ones).len(), 2, "{ones}");
+    // while a count of a field with a null in it keeps north alone
+    let (_, values) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("COUNT(score) = 2")),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&values).len(), 1, "{values}");
+    assert_eq!(attributes(&values)[0]["ward"], "north", "{values}");
+
+    // the docs' combined example shape, AVG(...) >= n AND MIN(...) >= m, over a
+    // request whose outStatistics asks for neither of them
+    let counted = stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]));
+    let (_, combined) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{counted}&groupByFieldsForStatistics=ward&orderByFields=ward&{}",
+                having_param("AVG(pop) >= 20 AND MIN(score) >= 5")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&combined),
+        vec![json!({"ward": "south", "count_pop": 2})],
+        "{combined}"
+    );
+
+    // every aggregate of the closed set is available to the clause, projected or
+    // not: south is the group of 30 and 40
+    for clause in [
+        "SUM(pop) > 50",
+        "AVG(pop) > 25",
+        "MIN(pop) > 25",
+        "MAX(pop) > 35",
+        "COUNT(code) = 2 AND SUM(pop) > 50",
+    ] {
+        let (_, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{grouped}&{}", having_param(clause))),
+        )
+        .await;
+        assert!(body["error"].is_null(), "{clause}: {body}");
+        assert_eq!(
+            attributes(&body),
+            vec![json!({"ward": "south", "sum_pop": 70.0})],
+            "{clause}: {body}"
+        );
+    }
+
+    // the sample forms behave as they do in outStatistics: south holds one score,
+    // and one value has no sample deviation, so its group is dropped rather than
+    // compared against a zero
+    for clause in ["VAR(score) > 1", "STDDEV(score) > 1"] {
+        let (_, body) = get_json(
+            &app,
+            &query_url(&name, &format!("{grouped}&{}", having_param(clause))),
+        )
+        .await;
+        assert_eq!(
+            attributes(&body),
+            vec![json!({"ward": "north", "sum_pop": 30.0})],
+            "{clause}: {body}"
+        );
+    }
+
+    // the aggregate a clause names may be one the answer projects, and then it is
+    // that column that is filtered on
+    let (_, projected) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{grouped}&{}", having_param("SUM(pop) > 100")),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&projected), Vec::<Value>::new(), "{projected}");
+
+    // `havingClause` is the same parameter under the name the REST reference uses
+    let (status, spelled) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{grouped}&{}",
+                having_named("havingClause", "COUNT(score) > 1")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{spelled}");
+    assert_eq!(
+        attributes(&spelled),
+        vec![json!({"ward": "north", "sum_pop": 30.0})],
+        "{spelled}"
+    );
+
+    // one clause under both names asks for one thing, which is answerable
+    let (_, twice) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{grouped}&{}&{}",
+                having_param("COUNT(score) > 1"),
+                having_named("havingClause", "COUNT(score) > 1")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&twice).len(), 1, "{twice}");
+
+    // paging and ordering still compose after a filter on an unprojected column
+    let (_, page) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{grouped}&{}&resultRecordCount=1",
+                having_param("COUNT(*) = 2")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&page).len(), 1, "{page}");
+    assert_eq!(attributes(&page)[0]["ward"], "north", "{page}");
+    assert_eq!(page["exceededTransferLimit"], true, "{page}");
+
+    // the layer is untouched by any of it
+    assert_eq!(facade_count(&app, &name).await, 4);
 }
 
 /// `having` filters the aggregated rows: the groups are made first and the
@@ -10304,6 +10508,38 @@ async fn test_arcgis_query_having_refuses_what_it_cannot_honor() {
                 having_param("ward = 'north'")
             ),
             "outStatistics",
+        ),
+        // the function form is held to the type rule outStatistics is held to
+        (
+            format!("{grouped}&{}", having_param("AVG(code) > 1")),
+            "avg is not supported on 'code'",
+        ),
+        (
+            format!("{grouped}&{}", having_param("SUM(ward) > 1")),
+            "sum is not supported on 'ward'",
+        ),
+        // a function this service has no aggregate for, and a field it has not got
+        (
+            format!("{grouped}&{}", having_param("MEDIAN(pop) > 1")),
+            "MEDIAN",
+        ),
+        (
+            format!("{grouped}&{}", having_param("AVG(nosuchfield) > 1")),
+            "nosuchfield",
+        ),
+        // an aggregate takes one field name and nothing else
+        (
+            format!("{grouped}&{}", having_param("AVG(pop, score) > 1")),
+            "avg takes one field name",
+        ),
+        // the two names are one parameter, so two different clauses is a refusal
+        (
+            format!(
+                "{grouped}&{}&{}",
+                having_param("COUNT(*) > 1"),
+                having_named("havingClause", "COUNT(*) > 100")
+            ),
+            "two names for one parameter",
         ),
     ] {
         let (status, body) = get_json(&app, &query_url(&name, &params)).await;

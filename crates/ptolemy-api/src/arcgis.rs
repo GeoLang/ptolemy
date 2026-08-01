@@ -48,7 +48,7 @@
 //! send and renders it as SQL with every literal bound, and refuses the rest by
 //! name for the reason above. Both use that one parser: a `where` clause names
 //! the layer's fields and filters the rows, and a `having` clause names the
-//! columns of a grouped answer and filters the groups. `orderByFields` and
+//! aggregates of a grouped answer and filters the groups. `orderByFields` and
 //! `outStatistics` are read the same way, by the `order_by` and `statistics`
 //! modules, and every one of them renders a field through `column`, which is the
 //! single place a property becomes SQL.
@@ -343,6 +343,39 @@ const UNSUPPORTED: [&str; 11] = [
     "geometryPrecision",
     "datumTransformation",
 ];
+
+/// The two names one parameter goes by. Esri's REST reference calls it
+/// `havingClause` and the ArcGIS JS API's own property is `having`, so a client
+/// may send either and both are read. Sending both with different values is
+/// refused: which of the two the client meant to filter by is not something to
+/// guess at.
+const HAVING_NAMES: [&str; 2] = ["having", "havingClause"];
+
+/// The clause a request asks to filter its groups by, under the name it sent it
+/// as, so a refusal quotes the spelling the client used.
+fn having_clause(params: &Params) -> Result<Option<(&'static str, &str)>, EsriError> {
+    let held: Vec<(&'static str, &str)> = HAVING_NAMES
+        .iter()
+        .filter_map(|name| {
+            params
+                .get(name)
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .map(|raw| (*name, raw))
+        })
+        .collect();
+    match held.as_slice() {
+        [] => Ok(None),
+        [(name, raw)] => Ok(Some((name, raw))),
+        // the same clause under both names asks for one thing, which is answerable
+        [(name, raw), (_, same)] if raw == same => Ok(Some((name, raw))),
+        _ => Err(EsriError::bad_request(format!(
+            "{} and {} are two names for one parameter and this request sends a different clause \
+             under each. Send one of them.",
+            HAVING_NAMES[0], HAVING_NAMES[1]
+        ))),
+    }
+}
 
 /// The response encoding a query answers in. `pjson` is `json` a browser can
 /// read; nothing downstream distinguishes them, so it is an alias.
@@ -1095,27 +1128,24 @@ async fn run_query(
     // make those rows and the grouping that makes more than one of them. Each
     // missing parameter is named rather than the clause being dropped, which
     // would answer every group under the client's own filter.
-    let asked_having = params
-        .get("having")
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty());
-    if asked_having.is_some() {
+    let asked_having = having_clause(&params)?;
+    if let Some((name, _)) = asked_having {
         if asked_stats.is_none() {
-            return Err(EsriError::bad_request(
-                "having filters the statistics outStatistics asks for, and this request asks for \
-                 none",
-            ));
+            return Err(EsriError::bad_request(format!(
+                "{name} filters the statistics outStatistics asks for, and this request asks for \
+                 none"
+            )));
         }
         if params
             .get("groupByFieldsForStatistics")
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            return Err(EsriError::bad_request(
-                "having filters the groups groupByFieldsForStatistics makes, and this request \
+            return Err(EsriError::bad_request(format!(
+                "{name} filters the groups groupByFieldsForStatistics makes, and this request \
                  names none. An ungrouped statistics query is one row, which a filter can only \
-                 keep or drop whole.",
-            ));
+                 keep or drop whole."
+            )));
         }
     }
 
@@ -1243,13 +1273,15 @@ async fn run_query(
     if let Some(raw) = asked_stats {
         let held = statistics::parse(raw, params.get("groupByFieldsForStatistics"), &layer)
             .map_err(EsriError::bad_request)?;
-        // the clause resolves against the answer's own columns rather than the
-        // layer's fields, because that is what a group holds: see `statistics`
+        // the clause resolves against the aggregated answer and the layer behind
+        // it, not against the rows: see `statistics`. An aggregate it names that
+        // the answer does not project is collected while it parses
+        let columns = held.having(&layer);
         let having = asked_having
-            .map(|clause| {
-                where_clause::parse(clause, &held).map_err(|why| {
+            .map(|(name, clause)| {
+                where_clause::parse(clause, &columns).map_err(|why| {
                     EsriError::bad_request(format!(
-                        "having '{}' is not supported in this version of the service: {why}",
+                        "{name} '{}' is not supported in this version of the service: {why}",
                         shown(clause)
                     ))
                 })
@@ -1267,16 +1299,25 @@ async fn run_query(
                 next + 1
             ),
             // the groups are made first and filtered after, which is what a
-            // HAVING is, and the subquery is what gives the client's columns this
-            // crate's own names to be filtered under. The ordinals the order and
-            // the tiebreaker run on name the same columns in either shape.
+            // HAVING is, and the subquery is what gives every column this crate's
+            // own name to be filtered under. The outer select projects the
+            // answer's own columns alone, so an aggregate the clause asked for and
+            // outStatistics did not is computed for the filter and never served.
+            // The ordinals the order and the tiebreaker run on name the same
+            // columns in either shape.
             Some(having) => {
+                let extra = columns.extra_sql(&mut next, &mut binds);
                 let filter = having.sql(&mut next, &mut binds);
-                let aliases = held.aliases().join(", ");
+                let grouped = std::iter::once(select)
+                    .chain(extra)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
-                    "{rows} SELECT {aliases} FROM (SELECT {select} FROM numbered{predicate}{}) \
-                     AS grouped ({aliases}) WHERE {filter}{} LIMIT ${} OFFSET ${}",
+                    "{rows} SELECT {} FROM (SELECT {grouped} FROM numbered{predicate}{}) \
+                     AS grouped ({}) WHERE {filter}{} LIMIT ${} OFFSET ${}",
+                    held.aliases().join(", "),
                     held.group_by(),
+                    columns.aliases().join(", "),
                     order_clause(&sorted),
                     next,
                     next + 1
