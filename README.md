@@ -298,17 +298,39 @@ download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
 `deleteAttachments`), with the writes gated like `applyEdits`.
 
 `extractChanges` answers what changed on `main` since a generation the client
-already holds. A layer's generation is the depth of `main`'s head, the number of
-changesets from the root to it, so the service root states `ChangeTracking` among
-its capabilities and publishes `changeTrackingInfo.layerServerGens`, and a client
-sends that number back. The job is stateless: `POST extractChanges` with
-`layers=0` and `layerServerGens=[{"id": 0, "serverGen": <n>}]` answers a
-`statusUrl`, the status answers `Completed` with a `resultUrl` on the first ask,
-and the change file holds the object ids of the rows added, updated and deleted
-in the window. The window is pinned to the head the submit saw, so a commit
-landing between the submit and the fetch belongs to the next one. A job id is
+already holds. A layer's generation is a point on its own event clock: the epoch
+milliseconds of the latest thing that happened on `main`, which is the newest of
+the head changeset's time and the times attachments on the branch were created and
+deleted at, and 0 for a branch nothing has happened to. The service root states
+`ChangeTracking` among its capabilities and publishes
+`changeTrackingInfo.layerServerGens`, and a client sends that number back.
+
+A clock rather than a count of commits, because uploading an attachment commits no
+changeset. A count left every attachment invisible to the cursor: a client that
+loaded features in one commit and then uploaded the attachments recorded a
+generation whose changeset predated all of them, so the next delta reported them
+all as adds and duplicated them, while one deleted later was created and deleted
+inside that same window and was reported in neither list, staying forever.
+
+The job is stateless: `POST extractChanges` with `layers=0` and
+`layerServerGens=[{"id": 0, "serverGen": <n>}]` answers a `statusUrl`, the status
+answers `Completed` with a `resultUrl` on the first ask, and the change file holds
+the object ids of the rows added, updated and deleted in the window. A window is
+half open, `(<n>, the clock at the submit]`: the features in it are the diff from
+the deepest changeset at or before `<n>`, which is the newest state the client
+already held, to the head the submit pinned. Both ends are fixed at the submit, so
+anything landing between the submit and the fetch belongs to the next window, and
+the generation the change file reports is where that next one opens. A job id is
 opaque and carries the whole request, so nothing is stored server side, and one
 this service did not issue is refused rather than answered.
+
+A generation below the layer's first commit is refused naming the floor, and so is
+one ahead of its clock. Both are cursors this service's clock could not have
+issued: in particular a cursor recorded when generations counted commits is a small
+number, which as a clock reading is 1970 and would open a window before the layer
+existed and report everything in it as an add. The refusal says to extract the
+layer in full and record the generation that answer carries. Generation 0 is not
+one of those, being the clock an untouched branch publishes and a full extraction.
 
 Only a layer with a real integer `objectid` publishes any of that, for the same
 reason only such a layer takes edits, and neither does a dataset whose rows come
@@ -318,25 +340,17 @@ fetches the rows themselves through `/query`. `dataFormat=sqlite`, the positiona
 `serverGens` form and a `returnInserts`/`returnUpdates`/`returnDeletes` of
 `false` are refused by name.
 
-A change file also reports attachment changes, off the attachments table's own
-timestamps rather than off a generation: an attachment commits no changeset, so it
-advances no generation and there is no ancestor to diff against. The window is
-the time range starting at the `created_at` of the changeset the requested
-generation names, and the beginning of time at generation 0. An attachment created
-after that start and still live is an add carrying `attachmentId`, `globalId`,
-`parentGlobalId`, `contentType`, `name`, `size` and an absolute `url` to fetch the
-bytes from; one deleted after the start that was already there when it opened is
-an attachment global id in `deleteIds`; one created and deleted inside the window
-is in neither, because the client never held it. `updates` is always empty, since
+A change file reports attachment changes over that same window. An attachment
+created inside it and still there when it closed is an add carrying `attachmentId`,
+`globalId`, `parentGlobalId`, `contentType`, `name`, `size` and an absolute `url`
+to fetch the bytes from; one already there when it opened that went inside it is an
+attachment global id in `deleteIds`; one created and deleted inside it is in
+neither, because the client never held it. `updates` is always empty, since
 replacing an attachment here is a delete and an upload.
 
-Being a time range makes the boundary approximate. The changeset timestamp is the
-API process's clock and an attachment's is the database's, so an attachment
-uploaded in the same instant as the bounding changeset may fall on either side of
-it. The range also has no upper bound, unlike the feature diff, which is pinned to
-the head the submit saw: an attachment arriving between the submit and the fetch is
-in the answer. Bounding it at the pinned head would leave out every attachment
-uploaded since the last commit, which is most of them.
+Every comparison is on the one clock, so the boundary is exact: a changeset's time
+and an attachment's both come from the database, and an instant is always the same
+generation, being truncated to the millisecond rather than rounded.
 
 Deleting an attachment is a soft delete: the row keeps its bytes and gains a
 `deleted_at`, which is what a change file diffs. Every read filters tombstones

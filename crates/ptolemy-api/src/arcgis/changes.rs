@@ -5,12 +5,25 @@
 //! `extractChanges`: what changed on the dataset's `main` branch since a
 //! generation the client already holds.
 //!
-//! A layer's generation is the depth of `main`'s head: how many changesets stand
-//! between the root and the head along the parent chain, and 0 for a branch with
-//! no commit yet. Depth only ever grows, because a commit appends to `main` and
-//! this facade's own writes commit there, so it is a cursor a client can write
-//! down and send back. Generation N names the ancestor at that depth, and the
-//! window is the store's own diff from that ancestor to the head.
+//! A layer's generation is a point on its own event clock: the epoch milliseconds
+//! of the latest thing that happened on `main`, which is the newest of the head
+//! changeset's time and the times attachments on the branch were created and
+//! deleted at. A branch nothing has happened to is at 0. It only ever grows, as
+//! long as time does, so it is a cursor a client can write down and send back.
+//!
+//! A clock rather than a count of commits, because uploading an attachment
+//! commits no changeset. Counting commits made every attachment invisible to the
+//! cursor: a client that loaded features in one commit and then uploaded the
+//! attachments recorded a generation whose changeset predated every one of them,
+//! so the next delta reported them all as adds and duplicated them, while one of
+//! them deleted later was created and deleted inside that same window and was
+//! reported in neither list, staying forever.
+//!
+//! A window from generation G is therefore half open, `(G, the clock at the
+//! submit]`, over both kinds of event. The features in it are the store's own
+//! diff from the deepest changeset the client already held, which is the newest
+//! one at or before G, to the head the submit pinned. A generation naming no
+//! changeset that early diffs from nothing.
 //!
 //! Only a layer with a real objectid column publishes any of this. A row-number
 //! layer's ids shift when a feature is deleted, so a list of the ids that changed
@@ -21,37 +34,30 @@
 //!
 //! The job is stateless. The protocol is submit, poll, fetch, and there is
 //! nothing here worth a job table: the job id carries the head the window is
-//! pinned to and the generation it starts from, the poll always answers
-//! `Completed`, and the fetch recomputes the diff. Pinning the head at submit is
-//! what keeps a commit that lands between the submit and the fetch out of the
-//! answer, so the change file and the generation it reports agree.
+//! pinned to and the two generations it runs between, the poll always answers
+//! `Completed`, and the fetch recomputes the diff.
 //!
 //! A change file's features carry the object id and nothing else. The consumer
 //! this exists for reads the ids and fetches the rows themselves through
 //! `/query`, so a geometry here would be bytes nobody reads.
 //!
-//! Attachment changes are reported off the attachments table's own timestamps,
-//! not off a generation. An attachment commits no changeset, so it advances no
-//! generation and there is no ancestor to diff against: the window is the time
-//! range that starts at the `created_at` of the changeset the requested
-//! generation names, and the beginning of time at generation 0. An attachment
-//! created after that start and still live is an add, and one deleted after it
-//! that was already there at the start is a delete, by the tombstone migration
-//! 026 put on the table.
-//!
-//! Being a time range makes it approximate at the boundary instant, in two ways
-//! a client should know about. An attachment uploaded in the same instant as the
-//! changeset that bounds the window may fall on either side of it, because both
-//! timestamps come from the one database clock and nothing orders them. And the
-//! range has no upper bound, unlike the feature diff, which is pinned to the head
-//! the submit saw: an attachment that arrives between the submit and the fetch is
-//! in the answer. Bounding it at the pinned head instead would leave out every
-//! attachment uploaded since the last commit, which is most of them, since
-//! uploading one is not a commit.
+//! The attachments in the window are the ones the tombstone migration 026 put on
+//! the table made visible: one created inside it and still there when it closed
+//! is an add, one that was already there when it opened and went inside it is a
+//! `deleteId`, and one created and deleted inside it cancels, because the client
+//! never held it. Every comparison is on the same clock the generation is, so the
+//! boundary is exact rather than approximate: both a changeset's time and an
+//! attachment's now come from the database, and one instant is always the same
+//! integer, being truncated to the millisecond rather than rounded.
 //!
 //! `updates` is always empty. Replacing an attachment here is a delete and an
 //! upload, which mints a new uuid, so the pair is reported as those two things
 //! and the consumer applies them in that order to the same effect.
+//!
+//! Both ends of the window are fixed at the submit, which is what makes a
+//! generation a cursor that neither duplicates nor loses: the client records the
+//! generation the change file reports, the next window opens exactly there, and an
+//! event that lands between the submit and the fetch belongs to that next one.
 //!
 //! The route table stays in the parent module, as the attachment routes do.
 
@@ -66,7 +72,6 @@ use ptolemy_core::diff::DiffOp;
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::postgres::PgRow;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
@@ -82,60 +87,114 @@ const NO_CHANGESETS: &str = "reads a table ptolemy does not own, so its rows cha
      ptolemy's history and there is no generation window to answer for. Read it through /query, \
      which always answers the table's current rows.";
 
-// ─── Generations ────────────────────────────────────────────────────
+// ─── The event clock ────────────────────────────────────────────────
+
+/// A timestamp as the generation it is: epoch milliseconds, truncated rather than
+/// rounded, so one instant is always the same integer and a comparison against a
+/// generation is exact in both directions. Fixed text over a column name this
+/// module writes, never a client's.
+fn millis_of(column: &str) -> String {
+    format!("floor(EXTRACT(EPOCH FROM {column}) * 1000)::bigint")
+}
+
+/// The branch's event clock: the latest thing that happened on it, as a
+/// generation, and 0 for a branch nothing has happened to.
+///
+/// Three kinds of event, because those are the three a change file reports: the
+/// head changeset, which is the newest one on the chain, and an attachment on the
+/// branch being created or deleted. A client reads this off the service root and
+/// sends it back, so an attachment uploaded after the last commit still moves the
+/// cursor past itself.
+async fn event_clock(store: &AppState, branch_id: Uuid) -> Result<i64, EsriError> {
+    let row = sqlx::query(&format!(
+        "SELECT GREATEST(
+             COALESCE((SELECT {head} FROM changesets c
+                         JOIN branches b ON b.head = c.id
+                        WHERE b.id = $1), 0),
+             COALESCE((SELECT max({created}) FROM attachments WHERE branch_id = $1), 0),
+             COALESCE((SELECT max({deleted}) FROM attachments WHERE branch_id = $1), 0)
+         ) AS clock",
+        head = millis_of("c.created_at"),
+        created = millis_of("created_at"),
+        deleted = millis_of("deleted_at"),
+    ))
+    .bind(branch_id)
+    .fetch_one(store.read_pool())
+    .await?;
+    Ok(row.get("clock"))
+}
+
+/// One changeset on `main`, and the generation it sits at.
+struct Commit {
+    id: Uuid,
+    at: i64,
+}
 
 /// `main`'s changeset chain, head first and the root last.
 ///
-/// The whole chain rather than a count, because one walk answers all three
-/// questions asked of it: how deep the head is, which changeset a generation
-/// names, and whether a changeset a client sent back is on this branch at all.
-struct Chain(Vec<Uuid>);
+/// The whole chain rather than one lookup, because one walk answers all three
+/// questions asked of it: which changeset a generation's diff runs from, when the
+/// branch's first event was, and whether a changeset a client sent back is on this
+/// branch at all.
+struct Chain(Vec<Commit>);
 
 impl Chain {
     async fn of(store: &AppState, branch_id: Uuid) -> Result<Chain, EsriError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "WITH RECURSIVE chain AS (
-                 SELECT c.id, c.parent_id, 0 AS behind
+                 SELECT c.id, c.parent_id, c.created_at, 0 AS behind
                    FROM changesets c
                    JOIN branches b ON b.head = c.id
                   WHERE b.id = $1
                UNION ALL
-                 SELECT c.id, c.parent_id, ch.behind + 1
+                 SELECT c.id, c.parent_id, c.created_at, ch.behind + 1
                    FROM changesets c
                    JOIN chain ch ON ch.parent_id = c.id
              )
-             SELECT id FROM chain ORDER BY behind",
-        )
+             SELECT id, {at} AS at FROM chain ORDER BY behind",
+            at = millis_of("created_at"),
+        ))
         .bind(branch_id)
         .fetch_all(store.read_pool())
         .await?;
-        Ok(Chain(rows.iter().map(|row| row.get("id")).collect()))
-    }
-
-    /// The generation the head is at, which is the chain's length.
-    fn depth(&self) -> i64 {
-        self.0.len() as i64
+        Ok(Chain(
+            rows.iter()
+                .map(|row| Commit {
+                    id: row.get("id"),
+                    at: row.get("at"),
+                })
+                .collect(),
+        ))
     }
 
     fn head(&self) -> Option<Uuid> {
-        self.0.first().copied()
+        self.0.first().map(|held| held.id)
     }
 
-    /// The changeset a generation names. `None` at generation 0, which is the
-    /// branch before its first commit and the point a diff from nothing starts
-    /// at. A generation past the head names nothing.
-    fn at(&self, generation: i64) -> Option<Uuid> {
-        if generation <= 0 || generation > self.depth() {
-            return None;
-        }
-        self.0.get((self.depth() - generation) as usize).copied()
+    /// The generation the branch's first commit sits at, which is the earliest one
+    /// any window here can open at. `None` for a branch with no commit.
+    fn root_at(&self) -> Option<i64> {
+        self.0.last().map(|held| held.at)
     }
 
-    /// The generation a changeset sits at, or `None` when it is not on this
-    /// chain. What makes a job id untrusted data rather than a lookup key.
-    fn generation_of(&self, changeset: Uuid) -> Option<i64> {
-        let behind = self.0.iter().position(|held| *held == changeset)?;
-        Some(self.depth() - behind as i64)
+    /// The changeset a window opening at `generation` runs its diff from: the
+    /// deepest one at or before it, which is the newest state the client already
+    /// holds. `None` when the branch had no commit that early, and the diff then
+    /// starts from nothing.
+    ///
+    /// The chain is newest first and a commit is always younger than its parent,
+    /// so the first one at or before the generation is the deepest one.
+    fn base(&self, generation: i64) -> Option<Uuid> {
+        self.0
+            .iter()
+            .find(|held| held.at <= generation)
+            .map(|held| held.id)
+    }
+
+    /// Whether a changeset is on this branch's own chain. What makes a job id
+    /// untrusted data rather than a lookup key.
+    fn holds(&self, changeset: Uuid) -> bool {
+        self.0.iter().any(|held| held.id == changeset)
     }
 }
 
@@ -181,10 +240,10 @@ async fn external(store: &AppState, dataset_id: Uuid) -> Result<bool, EsriError>
 /// What the service root publishes about change tracking, or `None` for a layer
 /// that cannot be tracked, whose root says nothing about it at all.
 ///
-/// `minServerGen` is the head's depth like `serverGen`: every generation behind
-/// the head is still answerable, because the chain it is read off is the history
-/// itself and nothing here prunes it, but a client is told the current one so it
-/// starts from where the service is now rather than from the beginning of time.
+/// `minServerGen` is the clock like `serverGen`: every generation back to the
+/// branch's first commit is still answerable, because the history it is read off
+/// is never pruned here, but a client is told the current one so it starts from
+/// where the service is now rather than from the beginning of time.
 pub(super) async fn tracking_info(
     store: &AppState,
     layer: &Layer,
@@ -192,29 +251,35 @@ pub(super) async fn tracking_info(
     if !trackable(store, layer).await? {
         return Ok(None);
     }
-    let depth = Chain::of(store, layer.branch_id).await?.depth();
+    let clock = event_clock(store, layer.branch_id).await?;
     Ok(Some(json!({
         "lastSyncDate": Value::Null,
-        "layerServerGens": [{"id": 0, "minServerGen": depth, "serverGen": depth}],
+        "layerServerGens": [{"id": 0, "minServerGen": clock, "serverGen": clock}],
     })))
 }
 
 // ─── Job ids ────────────────────────────────────────────────────────
 
 /// The whole of a submitted request: the head the window is pinned to, `None`
-/// for a branch that had no commit when it was submitted, and the generation the
-/// window starts from.
+/// for a branch that had no commit when it was submitted, the generation the
+/// window opens at, and the clock it closes at.
+///
+/// Both ends are fixed here rather than at the fetch. The head pins which commits
+/// the diff covers, and `at` pins which attachment events do and is the generation
+/// the change file reports back, so the next window opens exactly where this one
+/// closed: nothing is reported twice and nothing falls between two of them.
 ///
 /// It travels in the job id, base64url so a client handles one opaque token, and
 /// the server keeps nothing. It carries no secret and it is not signed, because
 /// nothing about it is trusted: the changeset has to be on the resolved layer's
-/// own chain and the generation has to be one that chain reaches, or the request
-/// is refused. A tampered id therefore cannot reach another dataset's history,
-/// and a malformed one is a refusal rather than a panic.
+/// own chain, the generation has to be one this service would have issued, and the
+/// clock cannot be ahead of the layer's own. A tampered id therefore cannot reach
+/// another dataset's history, and a malformed one is a refusal rather than a panic.
 #[derive(Debug, PartialEq)]
 struct Job {
     head: Option<Uuid>,
     generation: i64,
+    at: i64,
 }
 
 impl Job {
@@ -222,7 +287,7 @@ impl Job {
         use base64::Engine;
         let head = self.head.map(|id| id.to_string()).unwrap_or_default();
         base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!("{head}:{}", self.generation))
+            .encode(format!("{head}:{}:{}", self.generation, self.at))
     }
 
     fn decode(text: &str) -> Result<Job, EsriError> {
@@ -231,16 +296,25 @@ impl Job {
             .decode(text)
             .map_err(|_| unknown_job(text))?;
         let held = String::from_utf8(bytes).map_err(|_| unknown_job(text))?;
-        let (head, generation) = held.split_once(':').ok_or_else(|| unknown_job(text))?;
+        // three fields exactly, so an id issued by the version of this service
+        // that counted commits is refused rather than read as a clock
+        let [head, generation, at] = held.split(':').collect::<Vec<&str>>()[..] else {
+            return Err(unknown_job(text));
+        };
         let head = match head {
             "" => None,
             named => Some(Uuid::parse_str(named).map_err(|_| unknown_job(text))?),
         };
         let generation: i64 = generation.parse().map_err(|_| unknown_job(text))?;
-        if generation < 0 {
+        let at: i64 = at.parse().map_err(|_| unknown_job(text))?;
+        if generation < 0 || at < generation {
             return Err(unknown_job(text));
         }
-        Ok(Job { head, generation })
+        Ok(Job {
+            head,
+            generation,
+            at,
+        })
     }
 }
 
@@ -289,21 +363,47 @@ pub(super) async fn extract_changes(
     tracked_field(&store, &layer).await?;
     let chain = Chain::of(&store, layer.branch_id).await?;
     let asked = requested_generation(&params)?;
-    let depth = chain.depth();
-    if asked > depth {
+    let clock = event_clock(&store, layer.branch_id).await?;
+    if asked > clock {
         return Err(EsriError::bad_request(format!(
-            "serverGen {asked} is ahead of this layer, which is at generation {depth}. Ask for \
-             {depth} or a generation behind it."
+            "serverGen {asked} is ahead of this layer, which is at generation {clock}. Ask for \
+             {clock} or a generation behind it."
         )));
     }
+    check_on_the_clock(asked, &chain)?;
 
     let job = Job {
         head: chain.head(),
         generation: asked,
+        at: clock,
     };
     Ok(Json(json!({
         "statusUrl": under_service(&headers, &service, "jobs", &job.encode()),
     })))
+}
+
+/// Whether a generation is one this service's clock could have issued.
+///
+/// A generation below the branch's first commit is refused rather than answered.
+/// An earlier version of this service counted commits, so the cursor a client
+/// recorded then is a small number like 4, which as a clock reading is 1970 and
+/// names no changeset to diff from: the window would open at nothing and answer
+/// every row and every attachment the layer has as an add, which is the
+/// duplication this clock exists to stop. Told apart from a legitimate 0, which is
+/// the clock a branch nothing has happened to publishes and a full extraction.
+fn check_on_the_clock(generation: i64, chain: &Chain) -> Result<(), EsriError> {
+    let Some(root) = chain.root_at() else {
+        return Ok(());
+    };
+    if generation == 0 || generation >= root {
+        return Ok(());
+    }
+    Err(EsriError::bad_request(format!(
+        "serverGen {generation} predates this layer's clock, which starts at {root}. A generation \
+         is the epoch milliseconds of the last change on the layer, and a version of this service \
+         before it counted commits instead, so a generation recorded then names no point in this \
+         history. Extract the layer in full and record the generation that answer carries."
+    )))
 }
 
 /// The one layer this service has, as the request has to name it. A change file
@@ -424,16 +524,12 @@ fn under_service(headers: &HeaderMap, service: &str, route: &str, job: &str) -> 
 // ─── The job and its change file ────────────────────────────────────
 
 /// A job id as the two poll routes read it: the layer it names, the field a
-/// change file names rows by, the head the window is pinned to and the changeset
-/// it starts from.
+/// change file names rows by, the two ends the submit pinned and the changeset the
+/// feature diff runs from.
 struct Window {
     layer: Layer,
     oid_field: String,
     job: Job,
-    /// The pinned head's own generation, which is where the window ends and what
-    /// the change file reports back. Not the layer's generation now: a commit
-    /// that landed since the submit is outside this window.
-    at: i64,
     from: Option<Uuid>,
 }
 
@@ -452,19 +548,24 @@ async fn window(
     // the pinned head has to be this branch's own history, or a job id edited to
     // name another dataset's changeset would be answered with that dataset's
     // changes
-    let at = match job.head {
-        None => 0,
-        Some(head) => chain.generation_of(head).ok_or_else(|| unknown_job(id))?,
-    };
-    if job.generation > at {
+    if let Some(head) = job.head
+        && !chain.holds(head)
+    {
         return Err(unknown_job(id));
     }
-    let from = chain.at(job.generation);
+    // and neither end can be past where this layer has got to, so an edited clock
+    // cannot hand out a cursor that skips events this service never reported
+    if job.at > event_clock(store, layer.branch_id).await? {
+        return Err(unknown_job(id));
+    }
+    // the same refusal the submit gives, because a job id is data a client sends
+    // rather than a key this service looked up
+    check_on_the_clock(job.generation, &chain)?;
+    let from = chain.base(job.generation);
     Ok(Window {
         layer,
         oid_field,
         job,
-        at,
         from,
     })
 }
@@ -573,7 +674,7 @@ async fn edits(
             "features": {"adds": adds, "updates": updates, "deleteIds": delete_ids},
             "attachments": attachment_edits(store, held, base, service).await?,
         }],
-        "layerServerGens": [{"id": 0, "serverGen": held.at}],
+        "layerServerGens": [{"id": 0, "serverGen": held.job.at}],
     }))
 }
 
@@ -590,37 +691,20 @@ enum Section {
     Neither,
 }
 
-/// The section an attachment falls in, against the window's start. `None` is
-/// generation 0, which starts at the beginning of time: everything live is then
-/// an add, and nothing was there before the window to be reported gone.
-fn section(
-    created_at: OffsetDateTime,
-    deleted_at: Option<OffsetDateTime>,
-    start: Option<OffsetDateTime>,
-) -> Section {
-    let inside = |held: OffsetDateTime| start.is_none_or(|start| held > start);
-    match deleted_at {
-        None if inside(created_at) => Section::Add,
+/// The section an attachment falls in, over the half-open window `(from, to]`.
+///
+/// Both of its own times are generations, so this is integer comparison and the
+/// boundary is exact. Whether it is there is asked as of `to` rather than as of
+/// now: one deleted after the window closed is an add here and a delete in the
+/// next window, which is the order it happened in.
+fn section(created: i64, deleted: Option<i64>, from: i64, to: i64) -> Section {
+    let inside = |held: i64| held > from && held <= to;
+    match deleted {
+        _ if inside(created) && deleted.is_none_or(|gone| gone > to) => Section::Add,
         // there before the window opened and gone inside it
-        Some(gone) if inside(gone) && !inside(created_at) => Section::Delete,
+        Some(gone) if inside(gone) && created <= from => Section::Delete,
         _ => Section::Neither,
     }
-}
-
-/// The instant the window starts at, which is when the changeset the requested
-/// generation names was committed. `None` at generation 0.
-async fn window_start(
-    store: &AppState,
-    from: Option<Uuid>,
-) -> Result<Option<OffsetDateTime>, EsriError> {
-    let Some(changeset) = from else {
-        return Ok(None);
-    };
-    let row = sqlx::query("SELECT created_at FROM changesets WHERE id = $1")
-        .bind(changeset)
-        .fetch_one(store.read_pool())
-        .await?;
-    Ok(Some(row.get("created_at")))
 }
 
 /// What arrived on the layer's branch inside the window and what went.
@@ -634,25 +718,29 @@ async fn attachment_edits(
     base: &str,
     service: &str,
 ) -> Result<Value, EsriError> {
-    let start = window_start(store, held.from).await?;
-    // both timestamps are read against the one start, and the row is classified
-    // in Rust so the two sections cannot drift apart: see `section`
-    let rows = sqlx::query(
-        "SELECT id, feature_id, name, content_type, size_bytes, created_at, deleted_at
+    let from = held.job.generation;
+    let to = held.job.at;
+    // the window's lower end narrows the read and every row is then classified in
+    // Rust, so the two sections cannot drift apart: see `section`
+    let rows = sqlx::query(&format!(
+        "SELECT id, feature_id, name, content_type, size_bytes,
+                {created} AS created_gen, {deleted} AS deleted_gen
            FROM attachments
           WHERE branch_id = $1 AND feature_id IS NOT NULL
-            AND ($2::timestamptz IS NULL OR created_at > $2 OR deleted_at > $2)
+            AND ({created} > $2 OR {deleted} > $2)
           ORDER BY created_at, id",
-    )
+        created = millis_of("created_at"),
+        deleted = millis_of("deleted_at"),
+    ))
     .bind(held.layer.branch_id)
-    .bind(start)
+    .bind(from)
     .fetch_all(store.read_pool())
     .await?;
 
     let mut added: Vec<&PgRow> = Vec::new();
     let mut delete_ids: Vec<String> = Vec::new();
     for row in &rows {
-        match section(row.get("created_at"), row.get("deleted_at"), start) {
+        match section(row.get("created_gen"), row.get("deleted_gen"), from, to) {
             Section::Add => added.push(row),
             Section::Delete => delete_ids.push(attachments::global_id(row.get("id"))),
             Section::Neither => {}
@@ -740,52 +828,83 @@ async fn properties_before_delete(
 mod tests {
     use super::*;
 
-    /// A chain of four commits, head first, as the walk builds it.
+    /// A chain of four commits a second apart, head first, as the walk builds it.
+    /// The generations are the milliseconds the commits sit at.
     fn chain() -> Chain {
-        Chain(vec![
-            Uuid::from_u128(4),
-            Uuid::from_u128(3),
-            Uuid::from_u128(2),
-            Uuid::from_u128(1),
-        ])
+        Chain(
+            [(4, 4000), (3, 3000), (2, 2000), (1, 1000)]
+                .into_iter()
+                .map(|(id, at)| Commit {
+                    id: Uuid::from_u128(id),
+                    at,
+                })
+                .collect(),
+        )
     }
 
     #[test]
-    fn depth_is_how_many_commits_the_head_stands_on() {
-        assert_eq!(chain().depth(), 4);
-        assert_eq!(Chain(Vec::new()).depth(), 0);
-        assert_eq!(Chain(Vec::new()).head(), None);
+    fn the_head_and_the_first_commit_are_the_ends_of_the_chain() {
         assert_eq!(chain().head(), Some(Uuid::from_u128(4)));
+        assert_eq!(chain().root_at(), Some(1000));
+        assert_eq!(Chain(Vec::new()).head(), None);
+        assert_eq!(Chain(Vec::new()).root_at(), None);
+    }
+
+    /// A window's diff runs from the newest commit the client already held, which
+    /// is the deepest one at or before the generation it asks from.
+    #[test]
+    fn the_diff_runs_from_the_deepest_commit_at_or_before_the_generation() {
+        let chain = chain();
+        assert_eq!(chain.base(4000), Some(Uuid::from_u128(4)));
+        assert_eq!(chain.base(3500), Some(Uuid::from_u128(3)));
+        assert_eq!(chain.base(3000), Some(Uuid::from_u128(3)));
+        assert_eq!(chain.base(1000), Some(Uuid::from_u128(1)));
+        // a generation past the head still holds every commit
+        assert_eq!(chain.base(9000), Some(Uuid::from_u128(4)));
+        // before the first commit there is nothing to diff from, so a window
+        // opening there covers the whole layer
+        assert_eq!(chain.base(999), None);
+        assert_eq!(chain.base(0), None);
+        assert_eq!(Chain(Vec::new()).base(4000), None);
     }
 
     #[test]
-    fn a_generation_names_the_ancestor_at_that_depth() {
+    fn a_changeset_off_the_chain_is_not_held_by_it() {
         let chain = chain();
-        assert_eq!(chain.at(1), Some(Uuid::from_u128(1)));
-        assert_eq!(chain.at(3), Some(Uuid::from_u128(3)));
-        assert_eq!(chain.at(4), chain.head());
-        // generation 0 is the branch before its first commit, which is where a
-        // diff from nothing starts
-        assert_eq!(chain.at(0), None);
-        // and nothing past the head is on the chain
-        assert_eq!(chain.at(5), None);
-        assert_eq!(Chain(Vec::new()).at(1), None);
-    }
-
-    #[test]
-    fn a_changeset_off_the_chain_has_no_generation() {
-        let chain = chain();
-        assert_eq!(chain.generation_of(Uuid::from_u128(1)), Some(1));
-        assert_eq!(chain.generation_of(Uuid::from_u128(4)), Some(4));
+        assert!(chain.holds(Uuid::from_u128(1)));
+        assert!(chain.holds(Uuid::from_u128(4)));
         // another dataset's changeset, which is what a tampered job id carries
-        assert_eq!(chain.generation_of(Uuid::from_u128(99)), None);
+        assert!(!chain.holds(Uuid::from_u128(99)));
+    }
+
+    /// A cursor from the version of this service that counted commits reads as
+    /// 1970 on the clock, which would open a window before the layer existed and
+    /// answer every row it has as an add. Refused by name instead.
+    #[test]
+    fn a_generation_below_the_first_commit_is_refused_but_zero_is_not() {
+        let chain = chain();
+        let refused = check_on_the_clock(1, &chain).unwrap_err();
+        assert_eq!(refused.code, 400, "{}", refused.message);
+        assert!(refused.message.contains("predates"), "{}", refused.message);
+        assert!(refused.message.contains("1000"), "{}", refused.message);
+        assert!(check_on_the_clock(4, &chain).is_err());
+        assert!(check_on_the_clock(999, &chain).is_err());
+
+        // the clock a branch nothing has happened to publishes, and a full
+        // extraction, which is not a stale count of commits
+        assert!(check_on_the_clock(0, &chain).is_ok());
+        assert!(check_on_the_clock(1000, &chain).is_ok());
+        assert!(check_on_the_clock(5000, &chain).is_ok());
+        // a branch with no commit has no floor to be under
+        assert!(check_on_the_clock(1, &Chain(Vec::new())).is_ok());
     }
 
     #[test]
     fn a_job_id_round_trips() {
         let job = Job {
             head: Some(Uuid::from_u128(7)),
-            generation: 3,
+            generation: 3000,
+            at: 4000,
         };
         let held = Job::decode(&job.encode()).unwrap();
         assert_eq!(held, job);
@@ -794,27 +913,41 @@ mod tests {
         let empty = Job {
             head: None,
             generation: 0,
+            at: 0,
         };
         assert_eq!(Job::decode(&empty.encode()).unwrap(), empty);
 
         // and the id is opaque rather than a URL a client could read a uuid off
-        assert!(!job.encode().contains('-'), "{}", job.encode());
+        let encoded = job.encode();
+        assert!(
+            !encoded.contains(&Uuid::from_u128(7).to_string()),
+            "{encoded}"
+        );
     }
 
     #[test]
     fn a_tampered_job_id_is_refused_rather_than_guessed_at() {
+        let uuid = "00000000-0000-0000-0000-000000000007";
         for held in [
             "",
             "not base64!!",
             // valid base64url, no separator
             &base64_of("nothing here"),
             // a separator and no uuid
-            &base64_of("head:1"),
+            &base64_of("head:1:2"),
+            // an id from the version that counted commits, which carried two
+            // fields: read as a clock it would open a window in 1970
+            &base64_of(&format!("{uuid}:3")),
             // a uuid and no generation
-            &base64_of("00000000-0000-0000-0000-000000000007:"),
-            &base64_of("00000000-0000-0000-0000-000000000007:tomorrow"),
-            // a generation before the root
-            &base64_of("00000000-0000-0000-0000-000000000007:-1"),
+            &base64_of(&format!("{uuid}::")),
+            &base64_of(&format!("{uuid}:tomorrow:4000")),
+            &base64_of(&format!("{uuid}:3000:tomorrow")),
+            // a generation before the epoch
+            &base64_of(&format!("{uuid}:-1:4000")),
+            // a window that closes before it opens
+            &base64_of(&format!("{uuid}:4000:3000")),
+            // more fields than the id has
+            &base64_of(&format!("{uuid}:1:2:3")),
         ] {
             assert!(Job::decode(held).is_err(), "{held}");
         }
@@ -886,36 +1019,51 @@ mod tests {
         assert!(check_data_format(&geodatabase).is_err());
     }
 
-    /// The window's start, and three instants around it.
-    fn at(seconds: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(seconds).unwrap()
-    }
-
+    /// The window `(100, 200]`, and events on either side of both ends.
     #[test]
-    fn an_attachment_falls_in_the_section_its_timestamps_put_it_in() {
-        let start = Some(at(100));
+    fn an_attachment_falls_in_the_section_its_generations_put_it_in() {
+        let held = |created, deleted| section(created, deleted, 100, 200);
 
         // arrived inside the window and still there
-        assert_eq!(section(at(150), None, start), Section::Add);
+        assert_eq!(held(150, None), Section::Add);
         // there before the window and still there, so the client already has it
-        assert_eq!(section(at(50), None, start), Section::Neither);
+        assert_eq!(held(50, None), Section::Neither);
         // there before the window and gone inside it
-        assert_eq!(section(at(50), Some(at(150)), start), Section::Delete);
+        assert_eq!(held(50, Some(150)), Section::Delete);
         // arrived and went inside the window, which the client never saw
-        assert_eq!(section(at(120), Some(at(150)), start), Section::Neither);
+        assert_eq!(held(120, Some(150)), Section::Neither);
         // gone before the window opened, which the client already knows
-        assert_eq!(section(at(10), Some(at(50)), start), Section::Neither);
-        // the boundary instant itself is outside the window, so an attachment
-        // that shares it with the changeset belongs to the window before this one
-        assert_eq!(section(at(100), None, start), Section::Neither);
+        assert_eq!(held(10, Some(50)), Section::Neither);
+
+        // the window is half open, so the generation it opens at belongs to the
+        // window before it and the one it closes at belongs to this one
+        assert_eq!(held(100, None), Section::Neither);
+        assert_eq!(held(200, None), Section::Add);
+        assert_eq!(held(50, Some(100)), Section::Neither);
+        assert_eq!(held(50, Some(200)), Section::Delete);
+
+        // and nothing after it closes is in it at all
+        assert_eq!(held(250, None), Section::Neither);
+        assert_eq!(held(50, Some(250)), Section::Neither);
     }
 
-    /// Generation 0 starts at the beginning of time: every live attachment is an
-    /// add, and nothing was there before it to report gone.
+    /// One arriving inside the window and deleted after it closed is an add here
+    /// and a delete in the next window, which is the order it happened in: asking
+    /// whether it is there as of now instead would report it in neither, and the
+    /// client would be told to drop something it was never sent.
+    #[test]
+    fn an_attachment_deleted_after_the_window_closed_is_still_an_add_in_it() {
+        assert_eq!(section(150, Some(250), 100, 200), Section::Add);
+        // the next window, which opens where this one closed
+        assert_eq!(section(150, Some(250), 200, 300), Section::Delete);
+    }
+
+    /// Generation 0 opens at the epoch: every attachment the layer has is an add,
+    /// and nothing was there before it to report gone.
     #[test]
     fn generation_zero_holds_every_live_attachment_and_no_deletes() {
-        assert_eq!(section(at(1), None, None), Section::Add);
-        assert_eq!(section(at(1), Some(at(2)), None), Section::Neither);
+        assert_eq!(section(1, None, 0, 200), Section::Add);
+        assert_eq!(section(1, Some(2), 0, 200), Section::Neither);
     }
 
     #[test]

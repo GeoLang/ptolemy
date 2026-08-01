@@ -4,7 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Added
+### Changed
+
+- 2026-08-01: A layer's ArcGIS generation is a point on its own event clock, the
+  epoch milliseconds of the latest change on `main`, instead of the depth of the
+  changeset chain. Depth could not see an attachment, because uploading one commits
+  no changeset: a client that loaded features in one commit and then uploaded the
+  attachments recorded a generation whose changeset predated all of them, so the
+  next delta reported every attachment as an add and duplicated them, while one
+  deleted later was created and deleted inside that same window and was reported in
+  neither list, staying forever. The clock is the newest of the head changeset's
+  time and the times attachments on the branch were created and deleted at, so an
+  upload moves the cursor past itself. A window is now half open, `(G, the clock at
+  the submit]`, with the feature diff running from the deepest changeset at or
+  before `G` and both ends fixed at the submit, so nothing is reported twice and
+  nothing falls between two windows. Every comparison is on that one clock, which
+  makes the boundary exact rather than approximate: `PgStore::commit` now takes a
+  changeset's `created_at` from the database, as every other timestamp a commit
+  writes already did, and reads it back so the answer says what was stored. A
+  generation below the layer's first commit is refused naming the floor, which is
+  what a cursor recorded under the old depth numbering hits: as a clock reading it
+  is 1970, and answering it would report the whole layer as an add. Generation 0
+  still means a full extraction. The protocol shape is unchanged, and a job id from
+  before this release is refused as one this service did not issue.
 
 - 2026-08-01: `/api/v1/datasets/{id}/style` answers the `images` a picture marker
   or fill translates into, between `layers` and `losses`. Keyed by the name the

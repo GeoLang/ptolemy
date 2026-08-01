@@ -933,21 +933,29 @@ impl PgStore {
             }
         }
 
-        // Create changeset
+        // Create changeset.
+        //
+        // The time comes from the database rather than from this process, and is
+        // read back so the answer says what was stored. Every other timestamp a
+        // commit writes already came from there: feature_versions.created_at and
+        // change_feed.created_at are column defaults, and so is an attachment's.
+        // The ArcGIS facade's change tracking compares a changeset against those
+        // attachment timestamps, so two clocks there put its window boundary out
+        // by whatever they disagreed by.
         let changeset_id = Uuid::now_v7();
-        let now = OffsetDateTime::now_utc();
-        sqlx::query(
+        let now: OffsetDateTime = sqlx::query(
             "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             VALUES ($1, $2, $3, $4, $5, now())
+             RETURNING created_at",
         )
         .bind(changeset_id)
         .bind(branch_id)
         .bind(parent_id)
         .bind(message)
         .bind(author)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await?
+        .get("created_at");
 
         // Apply operations as feature_versions
         for op in operations {

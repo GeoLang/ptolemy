@@ -13183,9 +13183,9 @@ async fn test_arcgis_extract_changes_reports_the_edits_since_a_generation() {
     )
     .await;
 
-    // the cursor a full extraction writes down: one commit, so generation 1
+    // the cursor a full extraction writes down, which is when the commit landed
     let root = published_gen(&app, &name).await;
-    assert_eq!(root, 1);
+    assert!(root > 0, "a clock reading, not a count of commits: {root}");
 
     // an add, an update and a delete, which the facade lands as one commit
     let body = form_body(&[
@@ -13210,9 +13210,10 @@ async fn test_arcgis_extract_changes_reports_the_edits_since_a_generation() {
     assert_eq!(adds, vec![201], "{file}");
     assert_eq!(updates, vec![100], "{file}");
     assert_eq!(deletes, vec![200], "{file}");
-    // the window ends where the layer is now, which is one commit on
-    assert_eq!(file_gen(&file), root + 1, "{file}");
-    assert_eq!(published_gen(&app, &name).await, root + 1);
+    // the window closes where the layer is now, which is after the new commit
+    let next = file_gen(&file);
+    assert!(next > root, "{file}");
+    assert_eq!(published_gen(&app, &name).await, next);
 
     // an add carries the object id and no geometry: a client fetches the rows
     // themselves through /query
@@ -13225,18 +13226,18 @@ async fn test_arcgis_extract_changes_reports_the_edits_since_a_generation() {
     assert_eq!(attachments["updates"], json!([]), "{file}");
     assert_eq!(attachments["deleteIds"], json!([]), "{file}");
 
-    // and asking again from the new generation says nothing changed
-    let file = extract_changes(&app, &name, root + 1).await;
+    // and asking again from the generation it reported says nothing changed
+    let file = extract_changes(&app, &name, next).await;
     assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
-    assert_eq!(file_gen(&file), root + 1, "{file}");
+    assert_eq!(file_gen(&file), next, "{file}");
 }
 
-/// Generation 0 is the branch before its first commit, so a window from it holds
-/// every row the layer has.
+/// Generation 0 is the epoch, so a window from it holds every row the layer has.
 #[tokio::test]
 async fn test_arcgis_extract_changes_from_generation_zero_holds_every_row() {
     let (app, _) = setup_app().await;
     let (name, _ds, branch) = editable_layer(&app, "fromzero", "point").await;
+    // a branch nothing has happened to is at 0
     assert_eq!(published_gen(&app, &name).await, 0);
 
     // submitted while the branch is empty: the window is pinned there, so the
@@ -13259,7 +13260,7 @@ async fn test_arcgis_extract_changes_from_generation_zero_holds_every_row() {
     // asked again now, generation 0 covers the commit
     let file = extract_changes(&app, &name, 0).await;
     assert_eq!(changed(&file).0, vec![100], "{file}");
-    assert_eq!(file_gen(&file), 1, "{file}");
+    assert_eq!(file_gen(&file), published_gen(&app, &name).await, "{file}");
 }
 
 /// A commit that lands between the submit and the fetch is outside the window the
@@ -13290,6 +13291,7 @@ async fn test_arcgis_extract_changes_pins_the_head_it_was_submitted_at() {
         ]),
     )
     .await;
+    let pinned_at = published_gen(&app, &name).await;
     let status_url = submit_changes(&app, &name, root).await;
 
     // lands after the submit, so it belongs to the next window
@@ -13306,12 +13308,59 @@ async fn test_arcgis_extract_changes_pins_the_head_it_was_submitted_at() {
 
     let file = collect_changes(&app, &status_url).await;
     assert_eq!(changed(&file).0, vec![200], "{file}");
-    assert_eq!(file_gen(&file), root + 1, "{file}");
+    // the window closes at the clock the submit read, not at the clock now
+    assert_eq!(file_gen(&file), pinned_at, "{file}");
+    assert!(file_gen(&file) < published_gen(&app, &name).await, "{file}");
 
     // and the row that landed after it comes back in the window that starts
     // where this one ended
     let file = extract_changes(&app, &name, file_gen(&file)).await;
     assert_eq!(changed(&file).0, vec![300], "{file}");
+}
+
+/// A cursor recorded when this service counted commits is a small number, which
+/// as a clock reading is 1970. Answering it would open a window before the layer
+/// existed and report every row and every attachment it has as an add, which is
+/// the duplication the clock exists to stop, so it is refused by name instead.
+#[tokio::test]
+async fn test_arcgis_extract_changes_refuses_a_generation_that_predates_the_clock() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "stalegen", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    let clock = published_gen(&app, &name).await;
+
+    // 1 is what a client that had recorded "one commit deep" holds
+    for stale in [1, 2, 7] {
+        let (status, body) =
+            post_form(&app, &extract_changes_url(&name), &extract_body(stale)).await;
+        assert_eq!(status, StatusCode::OK, "{stale}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{stale}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("predates"), "{stale}: {message}");
+        assert!(message.contains(&clock.to_string()), "{stale}: {message}");
+        assert!(
+            message.contains("full"),
+            "it says what to do instead: {message}"
+        );
+    }
+
+    // 0 is not a stale count: it is the clock a branch nothing has happened to
+    // publishes, and a full extraction
+    let file = extract_changes(&app, &name, 0).await;
+    assert_eq!(changed(&file).0, vec![100], "{file}");
+
+    // and the layer's own generation is answered
+    let file = extract_changes(&app, &name, clock).await;
+    assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
 }
 
 /// A generation ahead of the layer is a client holding a cursor from somewhere
@@ -13408,12 +13457,13 @@ async fn test_arcgis_change_tracking_refuses_a_job_id_it_did_not_issue() {
         // base64url of a uuid-shaped name that is not a changeset of this branch
         "ZGVhZGJlZWYtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwOjE".into(),
         // base64url of ":1": a job pinned to a branch with no commit, asking for
-        // a generation that branch never reached
+        // a generation that branch never reached. Two fields where the id has
+        // three, which is also the shape the version that counted commits wrote
         "OjE".into(),
     ];
     // and a good id with a character added, which is no longer one this service
     // wrote
-    let good = submit_changes(&app, &mine, 1).await;
+    let good = submit_changes(&app, &mine, published_gen(&app, &mine).await).await;
     let good_id = good.rsplit('/').next().unwrap().to_string();
     ids.push(format!("{good_id}x"));
 
@@ -13727,9 +13777,12 @@ async fn test_arcgis_change_file_reports_attachment_adds_and_deletes() {
         ]),
     )
     .await;
-    assert_eq!(published_gen(&app, &name).await, 1);
+    // the clock after the load commit, which is what a client extracting here
+    // records before it uploads anything
+    let first = published_gen(&app, &name).await;
+    assert!(first > 0);
 
-    // there before the window opens, so a client at generation 2 holds it
+    // there before the window opens, so a client at the next generation holds it
     let (doomed, doomed_global) = add_attachment(&app, &name, 100, "doomed.png", b"aaa").await;
 
     // the commit that opens the window
@@ -13747,7 +13800,7 @@ async fn test_arcgis_change_file_reports_attachment_adds_and_deletes() {
     .await;
     assert_eq!(status, StatusCode::OK, "{out}");
     let opened = published_gen(&app, &name).await;
-    assert_eq!(opened, 2);
+    assert!(opened > first, "the clock moved with the commit");
 
     // inside the window: one that stays, one that comes and goes, and the delete
     // of the one that was already there
@@ -13806,7 +13859,7 @@ async fn test_arcgis_change_file_reports_attachment_adds_and_deletes() {
 
     // asked from a generation before the doomed one existed, that one is in
     // neither section either: it came and went inside that wider window
-    let earlier = extract_changes(&app, &name, 1).await;
+    let earlier = extract_changes(&app, &name, first).await;
     let (adds, _, deletes) = attachment_sections(&earlier);
     assert_eq!(adds.len(), 1, "{earlier}");
     assert_eq!(adds[0]["attachmentId"], arrived, "{earlier}");
@@ -13828,6 +13881,70 @@ async fn test_arcgis_change_file_reports_attachment_adds_and_deletes() {
     assert_eq!(status, StatusCode::OK, "{out}");
     let head = published_gen(&app, &name).await;
     let file = extract_changes(&app, &name, head).await;
+    assert_eq!(
+        attachment_sections(&file),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "{file}"
+    );
+}
+
+/// The load a migration tool actually does: features in one commit, then the
+/// attachments, then record the generation. Uploading an attachment commits no
+/// changeset, so a generation that counted commits was stuck at the load commit
+/// and reported every attachment as an add on the next delta, duplicating them,
+/// while one deleted later fell inside that same window and was reported in
+/// neither list. The event clock is what closes both.
+#[tokio::test]
+async fn test_arcgis_attachments_uploaded_after_the_load_commit_move_the_clock() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "loadthen", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    let loaded = published_gen(&app, &name).await;
+
+    // the uploads, which commit nothing
+    let (_, first_global) = add_attachment(&app, &name, 100, "one.png", b"aaa").await;
+    let (second, second_global) = add_attachment(&app, &name, 100, "two.png", b"bb").await;
+
+    // the clock moved even though the history did not, which is the whole point:
+    // a cursor recorded now is past the attachments rather than behind them
+    let baseline = published_gen(&app, &name).await;
+    assert!(
+        baseline > loaded,
+        "an upload has to move the clock: {loaded} then {baseline}"
+    );
+
+    // the delta a client takes straight after the load reports nothing at all,
+    // rather than re-adding the attachments it just uploaded
+    let file = extract_changes(&app, &name, baseline).await;
+    assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
+    assert_eq!(
+        attachment_sections(&file),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "no attachment it already holds is reported again: {file}"
+    );
+
+    // and one of them deleted later is reported gone rather than staying forever
+    delete_attachment_via_facade(&app, &name, 100, second).await;
+    let file = extract_changes(&app, &name, baseline).await;
+    let (adds, _, deletes) = attachment_sections(&file);
+    assert!(adds.is_empty(), "{file}");
+    assert_eq!(deletes, vec![second_global], "{file}");
+    assert!(!deletes.contains(&first_global), "{file}");
+
+    // the generation that answer carries is past the delete, so asking again from
+    // it reports nothing: the delete is not repeated either
+    let next = file_gen(&file);
+    assert!(next > baseline, "{file}");
+    let file = extract_changes(&app, &name, next).await;
     assert_eq!(
         attachment_sections(&file),
         (Vec::new(), Vec::new(), Vec::new()),
