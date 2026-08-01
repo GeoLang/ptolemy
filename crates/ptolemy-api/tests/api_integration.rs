@@ -8179,10 +8179,13 @@ fn calls(args: &str, name: &str) -> bool {
 /// entry is either a POST that only computes, or grant management, which
 /// rbac.rs gates harder. Adding a route to this list is the only way to opt out,
 /// and it cannot be done from a request.
-const UNGATED_TEMPLATES: [&str; 51] = [
+const UNGATED_TEMPLATES: [&str; 52] = [
     // the FeatureServer's two queries take a POST body only because an object id
-    // list is too long for a URL. They are the only ungated POSTs on the facade:
-    // applyEdits and the three attachment writes are gated like any other write.
+    // list is too long for a URL, and extractChanges takes one because the
+    // generations it is asked about are JSON. They are the only ungated POSTs on
+    // the facade: applyEdits and the three attachment writes are gated like any
+    // other write.
+    "/arcgis/rest/services/{service}/FeatureServer/extractChanges",
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/queryAttachments",
     "/api/v1/attribute-rules/{id}/validate",
@@ -11139,7 +11142,13 @@ async fn test_arcgis_metadata_says_which_layers_are_editable() {
         &format!("/arcgis/rest/services/{editable}/FeatureServer?f=json"),
     )
     .await;
-    assert_eq!(root["capabilities"], "Query,Create,Update,Delete", "{root}");
+    // the same layer that takes edits is the one whose changes can be described,
+    // and extractChanges is a service operation, so the service says so and the
+    // layer below does not
+    assert_eq!(
+        root["capabilities"], "Query,Create,Update,Delete,ChangeTracking",
+        "{root}"
+    );
     assert_eq!(root["allowGeometryUpdates"], true, "{root}");
 
     let (_, layer) = get_json(
@@ -12077,4 +12086,565 @@ async fn test_arcgis_layer_metadata_declares_attachment_support() {
         layer["advancedQueryCapabilities"]["supportsQueryAttachments"], true,
         "{layer}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ArcGIS FeatureServer change tracking
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: the extractChanges URL of a service. It is a service operation rather
+/// than a layer one, which is where Esri puts it.
+fn extract_changes_url(service: &str) -> String {
+    format!("/arcgis/rest/services/{service}/FeatureServer/extractChanges")
+}
+
+/// Helper: the path a facade URL names, so a test follows a statusUrl or a
+/// resultUrl the way a client does whatever host the base resolved to.
+fn facade_path(url: &Value) -> String {
+    let url = url.as_str().unwrap_or_else(|| panic!("a URL, not {url}"));
+    let at = url
+        .find("/arcgis/")
+        .unwrap_or_else(|| panic!("not a facade URL: {url}"));
+    url[at..].to_string()
+}
+
+/// Helper: the service root, and the generation it publishes for layer 0, which
+/// is the cursor a client writes down at a full read.
+async fn published_gen(app: &axum::Router, service: &str) -> i64 {
+    let (status, root) = get_json(
+        app,
+        &format!("/arcgis/rest/services/{service}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{root}");
+    assert!(
+        root["capabilities"]
+            .as_str()
+            .unwrap()
+            .split(',')
+            .any(|held| held.trim() == "ChangeTracking"),
+        "{root}"
+    );
+    let gens = &root["changeTrackingInfo"]["layerServerGens"][0];
+    assert_eq!(gens["id"], 0, "{root}");
+    assert_eq!(gens["minServerGen"], gens["serverGen"], "{root}");
+    gens["serverGen"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{root}"))
+}
+
+/// Helper: the form body a client submits extractChanges with.
+fn extract_body(since: i64) -> String {
+    form_body(&[
+        ("f", "json".into()),
+        ("layers", "0".into()),
+        (
+            "layerServerGens",
+            json!([{"id": 0, "serverGen": since}]).to_string(),
+        ),
+    ])
+}
+
+/// Helper: submit extractChanges and hand back the job's status URL path.
+async fn submit_changes(app: &axum::Router, service: &str, since: i64) -> String {
+    let (status, job) = post_form(app, &extract_changes_url(service), &extract_body(since)).await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert!(job["error"].is_null(), "{job}");
+    facade_path(&job["statusUrl"])
+}
+
+/// Helper: poll a job to its result and fetch the change file, which is the
+/// whole of what a client does past the submit.
+async fn collect_changes(app: &axum::Router, status_url: &str) -> Value {
+    let (status, held) = get_json(app, &format!("{status_url}?f=json")).await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["status"], "Completed", "{held}");
+    assert_eq!(
+        held["responseType"], "esriDataChangesResponseTypeEdits",
+        "{held}"
+    );
+    let result = facade_path(&held["resultUrl"]);
+    assert!(!result.is_empty(), "{held}");
+    let (status, file) = get_json(app, &result).await;
+    assert_eq!(status, StatusCode::OK, "{file}");
+    assert!(file["error"].is_null(), "{file}");
+    file
+}
+
+/// Helper: the whole delta loop, submit through fetch.
+async fn extract_changes(app: &axum::Router, service: &str, since: i64) -> Value {
+    let status_url = submit_changes(app, service, since).await;
+    collect_changes(app, &status_url).await
+}
+
+/// The object ids a change file names, as adds, updates and deletes. Read the way
+/// the consumer reads them: off the layer's own object id field on an add or an
+/// update, and off `deleteIds` for a delete.
+fn changed(file: &Value) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let edits = &file["edits"][0];
+    assert_eq!(edits["id"], 0, "{file}");
+    let ids = |section: &str| -> Vec<i64> {
+        edits["features"][section]
+            .as_array()
+            .unwrap_or_else(|| panic!("{section} in {file}"))
+            .iter()
+            .map(|row| {
+                row["attributes"]["OBJECTID"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("{row}"))
+            })
+            .collect()
+    };
+    let deletes = edits["features"]["deleteIds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{file}"))
+        .iter()
+        .map(|id| id.as_i64().unwrap_or_else(|| panic!("{id}")))
+        .collect();
+    (ids("adds"), ids("updates"), deletes)
+}
+
+/// The generation a change file's window ended at.
+fn file_gen(file: &Value) -> i64 {
+    let gens = &file["layerServerGens"][0];
+    assert_eq!(gens["id"], 0, "{file}");
+    gens["serverGen"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{file}"))
+}
+
+/// The loop a migration tool rides: read the service root's generation at a full
+/// extraction, edit the layer, then ask what changed since that generation and
+/// get the object ids of the rows that moved.
+#[tokio::test]
+async fn test_arcgis_extract_changes_reports_the_edits_since_a_generation() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "tracked", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 200, "name": "second"}},
+        ]),
+    )
+    .await;
+
+    // the cursor a full extraction writes down: one commit, so generation 1
+    let root = published_gen(&app, &name).await;
+    assert_eq!(root, 1);
+
+    // an add, an update and a delete, which the facade lands as one commit
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "third"}, "geometry": {"x": 3.0, "y": 3.0}}])
+                .to_string(),
+        ),
+        (
+            "updates",
+            json!([{"attributes": {"OBJECTID": 100, "name": "renamed"}}]).to_string(),
+        ),
+        ("deletes", "200".into()),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+
+    let file = extract_changes(&app, &name, root).await;
+    let (adds, updates, deletes) = changed(&file);
+    assert_eq!(adds, vec![201], "{file}");
+    assert_eq!(updates, vec![100], "{file}");
+    assert_eq!(deletes, vec![200], "{file}");
+    // the window ends where the layer is now, which is one commit on
+    assert_eq!(file_gen(&file), root + 1, "{file}");
+    assert_eq!(published_gen(&app, &name).await, root + 1);
+
+    // an add carries the object id and no geometry: a client fetches the rows
+    // themselves through /query
+    let added = &file["edits"][0]["features"]["adds"][0];
+    assert!(added["geometry"].is_null(), "{added}");
+    // attachment changes are never reported, and the arrays say so rather than
+    // being left out
+    let attachments = &file["edits"][0]["attachments"];
+    assert_eq!(attachments["adds"], json!([]), "{file}");
+    assert_eq!(attachments["updates"], json!([]), "{file}");
+    assert_eq!(attachments["deleteIds"], json!([]), "{file}");
+
+    // and asking again from the new generation says nothing changed
+    let file = extract_changes(&app, &name, root + 1).await;
+    assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
+    assert_eq!(file_gen(&file), root + 1, "{file}");
+}
+
+/// Generation 0 is the branch before its first commit, so a window from it holds
+/// every row the layer has.
+#[tokio::test]
+async fn test_arcgis_extract_changes_from_generation_zero_holds_every_row() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "fromzero", "point").await;
+    assert_eq!(published_gen(&app, &name).await, 0);
+
+    // submitted while the branch is empty: the window is pinned there, so the
+    // commit that lands next is outside it
+    let pinned = submit_changes(&app, &name, 0).await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    let file = collect_changes(&app, &pinned).await;
+    assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
+    assert_eq!(file_gen(&file), 0, "{file}");
+
+    // asked again now, generation 0 covers the commit
+    let file = extract_changes(&app, &name, 0).await;
+    assert_eq!(changed(&file).0, vec![100], "{file}");
+    assert_eq!(file_gen(&file), 1, "{file}");
+}
+
+/// A commit that lands between the submit and the fetch is outside the window the
+/// job pinned, so the change file and the generation it reports agree.
+#[tokio::test]
+async fn test_arcgis_extract_changes_pins_the_head_it_was_submitted_at() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "pinned", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    let root = published_gen(&app, &name).await;
+
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 200, "name": "second"}},
+        ]),
+    )
+    .await;
+    let status_url = submit_changes(&app, &name, root).await;
+
+    // lands after the submit, so it belongs to the next window
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(3.0, 3.0),
+             "properties": {"OBJECTID": 300, "name": "third"}},
+        ]),
+    )
+    .await;
+
+    let file = collect_changes(&app, &status_url).await;
+    assert_eq!(changed(&file).0, vec![200], "{file}");
+    assert_eq!(file_gen(&file), root + 1, "{file}");
+
+    // and the row that landed after it comes back in the window that starts
+    // where this one ended
+    let file = extract_changes(&app, &name, file_gen(&file)).await;
+    assert_eq!(changed(&file).0, vec![300], "{file}");
+}
+
+/// A generation ahead of the layer is a client holding a cursor from somewhere
+/// else, so it is refused naming both numbers rather than answered with an empty
+/// window.
+#[tokio::test]
+async fn test_arcgis_extract_changes_refuses_a_generation_past_the_head() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "ahead", "point").await;
+    let (status, body) = post_form(&app, &extract_changes_url(&name), &extract_body(7)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains('7'), "{message}");
+    assert!(message.contains('0'), "{message}");
+}
+
+/// A layer whose object ids are row numbers has nothing to track: an id shifts
+/// when a feature is deleted, so a list of the ids that changed would point at
+/// whatever moved into their place. Its root says nothing about tracking and the
+/// operation is refused by name.
+#[tokio::test]
+async fn test_arcgis_change_tracking_refuses_a_row_number_layer() {
+    let (app, _) = setup_app().await;
+    let name = format!("rownumber_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+    seed_points(&app, branch, 2).await;
+
+    let (status, root) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer?f=json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{root}");
+    assert_eq!(root["capabilities"], "Query", "{root}");
+    assert!(root["changeTrackingInfo"].is_null(), "{root}");
+
+    let (status, body) = post_form(&app, &extract_changes_url(&name), &extract_body(0)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("objectid"),
+        "{body}"
+    );
+}
+
+/// A job id is not a lookup key, it is data a client hands back, so nothing about
+/// it is trusted. A malformed one is refused, and so is a well-formed one issued
+/// for another dataset: without that, an id edited to name another dataset's
+/// changeset would be answered with that dataset's changes.
+#[tokio::test]
+async fn test_arcgis_change_tracking_refuses_a_job_id_it_did_not_issue() {
+    let (app, _) = setup_app().await;
+    let (mine, _ds, branch) = editable_layer(&app, "myjobs", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    let (other, _ds, other_branch) = editable_layer(&app, "otherjobs", "point").await;
+    commit_features(
+        &app,
+        other_branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(9.0, 9.0),
+             "properties": {"OBJECTID": 900, "name": "theirs"}},
+        ]),
+    )
+    .await;
+
+    // the other service's own job id, which names a head this layer's history
+    // never reaches
+    let theirs = submit_changes(&app, &other, 0).await;
+    let stolen = theirs.rsplit('/').next().unwrap().to_string();
+
+    let mut ids = vec![
+        stolen,
+        // not base64 at all, and a base64url alphabet that decodes to no text
+        "not-a-job-id".into(),
+        // base64url of "hello": no separator
+        "aGVsbG8".into(),
+        // base64url of "0000:1": a separator and no changeset
+        "MDAwMDox".into(),
+        // base64url of a uuid-shaped name that is not a changeset of this branch
+        "ZGVhZGJlZWYtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAwOjE".into(),
+        // base64url of ":1": a job pinned to a branch with no commit, asking for
+        // a generation that branch never reached
+        "OjE".into(),
+    ];
+    // and a good id with a character added, which is no longer one this service
+    // wrote
+    let good = submit_changes(&app, &mine, 1).await;
+    let good_id = good.rsplit('/').next().unwrap().to_string();
+    ids.push(format!("{good_id}x"));
+
+    for id in &ids {
+        for route in ["jobs", "changefiles"] {
+            let uri = format!("/arcgis/rest/services/{mine}/FeatureServer/{route}/{id}?f=json");
+            let (status, body) = get_json(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(body["error"]["code"], 400, "{uri}: {body}");
+            assert!(body["edits"].is_null(), "{uri}: {body}");
+        }
+    }
+
+    // the good one still works, so the refusals are the ids and not the routes
+    let file = collect_changes(&app, &good).await;
+    assert_eq!(changed(&file), (vec![], vec![], vec![]), "{file}");
+}
+
+/// Every extract parameter that would change which edits the answer covers is
+/// refused rather than ignored.
+#[tokio::test]
+async fn test_arcgis_extract_changes_refuses_parameters_it_cannot_honor() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "extractparams", "point").await;
+    let gens = json!([{"id": 0, "serverGen": 0}]).to_string();
+
+    for (label, pairs) in [
+        (
+            "a geodatabase this service cannot write",
+            vec![
+                ("layers", "0".to_string()),
+                ("layerServerGens", gens.clone()),
+                ("dataFormat", "sqlite".into()),
+            ],
+        ),
+        (
+            "another layer",
+            vec![
+                ("layers", "1".to_string()),
+                ("layerServerGens", gens.clone()),
+            ],
+        ),
+        (
+            "a generation for another layer",
+            vec![
+                ("layers", "0".to_string()),
+                (
+                    "layerServerGens",
+                    json!([{"id": 1, "serverGen": 0}]).to_string(),
+                ),
+            ],
+        ),
+        ("no generation at all", vec![("layers", "0".to_string())]),
+        (
+            "the positional generation form",
+            vec![
+                ("layers", "0".to_string()),
+                ("layerServerGens", gens.clone()),
+                ("serverGens", "0,0".into()),
+            ],
+        ),
+        (
+            "one kind of edit left out",
+            vec![
+                ("layers", "0".to_string()),
+                ("layerServerGens", gens.clone()),
+                ("returnUpdates", "false".into()),
+            ],
+        ),
+        (
+            "a format that is not json",
+            vec![
+                ("f", "geojson".to_string()),
+                ("layers", "0".into()),
+                ("layerServerGens", gens.clone()),
+            ],
+        ),
+    ] {
+        let body = form_body(&pairs);
+        let (status, out) = post_form(&app, &extract_changes_url(&name), &body).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {out}");
+        assert_eq!(out["error"]["code"], 400, "{label}: {out}");
+        assert!(out["statusUrl"].is_null(), "{label}: {out}");
+    }
+
+    // the three edit kinds are accepted as true, which is what the answer does
+    let body = form_body(&[
+        ("f", "json".into()),
+        ("layers", "0".into()),
+        ("layerServerGens", gens),
+        ("returnInserts", "true".into()),
+        ("returnUpdates", "true".into()),
+        ("returnDeletes", "true".into()),
+        ("returnIdsOnly", "true".into()),
+    ]);
+    let (status, out) = post_form(&app, &extract_changes_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["statusUrl"].as_str().is_some(), "{out}");
+}
+
+/// Change tracking widens nothing: a private dataset is as absent from these
+/// three routes as it is from the query.
+#[tokio::test]
+async fn test_arcgis_change_tracking_does_not_widen_a_private_dataset() {
+    let (app, _state) = setup_app_authed_with_state().await;
+    let name = format!("secretgens_{}", Uuid::now_v7().simple());
+    let admin = token_for(Role::Admin);
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&admin),
+        Some(json!({"name": name, "geometry_type": "point", "srid": 4326,
+                    "created_by": "admin", "visibility": "private"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ds = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        Some(&admin),
+        Some(editable_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{ds}/branches"),
+        Some(&admin),
+        Some(json!({"name": "main", "created_by": "admin"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // the admin's own job id, so the anonymous fetch is refused for the dataset
+    // and not for the id
+    let (status, job) = post_form_as(
+        &app,
+        &extract_changes_url(&name),
+        &extract_body(0),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    let status_url = facade_path(&job["statusUrl"]);
+    let id = status_url.rsplit('/').next().unwrap().to_string();
+
+    let (status, body) = post_form(&app, &extract_changes_url(&name), &extract_body(0)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["error"]["code"], 400, "{body}");
+    for route in ["jobs", "changefiles"] {
+        let uri = format!("/arcgis/rest/services/{name}/FeatureServer/{route}/{id}?f=json");
+        let (status, body) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{uri}: {body}");
+        assert!(body["edits"].is_null(), "{uri}: {body}");
+    }
+
+    // and the admin reads all three
+    let (status, held) = request_as(
+        &app,
+        "GET",
+        &format!("{status_url}?f=json"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["status"], "Completed", "{held}");
+    let (status, file) = request_as(
+        &app,
+        "GET",
+        &facade_path(&held["resultUrl"]),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{file}");
+    assert_eq!(file_gen(&file), 0, "{file}");
 }

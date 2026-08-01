@@ -22,6 +22,10 @@
 //! Attachments are the same rows the native routes serve, through the same store
 //! methods, and are gated the same way an edit is: see the `attachments` module.
 //!
+//! `extractChanges` answers what changed on `main` since a generation the client
+//! holds, out of the branch's own changesets: see the `changes` module for what a
+//! generation is and why only a layer with a real objectid column has one.
+//!
 //! One further divergence there: Esri takes an add with no geometry, for a table
 //! or a shape the client fills in later, and this refuses it. A ptolemy feature
 //! is a geometry and its attributes, and the store's insert takes the geometry
@@ -70,6 +74,7 @@ use uuid::Uuid;
 use crate::{AppState, auth::Actor};
 
 mod attachments;
+mod changes;
 mod column;
 mod order_by;
 mod statistics;
@@ -110,6 +115,22 @@ pub fn arcgis_routes() -> Router<AppState> {
         .route(
             "/arcgis/rest/services/{service}/FeatureServer/{layer}/{oid}/attachments/{attachmentId}",
             get(attachments::download_attachment),
+        )
+        // change tracking. The handlers are in the `changes` module and the
+        // table stays here for the same reason the attachment table does.
+        // `extractChanges` is a service operation rather than a layer one, which
+        // is where Esri puts it and what the job routes hang off.
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/extractChanges",
+            post(changes::extract_changes),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}",
+            get(changes::job_status),
+        )
+        .route(
+            "/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}",
+            get(changes::change_file),
         )
         // an upload's body holds the file, so these two carry their own limit
         // rather than the 2 MiB axum gives a multipart body by default
@@ -773,7 +794,17 @@ async fn service_root(
     require_esri_json(&params)?;
     let layer = resolve(&store, &actor, &service, LAYER_ID).await?;
 
-    Ok(Json(json!({
+    // a layer whose changes can be described says so here and carries the
+    // generation window a client sends back to extractChanges; one whose cannot
+    // says nothing about tracking at all. `ChangeTracking` is stated on the
+    // service and not on the layer because extractChanges is a service operation.
+    let tracking = changes::tracking_info(&store, &layer).await?;
+    let capabilities = match &tracking {
+        Some(_) => format!("{},ChangeTracking", layer.capabilities()),
+        None => layer.capabilities().to_string(),
+    };
+
+    let mut root = json!({
         "currentVersion": CURRENT_VERSION,
         "serviceDescription": format!("ptolemy dataset '{}', branch main", layer.name),
         "description": "",
@@ -787,7 +818,7 @@ async fn service_root(
         "maxRecordCount": MAX_RECORD_COUNT,
         "supportedQueryFormats": "JSON,geoJSON",
         "useStandardizedQueries": true,
-        "capabilities": layer.capabilities(),
+        "capabilities": capabilities,
         "spatialReference": spatial_reference(),
         "layers": [{
             "id": 0,
@@ -801,7 +832,13 @@ async fn service_root(
             "maxScale": 0,
         }],
         "tables": [],
-    })))
+    });
+
+    if let Some(info) = tracking {
+        root["changeTrackingInfo"] = info;
+    }
+
+    Ok(Json(root))
 }
 
 // ─── Layer metadata ─────────────────────────────────────────────────

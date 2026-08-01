@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: The ArcGIS facade tracks changes, so a client that read a service
+  once can ask what moved since. A layer's generation is the depth of `main`'s
+  head, the number of changesets from the root to it: the service root states
+  `ChangeTracking` among its capabilities and publishes
+  `changeTrackingInfo.layerServerGens`, and `POST extractChanges` takes that
+  number back as `layerServerGens`, answers a `statusUrl`, whose status answers
+  `Completed` with a `resultUrl` on the first ask, whose change file holds the
+  object ids of the rows added, updated and deleted between that generation's
+  changeset and the head, out of the store's own diff. The job carries the whole
+  request in an opaque id and nothing is stored server side, and the window is
+  pinned to the head the submit saw, so a commit that lands before the fetch
+  belongs to the next window rather than smearing this one. A job id is untrusted
+  data: the changeset it names has to be on the resolved layer's own `main` chain,
+  so one edited to name another dataset's history is refused rather than answered
+  with it. Only a layer with a real integer `objectid` publishes any of this, for
+  the reason only such a layer takes edits, and neither does a dataset reading a
+  table ptolemy does not own, whose rows change outside ptolemy's history: both
+  refuse `extractChanges` by name. A change file's features carry the object id
+  and no geometry, because a client fetches the rows themselves through `/query`,
+  and a changed row with no object id to name it by refuses the whole window
+  rather than being left out of a list that would report it unchanged. The
+  attachment arrays are always empty, because the attachments table keeps no
+  tombstone and a deleted attachment leaves nothing to diff. All three routes are
+  reads: `extractChanges` is public like the query POST, dataset visibility
+  applies to each of them, and `dataFormat=sqlite`, the positional `serverGens`
+  form and a `returnInserts`/`returnUpdates`/`returnDeletes` of `false` are
+  refused by name.
+
 - 2026-07-31: The ArcGIS facade's query answers statistics, distinct values and
   any order a client asks for. `orderByFields` takes a comma list of
   `field [ASC|DESC]` over the layer's fields instead of the object id alone, with

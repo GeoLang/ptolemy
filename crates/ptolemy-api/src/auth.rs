@@ -31,7 +31,8 @@ pub const WS_PREFIX: &str = "/ws/";
 
 /// The ArcGIS FeatureServer frontend's root. Every route under it reads except
 /// `applyEdits` and the three attachment writes, which are gated like any other
-/// write.
+/// write. `extractChanges` and its two job routes read the branch's changesets,
+/// so they are reads like the query is.
 ///
 /// It is also the only prefix where a request parameter is a credential and
 /// where a refusal is answered in the Geoservices error shape. See
@@ -299,9 +300,12 @@ pub fn needs_write_grant(method: &Method, route: &str) -> bool {
     }
     // the FeatureServer's attachment query lists attachments and takes a POST
     // body for the same reason its feature query does: an object id list is too
-    // long for a URL. Uploading, replacing and deleting one all fall through and
-    // are gated.
-    if route.starts_with(ARCGIS_PREFIX) && route.ends_with("/queryAttachments") {
+    // long for a URL. extractChanges takes one because the generations it is
+    // asked about are JSON, and it only reads the branch's changesets. Uploading,
+    // replacing and deleting an attachment all fall through and are gated.
+    if route.starts_with(ARCGIS_PREFIX)
+        && (route.ends_with("/queryAttachments") || route.ends_with("/extractChanges"))
+    {
         return false;
     }
 
@@ -385,12 +389,16 @@ pub fn classify(method: &Method, route: &str) -> Access {
     }
 
     // the FeatureServer's two queries read and take a POST body only because an
-    // object id list is too long for a URL. They are the only public POSTs on
-    // the facade: applyEdits and the attachment writes fall through to
-    // Access::Write below. The listing and download are GETs, so the read rule
-    // above already answered them.
+    // object id list is too long for a URL, and extractChanges reads the same
+    // rows' history: which rows changed is no more than /query already tells a
+    // caller. They are the only public POSTs on the facade: applyEdits and the
+    // attachment writes fall through to Access::Write below. The job poll and the
+    // change file are GETs, as are the attachment listing and download, so the
+    // read rule above already answered them.
     if route.starts_with(ARCGIS_PREFIX)
-        && (route.ends_with("/query") || route.ends_with("/queryAttachments"))
+        && (route.ends_with("/query")
+            || route.ends_with("/queryAttachments")
+            || route.ends_with("/extractChanges"))
     {
         return Access::Public;
     }
@@ -948,6 +956,41 @@ mod tests {
         assert!(needs_write_grant(
             &Method::POST,
             "/api/v1/branches/x/queryAttachments"
+        ));
+    }
+
+    /// Change tracking reads. `extractChanges` is a POST because the generations
+    /// it is asked about are JSON, and it answers which rows changed, which
+    /// `/query` already tells a caller: it must be public like the query POST and
+    /// must not be caught by the write ladder. The job poll and the change file
+    /// are GETs and are answered by the read rule.
+    #[test]
+    fn classify_arcgis_change_tracking_routes_are_public_reads() {
+        const SERVICE: &str = "/arcgis/rest/services/{service}/FeatureServer";
+        let extract = format!("{SERVICE}/extractChanges");
+        assert_eq!(classify(&Method::POST, &extract), Access::Public);
+        assert!(!needs_write_grant(&Method::POST, &extract));
+
+        for route in [
+            format!("{SERVICE}/jobs/{{jobId}}"),
+            format!("{SERVICE}/changefiles/{{jobId}}"),
+        ] {
+            assert_eq!(classify(&Method::GET, &route), Access::Public, "{route}");
+            assert!(!needs_write_grant(&Method::GET, &route), "{route}");
+            // and nothing about either path makes a mutating method public
+            assert_eq!(classify(&Method::POST, &route), Access::Write, "{route}");
+            assert!(needs_write_grant(&Method::POST, &route), "{route}");
+        }
+
+        // the exemption is scoped to the facade, so it cannot travel to a route
+        // somewhere else that ends in the same word
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/branches/x/extractChanges"),
+            Access::Write
+        );
+        assert!(needs_write_grant(
+            &Method::POST,
+            "/api/v1/branches/x/extractChanges"
         ));
     }
 

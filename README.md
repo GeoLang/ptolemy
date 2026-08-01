@@ -33,7 +33,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
 - **OGC API - Features** — Part 1 & 2 compliant
-- **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes and attachments, so Esri clients connect unchanged
+- **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes, attachments and `extractChanges` deltas, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)
 
@@ -281,6 +281,29 @@ Attachments are served and edited through the Esri routes (per-feature list and
 download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
 `deleteAttachments`), with the writes gated like `applyEdits`.
 
+`extractChanges` answers what changed on `main` since a generation the client
+already holds. A layer's generation is the depth of `main`'s head, the number of
+changesets from the root to it, so the service root states `ChangeTracking` among
+its capabilities and publishes `changeTrackingInfo.layerServerGens`, and a client
+sends that number back. The job is stateless: `POST extractChanges` with
+`layers=0` and `layerServerGens=[{"id": 0, "serverGen": <n>}]` answers a
+`statusUrl`, the status answers `Completed` with a `resultUrl` on the first ask,
+and the change file holds the object ids of the rows added, updated and deleted
+in the window. The window is pinned to the head the submit saw, so a commit
+landing between the submit and the fetch belongs to the next one. A job id is
+opaque and carries the whole request, so nothing is stored server side, and one
+this service did not issue is refused rather than answered.
+
+Only a layer with a real integer `objectid` publishes any of that, for the same
+reason only such a layer takes edits, and neither does a dataset whose rows come
+from a table ptolemy does not own, whose rows change outside ptolemy's history.
+Features in a change file carry the object id and no geometry, because a client
+fetches the rows themselves through `/query`. The attachment arrays in a change
+file are always empty: the attachments table keeps no tombstone, so a deleted
+attachment leaves nothing to diff and reporting adds alone would read as nothing
+deleted. `dataFormat=sqlite`, the positional `serverGens` form and a
+`returnInserts`/`returnUpdates`/`returnDeletes` of `false` are refused by name.
+
 Layer metadata carries `drawingInfo` when the dataset has a symbology rule whose
 symbol is tagged `{"format": "esri-drawing-info"}`, which is what verne writes
 when it migrates a hosted feature layer. The stored document is served back
@@ -485,6 +508,9 @@ client but any JSON structure will work.
 | GET POST | `/arcgis/rest/services/{service}/FeatureServer/0/queryAttachments` | ArcGIS attachment listing |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/0/{oid}/attachments` | ArcGIS feature attachments |
 | POST | `.../0/{oid}/addAttachment`, `updateAttachment`, `deleteAttachments` | ArcGIS attachment edits |
+| POST | `/arcgis/rest/services/{service}/FeatureServer/extractChanges` | ArcGIS change extraction |
+| GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
+| GET | `/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}` | ArcGIS change file |
 | GET | `/api/v1/audit` | Audit log |
 | GET | `/api/v1/branches/{id}/locks` | List feature locks |
 | POST | `/api/v1/branches/{id}/locks` | Lock a feature |
