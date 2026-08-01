@@ -363,7 +363,10 @@ A dataset with no such rule has no `drawingInfo` key at all.
 `GET /api/v1/datasets/{id}/style` translates that same document into Mapbox GL
 layers for non-Esri clients, with `source` and `sourceLayer` overridable by query
 parameter and everything the translation could not carry over listed under
-`losses`.
+`losses`. `images` carries the bitmaps a picture marker or fill inlines, keyed by
+the name the layers reference them under and each holding a `data_uri`, a `width`
+and a `height` in CSS pixels: the consumer registers them before the layers draw.
+The key is always present, empty for a style with no pictures in it.
 
 Not served: datasets whose `geometry_type` is `geometry` or
 `geometry_collection`, which have no single Esri layer type.

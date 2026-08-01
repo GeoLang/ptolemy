@@ -1920,8 +1920,9 @@ dependencies = [
 [[package]]
 name = "jung-esri"
 version = "0.1.0"
-source = "git+https://github.com/GeoLang/jung.git?branch=master#0f9cda5676faf2b77d4e665e705162a80fa7e69c"
+source = "git+https://github.com/GeoLang/jung.git?branch=master#ef5dc62d8f6f0b6ebdaebe48090c6e04b9771e1e"
 dependencies = [
+ "serde",
  "serde_json",
 ]
 

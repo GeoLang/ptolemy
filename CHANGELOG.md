@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-01: `/api/v1/datasets/{id}/style` answers the `images` a picture marker
+  or fill translates into, between `layers` and `losses`. Keyed by the name the
+  emitted layers reference the bitmap under, each holding the `data_uri` the symbol
+  inlined and the `width` and `height` in CSS pixels the consumer registers it at.
+  Always present, empty for a style with no pictures, so a consumer needs no test
+  for the key. Passed through as jung-esri built it: nothing here decodes the
+  base64 or looks at the bytes.
+
 - 2026-08-01: Change files from the ArcGIS facade report attachment changes, so a
   delta no longer keeps stale attachments. Three pieces. Attachments are soft
   deleted: a delete stamps `deleted_at` and the row stays, every read on every

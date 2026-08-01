@@ -1357,6 +1357,10 @@ async fn test_dataset_style_translates_stored_drawing_info() {
         "{body}"
     );
 
+    // a vector-only style names no images, and the key is there and empty rather
+    // than absent: the contract from this version on is that it is present
+    assert_eq!(body["images"], json!({}), "{body}");
+
     // the size ramp nobody drew is reported rather than dropped in silence
     let losses = body["losses"].as_array().unwrap();
     assert_eq!(losses.len(), 1, "{body}");
@@ -1381,6 +1385,66 @@ async fn test_dataset_style_translates_stored_drawing_info() {
     assert_eq!(body["layers"][0]["id"], "drilled-circle", "{body}");
     assert_eq!(body["layers"][0]["source"], "verne", "{body}");
     assert_eq!(body["layers"][0]["source-layer"], "drilled", "{body}");
+}
+
+/// A real 1x1 png, the smallest thing a service can inline in a picture symbol.
+const MARKER_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+/// The drawingInfo a hosted layer publishes for an inline picture marker, which
+/// is the renderer whose bitmap the translation has to carry over.
+fn esri_picture_drawing_info() -> Value {
+    json!({
+        "renderer": {
+            "type": "simple",
+            "symbol": {
+                "type": "esriPMS",
+                "url": "5f2b1e.png",
+                "imageData": MARKER_PNG,
+                "contentType": "image/png",
+                "width": 18,
+                "height": 18,
+            }
+        }
+    })
+}
+
+/// A picture marker's bitmap comes back under `images`, and the symbol layer
+/// names it: the consumer registers the image before the layers draw.
+#[tokio::test]
+async fn test_dataset_style_passes_picture_marker_images_through() {
+    let (app, _) = setup_app().await;
+    let name = format!("pics_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    store_esri_symbol(
+        &app,
+        ds,
+        None,
+        json!({"format": "esri-drawing-info", "drawingInfo": esri_picture_drawing_info()}),
+    )
+    .await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{ds}/style")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let images = body["images"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(images.len(), 1, "{body}");
+    let (image_name, image) = images.iter().next().unwrap();
+    assert_eq!(
+        image["data_uri"],
+        format!("data:image/png;base64,{MARKER_PNG}"),
+        "{body}"
+    );
+    // 18 esri points at 96 dpi, the size the consumer registers the bitmap at
+    assert_eq!(image["width"], 24.0, "{body}");
+    assert_eq!(image["height"], 24.0, "{body}");
+
+    // the layer references the image by that name, which is what pairs the two
+    let layers = body["layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1, "{body}");
+    assert_eq!(layers[0]["type"], "symbol", "{body}");
+    assert_eq!(layers[0]["layout"]["icon-image"], *image_name, "{body}");
 }
 
 #[tokio::test]

@@ -242,11 +242,15 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// The dataset's stored Esri style as Mapbox GL layers, with everything the
-/// translation dropped listed alongside them.
+/// The dataset's stored Esri style as Mapbox GL layers, with the images they name
+/// and everything the translation dropped listed alongside them.
 ///
 /// The losses are part of the answer rather than a log line: a client showing a
 /// migrated layer needs to know the renderer had a size ramp nobody drew.
+///
+/// `images` holds the bitmaps a picture marker or fill inlines, as data URIs the
+/// consumer registers before the layers draw. Passed through as the translator
+/// built them: nothing here decodes the base64 or looks at the bytes.
 async fn dataset_style(
     State(store): State<AppState>,
     actor: Actor,
@@ -297,6 +301,10 @@ async fn dataset_style(
         "source": source.source,
         "sourceLayer": source.source_layer,
         "layers": translated.layers,
+        // the bitmaps a picture symbol carries, keyed by the name the layers
+        // reference them under. Always present, empty for a vector-only style, so
+        // a consumer registers what is there without testing for the key
+        "images": translated.images,
         "losses": translated.losses.iter()
             .map(|loss| serde_json::json!({"path": loss.path, "reason": loss.reason}))
             .collect::<Vec<_>>(),
