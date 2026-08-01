@@ -22,10 +22,10 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 | **SFCGAL** | 3D geometry operations: extrude, volume, Minkowski sum, straight skeleton |
 | **h3-pg** | Uber H3 hexagonal spatial indexing, aggregation, compaction |
 | **pg_partman** | Automatic time-based partitioning (audit logs) |
-| **pgvector** | Vector similarity search, feature deduplication, distance-ranked bucketing |
+| **pgvector** | Vector similarity search, feature deduplication, distance-ranked bucketing. Without it the `similarity` routes answer `501` |
 | **pg_trgm** | Fuzzy text search for data catalog |
 | **pointcloud** | LiDAR/point cloud storage and spatial queries |
-| **MobilityDB** | Moving object trajectories, speed/distance analysis |
+| **MobilityDB** | Moving object trajectories, speed/distance analysis. Without it a trajectory is stored as JSONB and the analytics routes answer `501` |
 
 ### Standards Implemented
 
@@ -697,10 +697,10 @@ client but any JSON structure will work.
 | GET | `/api/v1/h3/cell?lng=&lat=` | Point → H3 cell |
 | GET | `/api/v1/h3/boundary?cell=` | Cell → boundary polygon |
 | **Vector Similarity** | | |
-| POST | `/api/v1/branches/{id}/similarity/search` | Similarity search |
-| GET | `/api/v1/branches/{id}/similarity/duplicates` | Find duplicates |
-| POST | `/api/v1/branches/{id}/similarity/embed` | Generate embeddings |
-| POST | `/api/v1/branches/{id}/similarity/cluster` | K-means clustering |
+| POST | `/api/v1/branches/{id}/similarity/search` | Similarity search, needs pgvector |
+| GET | `/api/v1/branches/{id}/similarity/duplicates` | Find duplicates, needs pgvector |
+| POST | `/api/v1/branches/{id}/similarity/embed` | Generate embeddings, needs pgvector |
+| POST | `/api/v1/branches/{id}/similarity/cluster` | K-means clustering, needs pgvector |
 | **Point Cloud** | | |
 | GET | `/api/v1/datasets/{id}/pointclouds` | List point cloud catalogs |
 | POST | `/api/v1/datasets/{id}/pointclouds` | Create catalog |
@@ -714,11 +714,11 @@ client but any JSON structure will work.
 | GET | `/api/v1/datasets/{id}/trajectories` | List trajectories |
 | POST | `/api/v1/datasets/{id}/trajectories` | Create trajectory |
 | GET | `/api/v1/trajectories/{id}` | Get trajectory |
-| GET | `/api/v1/trajectories/{id}/at?timestamp=` | Position at time |
-| GET | `/api/v1/trajectories/{id}/speed` | Speed analysis |
-| GET | `/api/v1/trajectories/{id}/distance` | Distance/duration |
-| POST | `/api/v1/trajectories/{id}/simplify` | Simplify trajectory |
-| POST | `/api/v1/datasets/{id}/trajectories/nearest` | Nearest approach |
+| GET | `/api/v1/trajectories/{id}/at?timestamp=` | Position at time, needs MobilityDB |
+| GET | `/api/v1/trajectories/{id}/speed` | Speed analysis, needs MobilityDB |
+| GET | `/api/v1/trajectories/{id}/distance` | Distance/duration, needs MobilityDB |
+| POST | `/api/v1/trajectories/{id}/simplify` | Simplify trajectory, needs MobilityDB |
+| POST | `/api/v1/datasets/{id}/trajectories/nearest` | Nearest approach, needs MobilityDB |
 | **CQL2 + OGC Tiles** | | |
 | POST | `/api/v1/branches/{id}/features/filter` | CQL2-JSON filter query, `limit` max 10000 |
 | GET | `/api/v1/tiles/tileMatrixSets` | List tile matrix sets |
@@ -796,6 +796,23 @@ ptolemy restore --input ptolemy_backup.dump
 ```bash
 cargo build --release
 ```
+
+## Tests
+
+The suite needs a migrated PostGIS database:
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@localhost/ptolemy_test cargo test --all -- --test-threads=1
+```
+
+`crates/ptolemy-api/tests/route_sweep.rs` is one test that calls every route
+mounted on the router, reading the route list off the router itself so a new
+route is covered without being added anywhere. It fails on SQLSTATE 42703
+(undefined column) and 42P01 (undefined table), which is what a handler naming a
+column the migrations do not create looks like, and every query here is a runtime
+`sqlx::query` that nothing else checks against the schema. It prints what it
+covered and every 500 it saw. Routes it deliberately skips are listed in the
+test with a reason each.
 
 ## Project Structure
 

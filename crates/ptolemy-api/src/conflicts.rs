@@ -562,7 +562,7 @@ impl IntoResponse for ConflictError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ConflictError::Db(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("conflicts", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

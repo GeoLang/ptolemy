@@ -242,7 +242,7 @@ impl IntoResponse for CatalogError {
         let (status, message) = match self {
             CatalogError::Store(e) => crate::errors::store_error_status(&e),
             CatalogError::Db(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("catalog", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

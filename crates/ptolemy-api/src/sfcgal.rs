@@ -246,7 +246,7 @@ impl IntoResponse for SfcgalError {
             SfcgalError::NotFound => (StatusCode::NOT_FOUND, "feature not found".to_string()),
             SfcgalError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             SfcgalError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("sfcgal", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
             SfcgalError::Store(e) => crate::errors::store_error_status(&e),

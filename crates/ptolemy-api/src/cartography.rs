@@ -485,7 +485,7 @@ impl IntoResponse for CartoError {
             CartoError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             CartoError::Store(e) => crate::errors::store_error_status(&e),
             CartoError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("cartography", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

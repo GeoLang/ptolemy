@@ -44,6 +44,18 @@ async fn has_mobilitydb(store: &AppState) -> Result<bool, sqlx::Error> {
         .await
 }
 
+/// The analytics routes below have no JSONB form: they call MobilityDB
+/// functions on `trip` and nothing else answers the question. Without the
+/// extension the call is not a failure to hide behind a 500, it is a route this
+/// deployment does not have.
+async fn require_mobilitydb(store: &AppState) -> Result<(), TrajError> {
+    if has_mobilitydb(store).await? {
+        Ok(())
+    } else {
+        Err(TrajError::NoMobilityDb)
+    }
+}
+
 #[derive(Serialize)]
 struct Trajectory {
     id: Uuid,
@@ -170,6 +182,7 @@ async fn position_at_time(
     Path(id): Path<Uuid>,
     Query(q): Query<PositionAtQuery>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
+    require_mobilitydb(&store).await?;
     let r = sqlx::query(
         "SELECT ST_AsGeoJSON(valueAtTimestamp(trip, $2::timestamptz))::jsonb as position
          FROM trajectories WHERE id = $1",
@@ -191,6 +204,7 @@ async fn trajectory_speed(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
+    require_mobilitydb(&store).await?;
     let r = sqlx::query(
         "SELECT twAvg(speed(trip)) as avg_speed,
                 maxValue(speed(trip)) as max_speed,
@@ -214,6 +228,7 @@ async fn trajectory_distance(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
+    require_mobilitydb(&store).await?;
     let r = sqlx::query(
         "SELECT length(trip)::float as distance,
                 duration(period)::text as duration
@@ -245,6 +260,7 @@ async fn simplify_trajectory(
     Path(id): Path<Uuid>,
     Json(req): Json<SimplifyRequest>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
+    require_mobilitydb(&store).await?;
     let r = sqlx::query(
         "SELECT numInstants(trip) as before_count,
                 numInstants(simplify(trip, $2)) as after_count
@@ -275,6 +291,7 @@ async fn nearest_approach(
     Path(_dataset_id): Path<Uuid>,
     Json(req): Json<NearestApproachRequest>,
 ) -> Result<Json<serde_json::Value>, TrajError> {
+    require_mobilitydb(&store).await?;
     let r = sqlx::query(
         "SELECT nearestApproachDistance(a.trip, b.trip) as distance,
                 nearestApproachInstant(a.trip, b.trip)::text as instant
@@ -297,6 +314,7 @@ enum TrajError {
     Db(sqlx::Error),
     Store(ptolemy_storage::StoreError),
     NotFound,
+    NoMobilityDb,
 }
 impl From<sqlx::Error> for TrajError {
     fn from(e: sqlx::Error) -> Self {
@@ -312,9 +330,13 @@ impl IntoResponse for TrajError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             TrajError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            TrajError::NoMobilityDb => (
+                StatusCode::NOT_IMPLEMENTED,
+                "trajectory analytics need the MobilityDB extension, which this database does not have".to_string(),
+            ),
             TrajError::Store(e) => crate::errors::store_error_status(&e),
             TrajError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("trajectory", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

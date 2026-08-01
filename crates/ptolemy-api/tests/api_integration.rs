@@ -113,6 +113,17 @@ async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// Whether the test database carries an optional extension. The routes that
+/// need one answer 501 where it is missing, so a test has to know which case it
+/// is looking at.
+async fn has_extension(state: &AppState, name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1)")
+        .bind(name)
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap()
+}
+
 /// Helper: create a dataset via API, return its ID.
 async fn create_dataset(app: &axum::Router) -> Uuid {
     let (status, body) = post_json(
@@ -1028,7 +1039,7 @@ async fn test_h3_hexagons() {
 
 #[tokio::test]
 async fn test_vector_generate_embeddings() {
-    let (app, _) = setup_app().await;
+    let (app, state) = setup_app().await;
     let ds_id = create_dataset(&app).await;
     let branch_id = create_branch(&app, ds_id, "main").await;
     let f1 = Uuid::now_v7();
@@ -1044,19 +1055,17 @@ async fn test_vector_generate_embeddings() {
         json!({"fields": ["name"]}),
     )
     .await;
-    // pgvector + pgcrypto might not be installed
-    assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "embed: {status} {body}"
-    );
-    if status == StatusCode::OK {
+    if has_extension(&state, "vector").await {
+        assert_eq!(status, StatusCode::OK, "embed: {body}");
         assert!(body["embedded"].as_i64().unwrap() >= 1);
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "embed: {body}");
     }
 }
 
 #[tokio::test]
 async fn test_vector_similarity_search() {
-    let (app, _) = setup_app().await;
+    let (app, state) = setup_app().await;
     let ds_id = create_dataset(&app).await;
     let branch_id = create_branch(&app, ds_id, "main").await;
 
@@ -1068,10 +1077,46 @@ async fn test_vector_similarity_search() {
         json!({"embedding": embedding, "limit": 5}),
     )
     .await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "similarity: {status} {body}"
-    );
+    let expected = if has_extension(&state, "vector").await {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_IMPLEMENTED
+    };
+    assert_eq!(status, expected, "similarity: {body}");
+}
+
+/// Every route that reads `feature_versions.embedding`, which migration 016
+/// only adds where pgvector is installed. Without it the answer is 501 naming
+/// the extension, never a 500 over the missing column.
+#[tokio::test]
+async fn test_vector_routes_report_missing_pgvector() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let installed = has_extension(&state, "vector").await;
+
+    let reads = [
+        format!("/api/v1/branches/{branch_id}/similarity/duplicates"),
+        format!("/api/v1/branches/{branch_id}/similarity/search"),
+        format!("/api/v1/branches/{branch_id}/similarity/embed"),
+        format!("/api/v1/branches/{branch_id}/similarity/cluster"),
+    ];
+    for (i, uri) in reads.iter().enumerate() {
+        let (status, body) = if i == 0 {
+            get_json(&app, uri).await
+        } else {
+            post_json(&app, uri, json!({"embedding": [0.0], "fields": ["name"]})).await
+        };
+        if installed {
+            assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("pgvector"),
+                "{uri}: {body}"
+            );
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1148,6 +1193,68 @@ async fn test_trajectory_create_and_read_back() {
     assert_eq!(status, StatusCode::OK, "list trajectories: {body}");
     assert_eq!(body[0]["id"], traj_id, "{body}");
     assert_eq!(body[0]["name"], "bus 12", "{body}");
+}
+
+/// The five analytics routes call MobilityDB functions on `trip` and have no
+/// other form, so on stock PostGIS they answer 501 naming the extension rather
+/// than 500 on a function nothing defines.
+#[tokio::test]
+async fn test_trajectory_analytics_report_missing_mobilitydb() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/trajectories"),
+        json!({
+            "name": "bus 12",
+            "points": [
+                {"lng": 1.0, "lat": 2.0, "timestamp": "2024-01-01T00:00:00Z"},
+                {"lng": 3.0, "lat": 4.0, "timestamp": "2024-01-01T01:00:00Z"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create trajectory: {body}");
+    let traj_id = body["id"].as_str().unwrap().to_string();
+    let installed = has_extension(&state, "mobilitydb").await;
+
+    let gets = [
+        format!("/api/v1/trajectories/{traj_id}/at?timestamp=2024-01-01T00:30:00Z"),
+        format!("/api/v1/trajectories/{traj_id}/speed"),
+        format!("/api/v1/trajectories/{traj_id}/distance"),
+    ];
+    let posts = [
+        (
+            format!("/api/v1/trajectories/{traj_id}/simplify"),
+            json!({"tolerance": 0.001}),
+        ),
+        (
+            format!("/api/v1/datasets/{ds_id}/trajectories/nearest"),
+            json!({"trajectory_a": traj_id, "trajectory_b": traj_id}),
+        ),
+    ];
+
+    for uri in &gets {
+        let (status, body) = get_json(&app, uri).await;
+        assert_mobilitydb_answer(installed, status, &body, uri);
+    }
+    for (uri, request) in &posts {
+        let (status, body) = post_json(&app, uri, request.clone()).await;
+        assert_mobilitydb_answer(installed, status, &body, uri);
+    }
+}
+
+fn assert_mobilitydb_answer(installed: bool, status: StatusCode, body: &Value, uri: &str) {
+    if installed {
+        assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("MobilityDB"),
+            "{uri}: {body}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4197,7 +4304,8 @@ async fn seed_private_dataset(app: &axum::Router) -> (Uuid, Uuid, String) {
 
 /// Reads whose handler needs an optional postgres extension the test database
 /// may not have (h3-pg, pgvector). Visibility still has to gate them, so they
-/// stay in the list, but an authorized caller may legitimately get a 500.
+/// stay in the list, but an authorized caller may legitimately get a 500 from
+/// h3 or a 501 from the pgvector routes.
 fn needs_optional_extension(uri: &str) -> bool {
     uri.contains("/h3/") || uri.contains("/similarity/")
 }

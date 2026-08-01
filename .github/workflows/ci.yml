@@ -60,6 +60,10 @@ jobs:
           PGPASSWORD=postgres psql -h localhost -U postgres -d ptolemy_test -c "CREATE EXTENSION IF NOT EXISTS postgis_topology;"
           PGPASSWORD=postgres psql -h localhost -U postgres -d ptolemy_test -c "CREATE EXTENSION IF NOT EXISTS h3;"
         continue-on-error: true
+      # ahead of the rest, and with the output shown: the sweep prints what it
+      # covered and every 500 it saw, which is the part worth reading
+      - name: Route sweep
+        run: cargo test -p ptolemy-api --test route_sweep -- --nocapture
       - name: Integration tests
         run: cargo test --all -- --test-threads=1
 

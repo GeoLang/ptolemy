@@ -327,7 +327,7 @@ impl IntoResponse for StacError {
         let (s, m) = match self {
             StacError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             StacError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("stac", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

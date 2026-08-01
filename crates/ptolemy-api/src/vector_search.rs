@@ -29,6 +29,22 @@ pub fn vector_routes() -> Router<AppState> {
         )
 }
 
+/// Migration 016 only adds `feature_versions.embedding` where pgvector is
+/// installed, and every route here reads it. Without the extension the column
+/// is not there and no query below can be answered, so say so rather than fail
+/// on the missing name.
+async fn require_pgvector(store: &AppState) -> Result<(), VectorError> {
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')")
+            .fetch_one(store.read_pool())
+            .await?;
+    if present {
+        Ok(())
+    } else {
+        Err(VectorError::NoPgvector)
+    }
+}
+
 /// Search for features similar to a given embedding vector.
 #[derive(Deserialize)]
 struct SimilaritySearchRequest {
@@ -56,6 +72,7 @@ async fn similarity_search(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<SimilaritySearchRequest>,
 ) -> Result<Json<Vec<SimilarityResult>>, VectorError> {
+    require_pgvector(&store).await?;
     let embedding_str = format!(
         "[{}]",
         req.embedding
@@ -115,6 +132,7 @@ async fn find_duplicates(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<DuplicateQuery>,
 ) -> Result<Json<Vec<DuplicatePair>>, VectorError> {
+    require_pgvector(&store).await?;
     let rows = sqlx::query(
         "WITH latest AS (
             SELECT DISTINCT ON (fv.feature_id) fv.feature_id as id, fv.embedding
@@ -161,6 +179,7 @@ async fn generate_embeddings(
     Extension(grant): Extension<WriteGrant>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<serde_json::Value>, VectorError> {
+    require_pgvector(&store).await?;
     // deterministic property-based embeddings, computed by pgcrypto in the store
     let embedded = store.embed_branch_features(&grant, &req.fields).await?;
     Ok(Json(
@@ -183,6 +202,7 @@ async fn cluster_by_embedding(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ClusterRequest>,
 ) -> Result<Json<serde_json::Value>, VectorError> {
+    require_pgvector(&store).await?;
     // Use pgvector distance-based partitioning (ntile over embedding distance from centroid)
     let rows = sqlx::query(
         "WITH latest AS (
@@ -223,6 +243,7 @@ async fn cluster_by_embedding(
 enum VectorError {
     Db(sqlx::Error),
     Store(ptolemy_storage::StoreError),
+    NoPgvector,
 }
 impl From<sqlx::Error> for VectorError {
     fn from(e: sqlx::Error) -> Self {
@@ -237,9 +258,14 @@ impl From<ptolemy_storage::StoreError> for VectorError {
 impl IntoResponse for VectorError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
+            VectorError::NoPgvector => (
+                StatusCode::NOT_IMPLEMENTED,
+                "feature similarity needs the pgvector extension, which this database does not have"
+                    .to_string(),
+            ),
             VectorError::Store(e) => crate::errors::store_error_status(&e),
             VectorError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("vector_search", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

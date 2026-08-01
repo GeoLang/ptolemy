@@ -236,6 +236,16 @@ impl EsriError {
         }
     }
 
+    /// Same, for a database error, logged with its SQLSTATE so the route sweep
+    /// can tell a missing column from any other failure.
+    fn db(context: &str, error: &sqlx::Error) -> Self {
+        crate::errors::log_db_error(context, error);
+        EsriError {
+            code: 500,
+            message: "internal error".into(),
+        }
+    }
+
     /// A store refusal as the code the rest of the API answers it with, so a
     /// denial reads as a denial rather than as an internal error. Used on the
     /// write path, where a refusal is the caller's answer. A read's store error
@@ -271,13 +281,16 @@ pub(crate) fn error_response(code: u16, message: &str) -> Response {
 
 impl From<sqlx::Error> for EsriError {
     fn from(e: sqlx::Error) -> Self {
-        EsriError::internal("query", e)
+        EsriError::db("arcgis query", &e)
     }
 }
 
 impl From<ptolemy_storage::StoreError> for EsriError {
     fn from(e: ptolemy_storage::StoreError) -> Self {
-        EsriError::internal("store", e)
+        match &e {
+            ptolemy_storage::StoreError::Db(db) => EsriError::db("arcgis store", db),
+            _ => EsriError::internal("store", e),
+        }
     }
 }
 

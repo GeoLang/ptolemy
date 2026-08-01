@@ -249,7 +249,7 @@ impl IntoResponse for LrsError {
             LrsError::Store(e) => crate::errors::store_error_status(&e),
             LrsError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             LrsError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("lrs", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

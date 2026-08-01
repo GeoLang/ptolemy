@@ -349,7 +349,7 @@ impl IntoResponse for PcError {
             PcError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             PcError::Store(e) => crate::errors::store_error_status(&e),
             PcError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("pointcloud", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

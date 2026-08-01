@@ -6,6 +6,36 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-01: Every mounted route is called against a migrated database on every
+  CI run, and a query naming a column or a table the schema does not have fails
+  the build. Four feature families had shipped with one, three of them found by
+  accident: nothing could catch them, because every query in `ptolemy-api` is a
+  runtime `sqlx::query` and not one is a compile-time `query!`, so sqlx's offline
+  checking does not apply without rewriting every call site. The new sweep,
+  `crates/ptolemy-api/tests/route_sweep.rs`, reads the route list off the router
+  rather than from a list someone maintains, so a route added tomorrow is covered
+  without anyone remembering to add it, calls each one with fixture data, and
+  fails on SQLSTATE 42703 and 42P01. It reads them off the log, since a handler
+  flattens a database error to `internal error` with a 500 and the ArcGIS facade
+  answers 200 with the failure in the body: `errors::log_db_error` is now the one
+  place a database error is logged, and it records the SQLSTATE. A route the
+  sweep cannot build a fixture for is listed in the test with a reason, and a
+  route whose extractor refuses the request fails the sweep, because then the
+  handler never ran and the sweep proved nothing about it.
+  Three things it found are fixed with it. `/geoprocessing/voronoi` took its
+  envelope from a `geometry` column that the subquery it selects from does not
+  have, so the route was a 500 for every request that left `envelope` out.
+  `/topologies/{name}/simplify` read `edge_id` from `ST_GetFaceEdges`, which
+  returns `(sequence, edge)`, and cast a record to `topology.TopoElement`, which
+  is an array: it never parsed, for any input. And the RBAC error path echoed the
+  raw database message to the client, which every other module logs instead.
+  The five MobilityDB analytics routes (`/trajectories/{id}/at`, `/speed`,
+  `/distance`, `/simplify` and the nearest-approach route) and the four pgvector
+  `similarity` routes now answer `501` naming the extension they need. All nine
+  called functions or columns that only exist with the extension installed, so on
+  the stock PostGIS that CI and the compose stack run they were a 500 over a name
+  nothing defines. Their behaviour where the extension is present is unchanged.
+
 - 2026-08-01: A write needs a grant. A dataset with no permission rows anywhere
   used to accept writes from any editor the role gate let through, which was a
   compatibility rule for datasets that predate enforcement, and it meant one

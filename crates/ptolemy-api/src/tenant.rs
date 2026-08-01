@@ -205,7 +205,7 @@ impl IntoResponse for TenantError {
             TenantError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             TenantError::Store(e) => crate::errors::store_error_status(&e),
             TenantError::Db(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("tenant", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

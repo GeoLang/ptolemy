@@ -226,9 +226,11 @@ async fn simplify_topology(
     Json(req): Json<SimplifyRequest>,
 ) -> Result<Json<serde_json::Value>, TopoError> {
     let _rows = sqlx::query(
+        // ST_GetFaceEdges returns (sequence, edge), and a TopoElement is the
+        // two-element array {id, type}, not a record
         "SELECT topology.ST_Simplify(topology.TopoGeom_addElement(
-            topology.CreateTopoGeom($1, 3, 1), (edge_id, 2)::topology.TopoElement
-        ), $2) FROM (SELECT edge_id FROM topology.ST_GetFaceEdges($1, 1) LIMIT 1) sub",
+            topology.CreateTopoGeom($1, 3, 1), ARRAY[edge, 2]::topology.TopoElement
+        ), $2) FROM (SELECT edge FROM topology.ST_GetFaceEdges($1, 1) LIMIT 1) sub",
     )
     .bind(&name)
     .bind(req.tolerance)
@@ -263,7 +265,7 @@ impl IntoResponse for TopoError {
             TopoError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             TopoError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             TopoError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("topology", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

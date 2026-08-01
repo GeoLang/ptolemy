@@ -239,7 +239,7 @@ impl IntoResponse for H3Error {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             H3Error::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("h3", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

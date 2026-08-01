@@ -399,7 +399,9 @@ async fn voronoi(
             .map_err(|_| GeoprocessingError::BadRequest("invalid envelope".into()))?;
         format!("ST_GeomFromGeoJSON('{env_json}')")
     } else {
-        "ST_Envelope(ST_Collect(geometry))".to_string()
+        // the outer select reads from points, which carries the collected
+        // centroids as geom and no geometry column of its own
+        "ST_Envelope(geom)".to_string()
     };
 
     let rows = sqlx::query(&format!(
@@ -917,7 +919,7 @@ impl IntoResponse for GeoprocessingError {
         let (status, message) = match self {
             GeoprocessingError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             GeoprocessingError::Store(e) => {
-                tracing::error!("Geoprocessing DB error: {e}");
+                crate::errors::log_db_error("geoprocessing", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

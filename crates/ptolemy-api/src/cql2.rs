@@ -650,7 +650,7 @@ impl IntoResponse for Cql2Error {
             Cql2Error::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             Cql2Error::Store(e) => crate::errors::store_error_status(&e),
             Cql2Error::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("cql2", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

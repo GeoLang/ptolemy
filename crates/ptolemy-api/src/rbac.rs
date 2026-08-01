@@ -298,7 +298,10 @@ impl IntoResponse for RbacError {
                 let (status, message) = crate::errors::store_error_status(&e);
                 (status, message).into_response()
             }
-            Self::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Self::Db(e) => {
+                crate::errors::log_db_error("rbac", &e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
         }

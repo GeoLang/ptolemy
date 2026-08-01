@@ -657,7 +657,7 @@ impl IntoResponse for NetworkError {
             NetworkError::NotFound => (StatusCode::NOT_FOUND, "network not found".to_string()),
             NetworkError::Store(e) => crate::errors::store_error_status(&e),
             NetworkError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("network", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

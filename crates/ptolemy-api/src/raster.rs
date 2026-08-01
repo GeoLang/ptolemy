@@ -295,7 +295,7 @@ impl IntoResponse for RasterError {
             RasterError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             RasterError::Store(e) => crate::errors::store_error_status(&e),
             RasterError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("raster", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

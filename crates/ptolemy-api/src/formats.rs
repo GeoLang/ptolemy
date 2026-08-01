@@ -623,7 +623,7 @@ impl IntoResponse for FormatError {
             FormatError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             FormatError::Store(e) => crate::errors::store_error_status(&e),
             FormatError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("formats", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

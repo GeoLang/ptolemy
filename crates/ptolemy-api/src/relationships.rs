@@ -309,7 +309,7 @@ impl IntoResponse for RelError {
             RelError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             RelError::Store(e) => crate::errors::store_error_status(&e),
             RelError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("relationships", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

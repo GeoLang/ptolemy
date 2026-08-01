@@ -409,7 +409,7 @@ impl IntoResponse for DomainError {
             DomainError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             DomainError::Store(e) => crate::errors::store_error_status(&e),
             DomainError::Db(e) => {
-                tracing::error!("DB: {e}");
+                crate::errors::log_db_error("domains", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };

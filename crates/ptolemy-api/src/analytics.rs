@@ -324,7 +324,7 @@ impl IntoResponse for AnalyticsError {
         let (status, message) = match self {
             AnalyticsError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AnalyticsError::Store(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("analytics", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

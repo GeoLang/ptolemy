@@ -383,7 +383,7 @@ impl IntoResponse for OgcError {
         let (status, message) = match self {
             OgcError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             OgcError::Store(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("ogc", &e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal error".to_string(),

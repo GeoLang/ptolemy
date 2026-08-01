@@ -790,12 +790,16 @@ impl IntoResponse for QgisError {
             }
             // database errors are logged, never echoed: they can carry
             // connection details and schema internals
+            QgisError::Store(ptolemy_storage::StoreError::Db(e)) => {
+                crate::errors::log_db_error("qgis store", &e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
             QgisError::Store(e) => {
                 tracing::error!("Store error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
             QgisError::Db(e) => {
-                tracing::error!("Database error: {e}");
+                crate::errors::log_db_error("qgis", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
             QgisError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
