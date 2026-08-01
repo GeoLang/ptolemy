@@ -468,16 +468,22 @@ impl PgStore {
     /// The same ladder for an existing attachment, whose owner is either a branch
     /// or a dataset. One query reads the two owner columns, so a delete does not
     /// have to load the blob to find out who guards it.
+    ///
+    /// A tombstoned attachment is absent, so a second delete is refused with the
+    /// same not-found the first one after it was hard deleted used to give.
     pub async fn ensure_attachment_writable(
         &self,
         attachment_id: Uuid,
         writer: &Writer,
     ) -> Result<(), StoreError> {
-        let row = sqlx::query("SELECT branch_id, dataset_id FROM attachments WHERE id = $1")
-            .bind(attachment_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("attachment {attachment_id}")))?;
+        let row = sqlx::query(
+            "SELECT branch_id, dataset_id FROM attachments
+              WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(attachment_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("attachment {attachment_id}")))?;
 
         match (
             row.get::<Option<Uuid>, _>("branch_id"),
@@ -2888,6 +2894,15 @@ impl PgStore {
     }
 
     // ─── Feature Attachments ────────────────────────────────────────────
+    //
+    // A delete is a soft delete: it sets `deleted_at` and the row stays, so the
+    // ArcGIS facade's change files can report what went. Every read here filters
+    // `deleted_at IS NULL`, which is what makes a tombstone invisible to
+    // everything but that one window query. The two id-resolution queries the
+    // permission layer runs, `private_datasets_for_ids` and
+    // `write_targets_for_id`, deliberately do not filter: a tombstoned
+    // attachment still belongs to its dataset, and its visibility and its ladder
+    // must not change because the row was deleted.
 
     pub async fn create_attachment(&self, attachment: &Attachment) -> Result<(), StoreError> {
         sqlx::query(
@@ -2918,7 +2933,7 @@ impl PgStore {
         let rows = sqlx::query(
             "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
              FROM attachments
-             WHERE feature_id = $1 AND branch_id = $2
+             WHERE feature_id = $1 AND branch_id = $2 AND deleted_at IS NULL
              ORDER BY created_at DESC",
         )
         .bind(feature_id)
@@ -2938,7 +2953,7 @@ impl PgStore {
         let rows = sqlx::query(
             "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
              FROM attachments
-             WHERE dataset_id = $1
+             WHERE dataset_id = $1 AND deleted_at IS NULL
              ORDER BY created_at DESC",
         )
         .bind(dataset_id)
@@ -2951,7 +2966,7 @@ impl PgStore {
     pub async fn get_attachment(&self, id: Uuid) -> Result<Attachment, StoreError> {
         let row = sqlx::query(
             "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
-             FROM attachments WHERE id = $1",
+             FROM attachments WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -2974,11 +2989,16 @@ impl PgStore {
         })
     }
 
+    /// Soft delete: the row keeps its bytes and gains a `deleted_at`, so a change
+    /// file can report it gone. Already tombstoned is left alone rather than
+    /// re-stamped, so the time a delete is reported under is the time it happened.
     pub async fn delete_attachment(&self, id: Uuid) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM attachments WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE attachments SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

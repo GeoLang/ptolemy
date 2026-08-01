@@ -166,6 +166,15 @@ const MAX_RECORD_COUNT: i64 = 1000;
 /// The only layer id a dataset's service has.
 const LAYER_ID: &str = "0";
 
+/// The field a layer publishes its features' global ids under.
+///
+/// Virtual: there is no such property, the value is the feature's own uuid, and
+/// only a layer with a real objectid column has one. An Esri client pairs an
+/// attachment with its feature by this field, and verne resolves an attachment's
+/// parent through `where globalid IN (...)`, so a layer that serves attachment
+/// changes has to serve it too. See [`Kind::GlobalId`].
+const GLOBAL_ID_FIELD: &str = "globalid";
+
 /// Every geometry this service stores is in EPSG:4326, and a response says its
 /// reference once rather than once per geometry.
 fn spatial_reference() -> Value {
@@ -427,6 +436,12 @@ fn require_esri_json(params: &Params) -> Result<(), EsriError> {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Oid,
+    /// The feature's own uuid, served as a guid in braces and upper case, which
+    /// is the shape Esri writes a global id in. Backed by the `id` column of the
+    /// read rather than by a property, so a comparison against it runs on that
+    /// column and a literal is normalised to the uuid's canonical text first:
+    /// see `column::Column`.
+    GlobalId,
     Text,
     Integer,
     Double,
@@ -438,6 +453,7 @@ impl Kind {
     fn esri(self) -> &'static str {
         match self {
             Kind::Oid => "esriFieldTypeOID",
+            Kind::GlobalId => "esriFieldTypeGlobalID",
             Kind::Integer => "esriFieldTypeInteger",
             Kind::Double => "esriFieldTypeDouble",
             Kind::Text | Kind::BooleanText | Kind::JsonText => "esriFieldTypeString",
@@ -463,15 +479,16 @@ struct Field {
 
 impl Field {
     /// `editable` is the layer's answer, not the field's: an editable layer
-    /// declares every field but the object id editable, and the id never is,
-    /// because it is the key a client holds the feature by.
+    /// declares every field but the two ids editable, and neither id ever is,
+    /// because they are the keys a client holds the feature by.
     fn declaration(&self, editable: bool) -> Value {
+        let identity = matches!(self.kind, Kind::Oid | Kind::GlobalId);
         let mut out = json!({
             "name": self.name,
             "type": self.kind.esri(),
             "alias": self.alias,
-            "nullable": self.kind != Kind::Oid,
-            "editable": editable && self.kind != Kind::Oid,
+            "nullable": !identity,
+            "editable": editable && !identity,
             "domain": Value::Null,
             "defaultValue": Value::Null,
         });
@@ -595,6 +612,16 @@ impl Layer {
             "Query"
         }
     }
+
+    /// The name a client reads this layer's global ids under, or the empty string
+    /// for a layer that has none. Esri states the empty string rather than
+    /// leaving the key out, and clients read it that way.
+    fn global_id_field(&self) -> &'static str {
+        match self.field(GLOBAL_ID_FIELD) {
+            Some(field) if field.kind == Kind::GlobalId => GLOBAL_ID_FIELD,
+            _ => "",
+        }
+    }
 }
 
 /// ptolemy's geometry type as an Esri layer type.
@@ -687,7 +714,10 @@ async fn resolve(
 /// property keys its features actually carry when it does not.
 ///
 /// The object id field is always first and always declared, so a client always
-/// has a key to page and pair rows by.
+/// has a key to page and pair rows by. The virtual global id follows it on a
+/// layer that has a real objectid column: it is the feature's uuid rather than a
+/// property, and a row-number layer has none, because its rows carry no id a
+/// client can hold either.
 async fn fields_of(
     store: &AppState,
     dataset_id: Uuid,
@@ -709,10 +739,21 @@ async fn fields_of(
         alias: oid.name().to_string(),
         kind: Kind::Oid,
     }];
-    // exactly one field is named objectid: a synthesized id takes that name, so
-    // a property of the same name that is not an integer id cannot also have it
+    let global_id = matches!(oid, Oid::Property(_));
+    if global_id {
+        fields.push(Field {
+            name: GLOBAL_ID_FIELD.to_string(),
+            alias: GLOBAL_ID_FIELD.to_string(),
+            kind: Kind::GlobalId,
+        });
+    }
+    // exactly one field is named objectid, and exactly one globalid: a
+    // synthesized id takes that name, so a property of the same name that is not
+    // an integer id cannot also have it
     for def in declared {
-        if def.name.eq_ignore_ascii_case(oid.name()) {
+        if def.name.eq_ignore_ascii_case(oid.name())
+            || (global_id && def.name.eq_ignore_ascii_case(GLOBAL_ID_FIELD))
+        {
             continue;
         }
         fields.push(Field {
@@ -936,7 +977,7 @@ async fn layer_metadata(
         "copyrightText": "",
         "geometryType": layer.geometry,
         "objectIdField": layer.oid.name(),
-        "globalIdField": "",
+        "globalIdField": layer.global_id_field(),
         "displayField": display.name,
         "fields": layer.fields.iter().map(|f| f.declaration(layer.editable())).collect::<Vec<_>>(),
         "extent": extent,
@@ -1014,6 +1055,8 @@ enum Bind {
     Text(Option<String>),
     Numbers(Vec<f64>),
     Texts(Vec<Option<String>>),
+    /// Feature ids, which no client sends: see [`oids_by_feature`].
+    Uuids(Vec<Uuid>),
 }
 
 /// The branch as `$1` and then each filter's value in the order the filters were
@@ -1031,6 +1074,7 @@ fn bound<'q>(
             Bind::Text(v) => query.bind(v.clone()),
             Bind::Numbers(v) => query.bind(v.clone()),
             Bind::Texts(v) => query.bind(v.clone()),
+            Bind::Uuids(v) => query.bind(v.clone()),
         };
     }
     query
@@ -1365,7 +1409,7 @@ async fn run_query(
         format!("ST_AsGeoJSON(ST_Transform(geometry, {out_srid}))::jsonb")
     };
     let sql = format!(
-        "{rows} SELECT oid, {shape} AS geojson, properties
+        "{rows} SELECT id, oid, {shape} AS geojson, properties
            FROM numbered{predicate}
           ORDER BY {sorted}
           LIMIT ${} OFFSET ${}",
@@ -1379,10 +1423,13 @@ async fn run_query(
         .map(|row| {
             let properties: Value = row.get("properties");
             let oid: Option<i64> = row.get("oid");
+            let feature_id: Uuid = row.get("id");
             let mut attributes = serde_json::Map::new();
             for field in &out_fields {
                 let value = match field.kind {
                     Kind::Oid => oid.map(Value::from).unwrap_or(Value::Null),
+                    // the feature's own uuid, in the shape Esri writes a guid in
+                    Kind::GlobalId => Value::from(attachments::global_id(feature_id)),
                     _ => field.value(&properties),
                 };
                 attributes.insert(field.name.clone(), value);
@@ -1411,7 +1458,7 @@ async fn run_query(
     Ok(Json(match format {
         Format::Esri => json!({
             "objectIdFieldName": layer.oid.name(),
-            "globalIdFieldName": "",
+            "globalIdFieldName": layer.global_id_field(),
             "geometryType": layer.geometry,
             "spatialReference": if out_srid == 4326 { spatial_reference() } else { mercator_reference() },
             "hasZ": false,
@@ -1825,7 +1872,8 @@ async fn apply_edits(
     }
     if params.flag("useGlobalIds")? {
         return Err(EsriError::bad_request(
-            "useGlobalIds is not supported: this layer has no global id field",
+            "useGlobalIds is not supported: an edit here names its feature by the object id in \
+             its attributes, and a global id is served rather than accepted",
         ));
     }
 
@@ -1879,9 +1927,10 @@ async fn apply_edits(
         let mut next = max_oid(&store, &layer).await? + 1;
         for feature in &adds {
             let mut properties = attributes_of(feature)?;
-            // the service assigns the id: a client-supplied one on an add would
-            // either collide with a feature that exists or renumber the layer
-            properties.retain(|key, _| !key.eq_ignore_ascii_case(oid_field));
+            // the service assigns both ids: a client-supplied object id on an add
+            // would either collide with a feature that exists or renumber the
+            // layer, and a global id is the feature's uuid, which the store mints
+            properties.retain(|key, _| !identity_key(key, oid_field));
             properties.insert(oid_field.clone(), json!(next));
             let shape = geometry_of(feature).ok_or_else(|| {
                 EsriError::bad_request(format!("'{}' {NEEDS_A_GEOMETRY}", layer.name))
@@ -1906,9 +1955,9 @@ async fn apply_edits(
         // merged over what the feature holds now
         let mut properties = stored.as_object().cloned().unwrap_or_default();
         for (key, value) in attributes_of(feature)? {
-            // the id stays as stored: it is the key a client holds the feature
-            // by, and an update that changed it would rename the feature
-            if key.eq_ignore_ascii_case(oid_field) {
+            // both ids stay as stored: they are the keys a client holds the
+            // feature by, and an update that changed one would rename the feature
+            if identity_key(&key, oid_field) {
                 continue;
             }
             properties.insert(key, value);
@@ -1987,6 +2036,14 @@ fn results(ids: &[i64]) -> Vec<Value> {
     ids.iter()
         .map(|oid| json!({"objectId": oid, "success": true}))
         .collect()
+}
+
+/// Whether an attribute names one of the layer's two ids, which an edit never
+/// writes. The object id is the service's to assign and the global id is the
+/// feature's uuid, so an attribute of either name is dropped rather than stored
+/// under a key `/query` would never read it back from.
+fn identity_key(key: &str, oid_field: &str) -> bool {
+    key.eq_ignore_ascii_case(oid_field) || key.eq_ignore_ascii_case(GLOBAL_ID_FIELD)
 }
 
 fn unknown_oid(layer: &Layer, oid: i64) -> EsriError {
@@ -2218,6 +2275,42 @@ async fn features_by_oid(
                 layer.name
             )));
         }
+    }
+    Ok(out)
+}
+
+/// The object id of every feature the ids name, for the features that are still
+/// on the branch. The mirror of [`features_by_oid`], through the same numbered
+/// read, so an id here is the id `/query` answers with.
+///
+/// A feature that is gone is absent rather than an error: the caller is reporting
+/// something that hangs off it, and a client that no longer has the feature has
+/// nothing to hang it on.
+async fn oids_by_feature(
+    store: &AppState,
+    layer: &Layer,
+    ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, i64>, EsriError> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let (external, source) = store.features_source_at(layer.branch_id, "$1").await?;
+    let mut next = 2;
+    let mut binds: Vec<Bind> = Vec::new();
+    let oid_sql = layer.oid.sql(&mut next, &mut binds);
+    let sql = format!(
+        "WITH numbered AS (
+             SELECT f.id, {oid_sql} AS oid FROM {source} f
+         )
+         SELECT id, oid FROM numbered WHERE id = ANY(${next}::uuid[]) AND oid IS NOT NULL"
+    );
+    binds.push(Bind::Uuids(ids.to_vec()));
+    let rows = bound(&sql, layer.branch_id, &binds)
+        .fetch_all(store.source_pool(external.as_ref()).await?)
+        .await?;
+    for row in rows {
+        out.insert(row.get("id"), row.get("oid"));
     }
     Ok(out)
 }

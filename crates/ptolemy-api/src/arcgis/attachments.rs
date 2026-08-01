@@ -73,7 +73,7 @@ const MAX_NAME_LEN: usize = 255;
 /// same millisecond would otherwise derive the same id and neither could be
 /// named. A hash collision is still possible and is refused loudly rather than
 /// resolved to whichever row came first: see [`find`].
-fn derived_id(id: Uuid) -> i64 {
+pub(super) fn derived_id(id: Uuid) -> i64 {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(id.as_bytes());
     digest[..6]
@@ -81,9 +81,24 @@ fn derived_id(id: Uuid) -> i64 {
         .fold(0i64, |built, byte| (built << 8) | i64::from(*byte))
 }
 
-/// The uuid as Esri writes a global id: in braces and upper case.
-fn global_id(id: Uuid) -> String {
+/// The uuid as Esri writes a global id: in braces and upper case. Both an
+/// attachment's own id and a feature's are written this way, and `/query` serves
+/// the layer's virtual `globalid` field in the same shape.
+pub(super) fn global_id(id: Uuid) -> String {
     format!("{{{}}}", id.to_string().to_uppercase())
+}
+
+/// The absolute URL an attachment's bytes are fetched from, which is the same
+/// download route [`download_attachment`] serves. Under the facade rather than
+/// under `/api/v1`, so a client holding an Esri-shaped credential can follow it:
+/// `X-Esri-Authorization` and the `token` parameter are read on these paths only.
+pub(super) fn download_url(base: &str, service: &str, oid: i64, attachment: Uuid) -> String {
+    format!(
+        "{}/{}/{oid}/attachments/{}",
+        super::service_url(base, service),
+        super::LAYER_ID,
+        derived_id(attachment)
+    )
 }
 
 /// One attachment as an `attachmentInfo`. `globalId` carries the store's own key,

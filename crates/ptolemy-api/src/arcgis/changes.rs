@@ -30,10 +30,28 @@
 //! this exists for reads the ids and fetches the rows themselves through
 //! `/query`, so a geometry here would be bytes nobody reads.
 //!
-//! Attachment changes are never reported. The attachments table keeps no
-//! tombstone, so a deleted attachment leaves nothing to diff, and adds alone
-//! would read to a client as "nothing was deleted". The arrays are there and
-//! empty.
+//! Attachment changes are reported off the attachments table's own timestamps,
+//! not off a generation. An attachment commits no changeset, so it advances no
+//! generation and there is no ancestor to diff against: the window is the time
+//! range that starts at the `created_at` of the changeset the requested
+//! generation names, and the beginning of time at generation 0. An attachment
+//! created after that start and still live is an add, and one deleted after it
+//! that was already there at the start is a delete, by the tombstone migration
+//! 026 put on the table.
+//!
+//! Being a time range makes it approximate at the boundary instant, in two ways
+//! a client should know about. An attachment uploaded in the same instant as the
+//! changeset that bounds the window may fall on either side of it, because both
+//! timestamps come from the one database clock and nothing orders them. And the
+//! range has no upper bound, unlike the feature diff, which is pinned to the head
+//! the submit saw: an attachment that arrives between the submit and the fetch is
+//! in the answer. Bounding it at the pinned head instead would leave out every
+//! attachment uploaded since the last commit, which is most of them, since
+//! uploading one is not a commit.
+//!
+//! `updates` is always empty. Replacing an attachment here is a delete and an
+//! upload, which mints a new uuid, so the pair is reported as those two things
+//! and the consumer applies them in that order to the same effect.
 //!
 //! The route table stays in the parent module, as the attachment routes do.
 
@@ -47,11 +65,13 @@ use axum::{
 use ptolemy_core::diff::DiffOp;
 use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::postgres::PgRow;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    EsriError, LAYER_ID, Layer, NEEDS_A_REAL_OID, Oid, Params, base_url, require_esri_json,
-    resolve, service_url, shown,
+    EsriError, LAYER_ID, Layer, NEEDS_A_REAL_OID, Oid, Params, attachments, base_url,
+    oids_by_feature, require_esri_json, resolve, service_url, shown,
 };
 use crate::{AppState, auth::Actor};
 
@@ -470,16 +490,23 @@ pub(super) async fn job_status(
 }
 
 /// The change file itself, recomputed against the head the job pinned.
+///
+/// The headers are read for the same reason the job routes read them: an
+/// attachment's bytes are named by an absolute URL, and the host a client can
+/// reach this service by is the one it asked on.
 pub(super) async fn change_file(
     State(store): State<AppState>,
     actor: Actor,
+    headers: HeaderMap,
     Path((service, id)): Path<(String, String)>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, EsriError> {
     let params = Params(params);
     require_esri_json(&params)?;
     let held = window(&store, &actor, &service, &id).await?;
-    Ok(Json(edits(&store, &held).await?))
+    Ok(Json(
+        edits(&store, &held, &base_url(&headers), &service).await?,
+    ))
 }
 
 /// One feature as a change file names it: the object id and nothing else.
@@ -491,7 +518,12 @@ fn row(oid: i64, field: &str) -> Value {
     json!({"attributes": {field: oid}})
 }
 
-async fn edits(store: &AppState, held: &Window) -> Result<Value, EsriError> {
+async fn edits(
+    store: &AppState,
+    held: &Window,
+    base: &str,
+    service: &str,
+) -> Result<Value, EsriError> {
     let field = held.oid_field.as_str();
     let mut adds: Vec<Value> = Vec::new();
     let mut updates: Vec<Value> = Vec::new();
@@ -539,14 +571,118 @@ async fn edits(store: &AppState, held: &Window) -> Result<Value, EsriError> {
         "edits": [{
             "id": 0,
             "features": {"adds": adds, "updates": updates, "deleteIds": delete_ids},
-            // the attachments table keeps no tombstone, so a deleted attachment
-            // leaves nothing to diff and a window over them cannot be built:
-            // stated as empty rather than left out, which is the shape a layer
-            // with no attachment edits has
-            "attachments": {"adds": [], "updates": [], "deleteIds": []},
+            "attachments": attachment_edits(store, held, base, service).await?,
         }],
         "layerServerGens": [{"id": 0, "serverGen": held.at}],
     }))
+}
+
+// ─── Attachment sections ────────────────────────────────────────────
+
+/// Which section of a change file one attachment belongs in.
+#[derive(Debug, PartialEq)]
+enum Section {
+    Add,
+    Delete,
+    /// Outside the window either way, or created and deleted inside it. A file
+    /// the client never saw is not a delete: naming it would tell the client to
+    /// drop an attachment it never had.
+    Neither,
+}
+
+/// The section an attachment falls in, against the window's start. `None` is
+/// generation 0, which starts at the beginning of time: everything live is then
+/// an add, and nothing was there before the window to be reported gone.
+fn section(
+    created_at: OffsetDateTime,
+    deleted_at: Option<OffsetDateTime>,
+    start: Option<OffsetDateTime>,
+) -> Section {
+    let inside = |held: OffsetDateTime| start.is_none_or(|start| held > start);
+    match deleted_at {
+        None if inside(created_at) => Section::Add,
+        // there before the window opened and gone inside it
+        Some(gone) if inside(gone) && !inside(created_at) => Section::Delete,
+        _ => Section::Neither,
+    }
+}
+
+/// The instant the window starts at, which is when the changeset the requested
+/// generation names was committed. `None` at generation 0.
+async fn window_start(
+    store: &AppState,
+    from: Option<Uuid>,
+) -> Result<Option<OffsetDateTime>, EsriError> {
+    let Some(changeset) = from else {
+        return Ok(None);
+    };
+    let row = sqlx::query("SELECT created_at FROM changesets WHERE id = $1")
+        .bind(changeset)
+        .fetch_one(store.read_pool())
+        .await?;
+    Ok(Some(row.get("created_at")))
+}
+
+/// What arrived on the layer's branch inside the window and what went.
+///
+/// `updates` is always empty: see the module documentation. `deleteIds` carries
+/// attachment global ids rather than the numbers `adds` carry as `attachmentId`,
+/// which is what Esri puts there and what the consumer pairs by.
+async fn attachment_edits(
+    store: &AppState,
+    held: &Window,
+    base: &str,
+    service: &str,
+) -> Result<Value, EsriError> {
+    let start = window_start(store, held.from).await?;
+    // both timestamps are read against the one start, and the row is classified
+    // in Rust so the two sections cannot drift apart: see `section`
+    let rows = sqlx::query(
+        "SELECT id, feature_id, name, content_type, size_bytes, created_at, deleted_at
+           FROM attachments
+          WHERE branch_id = $1 AND feature_id IS NOT NULL
+            AND ($2::timestamptz IS NULL OR created_at > $2 OR deleted_at > $2)
+          ORDER BY created_at, id",
+    )
+    .bind(held.layer.branch_id)
+    .bind(start)
+    .fetch_all(store.read_pool())
+    .await?;
+
+    let mut added: Vec<&PgRow> = Vec::new();
+    let mut delete_ids: Vec<String> = Vec::new();
+    for row in &rows {
+        match section(row.get("created_at"), row.get("deleted_at"), start) {
+            Section::Add => added.push(row),
+            Section::Delete => delete_ids.push(attachments::global_id(row.get("id"))),
+            Section::Neither => {}
+        }
+    }
+
+    // the parent's object id, which the download URL names. An attachment whose
+    // feature is no longer on the branch is left out: the same change file reports
+    // that feature gone, so the client drops it and everything hanging off it.
+    let parents: Vec<Uuid> = added.iter().map(|row| row.get("feature_id")).collect();
+    let oids = oids_by_feature(store, &held.layer, &parents).await?;
+    let adds: Vec<Value> = added
+        .iter()
+        .filter_map(|row| {
+            let parent: Uuid = row.get("feature_id");
+            let oid = oids.get(&parent)?;
+            let id: Uuid = row.get("id");
+            Some(json!({
+                "attachmentId": attachments::derived_id(id),
+                "globalId": attachments::global_id(id),
+                "parentGlobalId": attachments::global_id(parent),
+                "contentType": row.get::<String, _>("content_type"),
+                "name": row.get::<String, _>("name"),
+                "size": row.get::<i64, _>("size_bytes"),
+                "url": attachments::download_url(base, service, *oid, id),
+            }))
+        })
+        .collect();
+
+    Ok(json!({"adds": adds, "updates": [], "deleteIds": delete_ids}))
 }
 
 /// The object id a version's properties carry.
@@ -748,6 +884,38 @@ mod tests {
         assert!(check_data_format(&json).is_ok());
         let geodatabase = Params(vec![("dataFormat".into(), "sqlite".into())]);
         assert!(check_data_format(&geodatabase).is_err());
+    }
+
+    /// The window's start, and three instants around it.
+    fn at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(seconds).unwrap()
+    }
+
+    #[test]
+    fn an_attachment_falls_in_the_section_its_timestamps_put_it_in() {
+        let start = Some(at(100));
+
+        // arrived inside the window and still there
+        assert_eq!(section(at(150), None, start), Section::Add);
+        // there before the window and still there, so the client already has it
+        assert_eq!(section(at(50), None, start), Section::Neither);
+        // there before the window and gone inside it
+        assert_eq!(section(at(50), Some(at(150)), start), Section::Delete);
+        // arrived and went inside the window, which the client never saw
+        assert_eq!(section(at(120), Some(at(150)), start), Section::Neither);
+        // gone before the window opened, which the client already knows
+        assert_eq!(section(at(10), Some(at(50)), start), Section::Neither);
+        // the boundary instant itself is outside the window, so an attachment
+        // that shares it with the changeset belongs to the window before this one
+        assert_eq!(section(at(100), None, start), Section::Neither);
+    }
+
+    /// Generation 0 starts at the beginning of time: every live attachment is an
+    /// add, and nothing was there before it to report gone.
+    #[test]
+    fn generation_zero_holds_every_live_attachment_and_no_deletes() {
+        assert_eq!(section(at(1), None, None), Section::Add);
+        assert_eq!(section(at(1), Some(at(2)), None), Section::Neither);
     }
 
     #[test]

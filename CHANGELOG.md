@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-01: Change files from the ArcGIS facade report attachment changes, so a
+  delta no longer keeps stale attachments. Three pieces. Attachments are soft
+  deleted: a delete stamps `deleted_at` and the row stays, every read on every
+  route filters tombstones out, and a second delete is refused as not found the
+  way it was when the row went. A layer with a real `objectid` publishes a virtual
+  `globalid` field of type `esriFieldTypeGlobalID`, whose value is the feature's
+  uuid as a guid in braces and upper case: `/query` serves it, `outFields` may name
+  it, and `where globalid = '{...}'` and `globalid IN (...)` filter by it with or
+  without braces and in any case, which is the query a consumer resolves an
+  attachment's parent feature through. `applyEdits` drops a client-supplied
+  `globalid` attribute as it drops a client-supplied object id on an add, and a
+  row-number layer publishes no `globalIdField` at all. The change file's
+  attachment sections are a time window rather than a generation diff, because an
+  attachment commits no changeset: adds are what arrived after the requested
+  generation's changeset and is still live, `deleteIds` are the attachment global
+  ids of what was there when the window opened and went inside it, one created and
+  deleted inside the window is in neither, and `updates` is always empty because a
+  replacement here is a delete and an upload. An add carries `attachmentId`,
+  `globalId`, `parentGlobalId`, `contentType`, `name`, `size` and an absolute
+  facade download URL. The boundary is approximate: the changeset timestamp comes
+  from the API process's clock and an attachment's from the database's, and the
+  window has no upper bound, so an attachment arriving between the submit and the
+  fetch is in the answer rather than left out with every attachment uploaded since
+  the last commit.
+
 - 2026-07-31: The ArcGIS facade accepts `X-Esri-Authorization: Bearer <jwt>`,
   the header an Esri-ecosystem client puts its token in. verne sends exactly that
   and no `Authorization` header at all, so it could reach public datasets only.

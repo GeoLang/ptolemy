@@ -454,7 +454,7 @@ impl Lit {
 fn value_of(column: &Cell, lit: &Lit) -> Value {
     match lit {
         Lit::Number(value, _) if column.numeric() => Value::Number(*value),
-        other => Value::Text(other.text()),
+        other => Value::Text(column.literal(other.text())),
     }
 }
 
@@ -784,7 +784,7 @@ impl Parser<'_> {
             .collect();
         let values = match numbers {
             Some(numbers) if column.numeric() => List::Numbers(numbers),
-            _ => List::Texts(lits.iter().map(Lit::text).collect()),
+            _ => List::Texts(lits.iter().map(|lit| column.literal(lit.text())).collect()),
         };
         Ok(negate(Predicate::In { column, values }, negated))
     }
@@ -977,6 +977,7 @@ mod tests {
                 field("open", Kind::BooleanText),
                 field("tags", Kind::JsonText),
                 field("seen", Kind::Text),
+                field("globalid", Kind::GlobalId),
             ],
             oid: Oid::RowNumber,
         }
@@ -1072,6 +1073,40 @@ mod tests {
         assert_eq!(sql_of("OBJECTID <> 5"), "(oid::float8 <> $2::float8)");
         assert_eq!(sql_of("objectid = 'x'"), "(oid::text = $2::text)");
         assert_eq!(sql_of("objectid IS NULL"), "(oid::text IS NULL)");
+    }
+
+    /// The global id compares against the uuid column, and the literal is
+    /// normalised to that uuid's own text first: an Esri client writes a guid in
+    /// braces and upper case, and it has to name the same feature either way.
+    /// This is the query verne resolves an attachment's parent through.
+    #[test]
+    fn the_global_id_compares_the_normalised_guid_against_the_uuid_column() {
+        let uuid = "018f3a2b-7c4d-7e1f-8a9b-0c1d2e3f4a5b";
+        let braced = format!("{{{}}}", uuid.to_uppercase());
+        let (sql, binds) = rendered(&format!("globalid = '{braced}'"));
+        assert_eq!(sql, "(id::text = $2::text)");
+        assert_eq!(binds, vec![Bind::Text(Some(uuid.to_string()))]);
+
+        // and without the braces, which is the other way a client writes one
+        let (_, binds) = rendered(&format!("globalid = '{}'", uuid.to_uppercase()));
+        assert_eq!(binds, vec![Bind::Text(Some(uuid.to_string()))]);
+
+        // the IN list verne builds, braces and all
+        let (sql, binds) = rendered(&format!("globalid IN ('{braced}', '{braced}')"));
+        assert_eq!(sql, "(id::text = ANY($2::text[]))");
+        assert_eq!(
+            binds,
+            vec![Bind::Texts(vec![
+                Some(uuid.to_string()),
+                Some(uuid.to_string())
+            ])]
+        );
+
+        // a literal that is no uuid is bound like any other and matches nothing
+        let (_, binds) = rendered("globalid = 'nothing'");
+        assert_eq!(binds, vec![Bind::Text(Some("nothing".to_string()))]);
+        // NULL stays NULL, so IS NULL and NOT IN behave as SQL says
+        assert_eq!(sql_of("globalid IS NULL"), "(id::text IS NULL)");
     }
 
     /// A numeric comparison reads a value that is not a number as no value, so

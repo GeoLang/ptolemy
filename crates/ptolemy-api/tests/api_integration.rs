@@ -9115,8 +9115,12 @@ async fn test_arcgis_synthesizes_objectid_when_no_schema_declares_one() {
         .map(|f| f["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["objectid", "name"], "{layer}");
+    // a row-number layer publishes no global id either: its rows carry no id a
+    // client can write down, which is the same reason it takes no edits
+    assert_eq!(layer["globalIdField"], "", "{layer}");
 
     let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    assert_eq!(body["globalIdFieldName"], "", "{body}");
     let features = body["features"].as_array().unwrap();
     assert_eq!(features.len(), 3, "{body}");
     let ids: Vec<i64> = features
@@ -9124,6 +9128,204 @@ async fn test_arcgis_synthesizes_objectid_when_no_schema_declares_one() {
         .map(|f| f["attributes"]["objectid"].as_i64().unwrap())
         .collect();
     assert_eq!(ids, vec![1, 2, 3], "{body}");
+
+    // and there is no such field to name, so asking for it is refused by name
+    let (status, refused) = get_json(&app, &query_url(&name, "outFields=globalid")).await;
+    assert_eq!(status, StatusCode::OK, "{refused}");
+    assert_eq!(refused["error"]["code"], 400, "{refused}");
+}
+
+/// Helper: the global ids a where clause selects, sorted so a test does not
+/// depend on the order rows come back in.
+async fn global_ids_matching(app: &axum::Router, service: &str, clause: &str) -> Vec<String> {
+    let (status, body) = get_json(app, &query_url(service, &where_param(clause))).await;
+    assert_eq!(status, StatusCode::OK, "{clause}: {body}");
+    assert!(body["error"].is_null(), "{clause}: {body}");
+    let mut held: Vec<String> = body["features"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{clause}: {body}"))
+        .iter()
+        .map(|f| {
+            f["attributes"]["globalid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{f}"))
+                .to_string()
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+/// The virtual `globalid`: declared on the layer, served as the feature's uuid in
+/// braces and upper case, and filterable, which is how a consumer resolves an
+/// attachment's parent feature.
+#[tokio::test]
+async fn test_arcgis_serves_and_filters_the_virtual_global_id() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "guid", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 10, "name": "first"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 20, "name": "second"}},
+        ]),
+    )
+    .await;
+
+    // the layer names the field and declares it as esri's own global id type
+    let (_, layer) = get_json(
+        &app,
+        &format!("/arcgis/rest/services/{name}/FeatureServer/0?f=json"),
+    )
+    .await;
+    assert_eq!(layer["globalIdField"], "globalid", "{layer}");
+    let declared = layer["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "globalid")
+        .unwrap_or_else(|| panic!("{layer}"));
+    assert_eq!(declared["type"], "esriFieldTypeGlobalID", "{layer}");
+    assert_eq!(declared["editable"], false, "{layer}");
+
+    // served with the rows, as a guid in braces and upper case
+    let (_, body) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    assert_eq!(body["globalIdFieldName"], "globalid", "{body}");
+    let guids: Vec<String> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            f["attributes"]["globalid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{f}"))
+                .to_string()
+        })
+        .collect();
+    assert_eq!(guids.len(), 2, "{body}");
+    for guid in &guids {
+        assert!(guid.starts_with('{') && guid.ends_with('}'), "{guid}");
+        let held = Uuid::parse_str(guid.trim_matches(|c| c == '{' || c == '}')).unwrap();
+        assert_eq!(*guid, format!("{{{}}}", held.to_string().to_uppercase()));
+    }
+
+    // named on its own, it is answered beside the object id
+    let (_, one) = get_json(&app, &query_url(&name, "outFields=globalid")).await;
+    let held = &one["features"][0]["attributes"];
+    assert!(held["globalid"].is_string(), "{one}");
+    assert!(held["OBJECTID"].is_i64(), "{one}");
+
+    // and filtered by, which is the query a consumer pairs attachments through:
+    // braces and any case name the same feature
+    let first = guids[0].clone();
+    let bare = first.trim_matches(|c| c == '{' || c == '}').to_lowercase();
+    for clause in [
+        format!("globalid = '{first}'"),
+        format!("globalid = '{bare}'"),
+        format!("globalid IN ('{first}')"),
+        format!("globalid IN ('{bare}')"),
+    ] {
+        let held = global_ids_matching(&app, &name, &clause).await;
+        assert_eq!(held, vec![first.clone()], "{clause}");
+    }
+    // the IN list a consumer batches parents into
+    let mut both = guids.clone();
+    both.sort();
+    let clause = format!("globalid IN ('{first}', '{}')", guids[1]);
+    assert_eq!(global_ids_matching(&app, &name, &clause).await, both);
+
+    // a guid no feature carries answers no rows rather than an error
+    let (status, none) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &where_param("globalid = '{00000000-0000-0000-0000-000000000000}'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{none}");
+    assert!(none["features"].as_array().unwrap().is_empty(), "{none}");
+}
+
+/// An edit never writes either id: the object id is the service's to assign and
+/// the global id is the feature's uuid, so a client-supplied `globalid` attribute
+/// is dropped rather than stored under a key `/query` would never read it from.
+#[tokio::test]
+async fn test_arcgis_apply_edits_ignores_a_client_supplied_global_id() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, _branch) = editable_layer(&app, "guidedit", "point").await;
+
+    let planted = "{DEADBEEF-0000-0000-0000-000000000001}";
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{
+                "attributes": {"name": "first", "globalid": planted},
+                "geometry": {"x": 1.0, "y": 1.0},
+            }])
+            .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+    let oid = out["addResults"][0]["objectId"].as_i64().unwrap();
+
+    // the global id served is the feature's own uuid, not what the client sent
+    let (_, held) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let attributes = &held["features"][0]["attributes"];
+    assert_ne!(attributes["globalid"], planted, "{held}");
+    assert!(
+        Uuid::parse_str(
+            attributes["globalid"]
+                .as_str()
+                .unwrap()
+                .trim_matches(|c| c == '{' || c == '}')
+        )
+        .is_ok(),
+        "{held}"
+    );
+
+    // an update carrying one is ignored the same way, and the id does not move
+    let before = attributes["globalid"].clone();
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "updates",
+            json!([{"attributes": {"OBJECTID": oid, "name": "renamed", "globalid": planted}}])
+                .to_string(),
+        ),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["error"].is_null(), "{out}");
+    let (_, after) = get_json(&app, &query_url(&name, "outFields=*")).await;
+    let attributes = &after["features"][0]["attributes"];
+    assert_eq!(attributes["globalid"], before, "{after}");
+    assert_eq!(attributes["name"], "renamed", "{after}");
+
+    // useGlobalIds is still refused, because an edit names its feature by object id
+    let body = form_body(&[
+        ("f", "json".into()),
+        ("useGlobalIds", "true".into()),
+        ("deletes", oid.to_string()),
+    ]);
+    let (status, out) = post_form(&app, &apply_edits_url(&name), &body).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["error"]["code"], 400, "{out}");
+    assert!(
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("useGlobalIds"),
+        "{out}"
+    );
 }
 
 #[tokio::test]
@@ -9585,7 +9787,12 @@ async fn test_arcgis_query_reads_a_layer_whose_property_key_carries_a_quote() {
         .iter()
         .map(|f| f["name"].as_str().unwrap())
         .collect();
-    assert_eq!(declared, vec!["OBJECTID", "name", hostile], "{layer}");
+    // the virtual global id follows the object id on every real-oid layer
+    assert_eq!(
+        declared,
+        vec!["OBJECTID", "globalid", "name", hostile],
+        "{layer}"
+    );
 
     // a clause filters correctly against a real database with that key in the
     // data, and the whole feature still reads back
@@ -12947,8 +13154,8 @@ async fn test_arcgis_extract_changes_reports_the_edits_since_a_generation() {
     // themselves through /query
     let added = &file["edits"][0]["features"]["adds"][0];
     assert!(added["geometry"].is_null(), "{added}");
-    // attachment changes are never reported, and the arrays say so rather than
-    // being left out
+    // a layer with no attachment edits states the arrays empty rather than
+    // leaving them out
     let attachments = &file["edits"][0]["attachments"];
     assert_eq!(attachments["adds"], json!([]), "{file}");
     assert_eq!(attachments["updates"], json!([]), "{file}");
@@ -13325,4 +13532,350 @@ async fn test_arcgis_change_tracking_does_not_widen_a_private_dataset() {
     .await;
     assert_eq!(status, StatusCode::OK, "{file}");
     assert_eq!(file_gen(&file), 0, "{file}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ArcGIS change files: attachment sections
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Helper: upload one attachment through the facade and hand back the two ids it
+/// answers with, the number a client acts on it by and the global id a change
+/// file names it by.
+async fn add_attachment(
+    app: &axum::Router,
+    service: &str,
+    oid: i64,
+    filename: &str,
+    bytes: &[u8],
+) -> (i64, String) {
+    let (status, out) = post_multipart(
+        app,
+        &add_attachment_url(service, oid),
+        upload_multipart(filename, "image/png", bytes, &[("f", "json")]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filename}: {out}");
+    let held = &out["addAttachmentResult"];
+    (
+        held["objectId"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{filename}: {out}")),
+        held["globalId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{filename}: {out}"))
+            .to_string(),
+    )
+}
+
+/// Helper: delete one attachment through the facade.
+async fn delete_attachment_via_facade(app: &axum::Router, service: &str, oid: i64, id: i64) {
+    let (status, out) = post_form(
+        app,
+        &delete_attachments_url(service, oid),
+        &form_body(&[("f", "json".into()), ("attachmentIds", id.to_string())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["deleteAttachmentResults"],
+        json!([{"objectId": id, "success": true}]),
+        "{out}"
+    );
+}
+
+/// Helper: the whole delta loop as a client that names the host it reached,
+/// which is what the absolute URLs in the answer are built from.
+async fn extract_changes_from_host(
+    app: &axum::Router,
+    service: &str,
+    since: i64,
+    host: &str,
+) -> Value {
+    let get = async |uri: &str| -> Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("host", host)
+            .header("authorization", "Bearer test-skip")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    let status_url = submit_changes(app, service, since).await;
+    let held = get(&format!("{status_url}?f=json")).await;
+    assert_eq!(held["status"], "Completed", "{held}");
+    get(&facade_path(&held["resultUrl"])).await
+}
+
+/// Helper: the attachment sections of a change file, as the consumer reads them.
+fn attachment_sections(file: &Value) -> (Vec<Value>, Vec<Value>, Vec<String>) {
+    let held = &file["edits"][0]["attachments"];
+    let adds = held["adds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{file}"))
+        .clone();
+    let updates = held["updates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{file}"))
+        .clone();
+    let deletes = held["deleteIds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{file}"))
+        .iter()
+        .map(|id| id.as_str().unwrap_or_else(|| panic!("{id}")).to_string())
+        .collect();
+    (adds, updates, deletes)
+}
+
+/// Helper: the global id of the feature at one object id.
+async fn global_id_of(app: &axum::Router, service: &str, oid: i64) -> String {
+    let (status, body) = get_json(
+        app,
+        &query_url(service, &where_param(&format!("OBJECTID = {oid}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["features"][0]["attributes"]["globalid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_string()
+}
+
+/// A delta over attachments, which is what the tombstone and the time window are
+/// for: what arrived is an add carrying the parent and the bytes' URL, what went
+/// is a global id in deleteIds, and a file that came and went inside the window is
+/// in neither, because the client never held it.
+#[tokio::test]
+async fn test_arcgis_change_file_reports_attachment_adds_and_deletes() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "attachdelta", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+    assert_eq!(published_gen(&app, &name).await, 1);
+
+    // there before the window opens, so a client at generation 2 holds it
+    let (doomed, doomed_global) = add_attachment(&app, &name, 100, "doomed.png", b"aaa").await;
+
+    // the commit that opens the window
+    let (status, out) = post_form(
+        &app,
+        &apply_edits_url(&name),
+        &form_body(&[
+            ("f", "json".into()),
+            (
+                "updates",
+                json!([{"attributes": {"OBJECTID": 100, "name": "renamed"}}]).to_string(),
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let opened = published_gen(&app, &name).await;
+    assert_eq!(opened, 2);
+
+    // inside the window: one that stays, one that comes and goes, and the delete
+    // of the one that was already there
+    let (arrived, arrived_global) = add_attachment(&app, &name, 100, "arrived.png", b"bbbbb").await;
+    let (ephemeral, ephemeral_global) =
+        add_attachment(&app, &name, 100, "ephemeral.png", b"cc").await;
+    delete_attachment_via_facade(&app, &name, 100, ephemeral).await;
+    delete_attachment_via_facade(&app, &name, 100, doomed).await;
+
+    let parent = global_id_of(&app, &name, 100).await;
+    let file = extract_changes(&app, &name, opened).await;
+    let (adds, updates, deletes) = attachment_sections(&file);
+
+    // a replacement here is a delete and an upload, so nothing is ever an update
+    assert_eq!(updates, Vec::<Value>::new(), "{file}");
+
+    assert_eq!(adds.len(), 1, "{file}");
+    let record = &adds[0];
+    assert_eq!(record["attachmentId"], arrived, "{record}");
+    assert_eq!(record["name"], "arrived.png", "{record}");
+    assert_eq!(record["contentType"], "image/png", "{record}");
+    assert_eq!(record["size"], 5, "{record}");
+    assert_eq!(record["parentGlobalId"], parent, "{record}");
+    // the same global id the upload answered with, so a client pairs the two
+    assert_eq!(record["globalId"], arrived_global, "{record}");
+    assert!(
+        arrived_global.starts_with('{') && arrived_global.ends_with('}'),
+        "{arrived_global}"
+    );
+
+    // and the URL serves the bytes
+    let (status, _, bytes) = get_download(&app, &facade_path(&record["url"])).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(bytes, b"bbbbb", "{record}");
+
+    // it is absolute on the host the client asked on, which is what a consumer
+    // fetches without a base of its own to resolve against
+    let named = extract_changes_from_host(&app, &name, opened, "esri.example").await;
+    let (adds_from_host, _, _) = attachment_sections(&named);
+    let absolute = adds_from_host[0]["url"].as_str().unwrap();
+    assert!(
+        absolute.starts_with("http://esri.example/arcgis/rest/services/"),
+        "{absolute}"
+    );
+
+    // the one that was there before the window is reported gone, by global id
+    assert_eq!(deletes, vec![doomed_global.clone()], "{file}");
+
+    // and the one that came and went inside the window is in neither section: a
+    // client that never saw it has nothing to add and nothing to drop
+    assert!(!deletes.contains(&ephemeral_global), "{file}");
+    assert!(
+        !adds.iter().any(|held| held["globalId"] == ephemeral_global),
+        "{file}"
+    );
+
+    // asked from a generation before the doomed one existed, that one is in
+    // neither section either: it came and went inside that wider window
+    let earlier = extract_changes(&app, &name, 1).await;
+    let (adds, _, deletes) = attachment_sections(&earlier);
+    assert_eq!(adds.len(), 1, "{earlier}");
+    assert_eq!(adds[0]["attachmentId"], arrived, "{earlier}");
+    assert!(deletes.is_empty(), "{earlier}");
+
+    // a window that opens after every attachment answers empty arrays
+    let (status, out) = post_form(
+        &app,
+        &apply_edits_url(&name),
+        &form_body(&[
+            ("f", "json".into()),
+            (
+                "updates",
+                json!([{"attributes": {"OBJECTID": 100, "name": "again"}}]).to_string(),
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let head = published_gen(&app, &name).await;
+    let file = extract_changes(&app, &name, head).await;
+    assert_eq!(
+        attachment_sections(&file),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "{file}"
+    );
+}
+
+/// Generation 0 is the beginning of time, so every live attachment is an add and
+/// nothing is reported gone: a client starting from nothing has none to drop.
+#[tokio::test]
+async fn test_arcgis_change_file_from_generation_zero_holds_every_live_attachment() {
+    let (app, _) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "attachzero", "point").await;
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+
+    let (kept, _) = add_attachment(&app, &name, 100, "kept.png", b"aaa").await;
+    let (going, _) = add_attachment(&app, &name, 100, "going.png", b"bb").await;
+    delete_attachment_via_facade(&app, &name, 100, going).await;
+
+    let file = extract_changes(&app, &name, 0).await;
+    let (adds, updates, deletes) = attachment_sections(&file);
+    assert_eq!(adds.len(), 1, "{file}");
+    assert_eq!(adds[0]["attachmentId"], kept, "{file}");
+    assert!(updates.is_empty(), "{file}");
+    assert!(deletes.is_empty(), "{file}");
+}
+
+/// A tombstone is invisible everywhere a live attachment is visible: the facade's
+/// three reads and the native listing, download and meta. The change file is the
+/// one place it shows, and it shows as a delete.
+#[tokio::test]
+async fn test_a_tombstoned_attachment_is_invisible_on_every_read_route() {
+    let (app, state) = setup_app().await;
+    let (name, _ds, branch) = editable_layer(&app, "tombstone", "point").await;
+    let feature_id = Uuid::now_v7();
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": feature_id.to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 100, "name": "first"}},
+        ]),
+    )
+    .await;
+
+    let (numeric, _) = add_attachment(&app, &name, 100, "gone.png", b"aaa").await;
+    // the store's own uuid for it, which is what the native routes name it by
+    let held = state.list_attachments(feature_id, branch).await.unwrap();
+    assert_eq!(held.len(), 1);
+    let uuid = held[0].id;
+
+    delete_attachment_via_facade(&app, &name, 100, numeric).await;
+
+    // the facade: the per-feature listing, queryAttachments and the download
+    let (_, listing) = get_json(&app, &format!("{}?f=json", attachments_url(&name, 100))).await;
+    assert_eq!(listing["attachmentInfos"], json!([]), "{listing}");
+    let (_, groups) = get_json(
+        &app,
+        &format!("{}?f=json&objectIds=100", query_attachments_url(&name)),
+    )
+    .await;
+    assert_eq!(groups["attachmentGroups"], json!([]), "{groups}");
+    let (status, refused) = get_json(
+        &app,
+        &format!("{}/{numeric}?f=json", attachments_url(&name, 100)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refused}");
+    assert_eq!(refused["error"]["code"], 400, "{refused}");
+
+    // and a second delete is refused the same way, by an id naming no attachment
+    let (status, again) = post_form(
+        &app,
+        &delete_attachments_url(&name, 100),
+        &form_body(&[("f", "json".into()), ("attachmentIds", numeric.to_string())]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["error"]["code"], 400, "{again}");
+
+    // the native routes: the branch listing, the blob and the meta
+    let (_, native) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch}/features/{feature_id}/attachments"),
+    )
+    .await;
+    assert_eq!(native, json!([]), "{native}");
+    for uri in [
+        format!("/api/v1/attachments/{uuid}"),
+        format!("/api/v1/attachments/{uuid}/meta"),
+    ] {
+        let (status, body) = get_json(&app, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+
+    // the native delete, which used to answer not found once the row was gone
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/attachments/{uuid}"))
+        .header("authorization", "Bearer test-skip")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

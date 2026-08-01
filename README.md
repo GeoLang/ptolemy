@@ -314,11 +314,46 @@ Only a layer with a real integer `objectid` publishes any of that, for the same
 reason only such a layer takes edits, and neither does a dataset whose rows come
 from a table ptolemy does not own, whose rows change outside ptolemy's history.
 Features in a change file carry the object id and no geometry, because a client
-fetches the rows themselves through `/query`. The attachment arrays in a change
-file are always empty: the attachments table keeps no tombstone, so a deleted
-attachment leaves nothing to diff and reporting adds alone would read as nothing
-deleted. `dataFormat=sqlite`, the positional `serverGens` form and a
-`returnInserts`/`returnUpdates`/`returnDeletes` of `false` are refused by name.
+fetches the rows themselves through `/query`. `dataFormat=sqlite`, the positional
+`serverGens` form and a `returnInserts`/`returnUpdates`/`returnDeletes` of
+`false` are refused by name.
+
+A change file also reports attachment changes, off the attachments table's own
+timestamps rather than off a generation: an attachment commits no changeset, so it
+advances no generation and there is no ancestor to diff against. The window is
+the time range starting at the `created_at` of the changeset the requested
+generation names, and the beginning of time at generation 0. An attachment created
+after that start and still live is an add carrying `attachmentId`, `globalId`,
+`parentGlobalId`, `contentType`, `name`, `size` and an absolute `url` to fetch the
+bytes from; one deleted after the start that was already there when it opened is
+an attachment global id in `deleteIds`; one created and deleted inside the window
+is in neither, because the client never held it. `updates` is always empty, since
+replacing an attachment here is a delete and an upload.
+
+Being a time range makes the boundary approximate. The changeset timestamp is the
+API process's clock and an attachment's is the database's, so an attachment
+uploaded in the same instant as the bounding changeset may fall on either side of
+it. The range also has no upper bound, unlike the feature diff, which is pinned to
+the head the submit saw: an attachment arriving between the submit and the fetch is
+in the answer. Bounding it at the pinned head would leave out every attachment
+uploaded since the last commit, which is most of them.
+
+Deleting an attachment is a soft delete: the row keeps its bytes and gains a
+`deleted_at`, which is what a change file diffs. Every read filters tombstones
+out, on the Esri routes and on `/api/v1` alike, so a deleted attachment is gone
+from every listing, download and metadata read and a second delete is refused as
+not found.
+
+A layer with a real `objectid` also publishes a virtual `globalid` field, declared
+as `esriFieldTypeGlobalID` and named by `globalIdField`. Its value is the feature's
+own uuid as a guid in braces and upper case, which is the shape Esri clients and
+verne expect. `/query` serves it, `outFields` may name it, and `where` filters by
+it: `globalid = '{...}'` and `globalid IN ('{...}', ...)` both work, with or
+without the braces and in any case, which is how a consumer resolves the parent
+feature of an attachment that did not itself change. It is not a property and
+`applyEdits` never writes one: a client-supplied `globalid` attribute is dropped,
+as a client-supplied object id on an add is. A row-number layer publishes no
+`globalIdField`, for the same reason it takes no edits.
 
 Layer metadata carries `drawingInfo` when the dataset has a symbology rule whose
 symbol is tagged `{"format": "esri-drawing-info"}`, which is what verne writes

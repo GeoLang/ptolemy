@@ -27,6 +27,11 @@ use super::{Bind, Field, Kind};
 /// client's: see [`Column::sql`].
 const NUMBER: &str = "^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]+)?$";
 
+/// The feature uuid as a guid in braces and upper case, which is the shape
+/// `/query` serves a global id in and the shape a client compares what it saw
+/// against. Fixed text, over the `id` column the read's own CTE holds.
+const GLOBAL_ID_TEXT: &str = "('{' || upper(id::text) || '}')";
+
 /// A column to read, as the layer declared it. The name is the layer's own text
 /// and never the client's, and it is bound rather than rendered like every other
 /// value here; the kind is what decides whether the read runs on numbers or on
@@ -59,10 +64,35 @@ impl Column {
     /// everywhere else, and the object id as the bigint the CTE already holds
     /// rather than the double a comparison casts it to. What an order, a distinct
     /// read and a min or max run on.
+    ///
+    /// A global id is the guid text `/query` serves, so ordering or listing the
+    /// distinct values of it answers what the client saw in the attributes rather
+    /// than the bare uuid the comparison runs on.
     pub(super) fn natural(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
         match self.kind {
             Kind::Oid => "oid".to_string(),
+            Kind::GlobalId => GLOBAL_ID_TEXT.to_string(),
             _ => self.sql(self.numeric(), next, binds),
+        }
+    }
+
+    /// The text a literal compares as against this column.
+    ///
+    /// A global id is compared against the uuid's own canonical text, so the
+    /// braces and the upper case an Esri client writes a guid in are normalised
+    /// away first: `'{A1B2...}'`, `'a1b2...'` and every case between name the same
+    /// feature. Anything else compares the text as the client wrote it. A literal
+    /// that is no uuid normalises to something no uuid equals, which answers no
+    /// rows, and it is bound either way.
+    pub(super) fn literal(&self, text: Option<String>) -> Option<String> {
+        match self.kind {
+            Kind::GlobalId => text.map(|held| {
+                held.trim()
+                    .trim_start_matches('{')
+                    .trim_end_matches('}')
+                    .to_lowercase()
+            }),
+            _ => text,
         }
     }
 
@@ -80,6 +110,10 @@ impl Column {
             // id below 2^53 exactly, which is every id anything here assigns
             (Kind::Oid, true) => "oid::float8".to_string(),
             (Kind::Oid, false) => "oid::text".to_string(),
+            // the uuid's canonical text, which is what a normalised literal is
+            // compared against. Never numeric: `numeric()` says so, so a number
+            // written against it compares as the text the client sent
+            (Kind::GlobalId, _) => "id::text".to_string(),
             (_, true) => {
                 // one bind for the key, named twice: a placeholder can be
                 // referenced as often as the statement needs it
@@ -139,6 +173,16 @@ impl Cell {
         }
     }
 
+    /// The text a literal compares as against this cell. Only a column has a
+    /// shape of its own to normalise into: an aggregated column holds whatever
+    /// the statistic computed. See [`Column::literal`].
+    pub(super) fn literal(&self, text: Option<String>) -> Option<String> {
+        match self {
+            Cell::Field(column) => column.literal(text),
+            Cell::Aggregate { .. } => text,
+        }
+    }
+
     /// The cell as SQL, in the shape it is read in. An aggregate needs no bind and
     /// no guarded cast: the alias is fixed text and the column already holds a
     /// value of its own type, so a plain cast is all a comparison needs.
@@ -189,7 +233,7 @@ impl Read {
         match kind {
             Kind::Oid => Read::Int8,
             Kind::Integer | Kind::Double => Read::Float8,
-            Kind::Text | Kind::BooleanText | Kind::JsonText => Read::Text,
+            Kind::GlobalId | Kind::Text | Kind::BooleanText | Kind::JsonText => Read::Text,
         }
     }
 }

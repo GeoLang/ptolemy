@@ -2321,6 +2321,146 @@ async fn test_attachment_owner_check_rejects_bad_rows() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Attachment Tombstones
+// ═══════════════════════════════════════════════════════════════════════
+
+/// One feature attachment on a branch, of `size` bytes.
+fn attachment_of(
+    feature_id: Uuid,
+    branch_id: Uuid,
+    name: &str,
+    size: usize,
+) -> ptolemy_storage::Attachment {
+    ptolemy_storage::Attachment {
+        id: Uuid::now_v7(),
+        feature_id: Some(feature_id),
+        branch_id: Some(branch_id),
+        dataset_id: None,
+        name: name.to_string(),
+        content_type: "image/png".to_string(),
+        size_bytes: size as i64,
+        data: vec![0u8; size],
+        thumbnail: None,
+        metadata: json!({}),
+        created_by: "test".to_string(),
+        created_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// A deleted attachment is a tombstone rather than a gone row, and every read
+/// has to answer as though it were gone: the listing leaves it out and the two
+/// single-attachment reads refuse it by not-found.
+#[tokio::test]
+async fn test_deleted_attachment_is_invisible_to_every_read() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let feature = Uuid::now_v7();
+
+    let kept = attachment_of(feature, branch.id, "kept.png", 4);
+    let going = attachment_of(feature, branch.id, "going.png", 9);
+    store.create_attachment(&kept).await.unwrap();
+    store.create_attachment(&going).await.unwrap();
+    assert_eq!(
+        store
+            .list_attachments(feature, branch.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    store.delete_attachment(going.id).await.unwrap();
+
+    // the listing, which is what a size total is added up from: the tombstone's
+    // bytes are not part of what the dataset holds any more
+    let held = store.list_attachments(feature, branch.id).await.unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].id, kept.id);
+    assert_eq!(held.iter().map(|meta| meta.size_bytes).sum::<i64>(), 4);
+
+    // the blob read a download runs, and the one a meta read runs
+    assert!(store.get_attachment(going.id).await.is_err());
+    assert!(store.get_attachment(kept.id).await.is_ok());
+
+    // the row is still there, which is what a change file reports the delete off
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM attachments WHERE id = $1")
+        .bind(going.id)
+        .fetch_one(store.unguarded_pool())
+        .await
+        .unwrap();
+    assert_eq!(live, 1);
+}
+
+/// The same refusal a second delete met when the row was hard deleted: the
+/// ladder resolves a tombstone to nothing, so it is not found.
+#[tokio::test]
+async fn test_deleting_a_tombstoned_attachment_is_refused_as_not_found() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+    let branch = create_test_branch(&store, ds.id, "main").await;
+    let feature = Uuid::now_v7();
+
+    let held = attachment_of(feature, branch.id, "once.png", 3);
+    store.create_attachment(&held).await.unwrap();
+    store
+        .ensure_attachment_writable(held.id, &W)
+        .await
+        .expect("live");
+    store.delete_attachment(held.id).await.unwrap();
+
+    let refused = store.ensure_attachment_writable(held.id, &W).await;
+    assert!(
+        matches!(refused, Err(ptolemy_storage::StoreError::NotFound(_))),
+        "{refused:?}"
+    );
+
+    // and the tombstone keeps the time it was first stamped with, so a window
+    // reports the delete when it happened rather than when it was asked for again
+    let first: OffsetDateTime =
+        sqlx::query_scalar("SELECT deleted_at FROM attachments WHERE id = $1")
+            .bind(held.id)
+            .fetch_one(store.unguarded_pool())
+            .await
+            .unwrap();
+    store.delete_attachment(held.id).await.unwrap();
+    let again: OffsetDateTime =
+        sqlx::query_scalar("SELECT deleted_at FROM attachments WHERE id = $1")
+            .bind(held.id)
+            .fetch_one(store.unguarded_pool())
+            .await
+            .unwrap();
+    assert_eq!(first, again);
+}
+
+/// A dataset attachment is tombstoned the same way, and the dataset listing is
+/// the read that has to leave it out.
+#[tokio::test]
+async fn test_deleted_dataset_attachment_leaves_the_dataset_listing() {
+    let store = setup().await;
+    let ds = create_test_dataset(&store).await;
+
+    let mut held = attachment_of(Uuid::now_v7(), Uuid::now_v7(), "icon.png", 5);
+    held.feature_id = None;
+    held.branch_id = None;
+    held.dataset_id = Some(ds.id);
+    store.create_attachment(&held).await.unwrap();
+    assert_eq!(
+        store.list_dataset_attachments(ds.id).await.unwrap().len(),
+        1
+    );
+
+    store.delete_attachment(held.id).await.unwrap();
+    assert!(
+        store
+            .list_dataset_attachments(ds.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Native Geometry Tests
 // ═══════════════════════════════════════════════════════════════════════
 
