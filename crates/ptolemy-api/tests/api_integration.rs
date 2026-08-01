@@ -8757,6 +8757,16 @@ async fn test_arcgis_service_root_and_layer_metadata() {
         layer["advancedQueryCapabilities"]["supportsPagination"],
         true
     );
+    // a client reads these before it will send a statistics, distinct or ordered
+    // query at all, and before it will page an aggregated one
+    let advanced = &layer["advancedQueryCapabilities"];
+    assert_eq!(advanced["supportsStatistics"], true, "{layer}");
+    assert_eq!(advanced["supportsDistinct"], true, "{layer}");
+    assert_eq!(advanced["supportsOrderBy"], true, "{layer}");
+    assert_eq!(
+        advanced["supportsPaginationOnAggregatedQueries"], true,
+        "{layer}"
+    );
     // the attachment operations are served on every layer, whether or not this
     // one holds an attachment yet. Editing them still needs an editable layer,
     // which `capabilities` above says this one is not.
@@ -9136,12 +9146,14 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
 
     // a filter that silently did not apply would be worse than a refusal
     for refused in [
-        "orderByFields=name",
-        "orderByFields=objectid%20DESC",
+        "orderByFields=nosuchfield",
+        "orderByFields=name%20sideways",
         "outSR=27700",
         "outFields=nosuchfield",
         "returnZ=true",
+        // asking for statistics and naming none
         "outStatistics=%5B%5D",
+        "having=count(*)%3E1",
         "gdbVersion=SDE.DEFAULT",
     ] {
         let (status, body) = get_json(&app, &query_url(&name, refused)).await;
@@ -9161,6 +9173,8 @@ async fn test_arcgis_refuses_a_where_clause_it_cannot_honor() {
     for allowed in [
         "orderByFields=objectid",
         "orderByFields=objectid%20ASC",
+        "orderByFields=objectid%20DESC",
+        "orderByFields=name%20DESC%2Cobjectid",
         "outSR=4326",
         "outSR=%7B%22wkid%22%3A4326%7D",
         "outSR=3857",
@@ -9641,6 +9655,665 @@ async fn test_arcgis_query_where_refuses_what_it_cannot_honor_by_name() {
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains(names), "'{clause}' answered '{message}'");
     }
+}
+
+/// Helper: an `outStatistics` parameter, from the JSON a client would send.
+fn stats_param(spec: Value) -> String {
+    format!("outStatistics={}", urlencoding::encode(&spec.to_string()))
+}
+
+/// Helper: the attributes of every feature in an answer, in the order they came.
+fn attributes(body: &Value) -> Vec<Value> {
+    body["features"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{body}"))
+        .iter()
+        .map(|feature| feature["attributes"].clone())
+        .collect()
+}
+
+/// Helper: the declared type of one field of an answer.
+fn field_type(body: &Value, name: &str) -> String {
+    body["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{body}"))
+        .iter()
+        .find(|field| field["name"] == name)
+        .unwrap_or_else(|| panic!("no field {name} in {body}"))["type"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Helper: a layer whose schema declares the types a statistic needs, with
+/// numbers a test can add up by hand.
+///
+/// Four features in two wards of two, `pop` 10/20/30/40, `score` on three of
+/// them, and `code` a string field holding number-looking text.
+async fn seed_stats_layer(app: &axum::Router, name: &str) -> Uuid {
+    let ds = create_named_dataset(app, name, "point").await;
+    let branch = create_branch(app, ds, "main").await;
+
+    let (status, body) = request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(json!({"fields": [
+            {"name": "OBJECTID", "field_type": "integer", "required": true},
+            {"name": "ward", "field_type": "string", "required": false},
+            {"name": "pop", "field_type": "integer", "required": false},
+            {"name": "score", "field_type": "float", "required": false},
+            {"name": "code", "field_type": "string", "required": false},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    commit_features(
+        app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 1, "ward": "north", "pop": 10, "score": 1.0, "code": "7"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 2, "ward": "north", "pop": 20, "score": 3.0, "code": "7"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(3.0, 3.0),
+             "properties": {"OBJECTID": 3, "ward": "south", "pop": 30, "score": 5.0, "code": "100"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(50.0, 50.0),
+             "properties": {"OBJECTID": 4, "ward": "south", "pop": 40, "code": "abc"}},
+        ]),
+    )
+    .await;
+    ds
+}
+
+#[tokio::test]
+async fn test_arcgis_query_statistics_over_the_whole_layer() {
+    let (app, _) = setup_app().await;
+    let name = format!("stats_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    let (status, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &stats_param(json!([
+                {"statisticType": "count", "onStatisticField": "pop"},
+                {"statisticType": "count", "onStatisticField": "score"},
+                {"statisticType": "sum", "onStatisticField": "pop"},
+                {"statisticType": "avg", "onStatisticField": "pop", "outStatisticFieldName": "mean_pop"},
+                {"statisticType": "min", "onStatisticField": "pop"},
+                {"statisticType": "max", "onStatisticField": "pop"},
+                {"statisticType": "min", "onStatisticField": "ward"},
+            ])),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let rows = attributes(&body);
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["count_pop"], 4, "{body}");
+    // a count counts the values that are there, and one feature has no score
+    assert_eq!(rows[0]["count_score"], 3, "{body}");
+    assert_eq!(rows[0]["sum_pop"], 100.0, "{body}");
+    assert_eq!(rows[0]["mean_pop"], 25.0, "{body}");
+    assert_eq!(rows[0]["min_pop"], 10, "{body}");
+    assert_eq!(rows[0]["max_pop"], 40, "{body}");
+    // a min over text is text, and it is declared as text
+    assert_eq!(rows[0]["min_ward"], "north", "{body}");
+    assert_eq!(
+        field_type(&body, "min_ward"),
+        "esriFieldTypeString",
+        "{body}"
+    );
+
+    // a count is a whole number of rows and says so, and the numeric aggregates
+    // are doubles
+    assert_eq!(
+        field_type(&body, "count_pop"),
+        "esriFieldTypeInteger",
+        "{body}"
+    );
+    assert_eq!(
+        field_type(&body, "sum_pop"),
+        "esriFieldTypeDouble",
+        "{body}"
+    );
+    assert_eq!(
+        field_type(&body, "mean_pop"),
+        "esriFieldTypeDouble",
+        "{body}"
+    );
+
+    // an aggregate is not one feature, so it has no geometry to draw whatever
+    // returnGeometry says
+    let (_, with_geometry) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "returnGeometry=true&{}",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+        ),
+    )
+    .await;
+    assert!(
+        with_geometry["features"][0].get("geometry").is_none(),
+        "{with_geometry}"
+    );
+    assert_eq!(with_geometry["features"][0]["attributes"]["count_pop"], 4);
+
+    // the sample deviation of 10 and 20, which the where clause selects
+    let (_, spread) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{}&{}",
+                where_param("pop < 30"),
+                stats_param(json!([
+                    {"statisticType": "stddev", "onStatisticField": "pop"},
+                    {"statisticType": "var", "onStatisticField": "pop"},
+                    {"statisticType": "count", "onStatisticField": "pop"},
+                ]))
+            ),
+        ),
+    )
+    .await;
+    let held = &attributes(&spread)[0];
+    assert_eq!(held["count_pop"], 2, "{spread}");
+    assert_eq!(held["var_pop"], 50.0, "{spread}");
+    let stddev = held["stddev_pop"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("{spread}"));
+    assert!((stddev - 50f64.sqrt()).abs() < 1e-9, "{spread}");
+}
+
+#[tokio::test]
+async fn test_arcgis_query_statistics_group_by_and_page() {
+    let (app, _) = setup_app().await;
+    let name = format!("grouped_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    let counted = stats_param(json!([
+        {"statisticType": "count", "onStatisticField": "pop"},
+        {"statisticType": "sum", "onStatisticField": "pop"},
+    ]));
+
+    let (status, body) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{counted}&groupByFieldsForStatistics=ward&orderByFields=ward"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = attributes(&body);
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(rows[0]["ward"], "north", "{body}");
+    assert_eq!(rows[0]["count_pop"], 2, "{body}");
+    assert_eq!(rows[0]["sum_pop"], 30.0, "{body}");
+    assert_eq!(rows[1]["ward"], "south", "{body}");
+    assert_eq!(rows[1]["sum_pop"], 70.0, "{body}");
+    // the grouped field keeps its own type, and the group is not an object id
+    assert_eq!(field_type(&body, "ward"), "esriFieldTypeString", "{body}");
+    assert!(rows[0].get("OBJECTID").is_none(), "{body}");
+
+    // a statistic alias orders the groups like any other column
+    let (_, biggest) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{counted}&groupByFieldsForStatistics=ward&orderByFields=sum_pop%20DESC"),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&biggest)[0]["ward"], "south", "{biggest}");
+
+    // the where clause and the envelope narrow what is aggregated
+    let (_, filtered) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{counted}&groupByFieldsForStatistics=ward&orderByFields=ward&{}",
+                where_param("pop > 15")
+            ),
+        ),
+    )
+    .await;
+    let rows = attributes(&filtered);
+    assert_eq!(rows.len(), 2, "{filtered}");
+    assert_eq!(rows[0]["count_pop"], 1, "{filtered}");
+    assert_eq!(rows[0]["sum_pop"], 20.0, "{filtered}");
+    assert_eq!(rows[1]["sum_pop"], 70.0, "{filtered}");
+
+    // the envelope leaves out the far feature, so south is one row of 30
+    let (_, near) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{counted}&groupByFieldsForStatistics=ward&orderByFields=ward&geometry=0,0,10,10"
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&near)[1]["sum_pop"], 30.0, "{near}");
+
+    // and the groups page like rows, with the same limit report
+    let (_, first) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!("{counted}&groupByFieldsForStatistics=ward&resultRecordCount=1"),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&first).len(), 1, "{first}");
+    assert_eq!(first["exceededTransferLimit"], true, "{first}");
+    let (_, second) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "{counted}&groupByFieldsForStatistics=ward&resultRecordCount=1&resultOffset=1"
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&second)[0]["ward"], "south", "{second}");
+    assert_eq!(second["exceededTransferLimit"], false, "{second}");
+}
+
+#[tokio::test]
+async fn test_arcgis_query_statistics_refuse_what_they_cannot_answer() {
+    let (app, _) = setup_app().await;
+    let name = format!("badstats_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    // a name that could not be a field name is refused rather than escaped into
+    // an alias: the columns are read by position, so this never reached the SQL,
+    // and the layer proves it below by still being there
+    let hostile = "x\"; DROP TABLE features; --";
+    for (params, names) in [
+        (
+            stats_param(json!([{"statisticType": "sum", "onStatisticField": "code"}])),
+            "code",
+        ),
+        (
+            stats_param(json!([{"statisticType": "avg", "onStatisticField": "ward"}])),
+            "ward",
+        ),
+        (
+            stats_param(json!([{"statisticType": "median", "onStatisticField": "pop"}])),
+            "median",
+        ),
+        (
+            stats_param(json!([{"statisticType": "sum", "onStatisticField": "nosuchfield"}])),
+            "nosuchfield",
+        ),
+        (
+            stats_param(json!([{"statisticType": "count", "onStatisticField": "pop",
+                                "outStatisticFieldName": "9lives"}])),
+            "9lives",
+        ),
+        (
+            stats_param(json!([{"statisticType": "count", "onStatisticField": "pop",
+                                "outStatisticFieldName": hostile}])),
+            "not a field name",
+        ),
+        (
+            stats_param(json!([
+                {"statisticType": "count", "onStatisticField": "pop", "outStatisticFieldName": "total"},
+                {"statisticType": "sum", "onStatisticField": "pop", "outStatisticFieldName": "TOTAL"},
+            ])),
+            "both named",
+        ),
+        (
+            format!(
+                "{}&groupByFieldsForStatistics=nosuchfield",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+            "nosuchfield",
+        ),
+        (
+            "groupByFieldsForStatistics=ward".to_string(),
+            "groupByFieldsForStatistics",
+        ),
+        (
+            format!(
+                "returnDistinctValues=true&outFields=ward&{}",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+            "two different answers",
+        ),
+        (
+            format!(
+                "returnCountOnly=true&{}",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+            "not features",
+        ),
+        (
+            format!(
+                "returnIdsOnly=true&{}",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+            "not features",
+        ),
+        (
+            format!(
+                "{}&orderByFields=pop",
+                stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+            ),
+            "not one of the fields",
+        ),
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, &params)).await;
+        assert_eq!(status, StatusCode::OK, "{params}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{params}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(names), "'{params}' answered '{message}'");
+    }
+
+    // f=geojson describes features, and these answers are not features
+    let (_, geojson) = get_json(
+        &app,
+        &format!(
+            "/arcgis/rest/services/{name}/FeatureServer/0/query?f=geojson&{}",
+            stats_param(json!([{"statisticType": "count", "onStatisticField": "pop"}]))
+        ),
+    )
+    .await;
+    assert_eq!(geojson["error"]["code"], 400, "{geojson}");
+
+    // nothing was harmed by any of it
+    assert_eq!(facade_count(&app, &name).await, 4);
+}
+
+#[tokio::test]
+async fn test_arcgis_query_returns_distinct_values() {
+    let (app, _) = setup_app().await;
+    let name = format!("distinct_{}", Uuid::now_v7().simple());
+    seed_stats_layer(&app, &name).await;
+
+    // two wards over four features
+    let (status, body) = get_json(
+        &app,
+        &query_url(&name, "returnDistinctValues=true&outFields=ward"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let rows = attributes(&body);
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!(rows[0], json!({"ward": "north"}), "{body}");
+    assert_eq!(rows[1], json!({"ward": "south"}), "{body}");
+    // no geometry, and no object id: a distinct row is not one feature
+    assert!(body["features"][0].get("geometry").is_none(), "{body}");
+    assert_eq!(body["fields"].as_array().unwrap().len(), 1, "{body}");
+
+    // returnGeometry does not change that, which is what Esri does with it here
+    let (_, asked) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "returnDistinctValues=true&outFields=ward&returnGeometry=true",
+        ),
+    )
+    .await;
+    assert!(asked["features"][0].get("geometry").is_none(), "{asked}");
+
+    // a text field that holds number-looking values keeps them apart as text
+    let (_, codes) = get_json(
+        &app,
+        &query_url(&name, "returnDistinctValues=true&outFields=code"),
+    )
+    .await;
+    assert_eq!(attributes(&codes).len(), 3, "{codes}");
+
+    // two fields together are distinct as a pair
+    let (_, pairs) = get_json(
+        &app,
+        &query_url(&name, "returnDistinctValues=true&outFields=ward,pop"),
+    )
+    .await;
+    assert_eq!(attributes(&pairs).len(), 4, "{pairs}");
+
+    // the object id is a value like any other when it is asked for by name
+    let (_, ids) = get_json(
+        &app,
+        &query_url(&name, "returnDistinctValues=true&outFields=OBJECTID"),
+    )
+    .await;
+    let held: Vec<i64> = attributes(&ids)
+        .iter()
+        .map(|row| row["OBJECTID"].as_i64().unwrap())
+        .collect();
+    assert_eq!(held, vec![1, 2, 3, 4], "{ids}");
+
+    // the where clause and the envelope narrow the set the values come from
+    let (_, filtered) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &format!(
+                "returnDistinctValues=true&outFields=ward&{}",
+                where_param("pop < 30")
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(
+        attributes(&filtered),
+        vec![json!({"ward": "north"})],
+        "{filtered}"
+    );
+
+    // an order over the selected fields, and the reverse of it
+    let (_, down) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "returnDistinctValues=true&outFields=ward&orderByFields=ward%20DESC",
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&down)[0]["ward"], "south", "{down}");
+
+    // and the values page with the same limit report the rows use
+    let (_, first) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "returnDistinctValues=true&outFields=pop&resultRecordCount=2",
+        ),
+    )
+    .await;
+    let held: Vec<f64> = attributes(&first)
+        .iter()
+        .map(|row| row["pop"].as_f64().unwrap())
+        .collect();
+    assert_eq!(held, vec![10.0, 20.0], "{first}");
+    assert_eq!(first["exceededTransferLimit"], true, "{first}");
+    let (_, last) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "returnDistinctValues=true&outFields=pop&resultRecordCount=2&resultOffset=2",
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&last).len(), 2, "{last}");
+    assert_eq!(last["exceededTransferLimit"], false, "{last}");
+
+    // what it will not answer: no fields to be distinct over, and the shapes
+    // that are a different answer altogether
+    for (params, names) in [
+        ("returnDistinctValues=true", "outFields"),
+        ("returnDistinctValues=true&outFields=*", "'*'"),
+        (
+            "returnDistinctValues=true&outFields=nosuchfield",
+            "nosuchfield",
+        ),
+        (
+            "returnDistinctValues=true&outFields=ward&returnCountOnly=true",
+            "not features",
+        ),
+        (
+            "returnDistinctValues=true&outFields=ward&returnIdsOnly=true",
+            "not features",
+        ),
+        (
+            "returnDistinctValues=true&outFields=ward&orderByFields=pop",
+            "not one of the fields",
+        ),
+    ] {
+        let (status, body) = get_json(&app, &query_url(&name, params)).await;
+        assert_eq!(status, StatusCode::OK, "{params}: {body}");
+        assert_eq!(body["error"]["code"], 400, "{params}: {body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(names), "'{params}' answered '{message}'");
+    }
+}
+
+#[tokio::test]
+async fn test_arcgis_query_orders_by_any_field() {
+    let (app, _) = setup_app().await;
+    let name = format!("ordered_{}", Uuid::now_v7().simple());
+    seed_where_layer(&app, &name).await;
+
+    let ids = |body: &Value| -> Vec<i64> {
+        attributes(body)
+            .iter()
+            .map(|row| row["OBJECTID"].as_i64().unwrap())
+            .collect()
+    };
+
+    for (order, wanted) in [
+        ("name DESC", vec![30, 20, 10]),
+        ("name ASC", vec![10, 20, 30]),
+        ("name", vec![10, 20, 30]),
+        ("score DESC", vec![30, 20, 10]),
+        ("pop", vec![10, 20, 30]),
+        ("OBJECTID DESC", vec![30, 20, 10]),
+        // a partly-empty field puts its empty rows last in either direction
+        ("ward", vec![10, 20, 30]),
+        ("ward DESC", vec![10, 20, 30]),
+        // the first term decides, and the rest settle its ties
+        ("ward DESC, OBJECTID DESC", vec![10, 30, 20]),
+        ("code DESC", vec![20, 30, 10]),
+    ] {
+        let (status, body) = get_json(
+            &app,
+            &query_url(
+                &name,
+                &format!("outFields=*&orderByFields={}", urlencoding::encode(order)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{order}: {body}");
+        assert!(body["error"].is_null(), "{order}: {body}");
+        assert_eq!(ids(&body), wanted, "{order}: {body}");
+    }
+
+    // the ids-only answer is ordered too, rather than always by object id
+    let (_, listed) = get_json(
+        &app,
+        &query_url(&name, "returnIdsOnly=true&orderByFields=name%20DESC"),
+    )
+    .await;
+    assert_eq!(listed["objectIds"], json!([30, 20, 10]), "{listed}");
+
+    // and an order runs with the paging rather than under it
+    let (_, page) = get_json(
+        &app,
+        &query_url(
+            &name,
+            "outFields=*&orderByFields=name%20DESC&resultRecordCount=2",
+        ),
+    )
+    .await;
+    assert_eq!(ids(&page), vec![30, 20], "{page}");
+    assert_eq!(page["exceededTransferLimit"], true, "{page}");
+}
+
+/// A field declared as a number can hold text, because a schema may be declared
+/// after the rows were written. Ordering by it reads the numbers as numbers and
+/// puts the rest last, rather than failing the query.
+#[tokio::test]
+async fn test_arcgis_query_orders_a_numeric_field_holding_text() {
+    let (app, _) = setup_app().await;
+    let name = format!("mixedpop_{}", Uuid::now_v7().simple());
+    let ds = create_named_dataset(&app, &name, "point").await;
+    let branch = create_branch(&app, ds, "main").await;
+
+    commit_features(
+        &app,
+        branch,
+        json!([
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(1.0, 1.0),
+             "properties": {"OBJECTID": 1, "pop": "30"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(2.0, 2.0),
+             "properties": {"OBJECTID": 2, "pop": "not a number"}},
+            {"type": "insert", "feature_id": Uuid::now_v7().to_string(),
+             "geometry_wkb_hex": point_wkb(3.0, 3.0),
+             "properties": {"OBJECTID": 3, "pop": "10"}},
+        ]),
+    )
+    .await;
+
+    // the schema arrives after the rows, which is how a layer ends up declaring a
+    // type its values disagree with
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{ds}/schema"),
+        None,
+        Some(json!({"fields": [
+            {"name": "OBJECTID", "field_type": "integer", "required": true},
+            {"name": "pop", "field_type": "integer", "required": false},
+        ]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = get_json(&app, &query_url(&name, "outFields=*&orderByFields=pop")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let ids: Vec<i64> = attributes(&body)
+        .iter()
+        .map(|row| row["OBJECTID"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![3, 1, 2], "{body}");
+
+    // the same guard on the way into a statistic: the two numbers add up and the
+    // text is not one of them
+    let (_, summed) = get_json(
+        &app,
+        &query_url(
+            &name,
+            &stats_param(json!([
+                {"statisticType": "sum", "onStatisticField": "pop"},
+                {"statisticType": "count", "onStatisticField": "pop"},
+            ])),
+        ),
+    )
+    .await;
+    assert_eq!(attributes(&summed)[0]["sum_pop"], 40.0, "{summed}");
+    // a count counts values rather than numbers, so the text is one of them
+    assert_eq!(attributes(&summed)[0]["count_pop"], 3, "{summed}");
 }
 
 #[tokio::test]

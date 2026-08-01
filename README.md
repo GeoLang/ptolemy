@@ -254,12 +254,23 @@ branch. Dataset visibility applies exactly as it does to the other read routes.
 Query supports `where` (the SQL-92 subset Esri clients send: comparisons, `IN`,
 `LIKE`, `BETWEEN`, `IS NULL`, boolean logic and `DATE` literals), `objectIds`,
 `outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`,
-`resultOffset`/`resultRecordCount` paging with `exceededTransferLimit`,
-`orderByFields` on the object id, an `esriGeometryEnvelope` +
-`esriSpatialRelIntersects` filter, `outSR` and `inSR` as 4326 or Web Mercator
-(3857/102100), and `f=json`, `f=pjson` or `f=geojson`. Anything else it cannot
-honor is refused rather than ignored. Refusals follow the Geoservices
-convention: HTTP 200 with an `{"error": {...}}` body.
+`orderByFields` over any field with `ASC` or `DESC`,
+`resultOffset`/`resultRecordCount` paging with `exceededTransferLimit`, an
+`esriGeometryEnvelope` + `esriSpatialRelIntersects` filter, `outSR` and `inSR`
+as 4326 or Web Mercator (3857/102100), and `f=json`, `f=pjson` or `f=geojson`.
+`returnDistinctValues` answers the distinct values of the fields `outFields`
+names, and `outStatistics` with `groupByFieldsForStatistics` answers `count`,
+`sum`, `min`, `max`, `avg`, `stddev` and `var`. Both of those answer attributes
+and no geometry, page the way rows do, and take an `orderByFields` over the
+columns they return. Anything else it cannot honor is refused rather than
+ignored, `having` included. Refusals follow the Geoservices convention: HTTP 200
+with an `{"error": {...}}` body.
+
+Two divergences worth knowing on the aggregated shapes: `returnDistinctValues`
+needs `outFields` to name its fields, because Esri's answer for `*` is the whole
+table back under a different name, and a distinct or grouped row carries an
+object id only when the client asked for that field, because no one feature is
+behind it.
 
 `applyEdits` writes: the whole batch becomes one commit on `main` and any
 failure refuses all of it. Layers need a real integer `objectid` field to be
@@ -280,7 +291,7 @@ layers for non-Esri clients, with `source` and `sourceLayer` overridable by quer
 parameter and everything the translation could not carry over listed under
 `losses`.
 
-Not served: statistics, and datasets whose `geometry_type` is `geometry` or
+Not served: `having`, and datasets whose `geometry_type` is `geometry` or
 `geometry_collection`, which have no single Esri layer type.
 
 ## Access control

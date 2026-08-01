@@ -42,7 +42,16 @@
 //! `where` is the one parameter with a grammar behind it rather than a value.
 //! The `where_clause` module parses the SQL-92 subset Esri clients send and
 //! renders it as SQL with every literal bound, and refuses the rest by name for
-//! the reason above.
+//! the reason above. `orderByFields` and `outStatistics` are read the same way,
+//! by the `order_by` and `statistics` modules, and every one of them renders a
+//! field through `column`, which is the single place a property becomes SQL.
+//!
+//! A query answers in one of three shapes, and a request that asks for two of
+//! them is refused rather than served one of the two: the layer's own rows,
+//! the distinct values of the fields it named, or statistics over the rows it
+//! selected. The last two answer columns rather than features, so neither carries
+//! a geometry, and neither carries an object id unless the client asked for that
+//! field by name: there is no one feature behind such a row to hold by.
 
 use axum::{
     Json, Router,
@@ -55,12 +64,18 @@ use ptolemy_core::diff::DiffOp;
 use ptolemy_core::schema::{FieldDef, FieldType};
 use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::postgres::PgRow;
 use uuid::Uuid;
 
 use crate::{AppState, auth::Actor};
 
 mod attachments;
+mod column;
+mod order_by;
+mod statistics;
 mod where_clause;
+
+use column::{Column, Out};
 
 pub fn arcgis_routes() -> Router<AppState> {
     Router::new()
@@ -239,6 +254,17 @@ impl IntoResponse for EsriError {
     }
 }
 
+/// Text as a refusal quotes it, cut short: a parameter may carry kilobytes, and a
+/// refusal that repeats all of it is a refusal nobody can read.
+fn shown(text: &str) -> String {
+    const LIMIT: usize = 40;
+    if text.chars().count() <= LIMIT {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(LIMIT).collect();
+    format!("{head}...")
+}
+
 // ─── Parameters ─────────────────────────────────────────────────────
 
 /// The request's parameters, from the query string on a GET and the form body on
@@ -280,11 +306,8 @@ impl Params {
 /// of them can be honored here, and answering as though the parameter were
 /// absent would hand back the wrong rows under the client's own filter, so each
 /// is refused by name.
-const UNSUPPORTED: [&str; 15] = [
-    "outStatistics",
-    "groupByFieldsForStatistics",
+const UNSUPPORTED: [&str; 12] = [
     "having",
-    "returnDistinctValues",
     "returnExtentOnly",
     "returnZ",
     "returnM",
@@ -852,9 +875,12 @@ async fn layer_metadata(
         "capabilities": layer.capabilities(),
         "advancedQueryCapabilities": {
             "supportsPagination": true,
+            // a client reads this before it will page a statistics or distinct
+            // query, and those page the same way a row query does here
+            "supportsPaginationOnAggregatedQueries": true,
             "supportsOrderBy": true,
-            "supportsStatistics": false,
-            "supportsDistinct": false,
+            "supportsStatistics": true,
+            "supportsDistinct": true,
             "supportsQueryAttachments": true,
         },
         // the operations are served whether or not this layer holds an
@@ -952,27 +978,19 @@ async fn run_query(
     }
     let layer = resolve(&store, &actor, &service, &layer_id).await?;
 
-    // the id field is the only order the store can promise, and it is the order
-    // paging already runs in, so asking for it changes nothing and asking for
-    // anything else would be answered in the wrong order
-    if let Some(order) = params.get("orderByFields").map(str::trim)
-        && !order.is_empty()
-    {
-        let (field, direction) = match order.split_once(char::is_whitespace) {
-            Some((field, rest)) => (field, rest.trim()),
-            None => (order, ""),
-        };
-        if !field.eq_ignore_ascii_case(layer.oid.name())
-            || !(direction.is_empty() || direction.eq_ignore_ascii_case("asc"))
-        {
-            return Err(EsriError::bad_request(format!(
-                "orderByFields is not supported in this version of the service, except as \
-                 '{}' or '{} ASC': '{order}'",
-                layer.oid.name(),
-                layer.oid.name()
-            )));
-        }
-    }
+    // read here and resolved once the answer's own columns are known: a query
+    // over the layer's rows orders by the layer's fields, and a statistics or
+    // distinct query by the columns it answers with
+    let raw_order = params
+        .get("orderByFields")
+        .map(str::trim)
+        .unwrap_or_default();
+    let order = order_by::parse(raw_order).map_err(|why| {
+        EsriError::bad_request(format!(
+            "orderByFields '{}' is not supported in this version of the service: {why}",
+            shown(raw_order)
+        ))
+    })?;
 
     let out_srid = sr_srid(&params, "outSR")?.unwrap_or(4326);
     // RFC 7946 says GeoJSON is 4326, so a mercator FeatureCollection would be
@@ -990,7 +1008,46 @@ async fn run_query(
     let count_only = params.flag("returnCountOnly")?;
     let ids_only = params.flag("returnIdsOnly")?;
 
-    let out_fields = out_fields(&layer, params.get("outFields"))?;
+    // the two aggregated shapes. Each answers columns over the selected rows
+    // rather than the rows themselves, so a request that asks for both, or for
+    // one of them and for the object ids of rows that no longer exist as rows,
+    // is asking for two answers at once and is refused rather than served one.
+    let distinct = params.flag("returnDistinctValues")?;
+    let asked_stats = params
+        .get("outStatistics")
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    if asked_stats.is_some() && distinct {
+        return Err(EsriError::bad_request(
+            "outStatistics and returnDistinctValues ask for two different answers. Send one of \
+             them, and group the statistics with groupByFieldsForStatistics to get one row per \
+             distinct value.",
+        ));
+    }
+    let aggregated = asked_stats.is_some() || distinct;
+    if aggregated && (count_only || ids_only) {
+        return Err(EsriError::bad_request(format!(
+            "{} answers rows that are not features, so they have no object ids to count or list. \
+             Ask for the rows themselves.",
+            if distinct {
+                "returnDistinctValues"
+            } else {
+                "outStatistics"
+            }
+        )));
+    }
+    if aggregated && matches!(format, Format::GeoJson) {
+        return Err(EsriError::bad_request(
+            "f=geojson describes features, and a statistics or distinct answer is columns rather \
+             than features. Ask for f=json.",
+        ));
+    }
+    if asked_stats.is_none() && params.asks_for("groupByFieldsForStatistics") {
+        return Err(EsriError::bad_request(
+            "groupByFieldsForStatistics groups the statistics outStatistics asks for, and this \
+             request asks for none",
+        ));
+    }
 
     let mut filters: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
@@ -1009,7 +1066,7 @@ async fn run_query(
         let predicate = where_clause::parse(clause, &layer).map_err(|why| {
             EsriError::bad_request(format!(
                 "where '{}' is not supported in this version of the service: {why}",
-                where_clause::shown(clause)
+                shown(clause)
             ))
         })?;
         filters.push(predicate.sql(&mut next, &mut binds));
@@ -1069,6 +1126,8 @@ async fn run_query(
     };
 
     if count_only {
+        // a count has no rows to put in an order, so orderByFields names nothing
+        // this answer could honor or get wrong
         let sql = format!("{rows} SELECT count(*)::bigint AS n FROM numbered{predicate}");
         let n: i64 = bound(&sql, layer.branch_id, &binds)
             .fetch_one(pool)
@@ -1080,8 +1139,10 @@ async fn run_query(
     if ids_only {
         // a feature with no value for a real objectid column has no id to name,
         // so it cannot appear in a list of ids
+        let sorted = order_by::rows_sql(&order, &layer, &mut next, &mut binds)
+            .map_err(|why| refused_order(raw_order, why))?;
         let sql = format!(
-            "{rows} SELECT oid FROM numbered{predicate}{} oid IS NOT NULL ORDER BY oid",
+            "{rows} SELECT oid FROM numbered{predicate}{} oid IS NOT NULL ORDER BY {sorted}",
             if predicate.is_empty() {
                 " WHERE"
             } else {
@@ -1100,30 +1161,60 @@ async fn run_query(
         })));
     }
 
-    let limit = params
-        .get("resultRecordCount")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i64>().map_err(|_| {
-                EsriError::bad_request(format!("resultRecordCount must be an integer: '{s}'"))
-            })
-        })
-        .transpose()?
-        .unwrap_or(MAX_RECORD_COUNT)
-        .clamp(1, MAX_RECORD_COUNT);
-    let offset = params
-        .get("resultOffset")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.parse::<i64>().map_err(|_| {
-                EsriError::bad_request(format!("resultOffset must be an integer: '{s}'"))
-            })
-        })
-        .transpose()?
-        .unwrap_or(0)
-        .max(0);
+    let (limit, offset) = paging(&params)?;
+
+    // ─── The two aggregated shapes ─────────────────────────────────
+    //
+    // Both answer columns over the rows the filters selected, and both page the
+    // way a row query does: one row past the page says whether there is another.
+    // returnGeometry is not refused and not honored, which is what Esri does with
+    // it here: an aggregate is not one feature, so it has no shape to draw.
+
+    if let Some(raw) = asked_stats {
+        let held = statistics::parse(raw, params.get("groupByFieldsForStatistics"), &layer)
+            .map_err(EsriError::bad_request)?;
+        let select = held.select_list(&mut next, &mut binds);
+        let sorted = order_by::columns_sql(&order, &held.columns(), held.unique())
+            .map_err(|why| refused_order(raw_order, why))?;
+        let sql = format!(
+            "{rows} SELECT {select} FROM numbered{predicate}{}{} LIMIT ${} OFFSET ${}",
+            held.group_by(),
+            order_clause(&sorted),
+            next,
+            next + 1
+        );
+        let (page, exceeded) =
+            fetch_page(&sql, layer.branch_id, &binds, pool, limit, offset).await?;
+        return Ok(Json(columns_response(&held.outputs, &page, exceeded)));
+    }
+
+    if distinct {
+        let fields = distinct_fields(&layer, params.get("outFields"))?;
+        let outputs: Vec<Out> = fields.iter().map(|field| Out::of(field)).collect();
+        let select: Vec<String> = fields
+            .iter()
+            .map(|field| Column::of(field).natural(&mut next, &mut binds))
+            .collect();
+        let columns: Vec<String> = fields.iter().map(|field| field.name.clone()).collect();
+        // every column of a distinct answer is part of what makes its rows
+        // distinct, so ordering by all of them is what makes paging total
+        let sorted = order_by::columns_sql(&order, &columns, columns.len())
+            .map_err(|why| refused_order(raw_order, why))?;
+        let sql = format!(
+            "{rows} SELECT DISTINCT {} FROM numbered{predicate}{} LIMIT ${} OFFSET ${}",
+            select.join(", "),
+            order_clause(&sorted),
+            next,
+            next + 1
+        );
+        let (page, exceeded) =
+            fetch_page(&sql, layer.branch_id, &binds, pool, limit, offset).await?;
+        return Ok(Json(columns_response(&outputs, &page, exceeded)));
+    }
+
+    let out_fields = out_fields(&layer, params.get("outFields"))?;
+    let sorted = order_by::rows_sql(&order, &layer, &mut next, &mut binds)
+        .map_err(|why| refused_order(raw_order, why))?;
 
     // one row past the page, which is what says whether there is another page.
     // Cheaper than counting the whole filtered set on every page.
@@ -1135,18 +1226,12 @@ async fn run_query(
     let sql = format!(
         "{rows} SELECT oid, {shape} AS geojson, properties
            FROM numbered{predicate}
-          ORDER BY oid NULLS LAST, id
+          ORDER BY {sorted}
           LIMIT ${} OFFSET ${}",
         next,
         next + 1
     );
-    let mut page = bound(&sql, layer.branch_id, &binds)
-        .bind(limit + 1)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
-    let exceeded = page.len() as i64 > limit;
-    page.truncate(limit as usize);
+    let (page, exceeded) = fetch_page(&sql, layer.branch_id, &binds, pool, limit, offset).await?;
 
     let features: Vec<Value> = page
         .iter()
@@ -1202,6 +1287,102 @@ async fn run_query(
     }))
 }
 
+/// An order this query cannot answer in, as the refusal the client gets. Quotes
+/// the parameter as it arrived, because the reason names a field and the client
+/// sent a list.
+fn refused_order(raw: &str, why: String) -> EsriError {
+    EsriError::bad_request(format!(
+        "orderByFields '{}' is not supported in this version of the service: {why}",
+        shown(raw)
+    ))
+}
+
+/// `ORDER BY` with a body, or nothing at all: an ungrouped statistics query is
+/// one row, and there is nothing to sort.
+fn order_clause(body: &str) -> String {
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {body}")
+    }
+}
+
+/// The page a query asks for, as a limit and an offset. The limit is clamped to
+/// what the layer's metadata promised, because that is the number a client pages
+/// by.
+fn paging(params: &Params) -> Result<(i64, i64), EsriError> {
+    let read = |name: &str| -> Result<Option<i64>, EsriError> {
+        params
+            .get(name)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i64>().map_err(|_| {
+                    EsriError::bad_request(format!("{name} must be an integer: '{s}'"))
+                })
+            })
+            .transpose()
+    };
+    let limit = read("resultRecordCount")?
+        .unwrap_or(MAX_RECORD_COUNT)
+        .clamp(1, MAX_RECORD_COUNT);
+    let offset = read("resultOffset")?.unwrap_or(0).max(0);
+    Ok((limit, offset))
+}
+
+/// One page of a query, and whether there is another after it. Asks for one row
+/// past the page rather than counting the whole filtered set, which is what
+/// `exceededTransferLimit` needs to know and no more.
+async fn fetch_page(
+    sql: &str,
+    branch_id: Uuid,
+    binds: &[Bind],
+    pool: &sqlx::PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<PgRow>, bool), EsriError> {
+    let mut page = bound(sql, branch_id, binds)
+        .bind(limit + 1)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    let exceeded = page.len() as i64 > limit;
+    page.truncate(limit as usize);
+    Ok((page, exceeded))
+}
+
+/// A query that answered columns rather than features: distinct values, or
+/// statistics over the selected rows.
+///
+/// Esri's own shape for both, which is the feature response with attributes and
+/// nothing else: no geometry, because an aggregate has none, and no object id
+/// unless the client asked for that field by name, because no one feature is
+/// behind the row. Columns are read by position, so the name a client gave a
+/// statistic is a JSON key and never an identifier in the statement.
+fn columns_response(outputs: &[Out], page: &[PgRow], exceeded: bool) -> Value {
+    let features: Vec<Value> = page
+        .iter()
+        .map(|row| {
+            let mut attributes = serde_json::Map::new();
+            for (at, out) in outputs.iter().enumerate() {
+                attributes.insert(out.field.name.clone(), out.value(row, at));
+            }
+            json!({"attributes": attributes})
+        })
+        .collect();
+    let aliases: serde_json::Map<String, Value> = outputs
+        .iter()
+        .map(|out| (out.field.name.clone(), Value::from(out.field.alias.clone())))
+        .collect();
+    json!({
+        "displayFieldName": "",
+        "fieldAliases": aliases,
+        "fields": outputs.iter().map(|out| out.field.declaration(false)).collect::<Vec<_>>(),
+        "features": features,
+        "exceededTransferLimit": exceeded,
+    })
+}
+
 /// The fields a query answers with. The object id is always among them whatever
 /// was asked for: a client pages and pairs rows by it, and Esri's own services
 /// return it unasked for the same reason.
@@ -1211,10 +1392,50 @@ fn out_fields<'a>(layer: &'a Layer, asked: Option<&str>) -> Result<Vec<&'a Field
         return Ok(layer.fields.iter().collect());
     }
     let mut wanted: Vec<&Field> = vec![&layer.fields[0]];
+    for field in named_fields(layer, asked)? {
+        if !wanted.iter().any(|held| held.name == field.name) {
+            wanted.push(field);
+        }
+    }
+    Ok(wanted)
+}
+
+/// The fields a distinct query answers with, which the client has to name.
+///
+/// `*` and no `outFields` at all are refused rather than read as "every field".
+/// Esri answers them: distinct over every field, object id included, which is
+/// every row of the layer at the cost of a sort. A client that asked for distinct
+/// values and got its whole table back has been answered a question it did not
+/// ask, so the parameter is named instead.
+///
+/// The object id is not added the way it is to a plain query, either. A distinct
+/// row is not a feature and there is no one feature to hold it by, so the id is
+/// answered only when it was asked for, and then it is a value like any other.
+fn distinct_fields<'a>(layer: &'a Layer, asked: Option<&str>) -> Result<Vec<&'a Field>, EsriError> {
+    let asked = asked.map(str::trim).unwrap_or_default();
+    let wanted = if asked == "*" {
+        Vec::new()
+    } else {
+        named_fields(layer, asked)?
+    };
+    if wanted.is_empty() {
+        return Err(EsriError::bad_request(
+            "returnDistinctValues needs outFields to name the fields to answer the distinct \
+             values of. '*' is not one of them, because the distinct values of every field, \
+             object id included, are every row of the layer.",
+        ));
+    }
+    Ok(wanted)
+}
+
+/// The layer's own fields a comma-separated list names, in the order it named
+/// them and each of them once. An unknown name is refused rather than skipped.
+fn named_fields<'a>(layer: &'a Layer, asked: &str) -> Result<Vec<&'a Field>, EsriError> {
+    let mut wanted: Vec<&Field> = Vec::new();
     for name in asked.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let field = layer
-            .field(name)
-            .ok_or_else(|| EsriError::bad_request(format!("the layer has no field '{name}'")))?;
+        let field = layer.field(name).ok_or_else(|| {
+            EsriError::bad_request(format!("the layer has no field '{}'", shown(name)))
+        })?;
         if !wanted.iter().any(|held| held.name == field.name) {
             wanted.push(field);
         }

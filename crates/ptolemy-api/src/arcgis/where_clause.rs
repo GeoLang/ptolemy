@@ -25,7 +25,8 @@
 //! dataset whose dates are written any other way will not compare the way a
 //! client expects, and nothing here can tell that it is happening.
 
-use super::{Bind, Kind, Layer};
+use super::column::{Column, placeholder};
+use super::{Bind, Layer, shown};
 
 /// The longest clause this parser will look at. Long enough for the object id
 /// lists real clients send, short enough that a clause cannot be a way to make
@@ -35,10 +36,6 @@ const MAX_LENGTH: usize = 32768;
 /// How deep parentheses and `NOT` may nest. The parser is recursive descent, so
 /// this is what stands between a hostile clause and the stack.
 const MAX_DEPTH: usize = 32;
-
-/// A number as PostgreSQL will read one. Fixed text in the query, never a
-/// client's: see [`Column::sql`].
-const NUMBER: &str = "^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][+-]?[0-9]+)?$";
 
 /// Words that name something this parser does not implement. Each is refused by
 /// name rather than read as a field: a field of that name would be a
@@ -98,16 +95,6 @@ pub(super) enum Predicate {
     },
 }
 
-/// A column to compare, as the layer declared it. The name is the layer's own
-/// text and never the client's, and it is bound rather than rendered like every
-/// other value here; the kind is what decides whether the comparison runs on
-/// numbers or on text.
-#[derive(Clone)]
-pub(super) struct Column {
-    name: String,
-    kind: Kind,
-}
-
 /// A comparison's value, already in the shape its column is compared in. Text
 /// is optional because `NULL` is a value a client can write and SQL compares
 /// with, always to unknown.
@@ -120,41 +107,6 @@ pub(super) enum Value {
 pub(super) enum List {
     Numbers(Vec<f64>),
     Texts(Vec<Option<String>>),
-}
-
-impl Column {
-    /// The column as SQL over the `numbered` CTE, in the shape it is compared
-    /// in. That CTE selects the properties and the object id as bare columns, so
-    /// there is no table alias to qualify with.
-    ///
-    /// A numeric comparison reads the value as a number only when it looks like
-    /// one, so a dataset whose values disagree with its declared type answers no
-    /// rows rather than failing the whole query: a schema can be declared after
-    /// the rows were written.
-    fn sql(&self, numeric: bool, next: &mut i32, binds: &mut Vec<Bind>) -> String {
-        match (self.kind, numeric) {
-            // the object id is already a bigint in the CTE. float8 holds every
-            // id below 2^53 exactly, which is every id anything here assigns
-            (Kind::Oid, true) => "oid::float8".to_string(),
-            (Kind::Oid, false) => "oid::text".to_string(),
-            (_, true) => {
-                // one bind for the key, named twice: a placeholder can be
-                // referenced as often as the statement needs it
-                let text = self.text(next, binds);
-                format!("(CASE WHEN {text} ~ '{NUMBER}' THEN ({text})::float8 END)")
-            }
-            (_, false) => self.text(next, binds),
-        }
-    }
-
-    /// The property as text, with the key bound the way [`super::Oid::sql`] binds
-    /// it. A property key is a layer's own text rather than a client's, but
-    /// binding it means no key can be quoted wrongly whatever it holds, and the
-    /// clause no longer needs `standard_conforming_strings` to be on.
-    fn text(&self, next: &mut i32, binds: &mut Vec<Bind>) -> String {
-        let place = placeholder(next, binds, Bind::Text(Some(self.name.clone())));
-        format!("(properties->>{place}::text)")
-    }
 }
 
 impl Predicate {
@@ -205,15 +157,6 @@ impl Predicate {
     }
 }
 
-/// The next placeholder, with its value bound. Every literal in a clause goes
-/// through here, which is what keeps request data out of the SQL text.
-fn placeholder(next: &mut i32, binds: &mut Vec<Bind>, bind: Bind) -> String {
-    let at = *next;
-    *next += 1;
-    binds.push(bind);
-    format!("${at}")
-}
-
 fn joined(terms: &[Predicate], with: &str, next: &mut i32, binds: &mut Vec<Bind>) -> String {
     let parts: Vec<String> = terms.iter().map(|term| term.sql(next, binds)).collect();
     format!("({})", parts.join(with))
@@ -255,17 +198,6 @@ impl Token {
             Token::Sign(sign) => sign.to_string(),
         }
     }
-}
-
-/// Text as a refusal quotes it, cut short: a clause may carry kilobytes, and a
-/// refusal that repeats all of it is a refusal nobody can read.
-pub(super) fn shown(text: &str) -> String {
-    const LIMIT: usize = 40;
-    if text.chars().count() <= LIMIT {
-        return text.to_string();
-    }
-    let head: String = text.chars().take(LIMIT).collect();
-    format!("{head}...")
 }
 
 fn arithmetic(sign: char) -> String {
@@ -464,20 +396,11 @@ impl Lit {
     }
 }
 
-/// Whether a field's declared type makes a numeric comparison the right one.
-///
-/// A number against a text field compares as text: the field holds text,
-/// nothing declared its values to be numbers, and casting them to compare would
-/// answer on a reading of the data the layer never published.
-fn numeric_field(column: &Column) -> bool {
-    matches!(column.kind, Kind::Oid | Kind::Integer | Kind::Double)
-}
-
 /// A literal as the value a column is compared against, in the shape that
 /// column compares in.
 fn value_of(column: &Column, lit: &Lit) -> Value {
     match lit {
-        Lit::Number(value, _) if numeric_field(column) => Value::Number(*value),
+        Lit::Number(value, _) if column.numeric() => Value::Number(*value),
         other => Value::Text(other.text()),
     }
 }
@@ -807,7 +730,7 @@ impl Parser<'_> {
             })
             .collect();
         let values = match numbers {
-            Some(numbers) if numeric_field(&column) => List::Numbers(numbers),
+            Some(numbers) if column.numeric() => List::Numbers(numbers),
             _ => List::Texts(lits.iter().map(Lit::text).collect()),
         };
         Ok(negate(Predicate::In { column, values }, negated))
@@ -924,10 +847,7 @@ impl Parser<'_> {
             .field(word)
             .ok_or_else(|| format!("the layer has no field '{}'", shown(word)))?;
         self.at += 1;
-        Ok(Operand::Column(Column {
-            name: field.name.clone(),
-            kind: field.kind,
-        }))
+        Ok(Operand::Column(Column::of(field)))
     }
 }
 
@@ -951,7 +871,7 @@ fn number(spelling: String) -> Result<Lit, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Field, Oid};
+    use super::super::{Field, Kind, Oid};
     use super::*;
     use uuid::Uuid;
 

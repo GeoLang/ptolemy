@@ -6,6 +6,32 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-07-31: The ArcGIS facade's query answers statistics, distinct values and
+  any order a client asks for. `orderByFields` takes a comma list of
+  `field [ASC|DESC]` over the layer's fields instead of the object id alone, with
+  nulls last in both directions and the object id appended as the tiebreaker so
+  paging stays deterministic. `returnDistinctValues=true` answers the distinct
+  values of the fields `outFields` names, paged and orderable like rows.
+  `outStatistics` answers `count`, `sum`, `min`, `max`, `avg`, `stddev` and `var`,
+  grouped by `groupByFieldsForStatistics` or over everything the filters selected,
+  with `count` typed as an integer, the numeric aggregates as doubles and a min or
+  max keeping the type of the field it read. `where`, `objectIds` and the envelope
+  compose with all three, and a layer's `advancedQueryCapabilities` now declares
+  `supportsStatistics`, `supportsDistinct` and
+  `supportsPaginationOnAggregatedQueries`. Nothing a client sends reaches the SQL:
+  a field name is resolved through the layer and bound, a statistic type is
+  matched against a closed set and rendered as this crate's own function name, and
+  an `outStatisticFieldName` is a JSON key only, because the columns are read by
+  position. It is still held to `^[A-Za-z_][A-Za-z0-9_]{0,63}$` and refused by
+  name when it fails that, rather than escaped into place. Numeric statistics read
+  the same guarded cast the where clause compares with, so a field declaring a
+  type its values disagree with sums the numbers it has instead of failing the
+  query. Two divergences from Esri: `returnDistinctValues` needs `outFields` to
+  name its fields, because Esri's answer for `*` is the whole table back under a
+  different name, and a distinct or grouped row carries an object id only when the
+  client asked for that field, because no one feature is behind it. `having` stays
+  refused by name.
+
 - 2026-07-31: A migrated dataset's Esri symbology is served two ways. The ArcGIS
   facade's layer metadata carries `drawingInfo` when the dataset has a symbology
   rule whose symbol is tagged `{"format": "esri-drawing-info"}`, which is what
