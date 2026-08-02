@@ -1820,28 +1820,6 @@ async fn test_dataset_catalog_search() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Multi-Tenancy Tests
-// ═══════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn test_create_organization() {
-    let (app, _) = setup_app().await;
-
-    let (status, body) = post_json(
-        &app,
-        "/api/v1/orgs",
-        json!({"name": "TestOrg", "owner": "admin"}),
-    )
-    .await;
-    assert!(
-        status == StatusCode::CREATED
-            || status == StatusCode::OK
-            || status == StatusCode::UNPROCESSABLE_ENTITY,
-        "create org: {status} {body}"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Metrics & Health Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -2805,13 +2783,6 @@ async fn test_permission_check_read_needs_dataset_admin() {
     let dataset_id = create_dataset_authed(&app, &admin).await;
     let uri = format!("/api/v1/datasets/{dataset_id}/permissions/some-user/check");
     assert_read_needs_dataset_admin(&app, &uri, &admin).await;
-}
-
-#[tokio::test]
-async fn test_orgs_read_is_admin_only() {
-    let app = setup_app_authed().await;
-    let admin = token_for(Role::Admin);
-    assert_read_is_admin_only(&app, "/api/v1/orgs", &admin).await;
 }
 
 #[tokio::test]
@@ -8301,11 +8272,9 @@ async fn test_planted_segments_do_not_downgrade_other_routes() {
     let app = setup_app_authed().await;
     let (dataset_id, branch_id, _carol) = owned_dataset(&app).await;
     let eve = token_for_user("eve", Role::Editor);
-    let org_id = Uuid::now_v7();
 
     for planted in POLICY_KEYWORDS {
         for uri in [
-            format!("/api/v1/orgs/{org_id}/members/{planted}"),
             format!("/api/v1/datasets/{dataset_id}/permissions/{planted}"),
             format!("/api/v1/branches/{branch_id}/permissions/{planted}"),
         ] {

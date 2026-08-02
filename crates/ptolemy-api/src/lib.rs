@@ -42,7 +42,6 @@ pub mod sse;
 pub mod stac;
 pub mod sync;
 pub mod telemetry;
-pub mod tenant;
 pub mod topology;
 pub mod trajectory;
 pub mod vector_search;
@@ -142,7 +141,6 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/api/v1", ogc::ogc_routes())
         .nest("/api/v1", locks::lock_routes())
         .nest("/api/v1", catalog::catalog_routes())
-        .nest("/api/v1", tenant::tenant_routes())
         .nest("/api/v1", conflicts::conflict_routes())
         .nest("/api/v1", network::network_routes())
         .nest("/api/v1", lrs::lrs_routes())

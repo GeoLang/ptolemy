@@ -442,9 +442,9 @@ a `created_by` that is blank or a machine label (`unknown`, `system`, `cli`, a
 connector name), because those are not identities anyone holds a token for:
 those datasets are writable by instance admins only until one of them grants.
 
-Organization membership (`org_members`) is deliberately *not* part of this
-ladder: only an explicit grant lets you write. The `/permissions/{user}/check`
-endpoints still report the older cascading rule and are informational.
+Only an explicit grant lets you write, and the `/permissions/{user}/check`
+endpoints answer from the same grants. The unused org layer (`organizations`,
+`org_members`, `datasets.org_id`) was dropped in migration `028`.
 
 ### Reads: dataset visibility
 
@@ -468,7 +468,7 @@ confirmed by probing.
 
 Enumeration is gated by the same rule, so a private dataset is simply absent
 from `GET /api/v1/datasets`, `/api/v1/catalog/search`, `/api/v1/ogc/collections`,
-`/api/v1/stac/collections`, `/api/v1/qgis/datasets` and `/api/v1/orgs/{id}/datasets`
+`/api/v1/stac/collections` and `/api/v1/qgis/datasets`
 for a caller with no grant. The filter is a SQL predicate applied inside each
 query, so a paged search's `limit` counts only rows the caller may see.
 
@@ -597,11 +597,6 @@ client but any JSON structure will work.
 | GET | `/api/v1/branches/{id}/permissions` | List branch grants (dataset admin) |
 | POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (dataset admin) |
 | DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (dataset admin) |
-| GET | `/api/v1/orgs` | List organizations |
-| POST | `/api/v1/orgs` | Create organization |
-| GET | `/api/v1/orgs/{id}/members` | List members |
-| POST | `/api/v1/orgs/{id}/members` | Add member |
-| GET | `/api/v1/orgs/{id}/datasets` | Org datasets |
 | GET | `/api/v1/conflicts/{id}` | List merge conflicts |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |

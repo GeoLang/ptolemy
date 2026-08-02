@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-02: The unused org tenancy layer is gone: the `/api/v1/orgs*` routes,
+  the `org_members` fallback in the permission `/check` paths, and migration
+  `028` dropping `organizations`, `org_members` and `datasets.org_id`. The
+  fallback could report a permission the write ladder would refuse, since the
+  ladder never read orgs. Tenancy is per-user dataset grants and visibility.
+
 - 2026-08-01: Every mounted route is called against a migrated database on every
   CI run, and a query naming a column or a table the schema does not have fails
   the build. Four feature families had shipped with one, three of them found by

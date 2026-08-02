@@ -365,13 +365,10 @@ pub fn classify(method: &Method, route: &str) -> Access {
         return Access::Authenticated;
     }
 
-    // webhook config, org membership and audit are ACL/config that both hand out
-    // access and exfiltrate data, and have no per-dataset owner to delegate to,
-    // so they stay admin-only for every method.
-    if route.contains("/webhooks")
-        || route.starts_with("/api/v1/orgs")
-        || route.starts_with("/api/v1/audit")
-    {
+    // webhook config and audit are ACL/config that both hand out access and
+    // exfiltrate data, and have no per-dataset owner to delegate to, so they
+    // stay admin-only for every method.
+    if route.contains("/webhooks") || route.starts_with("/api/v1/audit") {
         return Access::Admin;
     }
 
@@ -856,8 +853,6 @@ mod tests {
         for (method, path) in [
             (Method::POST, "/api/v1/datasets/x/webhooks"),
             (Method::DELETE, "/api/v1/webhooks/x"),
-            (Method::POST, "/api/v1/orgs"),
-            (Method::DELETE, "/api/v1/orgs/x/members/u"),
             (Method::POST, "/api/v1/replication/peers"),
         ] {
             assert_eq!(classify(&method, path), Access::Admin, "{method} {path}");
@@ -868,12 +863,7 @@ mod tests {
     /// even though they are GETs.
     #[test]
     fn classify_sensitive_reads_are_admin() {
-        for path in [
-            "/api/v1/datasets/x/webhooks",
-            "/api/v1/orgs",
-            "/api/v1/orgs/x/members",
-            "/api/v1/audit",
-        ] {
+        for path in ["/api/v1/datasets/x/webhooks", "/api/v1/audit"] {
             assert_eq!(classify(&Method::GET, path), Access::Admin, "GET {path}");
         }
     }

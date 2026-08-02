@@ -459,11 +459,6 @@ const BODY: &[(&str, &str)] = &[
         r#"{"junction_ids":["{{features}}"]}"#,
     ),
     (
-        "POST /api/v1/orgs",
-        r#"{"name":"sweep_{{unique}}","slug":"sweep-{{unique}}"}"#,
-    ),
-    ("POST /api/v1/orgs/{id}/members", r#"{"user_id":"sweep"}"#),
-    (
         "POST /api/v1/parcels/merge",
         r#"{"branch_id":"{{branches}}","feature_ids":["{{features}}"],"author":"sweep"}"#,
     ),

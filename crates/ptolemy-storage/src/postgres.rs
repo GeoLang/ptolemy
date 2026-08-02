@@ -624,8 +624,8 @@ impl PgStore {
     ///
     /// An id kind missing from this query is an unguarded read of private
     /// content, so a new dataset-owned table belongs here at the same time as its
-    /// route. Ids that deliberately resolve to nothing: replication peers and
-    /// organizations, which are not dataset content.
+    /// route. Ids that deliberately resolve to nothing: replication peers,
+    /// which are not dataset content.
     ///
     /// Shape matters here, because this runs on every request that names a uuid.
     /// Each branch resolves an id to its owning dataset by primary key, and the
@@ -3304,27 +3304,12 @@ impl PgStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some(r) = row {
-            let perm: String = r.get("permission");
-            Ok(permission_level(&perm) >= permission_level(required))
-        } else {
-            // Check org membership fallback
-            let org_row = sqlx::query(
-                "SELECT om.role FROM org_members om
-                 JOIN datasets d ON d.org_id = om.org_id
-                 WHERE d.id = $1 AND om.user_id = $2",
-            )
-            .bind(dataset_id)
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-            if let Some(r) = org_row {
-                let role: String = r.get("role");
-                Ok(org_role_to_permission(&role) >= permission_level(required))
-            } else {
-                Ok(false)
+        match row {
+            Some(r) => {
+                let perm: String = r.get("permission");
+                Ok(permission_level(&perm) >= permission_level(required))
             }
+            None => Ok(false),
         }
     }
 
@@ -3405,28 +3390,12 @@ impl PgStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some(r) = ds_row {
-            let perm: String = r.get("permission");
-            return Ok(permission_level(&perm) >= permission_level(required));
-        }
-
-        // Fallback: check org membership
-        let org_row = sqlx::query(
-            "SELECT om.role FROM org_members om
-             JOIN datasets d ON d.org_id = om.org_id
-             JOIN branches b ON b.dataset_id = d.id
-             WHERE b.id = $1 AND om.user_id = $2",
-        )
-        .bind(branch_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(r) = org_row {
-            let role: String = r.get("role");
-            Ok(org_role_to_permission(&role) >= permission_level(required))
-        } else {
-            Ok(false)
+        match ds_row {
+            Some(r) => {
+                let perm: String = r.get("permission");
+                Ok(permission_level(&perm) >= permission_level(required))
+            }
+            None => Ok(false),
         }
     }
 
@@ -3860,16 +3829,6 @@ fn denied_dataset(dataset_id: Uuid) -> StoreError {
         "no write permission on dataset {dataset_id}: ask an admin of the dataset for a write or \
          admin grant"
     ))
-}
-
-/// Map org role to permission level.
-fn org_role_to_permission(role: &str) -> u8 {
-    match role {
-        "admin" | "owner" => 3,
-        "editor" | "member" => 2,
-        "viewer" => 1,
-        _ => 0,
-    }
 }
 
 fn op_feature_id(op: &DiffOp) -> Uuid {

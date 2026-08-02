@@ -922,26 +922,12 @@ impl PgStore {
 
 // ─── Writes with no grant, and why ──────────────────────────────────
 //
-// These three have no dataset or branch behind them, so there is no ladder to
+// These two have no dataset or branch behind them, so there is no ladder to
 // run and no grant to demand. They live here rather than in `ptolemy-api` so
 // that `ci/no-raw-writes.sh` needs no allowlist entry for them and the reason
 // each one is ungrantable sits next to its SQL.
 
 impl PgStore {
-    /// An organization is not owned by a dataset and does not exist yet when it
-    /// is created, so there is no id for the ladder to resolve. `POST /orgs` is
-    /// instance-admin-only in [`crate::PgStore`]'s caller, which is the gate.
-    pub async fn create_organization(&self, name: &str, slug: &str) -> Result<Uuid, StoreError> {
-        let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)")
-            .bind(id)
-            .bind(name)
-            .bind(slug)
-            .execute(&self.pool)
-            .await?;
-        Ok(id)
-    }
-
     /// Background maintenance: no request, no caller, no target. Deletes locks
     /// whose expiry has already passed, which is the row's own decision.
     pub async fn delete_expired_feature_locks(&self) -> Result<u64, StoreError> {
@@ -959,44 +945,5 @@ impl PgStore {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected())
-    }
-}
-
-// ─── Organization membership ────────────────────────────────────────
-//
-// The org routes are instance-admin-only, and an org id resolves to no dataset,
-// so the grant the write layer mints for them proves the layer ran and pins the
-// org id rather than carrying a permission decision.
-
-impl PgStore {
-    pub async fn add_org_member(
-        &self,
-        grant: &WriteGrant,
-        user_id: &str,
-        role: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, $3)
-             ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3",
-        )
-        .bind(grant.id())
-        .bind(user_id)
-        .bind(role)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn remove_org_member(
-        &self,
-        grant: &WriteGrant,
-        user_id: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
-            .bind(grant.id())
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 }
