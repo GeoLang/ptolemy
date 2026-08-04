@@ -433,7 +433,6 @@ mod tests {
     fn lookalike_write_routes_stay_gated() {
         assert!(gated("POST", "/api/v1/branches/{t}/merge/{s}"));
         assert!(gated("POST", "/api/v1/incidents"));
-        assert!(gated("POST", "/api/v1/branches/{id}/reproject"));
         assert!(gated("POST", "/api/v1/branches/{id}/import/geojson"));
     }
 

@@ -807,24 +807,6 @@ impl PgStore {
 // ─── Branch-wide rewrites ───────────────────────────────────────────
 
 impl PgStore {
-    /// `grant` is on the branch, so a reprojection can only ever touch the
-    /// branch the ladder checked.
-    pub async fn reproject_branch_features(
-        &self,
-        grant: &WriteGrant,
-        target_srid: i32,
-    ) -> Result<u64, StoreError> {
-        let result = sqlx::query(
-            "UPDATE features SET geometry = ST_Transform(geometry, $2)
-             WHERE branch_id = $1 AND geometry IS NOT NULL",
-        )
-        .bind(grant.id())
-        .bind(target_srid)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     /// `grant` is on the branch whose feature versions get an H3 cell.
     pub async fn index_branch_features_h3(
         &self,

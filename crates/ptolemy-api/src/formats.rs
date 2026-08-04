@@ -6,13 +6,12 @@
 //! Also CRS transformation via PostGIS (PROJ-backed ST_Transform).
 
 use axum::{
-    Extension, Json, Router,
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
-use ptolemy_storage::WriteGrant;
 use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
@@ -27,7 +26,6 @@ pub fn format_routes() -> Router<AppState> {
         .route("/branches/{id}/import/geojson", post(import_geojson))
         .route("/branches/{id}/import/csv", post(import_csv))
         .route("/branches/{id}/transform", post(transform_crs))
-        .route("/branches/{id}/reproject", post(reproject_features))
         .route("/crs/search", get(search_crs))
         .route("/crs/{srid}", get(get_crs_info))
 }
@@ -511,31 +509,6 @@ async fn transform_crs(
         "to_srid": req.to_srid,
         "geometry": row.get::<serde_json::Value, _>("geojson"),
         "wkb_hex": row.get::<String, _>("wkb_hex"),
-    })))
-}
-
-/// Reproject all features on a branch to a new SRID.
-#[derive(Deserialize)]
-struct ReprojectRequest {
-    target_srid: i32,
-}
-
-async fn reproject_features(
-    State(store): State<AppState>,
-    Extension(grant): Extension<WriteGrant>,
-    actor: Actor,
-    Json(req): Json<ReprojectRequest>,
-) -> Result<Json<serde_json::Value>, FormatError> {
-    store
-        .ensure_branch_writable(grant.id(), &actor.writer())
-        .await?;
-    let reprojected = store
-        .reproject_branch_features(&grant, req.target_srid)
-        .await?;
-
-    Ok(Json(serde_json::json!({
-        "reprojected": reprojected,
-        "target_srid": req.target_srid,
     })))
 }
 

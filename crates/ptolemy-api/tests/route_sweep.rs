@@ -314,10 +314,6 @@ const BODY: &[(&str, &str)] = &[
         r#"{"user_id":"sweep","permission":"read","granted_by":"sweep"}"#,
     ),
     (
-        "POST /api/v1/branches/{id}/reproject",
-        r#"{"target_srid":3857}"#,
-    ),
-    (
         "POST /api/v1/branches/{id}/similarity/embed",
         r#"{"fields":["sweep"]}"#,
     ),

@@ -352,60 +352,117 @@ struct PathResult {
     total_cost: f64,
 }
 
+// pgRouting wants bigint vertex and edge ids, the schema has uuids. Both rank
+// helpers assign row_number() over the network's rows, the outer statement
+// ranks the same rows the same way to translate the request uuids in and the
+// result ids back out, and because every rank is computed inside the one
+// statement the mapping cannot drift. `net` is the sql expression for the
+// network id: a bind parameter outside, a spliced literal inside the quoted
+// sql handed to pgr_*.
+
+fn node_rank(net: &str) -> String {
+    format!(
+        "SELECT id, geometry, row_number() OVER (ORDER BY id) AS nid \
+         FROM network_junctions WHERE network_id = {net}"
+    )
+}
+
+fn edge_rank(net: &str) -> String {
+    format!(
+        "SELECT id, from_junction, to_junction, cost, row_number() OVER (ORDER BY id) AS eid \
+         FROM network_edges WHERE network_id = {net} AND enabled = TRUE"
+    )
+}
+
+/// A sql expression evaluating to the edges sql string handed to pgr_*
+/// functions. `xy` adds the endpoint coordinates pgr_astar's heuristic needs.
+fn pgr_edges_expr(xy: bool) -> String {
+    let net = "''' || $1::text || '''";
+    let xy_cols = if xy {
+        ", ST_X(ns.geometry) AS x1, ST_Y(ns.geometry) AS y1, \
+         ST_X(nt.geometry) AS x2, ST_Y(nt.geometry) AS y2"
+    } else {
+        ""
+    };
+    format!(
+        "'WITH n AS ({n}), e AS ({e}) \
+         SELECT e.eid AS id, ns.nid AS source, nt.nid AS target, \
+                e.cost, e.cost AS reverse_cost{xy_cols} \
+         FROM e JOIN n ns ON ns.id = e.from_junction \
+                JOIN n nt ON nt.id = e.to_junction'",
+        n = node_rank(net),
+        e = edge_rank(net)
+    )
+}
+
+/// Shared tail of the path-shaped statements: an unknown junction coalesces to
+/// rank 0, which no vertex holds, so pgr_* returns no rows and the route
+/// answers empty instead of erroring.
+fn path_sql(pgr_call: &str) -> String {
+    format!(
+        "WITH n AS ({n}), e AS ({e}),
+         path AS (SELECT * FROM {pgr_call})
+         SELECT p.seq, nj.id AS node_id, ne.id AS edge_id, p.cost, p.agg_cost
+         FROM path p
+         JOIN n nj ON nj.nid = p.node
+         LEFT JOIN e ne ON ne.eid = p.edge
+         ORDER BY p.seq",
+        n = node_rank("$1"),
+        e = edge_rank("$1")
+    )
+}
+
+fn rows_to_path(rows: &[sqlx::postgres::PgRow]) -> PathResult {
+    if rows.is_empty() {
+        return PathResult {
+            found: false,
+            path_junctions: vec![],
+            path_edges: vec![],
+            total_cost: 0.0,
+        };
+    }
+    let mut path_junctions = Vec::new();
+    let mut path_edges = Vec::new();
+    let mut total_cost = 0.0f64;
+    for row in rows {
+        path_junctions.push(row.get("node_id"));
+        // the arrival row carries edge -1, which ranks to no edge
+        if let Some(edge) = row.get::<Option<Uuid>, _>("edge_id") {
+            path_edges.push(edge);
+        }
+        let agg: f64 = row.get("agg_cost");
+        if agg > total_cost {
+            total_cost = agg;
+        }
+    }
+    PathResult {
+        found: true,
+        path_junctions,
+        path_edges,
+        total_cost,
+    }
+}
+
 async fn shortest_path(
     State(store): State<AppState>,
     Path(network_id): Path<Uuid>,
     Json(req): Json<ShortestPathRequest>,
 ) -> Result<Json<PathResult>, NetworkError> {
     require_pgrouting(&store).await?;
-    // Use pgRouting pgr_dijkstra for optimal performance
-    let rows = sqlx::query(
-        "SELECT seq, node, edge, cost, agg_cost
-         FROM pgr_dijkstra(
-             'SELECT e.id, e.from_junction::bigint AS source, e.to_junction::bigint AS target,
-                     e.cost, e.cost AS reverse_cost
-              FROM network_edges e WHERE e.network_id = ''' || $1::text || ''' AND e.enabled = TRUE',
-             $2::bigint, $3::bigint, directed := false
-         )",
-    )
-    .bind(network_id)
-    .bind(req.from_junction)
-    .bind(req.to_junction)
-    .fetch_all(store.read_pool())
-    .await?;
-
-    if rows.is_empty() {
-        return Ok(Json(PathResult {
-            found: false,
-            path_junctions: vec![],
-            path_edges: vec![],
-            total_cost: 0.0,
-        }));
-    }
-
-    let mut path_junctions = Vec::new();
-    let mut path_edges = Vec::new();
-    let mut total_cost = 0.0f64;
-    for row in &rows {
-        let node: i64 = row.get("node");
-        let edge: i64 = row.get("edge");
-        let agg: f64 = row.get("agg_cost");
-        // Convert bigint back to UUID via lookup
-        path_junctions.push(Uuid::from_u128(node as u128));
-        if edge >= 0 {
-            path_edges.push(Uuid::from_u128(edge as u128));
-        }
-        if agg > total_cost {
-            total_cost = agg;
-        }
-    }
-
-    Ok(Json(PathResult {
-        found: true,
-        path_junctions,
-        path_edges,
-        total_cost,
-    }))
+    let call = format!(
+        "pgr_dijkstra({expr},
+             COALESCE((SELECT nid FROM n WHERE id = $2), 0),
+             COALESCE((SELECT nid FROM n WHERE id = $3), 0),
+             directed := false)",
+        expr = pgr_edges_expr(false)
+    );
+    let rows = sqlx::query(&path_sql(&call))
+        .bind(network_id)
+        .bind(req.from_junction)
+        .bind(req.to_junction)
+        .fetch_all(store.read_pool())
+        .await?;
+    Ok(Json(rows_to_path(&rows)))
 }
 
 // ─── A* (heuristic shortest path) ──────────────────────────────────
@@ -422,57 +479,20 @@ async fn astar_path(
     Json(req): Json<AstarRequest>,
 ) -> Result<Json<PathResult>, NetworkError> {
     require_pgrouting(&store).await?;
-    let rows = sqlx::query(
-        "SELECT seq, node, edge, cost, agg_cost
-         FROM pgr_astar(
-             'SELECT e.id, e.from_junction::bigint AS source, e.to_junction::bigint AS target,
-                     e.cost, e.cost AS reverse_cost,
-                     ST_X(j1.geometry) AS x1, ST_Y(j1.geometry) AS y1,
-                     ST_X(j2.geometry) AS x2, ST_Y(j2.geometry) AS y2
-              FROM network_edges e
-              JOIN network_junctions j1 ON j1.id = e.from_junction
-              JOIN network_junctions j2 ON j2.id = e.to_junction
-              WHERE e.network_id = ''' || $1::text || ''' AND e.enabled = TRUE',
-             $2::bigint, $3::bigint, directed := false
-         )",
-    )
-    .bind(network_id)
-    .bind(req.from_junction)
-    .bind(req.to_junction)
-    .fetch_all(store.read_pool())
-    .await?;
-
-    if rows.is_empty() {
-        return Ok(Json(PathResult {
-            found: false,
-            path_junctions: vec![],
-            path_edges: vec![],
-            total_cost: 0.0,
-        }));
-    }
-
-    let mut path_junctions = Vec::new();
-    let mut path_edges = Vec::new();
-    let mut total_cost = 0.0f64;
-    for row in &rows {
-        let node: i64 = row.get("node");
-        let edge: i64 = row.get("edge");
-        let agg: f64 = row.get("agg_cost");
-        path_junctions.push(Uuid::from_u128(node as u128));
-        if edge >= 0 {
-            path_edges.push(Uuid::from_u128(edge as u128));
-        }
-        if agg > total_cost {
-            total_cost = agg;
-        }
-    }
-
-    Ok(Json(PathResult {
-        found: true,
-        path_junctions,
-        path_edges,
-        total_cost,
-    }))
+    let call = format!(
+        "pgr_astar({expr},
+             COALESCE((SELECT nid FROM n WHERE id = $2), 0),
+             COALESCE((SELECT nid FROM n WHERE id = $3), 0),
+             directed := false)",
+        expr = pgr_edges_expr(true)
+    );
+    let rows = sqlx::query(&path_sql(&call))
+        .bind(network_id)
+        .bind(req.from_junction)
+        .bind(req.to_junction)
+        .fetch_all(store.read_pool())
+        .await?;
+    Ok(Json(rows_to_path(&rows)))
 }
 
 // ─── Driving Distance / Isochrone ───────────────────────────────────
@@ -490,8 +510,8 @@ struct IsochroneResult {
 
 #[derive(Serialize)]
 struct IsochroneNode {
-    node: i64,
-    edge: i64,
+    node: Uuid,
+    edge: Option<Uuid>,
     cost: f64,
     agg_cost: f64,
 }
@@ -502,26 +522,24 @@ async fn driving_distance(
     Json(req): Json<DrivingDistanceRequest>,
 ) -> Result<Json<IsochroneResult>, NetworkError> {
     require_pgrouting(&store).await?;
-    let rows = sqlx::query(
-        "SELECT seq, node, edge, cost, agg_cost
-         FROM pgr_drivingDistance(
-             'SELECT e.id, e.from_junction::bigint AS source, e.to_junction::bigint AS target,
-                     e.cost, e.cost AS reverse_cost
-              FROM network_edges e WHERE e.network_id = ''' || $1::text || ''' AND e.enabled = TRUE',
-             $2::bigint, $3, directed := false
-         )",
-    )
-    .bind(network_id)
-    .bind(req.start_junction)
-    .bind(req.max_cost)
-    .fetch_all(store.read_pool())
-    .await?;
+    let call = format!(
+        "pgr_drivingDistance({expr},
+             COALESCE((SELECT nid FROM n WHERE id = $2), 0),
+             $3, directed := false)",
+        expr = pgr_edges_expr(false)
+    );
+    let rows = sqlx::query(&path_sql(&call))
+        .bind(network_id)
+        .bind(req.start_junction)
+        .bind(req.max_cost)
+        .fetch_all(store.read_pool())
+        .await?;
 
     let nodes: Vec<IsochroneNode> = rows
         .iter()
         .map(|r| IsochroneNode {
-            node: r.get("node"),
-            edge: r.get("edge"),
+            node: r.get("node_id"),
+            edge: r.get("edge_id"),
             cost: r.get("cost"),
             agg_cost: r.get("agg_cost"),
         })
@@ -542,7 +560,7 @@ struct TspRequest {
 
 #[derive(Serialize)]
 struct TspResult {
-    ordered_nodes: Vec<i64>,
+    ordered_junctions: Vec<Uuid>,
     total_cost: f64,
 }
 
@@ -552,36 +570,51 @@ async fn tsp_tour(
     Json(req): Json<TspRequest>,
 ) -> Result<Json<TspResult>, NetworkError> {
     require_pgrouting(&store).await?;
-    // First compute cost matrix, then run TSP
-    let start = req.start_junction.map(|u| u.as_u128() as i64).unwrap_or(0);
-    let ids: Vec<i64> = req
-        .junction_ids
-        .iter()
-        .map(|u| u.as_u128() as i64)
-        .collect();
-
-    let rows = sqlx::query(
-        "SELECT seq, node, cost, agg_cost
-         FROM pgr_TSP(
-             $$SELECT * FROM pgr_dijkstraCostMatrix(
-                 'SELECT e.id, e.from_junction::bigint AS source, e.to_junction::bigint AS target,
-                         e.cost, e.cost AS reverse_cost
-                  FROM network_edges e WHERE e.network_id = $4 AND e.enabled = TRUE',
-                 $1::bigint[], directed := false
-             )$$,
-             start_id := $2
-         )",
+    // a matrix under two stops has no tour, and pgr_TSP errors rather than
+    // returning empty on one, so resolve the request against real junctions
+    // first
+    let stops: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM network_junctions WHERE network_id = $1 AND id = ANY($2)",
     )
-    .bind(&ids)
-    .bind(start)
     .bind(network_id)
-    .fetch_all(store.read_pool())
+    .bind(&req.junction_ids)
+    .fetch_one(store.read_pool())
     .await?;
+    if stops < 2 {
+        return Ok(Json(TspResult {
+            ordered_junctions: vec![],
+            total_cost: 0.0,
+        }));
+    }
+
+    // the matrix sql is assembled in-database: quote_literal re-quotes the
+    // edges sql for its second level of nesting, and the wanted ranks become
+    // an array literal
+    let sql = format!(
+        "WITH n AS ({n}),
+         tour AS (SELECT seq, node, agg_cost FROM pgr_TSP(
+             'SELECT * FROM pgr_dijkstraCostMatrix(' || quote_literal({expr}) || ', '
+                 || (SELECT 'ARRAY[' || string_agg(nid::text, ',') || ']::bigint[]'
+                     FROM n WHERE id = ANY($2))
+                 || ', directed := false)',
+             start_id := COALESCE((SELECT nid FROM n WHERE id = $3 AND id = ANY($2)), 0)))
+         SELECT t.seq, nj.id AS node_id, t.agg_cost
+         FROM tour t JOIN n nj ON nj.nid = t.node
+         ORDER BY t.seq",
+        n = node_rank("$1"),
+        expr = pgr_edges_expr(false)
+    );
+    let rows = sqlx::query(&sql)
+        .bind(network_id)
+        .bind(&req.junction_ids)
+        .bind(req.start_junction)
+        .fetch_all(store.read_pool())
+        .await?;
 
     let mut ordered = Vec::new();
     let mut total = 0.0f64;
     for row in &rows {
-        ordered.push(row.get::<i64, _>("node"));
+        ordered.push(row.get::<Uuid, _>("node_id"));
         let agg: f64 = row.get("agg_cost");
         if agg > total {
             total = agg;
@@ -589,7 +622,7 @@ async fn tsp_tour(
     }
 
     Ok(Json(TspResult {
-        ordered_nodes: ordered,
+        ordered_junctions: ordered,
         total_cost: total,
     }))
 }
@@ -616,22 +649,14 @@ async fn check_connectivity(
     .fetch_one(store.read_pool())
     .await?;
 
-    // Use pgRouting connectedComponents for accurate component count
-    let components = sqlx::query(
-        "SELECT COUNT(DISTINCT component) as num_components
-         FROM pgr_connectedComponents(
-             'SELECT e.id, e.from_junction::bigint AS source, e.to_junction::bigint AS target,
-                     e.cost FROM network_edges e
-              WHERE e.network_id = ''' || $1::text || ''' AND e.enabled = TRUE'
-         )",
-    )
+    let components: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT COUNT(DISTINCT component)
+         FROM pgr_connectedComponents({expr})",
+        expr = pgr_edges_expr(false)
+    ))
     .bind(network_id)
     .fetch_optional(store.read_pool())
     .await?;
-
-    let num_components = components
-        .map(|r| r.get::<i64, _>("num_components"))
-        .unwrap_or(0);
 
     let isolated = sqlx::query(
         "SELECT j.id FROM network_junctions j
@@ -649,7 +674,7 @@ async fn check_connectivity(
     Ok(Json(ConnectivityReport {
         total_junctions: stats.get("junctions"),
         total_edges: stats.get("edges"),
-        connected_components: num_components,
+        connected_components: components.unwrap_or(0),
         isolated_junctions: isolated.into_iter().map(|r| r.get("id")).collect(),
     }))
 }

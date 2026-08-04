@@ -423,7 +423,7 @@ rule of their own either, removing them all falls back to the dataset scope.
 
 On commit, batch commit, merge (plain, topology-aware, review and
 conflict-resolving), GeoJSON/CSV import, QGIS push, WFS transaction, sync push,
-branch creation, reproject, repair and compaction:
+branch creation, repair and compaction:
 
 1. An `admin` role token bypasses per-dataset grants.
 2. Otherwise, if the target **branch** has any permission rows, the caller needs
@@ -731,7 +731,6 @@ client but any JSON structure will work.
 | GET | `/api/v1/branches/{id}/export/csv` | Export CSV |
 | GET | `/api/v1/branches/{id}/export/flatgeobuf` | Export FlatGeobuf |
 | POST | `/api/v1/branches/{id}/transform` | Transform single geometry CRS |
-| POST | `/api/v1/branches/{id}/reproject` | Reproject all features |
 | POST | `/api/v1/branches/{id}/import/geojson` | Import a FeatureCollection |
 | POST | `/api/v1/branches/{id}/import/csv` | Import point rows from CSV |
 | GET | `/api/v1/crs/search?q=` | Search coordinate systems |

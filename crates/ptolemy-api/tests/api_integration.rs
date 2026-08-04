@@ -1419,6 +1419,116 @@ async fn test_pgrouting_routes_report_missing_pgrouting() {
     }
 }
 
+/// A three-stop line a-b-c with unit edge costs, exercised end to end where
+/// pgRouting is installed. The routes rank junction uuids to bigints inside
+/// each statement and rank the results back, so every id below round-trips.
+#[tokio::test]
+async fn test_pgrouting_routes_round_trip_junction_uuids() {
+    let (app, state) = setup_app().await;
+    if !has_extension(&state, "pgrouting").await {
+        return;
+    }
+    let ds_id = create_dataset(&app).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/networks"),
+        json!({"name": "mains"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create network: {body}");
+    let net_id = body["id"].as_str().unwrap().to_string();
+
+    let mut junctions = Vec::new();
+    for lng in [0.0, 1.0, 2.0] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/networks/{net_id}/junctions"),
+            json!({"lng": lng, "lat": 0.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "junction: {body}");
+        junctions.push(body["id"].as_str().unwrap().to_string());
+    }
+    let (a, b, c) = (&junctions[0], &junctions[1], &junctions[2]);
+    for (from, to) in [(a, b), (b, c)] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/networks/{net_id}/edges"),
+            json!({"feature_id": Uuid::now_v7(), "from_junction": from, "to_junction": to, "cost": 1.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "edge: {body}");
+    }
+
+    for route in ["shortest-path", "astar"] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/networks/{net_id}/{route}"),
+            json!({"from_junction": a, "to_junction": c}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert_eq!(body["found"], true, "{route}: {body}");
+        assert_eq!(body["path_junctions"], json!([a, b, c]), "{route}: {body}");
+        assert_eq!(
+            body["path_edges"].as_array().unwrap().len(),
+            2,
+            "{route}: {body}"
+        );
+        assert_eq!(body["total_cost"], 2.0, "{route}: {body}");
+    }
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/networks/{net_id}/isochrone"),
+        json!({"start_junction": a, "max_cost": 1.5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "isochrone: {body}");
+    let reached: Vec<&str> = body["reachable_nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_str().unwrap())
+        .collect();
+    assert!(reached.contains(&a.as_str()), "isochrone: {body}");
+    assert!(reached.contains(&b.as_str()), "isochrone: {body}");
+    assert!(!reached.contains(&c.as_str()), "isochrone: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/networks/{net_id}/tsp"),
+        json!({"junction_ids": [a, b, c], "start_junction": a}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "tsp: {body}");
+    let tour = body["ordered_junctions"].as_array().unwrap();
+    for j in [a, b, c] {
+        assert!(tour.contains(&json!(j)), "tsp misses {j}: {body}");
+    }
+
+    let (status, body) = get_json(&app, &format!("/api/v1/networks/{net_id}/connectivity")).await;
+    assert_eq!(status, StatusCode::OK, "connectivity: {body}");
+    assert_eq!(body["total_junctions"], 3, "connectivity: {body}");
+    assert_eq!(body["total_edges"], 2, "connectivity: {body}");
+    assert_eq!(body["connected_components"], 1, "connectivity: {body}");
+    assert_eq!(
+        body["isolated_junctions"],
+        json!([]),
+        "connectivity: {body}"
+    );
+
+    // an unknown junction ranks to nothing and the path is not found, not a 500
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/networks/{net_id}/shortest-path"),
+        json!({"from_junction": Uuid::now_v7(), "to_junction": c}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "absent junction: {body}");
+    assert_eq!(body["found"], false, "absent junction: {body}");
+}
+
 fn assert_pgrouting_answer(installed: bool, status: StatusCode, body: &Value, uri: &str) {
     if installed {
         assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");

@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-04: The routing routes work where pgRouting is installed: junction
+  and edge uuids are ranked to the bigints `pgr_*` functions want with
+  `row_number()` inside each statement, and the results rank back to uuids, so
+  shortest-path, astar, isochrone, tsp and connectivity return real paths
+  (validated end to end against pgRouting 3.8, with an integration test that
+  runs wherever the extension exists). An unknown junction answers an empty
+  path, not an error. The isochrone and tsp responses carry junction uuids now
+  (`node`/`edge` uuid fields, `ordered_junctions`) instead of fabricated
+  bigints. Migration 029 drops the unused `pgr_network_edges` view, whose
+  text-to-bigint cast failed on any real row. `POST
+  /branches/{id}/reproject` is removed rather than rewritten: it updated the
+  read-only `features` view, so it never worked against the current schema.
+
 - 2026-08-04: The fixable class of the route sweep's standing 500s is fixed,
   taking the sweep's report from 24 to 7, and the 7 left are fixture artifacts
   or decision-shaped (tracked in the platform DESIGN_TODO). The h3, sfcgal,
