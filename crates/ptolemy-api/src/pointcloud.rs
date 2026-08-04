@@ -34,6 +34,24 @@ pub fn pointcloud_routes() -> Router<AppState> {
         .route("/pointclouds/{id}/profile", post(elevation_profile))
 }
 
+/// Migration 015 only gives `pointcloud_patches.pa` the `pcpatch` type where
+/// the pointcloud extension is installed; without it the column is BYTEA and
+/// the `PC_*` functions are undefined. The catalog and patch listings read
+/// neither, so only the two routes that do are gated, and each gates after its
+/// own ladder and argument checks so a 501 never stands in for a 403 or a 400.
+async fn require_pointcloud(store: &AppState) -> Result<(), PcError> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pointcloud')",
+    )
+    .fetch_one(store.read_pool())
+    .await?;
+    if present {
+        Ok(())
+    } else {
+        Err(PcError::NoPointCloud)
+    }
+}
+
 #[derive(Serialize)]
 struct PointCloudCatalog {
     id: Uuid,
@@ -175,6 +193,7 @@ async fn add_patch(
         hex::decode(&req.bounds_wkb_hex).map_err(|_| PcError::Bad("invalid bounds hex".into()))?;
     let patch_data =
         hex::decode(&req.patch_hex).map_err(|_| PcError::Bad("invalid patch hex".into()))?;
+    require_pointcloud(&store).await?;
     let id = store
         .add_pointcloud_patch(
             &grant,
@@ -277,6 +296,7 @@ async fn elevation_profile(
     Json(req): Json<ProfileRequest>,
 ) -> Result<Json<serde_json::Value>, PcError> {
     let wkb = hex::decode(&req.line_wkb_hex).map_err(|_| PcError::Bad("invalid hex".into()))?;
+    require_pointcloud(&store).await?;
     // Query real elevation from point cloud patches along the line
     let rows = sqlx::query(
         "WITH line AS (
@@ -331,6 +351,7 @@ enum PcError {
     Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
+    NoPointCloud,
 }
 impl From<sqlx::Error> for PcError {
     fn from(e: sqlx::Error) -> Self {
@@ -347,6 +368,11 @@ impl IntoResponse for PcError {
         let (s, m) = match self {
             PcError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             PcError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
+            PcError::NoPointCloud => (
+                StatusCode::NOT_IMPLEMENTED,
+                "point cloud patches need the pointcloud extension, which this database does not have"
+                    .to_string(),
+            ),
             PcError::Store(e) => crate::errors::store_error_status(&e),
             PcError::Db(e) => {
                 crate::errors::log_db_error("pointcloud", &e);

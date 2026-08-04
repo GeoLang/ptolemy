@@ -100,7 +100,7 @@ async fn union_analysis(
         SELECT
             COUNT(*) as cnt,
             ST_AsGeoJSON(ST_Union(geometry))::jsonb as geojson,
-            COALESCE(ST_Area(ST_Union(geometry::geography)), 0) as area
+            COALESCE(ST_Area(ST_Union(geometry)::geography), 0) as area
         FROM live",
     )
     .bind(branch_id)
@@ -222,16 +222,17 @@ async fn anomaly_detection(
             SELECT feature_id, geometry FROM latest
             WHERE operation != 'delete' AND geometry IS NOT NULL
         ),
+        centroid AS (
+            SELECT ST_Centroid(ST_Collect(geometry)) as center FROM live
+        ),
         stats AS (
-            SELECT
-                ST_Centroid(ST_Collect(geometry)) as center,
-                COALESCE(STDDEV(ST_Distance(geometry::geography, ST_Centroid(ST_Collect(geometry))::geography)), 1) as stddev_dist
-            FROM live
+            SELECT COALESCE(STDDEV(ST_Distance(live.geometry::geography, centroid.center::geography)), 1) as stddev_dist
+            FROM live, centroid
         )
         SELECT feature_id, 'spatial_outlier' as atype,
             'Feature is >3 std deviations from dataset centroid' as descr
-        FROM live, stats
-        WHERE ST_Distance(live.geometry::geography, stats.center::geography) > stats.stddev_dist * 3
+        FROM live, centroid, stats
+        WHERE ST_Distance(live.geometry::geography, centroid.center::geography) > stats.stddev_dist * 3
         UNION ALL
         SELECT feature_id, 'self_intersection' as atype,
             'Geometry contains self-intersections' as descr

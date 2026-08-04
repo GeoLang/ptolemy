@@ -29,6 +29,18 @@ pub fn h3_routes() -> Router<AppState> {
         .route("/h3/boundary", get(cell_boundary))
 }
 
+/// Every route here calls an `h3_*` function or names the `h3index` type, both
+/// of which only exist with the h3 extension installed. Without it the call is
+/// not a failure to hide behind a 500, it is a route this deployment does not
+/// have.
+async fn require_h3(store: &AppState) -> Result<(), H3Error> {
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'h3')")
+            .fetch_one(store.read_pool())
+            .await?;
+    if present { Ok(()) } else { Err(H3Error::NoH3) }
+}
+
 /// Index all features on a branch with H3 cells at given resolution.
 #[derive(Deserialize)]
 struct IndexH3Request {
@@ -44,6 +56,7 @@ async fn index_features_h3(
     Extension(grant): Extension<WriteGrant>,
     Json(req): Json<IndexH3Request>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let indexed = store
         .index_branch_features_h3(&grant, req.resolution)
         .await?;
@@ -67,6 +80,7 @@ async fn get_hexagons(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let (_, source) = store.features_source(branch_id).await?;
     let rows = sqlx::query(&format!(
         "SELECT DISTINCT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
@@ -98,6 +112,7 @@ async fn aggregate_by_hex(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let (_, source) = store.features_source(branch_id).await?;
     let rows = sqlx::query(&format!(
         "SELECT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
@@ -143,6 +158,7 @@ async fn hex_neighbors(
     Path(_branch_id): Path<Uuid>,
     Query(q): Query<NeighborQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let rows = sqlx::query("SELECT h3_grid_disk($1::h3index, $2) as neighbors")
         .bind(&q.cell)
         .bind(q.k)
@@ -169,6 +185,7 @@ async fn compact_hexes(
     Path(_branch_id): Path<Uuid>,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let row = sqlx::query(
         "SELECT array_agg(h3_compact_cells(ARRAY(SELECT unnest($1::h3index[]))::h3index[])::text) as compacted",
     ).bind(&req.cells)
@@ -193,6 +210,7 @@ async fn point_to_cell(
     State(store): State<AppState>,
     Query(q): Query<PointToCellQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let row = sqlx::query(
         "SELECT h3_lat_lng_to_cell(ST_SetSRID(ST_MakePoint($1, $2), 4326)::point, $3)::text as cell",
     ).bind(q.lng).bind(q.lat).bind(q.resolution)
@@ -212,6 +230,7 @@ async fn cell_boundary(
     State(store): State<AppState>,
     Query(q): Query<CellBoundaryQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
+    require_h3(&store).await?;
     let row = sqlx::query(
         "SELECT ST_AsGeoJSON(h3_cell_to_boundary($1::h3index)::geometry)::jsonb as boundary",
     )
@@ -224,6 +243,7 @@ async fn cell_boundary(
 enum H3Error {
     Db(sqlx::Error),
     Store(ptolemy_storage::StoreError),
+    NoH3,
 }
 impl From<sqlx::Error> for H3Error {
     fn from(e: sqlx::Error) -> Self {
@@ -238,6 +258,11 @@ impl From<ptolemy_storage::StoreError> for H3Error {
 impl IntoResponse for H3Error {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
+            H3Error::NoH3 => (
+                StatusCode::NOT_IMPLEMENTED,
+                "hexagonal indexing needs the h3 extension, which this database does not have"
+                    .to_string(),
+            ),
             H3Error::Db(e) => {
                 crate::errors::log_db_error("h3", &e);
                 (

@@ -31,6 +31,23 @@ pub fn sfcgal_routes() -> Router<AppState> {
         .route("/branches/{id}/3d/visibility", post(visibility))
 }
 
+/// Every route here calls an SFCGAL function (`ST_Extrude`, `ST_Volume`,
+/// `ST_3DIntersection` and the rest), none of which a PostGIS build without
+/// `postgis_sfcgal` defines. Without it the call is not a failure to hide
+/// behind a 500, it is a route this deployment does not have.
+async fn require_sfcgal(store: &AppState) -> Result<(), SfcgalError> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis_sfcgal')",
+    )
+    .fetch_one(store.read_pool())
+    .await?;
+    if present {
+        Ok(())
+    } else {
+        Err(SfcgalError::NoSfcgal)
+    }
+}
+
 #[derive(Deserialize)]
 struct ExtrudeRequest {
     feature_id: Uuid,
@@ -42,6 +59,7 @@ async fn extrude_3d(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ExtrudeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Extrude(ST_Force3D(geometry), 0, 0, $3))::jsonb as geojson
@@ -66,6 +84,7 @@ async fn compute_volume(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<VolumeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_3DArea(geometry) as surface_area, ST_Volume(geometry) as volume
@@ -93,6 +112,7 @@ async fn intersection_3d(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<Intersection3DRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     // both sides are the same branch, so the same scoped source twice
     let (_, source) = store.features_source_at(branch_id, "$3").await?;
     let row = sqlx::query(&format!(
@@ -119,6 +139,7 @@ async fn straight_skeleton(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<SkeletonRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_StraightSkeleton(geometry))::jsonb as geojson
@@ -143,6 +164,7 @@ async fn minkowski_sum(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<MinkowskiRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let wkb = hex::decode(&req.buffer_geometry_wkb_hex)
         .map_err(|_| SfcgalError::Bad("invalid hex".into()))?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
@@ -169,6 +191,7 @@ async fn tesselate(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<TesselateRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Tesselate(geometry))::jsonb as geojson
@@ -195,6 +218,7 @@ async fn visibility(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<VisibilityRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
+    require_sfcgal(&store).await?;
     let (_, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_3DDistance(
@@ -229,6 +253,7 @@ enum SfcgalError {
     Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
+    NoSfcgal,
 }
 impl From<sqlx::Error> for SfcgalError {
     fn from(e: sqlx::Error) -> Self {
@@ -245,6 +270,11 @@ impl IntoResponse for SfcgalError {
         let (s, m) = match self {
             SfcgalError::NotFound => (StatusCode::NOT_FOUND, "feature not found".to_string()),
             SfcgalError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
+            SfcgalError::NoSfcgal => (
+                StatusCode::NOT_IMPLEMENTED,
+                "3d geometry operations need the postgis_sfcgal extension, which this database does not have"
+                    .to_string(),
+            ),
             SfcgalError::Db(e) => {
                 crate::errors::log_db_error("sfcgal", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())

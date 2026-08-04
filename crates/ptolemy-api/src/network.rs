@@ -38,6 +38,24 @@ pub fn network_routes() -> Router<AppState> {
         .route("/networks/{id}/connectivity", get(check_connectivity))
 }
 
+/// The routing routes below call `pgr_*` functions and have no hand-rolled
+/// form: `trace_network` walks the edge table itself, but dijkstra, A*, driving
+/// distance, TSP and connected components are pgRouting or nothing. Without the
+/// extension the call is not a failure to hide behind a 500, it is a route this
+/// deployment does not have.
+async fn require_pgrouting(store: &AppState) -> Result<(), NetworkError> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgrouting')",
+    )
+    .fetch_one(store.read_pool())
+    .await?;
+    if present {
+        Ok(())
+    } else {
+        Err(NetworkError::NoPgRouting)
+    }
+}
+
 #[derive(Serialize)]
 struct Network {
     id: Uuid,
@@ -339,6 +357,7 @@ async fn shortest_path(
     Path(network_id): Path<Uuid>,
     Json(req): Json<ShortestPathRequest>,
 ) -> Result<Json<PathResult>, NetworkError> {
+    require_pgrouting(&store).await?;
     // Use pgRouting pgr_dijkstra for optimal performance
     let rows = sqlx::query(
         "SELECT seq, node, edge, cost, agg_cost
@@ -402,6 +421,7 @@ async fn astar_path(
     Path(network_id): Path<Uuid>,
     Json(req): Json<AstarRequest>,
 ) -> Result<Json<PathResult>, NetworkError> {
+    require_pgrouting(&store).await?;
     let rows = sqlx::query(
         "SELECT seq, node, edge, cost, agg_cost
          FROM pgr_astar(
@@ -481,6 +501,7 @@ async fn driving_distance(
     Path(network_id): Path<Uuid>,
     Json(req): Json<DrivingDistanceRequest>,
 ) -> Result<Json<IsochroneResult>, NetworkError> {
+    require_pgrouting(&store).await?;
     let rows = sqlx::query(
         "SELECT seq, node, edge, cost, agg_cost
          FROM pgr_drivingDistance(
@@ -530,6 +551,7 @@ async fn tsp_tour(
     Path(network_id): Path<Uuid>,
     Json(req): Json<TspRequest>,
 ) -> Result<Json<TspResult>, NetworkError> {
+    require_pgrouting(&store).await?;
     // First compute cost matrix, then run TSP
     let start = req.start_junction.map(|u| u.as_u128() as i64).unwrap_or(0);
     let ids: Vec<i64> = req
@@ -584,6 +606,7 @@ async fn check_connectivity(
     State(store): State<AppState>,
     Path(network_id): Path<Uuid>,
 ) -> Result<Json<ConnectivityReport>, NetworkError> {
+    require_pgrouting(&store).await?;
     let stats = sqlx::query(
         "SELECT
             (SELECT COUNT(*) FROM network_junctions WHERE network_id = $1) as junctions,
@@ -637,6 +660,7 @@ enum NetworkError {
     Db(sqlx::Error),
     Store(ptolemy_storage::StoreError),
     NotFound,
+    NoPgRouting,
 }
 
 impl From<sqlx::Error> for NetworkError {
@@ -655,6 +679,11 @@ impl IntoResponse for NetworkError {
     fn into_response(self) -> axum::response::Response {
         let (s, m) = match self {
             NetworkError::NotFound => (StatusCode::NOT_FOUND, "network not found".to_string()),
+            NetworkError::NoPgRouting => (
+                StatusCode::NOT_IMPLEMENTED,
+                "network routing needs the pgRouting extension, which this database does not have"
+                    .to_string(),
+            ),
             NetworkError::Store(e) => crate::errors::store_error_status(&e),
             NetworkError::Db(e) => {
                 crate::errors::log_db_error("network", &e);

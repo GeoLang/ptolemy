@@ -911,8 +911,9 @@ impl PgStore {
              WHERE b.id = $1 FOR UPDATE OF b",
         )
         .bind(branch_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("branch {branch_id}")))?;
         if branch_row
             .get::<Option<String>, _>("external_table")
             .is_some()

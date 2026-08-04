@@ -469,7 +469,7 @@ async fn convex_hull(
         "{LIVE_FEATURES_CTE}
          SELECT
              ST_AsGeoJSON(ST_ConvexHull(ST_Collect(geometry)))::jsonb as geojson,
-             COALESCE(ST_Area(ST_ConvexHull(ST_Collect(geometry::geography))), 0) as area
+             COALESCE(ST_Area(ST_ConvexHull(ST_Collect(geometry))::geography), 0) as area
          FROM live
          WHERE TRUE {filter}"
     ))
@@ -478,7 +478,11 @@ async fn convex_hull(
     .await?;
 
     Ok(Json(SingleGeometryResult {
-        geometry: row.get("geojson"),
+        // a branch with no live features collects to NULL, which is a hull of
+        // nothing rather than a failure
+        geometry: row
+            .get::<Option<serde_json::Value>, _>("geojson")
+            .unwrap_or(serde_json::Value::Null),
         area_sq_meters: row.get("area"),
     }))
 }

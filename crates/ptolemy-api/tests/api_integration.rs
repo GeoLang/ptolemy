@@ -418,6 +418,56 @@ async fn test_pointcloud_catalog() {
     assert_eq!(body["patch_count"], 0);
 }
 
+/// Migration 015 only gives `pointcloud_patches.pa` the `pcpatch` type where
+/// the pointcloud extension is installed. Without it the two routes that read
+/// or write a patch answer 501 naming it, never a 500 over a missing type. The
+/// catalog routes touch neither and keep working.
+#[tokio::test]
+async fn test_pointcloud_patch_routes_report_missing_pointcloud() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/pointclouds"),
+        json!({"name": "lidar_scan", "srid": 4326}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create pc catalog: {body}");
+    let catalog_id = body["id"].as_str().unwrap().to_string();
+    let installed = has_extension(&state, "pointcloud").await;
+
+    let posts = [
+        (
+            format!("/api/v1/pointclouds/{catalog_id}/patches"),
+            json!({
+                "bounds_wkb_hex": "0101000000000000000000F03F0000000000000040",
+                "num_points": 1,
+                "patch_hex": "00",
+            }),
+        ),
+        (
+            format!("/api/v1/pointclouds/{catalog_id}/profile"),
+            json!({"line_wkb_hex": "01020000000200000000000000000000000000000000000000000000000000f03f000000000000f03f"}),
+        ),
+    ];
+    for (uri, request) in &posts {
+        let (status, body) = post_json(&app, uri, request.clone()).await;
+        if installed {
+            assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("pointcloud"),
+                "{uri}: {body}"
+            );
+        }
+    }
+
+    // the catalog side needs no extension and must not have picked up a 501
+    let (status, body) = get_json(&app, &format!("/api/v1/pointclouds/{catalog_id}/stats")).await;
+    assert_eq!(status, StatusCode::OK, "pc stats: {body}");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Format Export Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -943,6 +993,80 @@ async fn test_buffer_analysis() {
     );
 }
 
+/// `ST_Union` and `ST_Collect` have no geography form, so both of these routes
+/// used to be a 500 for every request. The union is taken on geometry and only
+/// the result cast, which is what makes the area come back in square meters.
+#[tokio::test]
+async fn test_union_and_convex_hull_report_area_in_square_meters() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    // the same two adjacent unit squares the merge test uses
+    let sq1 = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    let sq2 = "01030000000100000005000000000000000000F03F0000000000000000000000000000004000000000000000000000000000000040000000000000F03F000000000000F03F000000000000F03F000000000000F03F0000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": sq1, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": sq2, "properties": {}}
+    ])).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/union"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "union: {body}");
+    assert_eq!(body["feature_count"], 2, "union: {body}");
+    assert!(body["union_geojson"].is_object(), "union: {body}");
+    let area = body["total_area_sq_meters"].as_f64().unwrap();
+    assert!(area > 1.0e10 && area < 1.0e11, "union area: {area}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/convex-hull"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "convex hull: {body}");
+    assert!(body["geometry"].is_object(), "convex hull: {body}");
+    let area = body["area_sq_meters"].as_f64().unwrap();
+    assert!(area > 1.0e10 && area < 1.0e11, "convex hull area: {area}");
+}
+
+/// The outlier arm measures each feature against the centroid of the whole
+/// branch, which needs one aggregate's result inside another and so has to be
+/// computed a CTE earlier. Two points sit equally far from the midpoint between
+/// them, so the standard deviation of the two distances is zero and both clear
+/// a threshold of three times it: the arm is proven to have run.
+#[tokio::test]
+async fn test_anomaly_detection_finds_spatial_outliers() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    // POINT(1 2) and POINT(10 20), a thousand kilometres apart
+    let near = "0101000000000000000000F03F0000000000000040";
+    let far = "010100000000000000000024400000000000003440";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": near, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": far, "properties": {}}
+    ])).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/anomalies"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "anomalies: {body}");
+    let found = body.as_array().expect("an array of anomalies");
+    assert!(
+        found.iter().any(|a| a["anomaly_type"] == "spatial_outlier"),
+        "anomalies: {body}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Topology Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -989,6 +1113,66 @@ async fn test_sfcgal_extrude() {
     );
 }
 
+/// Every 3d route calls an SFCGAL function, which a PostGIS build without
+/// `postgis_sfcgal` does not define. Migration 015 installs it where the build
+/// carries it, so on the image CI runs this asserts the other side: the guard
+/// lets the call through.
+#[tokio::test]
+async fn test_sfcgal_routes_report_missing_sfcgal() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let polygon_hex = "01030000000100000005000000000000000000000000000000000000000000000000002440000000000000000000000000000024400000000000002440000000000000000000000000000024400000000000000000000000000000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": polygon_hex, "properties": {}}
+    ])).await;
+    let installed = has_extension(&state, "postgis_sfcgal").await;
+
+    let posts = [
+        (
+            format!("/api/v1/branches/{branch_id}/3d/extrude"),
+            json!({"feature_id": f1.to_string(), "height": 10.0}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/volume"),
+            json!({"feature_id": f1.to_string()}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/intersection"),
+            json!({"feature_a": f1.to_string(), "feature_b": f1.to_string()}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/straight-skeleton"),
+            json!({"feature_id": f1.to_string()}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/minkowski-sum"),
+            json!({"feature_id": f1.to_string(), "buffer_geometry_wkb_hex": polygon_hex}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/tesselate"),
+            json!({"feature_id": f1.to_string()}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/3d/visibility"),
+            json!({"observer_x": 1.0, "observer_y": 1.0, "observer_z": 1.0, "feature_id": f1.to_string()}),
+        ),
+    ];
+    for (uri, request) in &posts {
+        let (status, body) = post_json(&app, uri, request.clone()).await;
+        if installed {
+            assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        } else {
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("postgis_sfcgal"),
+                "{uri}: {body}"
+            );
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // H3 Hexagonal Index Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -1011,9 +1195,9 @@ async fn test_h3_index_features() {
         json!({"resolution": 7}),
     )
     .await;
-    // h3-pg might not be installed in test env
+    // h3-pg might not be installed in test env, and then the route says so
     assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+        status == StatusCode::OK || status == StatusCode::NOT_IMPLEMENTED,
         "h3 index: {status} {body}"
     );
 }
@@ -1029,8 +1213,58 @@ async fn test_h3_hexagons() {
         &format!("/api/v1/branches/{branch_id}/h3/hexagons?resolution=7"),
     )
     .await;
-    // h3-pg might not be installed
-    assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
+    // h3-pg might not be installed, and then the route says so
+    assert!(status == StatusCode::OK || status == StatusCode::NOT_IMPLEMENTED);
+}
+
+/// Every h3 route names an `h3_*` function or the `h3index` type, neither of
+/// which exists without the extension. On the stock PostGIS that CI and the
+/// compose stack run they answer 501 naming it, never a 500 over a missing name.
+#[tokio::test]
+async fn test_h3_routes_report_missing_h3() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let installed = has_extension(&state, "h3").await;
+
+    let gets = [
+        format!("/api/v1/branches/{branch_id}/h3/hexagons?resolution=7"),
+        format!("/api/v1/branches/{branch_id}/h3/aggregate?resolution=7"),
+        format!("/api/v1/branches/{branch_id}/h3/neighbors?cell=8928308280fffff"),
+        "/api/v1/h3/cell?lat=0&lng=0&resolution=7".to_string(),
+        "/api/v1/h3/boundary?cell=8928308280fffff".to_string(),
+    ];
+    let posts = [
+        (
+            format!("/api/v1/branches/{branch_id}/h3/index"),
+            json!({"resolution": 7}),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/h3/compact"),
+            json!({"cells": ["8928308280fffff"]}),
+        ),
+    ];
+
+    for uri in &gets {
+        let (status, body) = get_json(&app, uri).await;
+        assert_h3_answer(installed, status, &body, uri);
+    }
+    for (uri, request) in &posts {
+        let (status, body) = post_json(&app, uri, request.clone()).await;
+        assert_h3_answer(installed, status, &body, uri);
+    }
+}
+
+fn assert_h3_answer(installed: bool, status: StatusCode, body: &Value, uri: &str) {
+    if installed {
+        assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("h3 extension"),
+            "{uri}: {body}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1136,6 +1370,93 @@ async fn test_network_shortest_path() {
         status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
         "network list: {status}"
     );
+}
+
+/// Dijkstra, A*, driving distance, TSP and connected components are pgRouting
+/// or nothing, so without the extension they answer 501 naming it. The junction
+/// ids are deliberately absent rows: the guard runs before the query, so what
+/// the network holds does not change the answer.
+#[tokio::test]
+async fn test_pgrouting_routes_report_missing_pgrouting() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/networks"),
+        json!({"name": "water_mains"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create network: {body}");
+    let net_id = body["id"].as_str().unwrap().to_string();
+    let installed = has_extension(&state, "pgrouting").await;
+    let junction = Uuid::now_v7();
+
+    let uri = format!("/api/v1/networks/{net_id}/connectivity");
+    let (status, body) = get_json(&app, &uri).await;
+    assert_pgrouting_answer(installed, status, &body, &uri);
+
+    let posts = [
+        (
+            format!("/api/v1/networks/{net_id}/shortest-path"),
+            json!({"from_junction": junction, "to_junction": junction}),
+        ),
+        (
+            format!("/api/v1/networks/{net_id}/astar"),
+            json!({"from_junction": junction, "to_junction": junction}),
+        ),
+        (
+            format!("/api/v1/networks/{net_id}/isochrone"),
+            json!({"start_junction": junction, "max_cost": 10.0}),
+        ),
+        (
+            format!("/api/v1/networks/{net_id}/tsp"),
+            json!({"junction_ids": [junction]}),
+        ),
+    ];
+    for (uri, request) in &posts {
+        let (status, body) = post_json(&app, uri, request.clone()).await;
+        assert_pgrouting_answer(installed, status, &body, uri);
+    }
+}
+
+fn assert_pgrouting_answer(installed: bool, status: StatusCode, body: &Value, uri: &str) {
+    if installed {
+        assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("pgRouting"),
+            "{uri}: {body}"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Industry Vertical Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// An incident is a commit, and the branch it commits to arrives in the body
+/// where no extractor can check it. A branch that does not exist is a 404, not
+/// the 500 a `fetch_one` on the empty branch lookup used to raise.
+#[tokio::test]
+async fn test_create_incident_on_missing_branch_is_404() {
+    let (app, _) = setup_app().await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/incidents",
+        json!({
+            "branch_id": Uuid::now_v7(),
+            "incident_type": "wildfire",
+            "severity": "high",
+            "lat": 1.0,
+            "lng": 2.0,
+            "description": "grass fire at the ridge",
+            "author": "dispatch",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "create incident: {body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

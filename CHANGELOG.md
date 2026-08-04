@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-04: The fixable class of the route sweep's standing 500s is fixed,
+  taking the sweep's report from 24 to 7, and the 7 left are fixture artifacts
+  or decision-shaped (tracked in the platform DESIGN_TODO). The h3, sfcgal,
+  pgRouting and pointcloud route groups answer 501 naming the missing extension
+  instead of 500 (checks run after auth and validation so they never mask a 403
+  or 400, and the pointcloud catalog routes stay ungated since migration 015
+  only types `pa` as `pcpatch` where the extension exists). `analytics/union`
+  and `geoprocessing/convex-hull` aggregate on geometry and cast the result to
+  geography, which is the form PostGIS has, so both answer areas in square
+  meters instead of failing every request. `analytics/anomalies` computes its
+  centroid in its own CTE so the aggregate nesting is legal. `POST /incidents`
+  on a missing branch is 404, fixed at the storage-layer branch lookup
+  (`fetch_optional` mapped to `NotFound`). Integration tests cover each, with
+  the 501 assertions flipping when the extension is installed.
+
 - 2026-08-02: The unused org tenancy layer is gone: the `/api/v1/orgs*` routes,
   the `org_members` fallback in the permission `/check` paths, and migration
   `028` dropping `organizations`, `org_members` and `datasets.org_id`. The
