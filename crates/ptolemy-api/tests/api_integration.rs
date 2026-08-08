@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use ptolemy_api::{AppState, AuthConfig, Role, app_with_auth, generate_token};
 use ptolemy_storage::postgres::PgStore;
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -353,8 +353,54 @@ async fn test_merge_branches() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn test_route_creation_adds_distance_measures() {
+    let (app, state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let line_wkb =
+        "01020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F";
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/routes"),
+        json!({"name": "measured", "geometry_wkb_hex": line_wkb}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create route: {body}");
+    let route_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let row = sqlx::query(
+        "SELECT total_length,
+                ST_M(ST_StartPoint(geometry)) AS start_measure,
+                ST_M(ST_EndPoint(geometry)) AS end_measure
+         FROM routes WHERE id = $1",
+    )
+    .bind(route_id)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    let total_length: f64 = row.get("total_length");
+    let start_measure: f64 = row.get("start_measure");
+    let end_measure: f64 = row.get("end_measure");
+    assert!(total_length > 0.0);
+    assert_eq!(start_measure, 0.0);
+    assert!((end_measure - total_length).abs() < 1e-6);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/routes/{route_id}/events"),
+        json!({
+            "event_type": "midpoint",
+            "from_measure": total_length / 2.0,
+            "properties": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create route event: {body}");
+}
+
+#[tokio::test]
 async fn test_raster_catalog_and_tiles() {
-    let (app, _) = setup_app().await;
+    let (app, state) = setup_app().await;
     let ds_id = create_dataset(&app).await;
 
     // Create raster catalog
@@ -381,6 +427,37 @@ async fn test_raster_catalog_and_tiles() {
     let (status, body) = get_json(&app, &format!("/api/v1/rasters/{catalog_id}/stats")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["tile_count"], 0);
+
+    let raster_wkb = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT ST_AsWKB(ST_MakeEmptyRaster(1, 1, 0, 1, 1, -1, 0, 0, 4326))",
+    )
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    let bounds_wkb = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/rasters/{catalog_id}/tiles"),
+        json!({
+            "zoom_level": 0,
+            "bounds_wkb_hex": bounds_wkb,
+            "rast_hex": hex::encode(raster_wkb)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "upload tile: {body}");
+
+    let row = sqlx::query(
+        "SELECT ST_Width(rast) AS width, ST_Height(rast) AS height, ST_SRID(rast) AS srid
+         FROM raster_tiles WHERE catalog_id = $1",
+    )
+    .bind(Uuid::parse_str(catalog_id).unwrap())
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(row.get::<i32, _>("width"), 1);
+    assert_eq!(row.get::<i32, _>("height"), 1);
+    assert_eq!(row.get::<i32, _>("srid"), 4326);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

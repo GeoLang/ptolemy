@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-08: Linear referencing route creation now derives an M dimension
+  from cumulative geodesic length, so ordinary LineString WKB can be stored in
+  the `LineStringM` route column and used by route events. Raster tile upload
+  now decodes PostGIS raster WKB with `ST_RastFromWKB` instead of attempting a
+  `bytea` to `raster` cast. Integration tests exercise both write paths.
+
 - 2026-08-04: The routing routes work where pgRouting is installed: junction
   and edge uuids are ranked to the bigints `pgr_*` functions want with
   `row_number()` inside each statement, and the results rank back to uuids, so

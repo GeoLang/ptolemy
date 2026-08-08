@@ -583,8 +583,17 @@ impl PgStore {
     ) -> Result<Uuid, StoreError> {
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO routes (id, dataset_id, name, geometry, total_length)
-             VALUES ($1, $2, $3, ST_GeomFromWKB($4, 4326), ST_Length(ST_GeomFromWKB($4, 4326)::geography))",
+            "WITH input AS (
+                 SELECT ST_Force2D(ST_GeomFromWKB($4, 4326)) AS geometry
+             ), measured AS (
+                 SELECT geometry, ST_Length(geometry::geography) AS total_length
+                 FROM input
+             )
+             INSERT INTO routes (id, dataset_id, name, geometry, total_length)
+             SELECT $1, $2, $3,
+                    ST_AddMeasure(geometry, 0, total_length),
+                    total_length
+             FROM measured",
         )
         .bind(id)
         .bind(grant.id())
@@ -609,7 +618,7 @@ impl PgStore {
                 sqlx::query(
                     "INSERT INTO route_events (id, route_id, event_type, from_measure, to_measure, properties, geometry)
                      SELECT $1, $2, $3, $4, $5, $6,
-                            ST_LocateBetween(r.geometry, $4, $5)
+                            ST_Force2D(ST_LocateBetween(r.geometry, $4, $5))
                      FROM routes r WHERE r.id = $2",
                 )
                 .bind(id)
@@ -625,7 +634,7 @@ impl PgStore {
                 sqlx::query(
                     "INSERT INTO route_events (id, route_id, event_type, from_measure, properties, geometry)
                      SELECT $1, $2, $3, $4, $5,
-                            ST_LocateAlong(r.geometry, $4)
+                            ST_Force2D(ST_LocateAlong(r.geometry, $4))
                      FROM routes r WHERE r.id = $2",
                 )
                 .bind(id)
@@ -694,7 +703,7 @@ impl PgStore {
         let id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO raster_tiles (id, catalog_id, bounds, zoom_level, rast)
-             VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, $5::raster)",
+             VALUES ($1, $2, ST_GeomFromWKB($3, 4326), $4, ST_RastFromWKB($5))",
         )
         .bind(id)
         .bind(grant.id())
