@@ -458,6 +458,26 @@ async fn test_raster_catalog_and_tiles() {
     assert_eq!(row.get::<i32, _>("width"), 1);
     assert_eq!(row.get::<i32, _>("height"), 1);
     assert_eq!(row.get::<i32, _>("srid"), 4326);
+
+    // too short to be a raster header, and a well-formed header the decoder
+    // rejects on version: both are the client's bytes, not a server fault
+    for rast_hex in ["00", &"ff".repeat(70)] {
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/rasters/{catalog_id}/tiles"),
+            json!({
+                "zoom_level": 0,
+                "bounds_wkb_hex": bounds_wkb,
+                "rast_hex": rast_hex
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "upload {rast_hex}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("not valid WKB"),
+            "upload {rast_hex}: {body}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

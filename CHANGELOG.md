@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-09: `POST /rasters/{id}/tiles` answers 400 for raster bytes PostGIS
+  cannot decode, where it used to answer 500. The decoder's complaint is
+  reported to the client instead of being logged as a server fault.
+
 - 2026-08-08: Linear referencing route creation now derives an M dimension
   from cumulative geodesic length, so ordinary LineString WKB can be stored in
   the `LineStringM` route column and used by route events. Raster tile upload
