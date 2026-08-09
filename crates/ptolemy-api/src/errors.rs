@@ -22,6 +22,12 @@ use ptolemy_storage::StoreError;
 pub const UNDEFINED_COLUMN: &str = "42703";
 /// A query naming a relation that does not exist.
 pub const UNDEFINED_TABLE: &str = "42P01";
+/// A query calling a function no extension in this database provides.
+pub const UNDEFINED_FUNCTION: &str = "42883";
+/// PostGIS reports every error it raises itself under this one SQLSTATE, so it
+/// says only that PostGIS refused, never why. A route that wants to tell a bad
+/// request apart from a server fault has to read the message too.
+pub const POSTGIS_ERROR: &str = "XX000";
 
 /// The SQLSTATE a database error carries, or `-` when it carries none.
 ///

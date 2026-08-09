@@ -215,12 +215,12 @@ async fn upload_tile(
     Ok(StatusCode::CREATED)
 }
 
-/// PostGIS raises every complaint about raster WKB from one decoder, under the
-/// catch-all SQLSTATE it uses for all of its own errors, so the function name is
-/// what separates bytes the client got wrong from a server fault.
+/// PostGIS raises every complaint about raster WKB from one decoder, so the
+/// function name is what separates bytes the client got wrong from a server
+/// fault.
 fn undecodable_raster_or_internal(error: ptolemy_storage::StoreError) -> RasterError {
     if let ptolemy_storage::StoreError::Db(sqlx::Error::Database(db)) = &error
-        && db.code().as_deref() == Some(POSTGIS_ERROR_SQLSTATE)
+        && db.code().as_deref() == Some(crate::errors::POSTGIS_ERROR)
         && db.message().contains(RASTER_WKB_DECODER)
     {
         return RasterError::Bad(format!("raster is not valid WKB: {}", db.message()));
@@ -228,8 +228,6 @@ fn undecodable_raster_or_internal(error: ptolemy_storage::StoreError) -> RasterE
     RasterError::Store(error)
 }
 
-/// `internal_error`, which PostGIS reports every `rterror` under.
-const POSTGIS_ERROR_SQLSTATE: &str = "XX000";
 /// The PostGIS function that turns raster WKB into a raster.
 const RASTER_WKB_DECODER: &str = "rt_raster_from_wkb";
 

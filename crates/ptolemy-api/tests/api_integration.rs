@@ -124,6 +124,14 @@ async fn has_extension(state: &AppState, name: &str) -> bool {
         .unwrap()
 }
 
+async fn has_function(state: &AppState, name: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = $1)")
+        .bind(name)
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap()
+}
+
 /// Helper: create a dataset via API, return its ID.
 async fn create_dataset(app: &axum::Router) -> Uuid {
     let (status, body) = post_json(
@@ -1267,6 +1275,120 @@ async fn test_sfcgal_routes_report_missing_sfcgal() {
                 "{uri}: {body}"
             );
         }
+    }
+}
+
+/// The buffer geometry is the client's, so a shape SFCGAL will not sweep is a
+/// bad request. Skipped where the extension is missing: the guard answers 501
+/// before the query runs, which `test_sfcgal_routes_report_missing_sfcgal` owns.
+#[tokio::test]
+async fn test_minkowski_sum_rejects_non_polygon_buffer() {
+    let (app, state) = setup_app().await;
+    if !has_extension(&state, "postgis_sfcgal").await {
+        return;
+    }
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let feature_id = Uuid::now_v7();
+    let polygon_hex = "01030000000100000005000000000000000000000000000000000000000000000000002440000000000000000000000000000024400000000000002440000000000000000000000000000024400000000000000000000000000000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": feature_id.to_string(), "geometry_wkb_hex": polygon_hex, "properties": {}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/3d/minkowski-sum");
+
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"feature_id": feature_id.to_string(), "buffer_geometry_wkb_hex": polygon_hex}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "polygon buffer: {body}");
+
+    let line_hex =
+        "01020000000200000000000000000000000000000000000000000000000000F03F000000000000F03F";
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"feature_id": feature_id.to_string(), "buffer_geometry_wkb_hex": line_hex}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "line buffer: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be a polygon"),
+        "line buffer: {body}"
+    );
+}
+
+/// PostGIS cuts a polygon but refuses a point, and which one is being cut is
+/// the client's choice.
+#[tokio::test]
+async fn test_split_rejects_unsplittable_geometry() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let polygon_id = Uuid::now_v7();
+    let point_id = Uuid::now_v7();
+    let polygon_hex = "01030000000100000005000000000000000000000000000000000000000000000000002440000000000000000000000000000024400000000000002440000000000000000000000000000024400000000000000000000000000000000000000000";
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": polygon_id.to_string(), "geometry_wkb_hex": polygon_hex, "properties": {}},
+        {"type": "insert", "feature_id": point_id.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/geoprocessing/split");
+    let split_line = json!({"type": "LineString", "coordinates": [[-1.0, 5.0], [11.0, 5.0]]});
+
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"feature_id": polygon_id.to_string(), "split_line": split_line}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "split polygon: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        &uri,
+        json!({"feature_id": point_id.to_string(), "split_line": split_line}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "split point: {body}");
+    assert!(
+        body["error"].as_str().unwrap().starts_with("Splitting"),
+        "split point: {body}"
+    );
+}
+
+/// `ST_ContourLines` is absent from the PostGIS image CI runs, so contour
+/// reports the gap rather than a server fault. Where a build does carry it, the
+/// assertion flips: the route must not claim the function is missing.
+#[tokio::test]
+async fn test_contour_reports_missing_contour_lines() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let feature_id = Uuid::now_v7();
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": feature_id.to_string(), "geometry_wkb_hex": point_hex, "properties": {"elevation": 12.5}}
+    ])).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/contour"),
+        json!({"value_property": "elevation", "interval": 1.0}),
+    )
+    .await;
+    if has_function(&state, "st_contourlines").await {
+        assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "contour: {body}");
+    } else {
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "contour: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("ST_ContourLines"),
+            "contour: {body}"
+        );
     }
 }
 

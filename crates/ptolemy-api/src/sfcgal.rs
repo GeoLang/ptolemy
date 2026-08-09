@@ -176,10 +176,26 @@ async fn minkowski_sum(
     .bind(branch_id)
     .bind(&wkb)
     .fetch_optional(store.read_pool())
-    .await?
+    .await
+    .map_err(unsummable_or_internal)?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
 }
+
+/// SFCGAL takes a polygon as the shape to sweep and rejects anything else. The
+/// buffer geometry is the client's, so its refusal is the client's answer.
+fn unsummable_or_internal(error: sqlx::Error) -> SfcgalError {
+    if let sqlx::Error::Database(db) = &error
+        && db.code().as_deref() == Some(crate::errors::POSTGIS_ERROR)
+        && db.message().contains(MINKOWSKI_REFUSAL)
+    {
+        return SfcgalError::Bad(db.message().to_string());
+    }
+    SfcgalError::Db(error)
+}
+
+/// SFCGAL prefixes what it will not sum with the name of the operation.
+const MINKOWSKI_REFUSAL: &str = "minkowski_sum()";
 
 #[derive(Deserialize)]
 struct TesselateRequest {

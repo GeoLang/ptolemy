@@ -698,7 +698,8 @@ async fn contour(
     .bind(branch_id)
     .bind(req.interval)
     .fetch_all(store.read_pool())
-    .await?;
+    .await
+    .map_err(no_contour_lines_or_internal)?;
 
     let features = rows
         .iter()
@@ -718,6 +719,21 @@ async fn contour(
         features,
     }))
 }
+
+/// `ST_ContourLines` ships with the raster extension from PostGIS 3.4, so a
+/// build without it resolves no such function rather than failing the query.
+fn no_contour_lines_or_internal(error: sqlx::Error) -> GeoprocessingError {
+    if let sqlx::Error::Database(db) = &error
+        && db.code().as_deref() == Some(crate::errors::UNDEFINED_FUNCTION)
+        && db.message().contains(CONTOUR_FUNCTION)
+    {
+        return GeoprocessingError::NoContourLines;
+    }
+    GeoprocessingError::Store(error)
+}
+
+/// Lowercased, which is how postgres names the function it could not resolve.
+const CONTOUR_FUNCTION: &str = "st_contourlines";
 
 // ─── Merge Features ─────────────────────────────────────────────────
 
@@ -784,7 +800,8 @@ async fn split_features(
     .bind(req.feature_id)
     .bind(&line)
     .fetch_all(store.read_pool())
-    .await?;
+    .await
+    .map_err(unsplittable_or_internal)?;
 
     let features = rows
         .iter()
@@ -804,6 +821,22 @@ async fn split_features(
         features,
     }))
 }
+
+/// PostGIS refuses both geometries it cannot cut and splitters it cannot cut
+/// with, and both are the client's, so its refusal is the client's answer.
+fn unsplittable_or_internal(error: sqlx::Error) -> GeoprocessingError {
+    if let sqlx::Error::Database(db) = &error
+        && db.code().as_deref() == Some(crate::errors::POSTGIS_ERROR)
+        && db.message().starts_with(SPLIT_REFUSAL)
+    {
+        return GeoprocessingError::BadRequest(db.message().to_string());
+    }
+    GeoprocessingError::Store(error)
+}
+
+/// How PostGIS opens every refusal to split, whether the geometry or the
+/// splitter is the unsupported one.
+const SPLIT_REFUSAL: &str = "Splitting ";
 
 // ─── Simplify ───────────────────────────────────────────────────────
 
@@ -910,6 +943,7 @@ async fn densify(
 enum GeoprocessingError {
     Store(sqlx::Error),
     BadRequest(String),
+    NoContourLines,
 }
 
 impl From<sqlx::Error> for GeoprocessingError {
@@ -922,6 +956,10 @@ impl IntoResponse for GeoprocessingError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             GeoprocessingError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            GeoprocessingError::NoContourLines => (
+                StatusCode::NOT_IMPLEMENTED,
+                "contours need ST_ContourLines, which this PostGIS build does not have".to_string(),
+            ),
             GeoprocessingError::Store(e) => {
                 crate::errors::log_db_error("geoprocessing", &e);
                 (
