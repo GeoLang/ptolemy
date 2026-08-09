@@ -206,13 +206,44 @@ async fn add_face(
         .bind(&name)
         .bind(&wkb)
         .fetch_one(store.read_pool())
-        .await?;
+        .await
+        .map_err(unusable_face_or_internal)?;
     let face_id: i32 = row.get("face_id");
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({"face_id": face_id})),
     ))
 }
+
+/// `AddFace` rejects the face it was handed and reports a topology that
+/// contradicts itself under the same SQLSTATE, and only the wording tells them
+/// apart. Anything not listed here stays a server fault: a client cannot fix
+/// edges that disagree about which face they bound by sending a different
+/// polygon.
+fn unusable_face_or_internal(error: sqlx::Error) -> TopoError {
+    if let sqlx::Error::Database(db) = &error
+        && db.code().as_deref() == Some(PLPGSQL_RAISE)
+        && ADD_FACE_REFUSALS
+            .iter()
+            .any(|refusal| db.message().starts_with(refusal))
+    {
+        return TopoError::Bad(db.message().to_string());
+    }
+    TopoError::Db(error)
+}
+
+/// `raise_exception`, which every `RAISE` in the topology extension reports
+/// under, whatever it is about.
+const PLPGSQL_RAISE: &str = "P0001";
+
+/// How `AddFace` opens each complaint about the geometry it was given. Trimmed
+/// of the trailing detail the ones about a point carry.
+const ADD_FACE_REFUSALS: [&str; 4] = [
+    "Face geometry must be a polygon",
+    "Found no edges on the polygon boundary",
+    "Polygon boundary is not fully defined by existing edges",
+    "Invalid null argument",
+];
 
 #[derive(Deserialize)]
 struct SimplifyRequest {

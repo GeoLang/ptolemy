@@ -1186,6 +1186,58 @@ async fn test_topology_validate() {
     assert!(status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR);
 }
 
+/// A face the topology's edges do not bound, and a geometry that is not a face
+/// at all, are both the client's to fix. A topology whose edges contradict each
+/// other is not, and stays a 500 the client never sees the detail of.
+#[tokio::test]
+async fn test_add_face_rejects_unusable_geometry() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let name = format!("addface_{}", Uuid::now_v7().simple());
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{ds_id}/topologies"),
+        json!({"name": name, "srid": 4326}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create topology: {body}");
+
+    // AddFace only registers a face the existing edges already bound, and no
+    // route adds an edge, so the ring the success case needs is seeded here
+    let ring = "0102000000050000000000000000000000000000000000000000000000000008400000000000000000000000000000084000000000000008400000000000000000000000000000084000000000000000000000000000000000";
+    sqlx::query("SELECT topology.TopoGeo_AddLineString($1, ST_GeomFromWKB($2, 4326), 0)")
+        .bind(&name)
+        .bind(hex::decode(ring).unwrap())
+        .fetch_all(state.unguarded_pool())
+        .await
+        .unwrap();
+
+    let square = "010300000001000000050000000000000000000000000000000000000000000000000008400000000000000000000000000000084000000000000008400000000000000000000000000000084000000000000000000000000000000000";
+    let uri = format!("/api/v1/topologies/{name}/add-face");
+    let (status, body) = post_json(&app, &uri, json!({"geometry_wkb_hex": square})).await;
+    assert_eq!(status, StatusCode::CREATED, "bounded face: {body}");
+
+    let point = "0101000000000000000000F03F0000000000000040";
+    let (status, body) = post_json(&app, &uri, json!({"geometry_wkb_hex": point})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "point face: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be a polygon"),
+        "point face: {body}"
+    );
+
+    let elsewhere = "01030000000100000005000000000000000000244000000000000024400000000000002a4000000000000024400000000000002a400000000000002a4000000000000024400000000000002a4000000000000024400000000000002440";
+    let (status, body) = post_json(&app, &uri, json!({"geometry_wkb_hex": elsewhere})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unbounded face: {body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("Found no edges"),
+        "unbounded face: {body}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // SFCGAL 3D Tests
 // ═══════════════════════════════════════════════════════════════════════

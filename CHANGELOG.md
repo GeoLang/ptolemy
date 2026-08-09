@@ -6,14 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- 2026-08-09: Three more routes tell a bad request apart from a server fault.
+- 2026-08-09: Four more routes tell a bad request apart from a server fault.
   `POST /branches/{id}/geoprocessing/split` answers 400 when PostGIS refuses the
-  geometry or the splitter, and `POST /branches/{id}/3d/minkowski-sum` answers
-  400 when the buffer geometry is not the polygon SFCGAL needs, both carrying
-  the refusal. `POST /branches/{id}/geoprocessing/contour` answers 501 naming
-  `ST_ContourLines` on a PostGIS build without it, which includes the 3.4 image
-  CI runs. This leaves the route sweep reporting one 500,
-  `POST /topologies/{name}/add-face`.
+  geometry or the splitter, `POST /branches/{id}/3d/minkowski-sum` answers 400
+  when the buffer geometry is not the polygon SFCGAL needs, and
+  `POST /topologies/{name}/add-face` answers 400 when the face is not a polygon
+  or the topology's edges do not bound it, all three carrying the refusal. A
+  topology whose edges contradict each other stays a 500, since no change to the
+  request fixes it. `POST /branches/{id}/geoprocessing/contour` answers 501
+  naming `ST_ContourLines` on a PostGIS build without it, which includes the 3.4
+  image CI runs. The route sweep now reports no 500s.
 
 - 2026-08-09: `POST /rasters/{id}/tiles` answers 400 for raster bytes PostGIS
   cannot decode, where it used to answer 500. The decoder's complaint is
