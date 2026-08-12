@@ -19,9 +19,14 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use ptolemy_storage::{Reader, Writer};
 use serde::{Deserialize, Serialize};
+
+const TOOL_TOKEN_USE: &str = "tool";
+const PTOLEMY_READ_SCOPE: &str = "ptolemy:read";
+const PTOLEMY_WRITE_SCOPE: &str = "ptolemy:write";
 
 /// Shortest HS256 secret we accept, matching collecta.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -59,6 +64,96 @@ pub struct Claims {
     pub exp: usize,
     /// Role name: `admin`, `editor` or `viewer`
     pub role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenClaims {
+    sub: String,
+    exp: usize,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    token_use: Option<String>,
+    #[serde(default)]
+    scope: Option<serde_json::Value>,
+}
+
+enum VerifiedToken {
+    Platform(Claims),
+    Tool { claims: Claims, scopes: Vec<String> },
+}
+
+impl VerifiedToken {
+    fn claims(&self) -> &Claims {
+        match self {
+            Self::Platform(claims) | Self::Tool { claims, .. } => claims,
+        }
+    }
+}
+
+fn verify_token(token: &str, key: &DecodingKey) -> Result<VerifiedToken, ()> {
+    let claims = decode::<TokenClaims>(token, key, &Validation::default())
+        .map_err(|_| ())?
+        .claims;
+
+    match claims.token_use.as_deref() {
+        None => Ok(VerifiedToken::Platform(Claims {
+            sub: claims.sub,
+            exp: claims.exp,
+            role: claims.role.ok_or(())?,
+        })),
+        Some(TOOL_TOKEN_USE) => {
+            if claims.sub.is_empty() || claims.role.is_some() {
+                return Err(());
+            }
+            let scopes = claims
+                .scope
+                .and_then(|scope| scope.as_array().cloned())
+                .ok_or(())?
+                .into_iter()
+                .map(|scope| scope.as_str().map(str::to_owned).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(VerifiedToken::Tool {
+                claims: Claims {
+                    sub: claims.sub,
+                    exp: claims.exp,
+                    role: String::new(),
+                },
+                scopes,
+            })
+        }
+        Some(_) => Err(()),
+    }
+}
+
+fn declares_scoped_token(token: &str) -> bool {
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(payload) = URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|claims| claims.get("token_use").cloned())
+        .is_some()
+}
+
+fn tool_scope(method: &Method, route: &str, access: Access) -> Option<&'static str> {
+    if access == Access::Admin {
+        return None;
+    }
+    let is_write = route.starts_with(WS_PREFIX)
+        || access == Access::Write
+        || (matches!(
+            *method,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) && route.contains("/permissions"));
+    Some(if is_write {
+        PTOLEMY_WRITE_SCOPE
+    } else {
+        PTOLEMY_READ_SCOPE
+    })
 }
 
 impl Claims {
@@ -570,22 +665,48 @@ pub async fn auth_middleware(
     // free-text segment. Falling back to the raw path is only reachable when no
     // route matched, where the fallback answers 404 and no handler runs, so the
     // decision picks the error the client sees and grants nothing.
-    let access = {
-        let route = route_template(request.extensions()).unwrap_or_else(|| request.uri().path());
-        classify(request.method(), route)
-    };
+    let route = route_template(request.extensions())
+        .unwrap_or_else(|| request.uri().path())
+        .to_owned();
+    let access = classify(request.method(), &route);
     let token = request_token(request.headers(), request.uri()).map(str::to_owned);
     let key = DecodingKey::from_secret(config.secret.as_bytes());
-    let claims = token
+    let verified = token
         .as_deref()
-        .and_then(|t| decode::<Claims>(t, &key, &Validation::default()).ok())
-        .map(|data| data.claims);
+        .and_then(|token| verify_token(token, &key).ok());
+    let esri = request.uri().path().starts_with(ARCGIS_PREFIX);
 
     if access == Access::Public {
         // a public route ignores a bad token rather than rejecting it, keeping
         // anonymous reads working; a good one still identifies the caller so
         // private-dataset reads can be allowed
-        if let Some(claims) = claims {
+        if verified.is_none() && token.as_deref().is_some_and(declares_scoped_token) {
+            return refuse(
+                esri,
+                StatusCode::UNAUTHORIZED,
+                498,
+                "invalid or expired token",
+            );
+        }
+        if let Some(VerifiedToken::Tool { claims, scopes }) = &verified {
+            let Some(required) = tool_scope(request.method(), &route, access) else {
+                return refuse(
+                    esri,
+                    StatusCode::FORBIDDEN,
+                    403,
+                    "required tool scope missing",
+                );
+            };
+            if !scopes.iter().any(|scope| scope == required) {
+                return refuse(
+                    esri,
+                    StatusCode::FORBIDDEN,
+                    403,
+                    "required tool scope missing",
+                );
+            }
+            request.extensions_mut().insert(claims.clone());
+        } else if let Some(VerifiedToken::Platform(claims)) = verified {
             request.extensions_mut().insert(claims);
         }
         return next.run(request).await;
@@ -593,14 +714,12 @@ pub async fn auth_middleware(
 
     // the refusal shape follows the path, so the Esri facade is refused in the
     // shape its clients read, and nothing about the decision itself changes
-    let esri = request.uri().path().starts_with(ARCGIS_PREFIX);
-
     if token.is_none() {
         return refuse(esri, StatusCode::UNAUTHORIZED, 499, "missing bearer token");
     }
     // the decode error is not echoed back: it distinguishes "expired" from
     // "bad signature", which helps an attacker more than a caller
-    let Some(claims) = claims else {
+    let Some(verified) = verified else {
         return refuse(
             esri,
             StatusCode::UNAUTHORIZED,
@@ -609,27 +728,33 @@ pub async fn auth_middleware(
         );
     };
 
-    let allowed = match access {
-        Access::Public => true,
-        // an unknown role string is still not a role, so it gets nothing
-        Access::Authenticated => claims.parsed_role().is_some(),
-        Access::Write => claims.can_write(),
-        Access::Admin => claims.can_admin(),
+    let allowed = match &verified {
+        VerifiedToken::Platform(claims) => match access {
+            Access::Public => true,
+            Access::Authenticated => claims.parsed_role().is_some(),
+            Access::Write => claims.can_write(),
+            Access::Admin => claims.can_admin(),
+        },
+        VerifiedToken::Tool { scopes, .. } => tool_scope(request.method(), &route, access)
+            .is_some_and(|required| scopes.iter().any(|scope| scope == required)),
     };
     if !allowed {
         return refuse(
             esri,
             StatusCode::FORBIDDEN,
             403,
-            match access {
-                Access::Admin => "admin role required",
-                Access::Authenticated => "unknown role",
-                _ => "editor or admin role required",
+            match &verified {
+                VerifiedToken::Tool { .. } => "required tool scope missing",
+                VerifiedToken::Platform(_) => match access {
+                    Access::Admin => "admin role required",
+                    Access::Authenticated => "unknown role",
+                    _ => "editor or admin role required",
+                },
             },
         );
     }
 
-    request.extensions_mut().insert(claims);
+    request.extensions_mut().insert(verified.claims().clone());
     next.run(request).await
 }
 
@@ -754,8 +879,138 @@ pub fn generate_token_from_env(sub: &str, role: Role) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, middleware, routing::get};
+    use tower::ServiceExt;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn signed(claims: serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn live_expiry() -> usize {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize
+            + 300
+    }
+
+    async fn middleware_status(method: Method, path: &str, token: &str) -> StatusCode {
+        let app = Router::new()
+            .route("/api/v1/datasets", get(|| async {}).post(|| async {}))
+            .route("/metrics", get(|| async {}))
+            .layer(middleware::from_fn_with_state(
+                AuthConfig::enabled(SECRET),
+                auth_middleware,
+            ));
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn tool_tokens_need_the_exact_operation_scope() {
+        let read = signed(serde_json::json!({
+            "sub": "user-1",
+            "exp": live_expiry(),
+            "token_use": "tool",
+            "scope": [PTOLEMY_READ_SCOPE]
+        }));
+        assert_eq!(
+            middleware_status(Method::GET, "/api/v1/datasets", &read).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            middleware_status(Method::POST, "/api/v1/datasets", &read).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let wrong_service = signed(serde_json::json!({
+            "sub": "user-1",
+            "exp": live_expiry(),
+            "token_use": "tool",
+            "scope": ["tiletopia:read"]
+        }));
+        assert_eq!(
+            middleware_status(Method::GET, "/api/v1/datasets", &wrong_service).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_token_cannot_fall_back_to_an_admin_role() {
+        let token = signed(serde_json::json!({
+            "sub": "user-1",
+            "exp": live_expiry(),
+            "role": "admin",
+            "token_use": "tool",
+            "scope": [PTOLEMY_READ_SCOPE, PTOLEMY_WRITE_SCOPE]
+        }));
+        assert_eq!(
+            middleware_status(Method::GET, "/metrics", &token).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_and_unknown_tool_claims_are_unauthorized() {
+        for claims in [
+            serde_json::json!({
+                "sub": "user-1", "exp": live_expiry(), "token_use": "tool"
+            }),
+            serde_json::json!({
+                "sub": "user-1", "exp": live_expiry(), "token_use": "tool", "scope": "ptolemy:read"
+            }),
+            serde_json::json!({
+                "sub": "user-1", "exp": live_expiry(), "token_use": "other", "scope": [PTOLEMY_READ_SCOPE]
+            }),
+        ] {
+            let token = signed(claims);
+            assert_eq!(
+                middleware_status(Method::POST, "/api/v1/datasets", &token).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let expired = signed(serde_json::json!({
+            "sub": "user-1",
+            "exp": 1_000_000,
+            "token_use": "tool",
+            "scope": [PTOLEMY_READ_SCOPE]
+        }));
+        assert_eq!(
+            middleware_status(Method::GET, "/api/v1/datasets", &expired).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_roles_keep_the_existing_write_rule() {
+        let editor = generate_token(SECRET, "user-1", Role::Editor, 300);
+        let viewer = generate_token(SECRET, "user-1", Role::Viewer, 300);
+        assert_eq!(
+            middleware_status(Method::POST, "/api/v1/datasets", &editor).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            middleware_status(Method::POST, "/api/v1/datasets", &viewer).await,
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[test]
     fn resolve_rejects_missing_secret() {
