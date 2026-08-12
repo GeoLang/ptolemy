@@ -31,6 +31,7 @@ pub struct RelationshipClassInput<'a> {
     pub cardinality: &'a str,
     pub forward_label: &'a str,
     pub backward_label: &'a str,
+    pub is_composite: bool,
 }
 
 impl PgStore {
@@ -43,8 +44,8 @@ impl PgStore {
         let id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO relationship_classes
-                (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key, cardinality, forward_label, backward_label)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key, cardinality, forward_label, backward_label, is_composite)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(input.name)
@@ -54,6 +55,7 @@ impl PgStore {
         .bind(input.cardinality)
         .bind(input.forward_label)
         .bind(input.backward_label)
+        .bind(input.is_composite)
         .execute(&self.pool)
         .await?;
         Ok(id)

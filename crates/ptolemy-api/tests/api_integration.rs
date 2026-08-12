@@ -2373,6 +2373,7 @@ async fn test_relationship_class_and_record_round_trip() {
             "cardinality": "one_to_many",
             "forward_label": "owned by",
             "backward_label": "owns",
+            "is_composite": true,
         }),
     )
     .await;
@@ -2385,10 +2386,12 @@ async fn test_relationship_class_and_record_round_trip() {
     assert_eq!(body["cardinality"], "one_to_many", "{body}");
     assert_eq!(body["forward_label"], "owned by", "{body}");
     assert_eq!(body["backward_label"], "owns", "{body}");
+    assert_eq!(body["is_composite"], true, "{body}");
 
     let (status, body) = get_json(&app, &format!("/api/v1/datasets/{origin}/relationships")).await;
     assert_eq!(status, StatusCode::OK, "list classes: {body}");
     assert_eq!(body[0]["id"], class_id, "{body}");
+    assert_eq!(body[0]["is_composite"], true, "{body}");
 
     let parcel = Uuid::now_v7();
     let owner = Uuid::now_v7();
@@ -2435,6 +2438,33 @@ async fn test_relationship_class_and_record_round_trip() {
         "{body}"
     );
     assert_eq!(body["backward"][0]["label"], "owns", "{body}");
+}
+
+/// A body that says nothing about `is_composite` gets a simple class, which is
+/// what every class written before the field existed already is.
+#[tokio::test]
+async fn test_relationship_class_defaults_to_simple() {
+    let (app, _) = setup_app().await;
+    let origin = create_dataset(&app).await;
+    let destination = create_dataset(&app).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{origin}/relationships"),
+        json!({
+            "name": "parcel to owner",
+            "origin_dataset_id": origin,
+            "destination_dataset_id": destination,
+            "origin_foreign_key": "parcel_id",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create class: {body}");
+    let class_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(&app, &format!("/api/v1/relationship-classes/{class_id}")).await;
+    assert_eq!(status, StatusCode::OK, "get class: {body}");
+    assert_eq!(body["is_composite"], false, "{body}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

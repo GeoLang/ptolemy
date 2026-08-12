@@ -45,6 +45,7 @@ struct RelationshipClass {
     cardinality: String,
     forward_label: String,
     backward_label: String,
+    is_composite: bool,
 }
 
 async fn list_classes(
@@ -54,7 +55,8 @@ async fn list_classes(
     let rows = sqlx::query(
         "SELECT id, name, origin_dataset_id, destination_dataset_id, cardinality,
                 COALESCE(forward_label, '') AS forward_label,
-                COALESCE(backward_label, '') AS backward_label
+                COALESCE(backward_label, '') AS backward_label,
+                is_composite
          FROM relationship_classes
          WHERE origin_dataset_id = $1 OR destination_dataset_id = $1
          ORDER BY name",
@@ -73,6 +75,7 @@ async fn list_classes(
                 cardinality: r.get("cardinality"),
                 forward_label: r.get("forward_label"),
                 backward_label: r.get("backward_label"),
+                is_composite: r.get("is_composite"),
             })
             .collect(),
     ))
@@ -91,6 +94,9 @@ struct CreateClassRequest {
     forward_label: String,
     #[serde(default)]
     backward_label: String,
+    /// composite: deleting an origin feature deletes its related destinations
+    #[serde(default)]
+    is_composite: bool,
 }
 fn default_cardinality() -> String {
     "one_to_many".into()
@@ -117,6 +123,7 @@ async fn create_class(
                 cardinality: &req.cardinality,
                 forward_label: &req.forward_label,
                 backward_label: &req.backward_label,
+                is_composite: req.is_composite,
             },
         )
         .await?;
@@ -130,7 +137,8 @@ async fn get_class(
     let r = sqlx::query(
         "SELECT id, name, origin_dataset_id, destination_dataset_id, cardinality,
                 COALESCE(forward_label, '') AS forward_label,
-                COALESCE(backward_label, '') AS backward_label
+                COALESCE(backward_label, '') AS backward_label,
+                is_composite
          FROM relationship_classes WHERE id = $1",
     )
     .bind(id)
@@ -145,6 +153,7 @@ async fn get_class(
         cardinality: r.get("cardinality"),
         forward_label: r.get("forward_label"),
         backward_label: r.get("backward_label"),
+        is_composite: r.get("is_composite"),
     }))
 }
 
