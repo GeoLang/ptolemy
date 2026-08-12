@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-12: Relationship classes carry `is_composite`. `POST
+  /datasets/{id}/relationships` accepts it and both `GET
+  /relationship-classes/{id}` and `GET /datasets/{id}/relationships` return it.
+  The column has been there since migration 013 with no route setting it, so an
+  Esri geodatabase migration lost the composite flag on the way in. A body that
+  omits the field creates a simple class, which is what every existing row
+  already is.
+
 - 2026-08-09: Four more routes tell a bad request apart from a server fault.
   `POST /branches/{id}/geoprocessing/split` answers 400 when PostGIS refuses the
   geometry or the splitter, `POST /branches/{id}/3d/minkowski-sum` answers 400
