@@ -210,6 +210,32 @@ ptolemy serve --database-url postgres://localhost/ptolemy
 # Metrics at http://localhost:3000/metrics
 ```
 
+## Container image
+
+Every push to `master` publishes `ghcr.io/geolang/ptolemy`, tagged `master` and
+`sha-<short-sha>`; a `v*` tag publishes that version plus `latest`. Pin to a
+`sha-` tag if you need a fixed API surface.
+
+```bash
+docker run -p 3000:3000 \
+  -e DATABASE_URL=postgres://ptolemy:ptolemy@db/ptolemy \
+  -e PTOLEMY_JWT_SECRET=$(openssl rand -hex 32) \
+  ghcr.io/geolang/ptolemy:master
+```
+
+`DATABASE_URL` and `PTOLEMY_JWT_SECRET` are the two it refuses to start without,
+the second unless `PTOLEMY_AUTH_DISABLED=true`. Everything else in
+[Configuration](#configuration) has a default.
+
+`serve` applies migrations before it binds, so no separate `ptolemy migrate` step
+is needed. The image binds `0.0.0.0:3000` and answers `/api/v1/healthz` as soon
+as the process is up and `/api/v1/readyz` once the database is reachable; wait on
+`readyz` rather than `healthz` if you are about to issue requests.
+
+Pair it with `postgis/postgis:16-3.4`. The first migration declares a PostGIS
+`geometry` column, so a database without the extension fails to migrate; H3,
+pgRouting, SFCGAL and the rest are created if installed and skipped if not.
+
 ## Configuration
 
 | Variable | Description | Default |

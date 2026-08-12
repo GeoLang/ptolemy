@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- 2026-08-11: Every push to master publishes `ghcr.io/geolang/ptolemy`, tagged
+  `master` and `sha-<short-sha>`, and a `v*` tag publishes that version plus
+  `latest`. The workflow builds the image, starts it against a PostGIS container
+  and waits on `/api/v1/readyz` before pushing anything, so a commit that breaks
+  startup or migrations fails here rather than in a consumer's CI. Downstream
+  repos that need a real ptolemy can now pull one instead of gating their tests
+  on a hand-run server.
+
 ### Changed
 
 - 2026-08-09: Four more routes tell a bad request apart from a server fault.
