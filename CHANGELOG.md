@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-12: sha2 on 0.11 and hmac on 0.13, which digest 0.11 requires. The API
+  key digest is hex encoded by the `hex` crate instead of `{:x}`, which digest
+  0.11 no longer implements. Both strings that outlive the process are pinned by
+  golden tests first: `api_keys.key_hash`, or no stored key matches again, and
+  the `X-Ptolemy-Signature` webhook header, which receivers verify.
+
 - 2026-08-12: Relationship classes carry `is_composite`. `POST
   /datasets/{id}/relationships` accepts it and both `GET
   /relationship-classes/{id}` and `GET /datasets/{id}/relationships` return it.

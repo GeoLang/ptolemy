@@ -4,7 +4,7 @@
 
 //! Background webhook delivery engine with HMAC signing and retries.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use ptolemy_core::event::Webhook;
 use reqwest::Client;
 use sha2::Sha256;
@@ -66,11 +66,9 @@ async fn deliver_with_retries(client: &Client, job: &DeliveryJob, max_retries: u
 
         // HMAC signature if secret is configured
         if let Some(secret) = &job.webhook.secret
-            && let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes())
+            && let Some(signature) = signature_header(secret, &body_bytes)
         {
-            mac.update(&body_bytes);
-            let signature = hex::encode(mac.finalize().into_bytes());
-            request = request.header("X-Ptolemy-Signature", format!("sha256={signature}"));
+            request = request.header("X-Ptolemy-Signature", signature);
         }
 
         match request.body(body_bytes.clone()).send().await {
@@ -112,4 +110,32 @@ async fn deliver_with_retries(client: &Client, job: &DeliveryJob, max_retries: u
         event_id = %job.event_id,
         "Webhook delivery exhausted all retries"
     );
+}
+
+/// The `X-Ptolemy-Signature` value for a body, `None` when the secret cannot key
+/// an HMAC. Receivers verify this string, so it is a wire contract.
+fn signature_header(secret: &str, body: &[u8]) -> Option<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(body);
+    Some(format!(
+        "sha256={}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // this digest holds a byte below 0x10, so a dropped zero pad fails here
+    #[test]
+    fn signature_header_golden() {
+        assert_eq!(
+            signature_header("ptolemy webhook golden secret", br#"{"event":"golden"}"#),
+            Some(
+                "sha256=0eb8a80f1ebdca22ca35b7d6d1687a05a0f03dda1db87ddd7788142b730a4286"
+                    .to_string()
+            )
+        );
+    }
 }

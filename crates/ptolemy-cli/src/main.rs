@@ -1166,11 +1166,14 @@ fn generate_api_key() -> String {
 }
 
 /// Hash an API key for storage (SHA-256).
+///
+/// `api_keys.key_hash` holds these strings, so the encoding has to stay byte
+/// for byte what it always was or no stored key matches again.
 fn hash_api_key(key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -1307,6 +1310,11 @@ mod tests {
         assert_eq!(hash1, hash2); // deterministic
         assert_ne!(hash1, hash_api_key("different_key")); // different keys → different hashes
         assert_eq!(hash1.len(), 64); // SHA-256 hex = 64 chars
+        // this digest holds two 0x00 bytes, so a dropped zero pad fails here
+        assert_eq!(
+            hash1,
+            "6c8a16a1b715daad00a766ad25d32d65e8d70d02e64451fa7602590eb8a1368e"
+        );
     }
 
     #[test]
