@@ -52,53 +52,126 @@ async fn list_conflicts(
     State(store): State<AppState>,
     Path(merge_id): Path<Uuid>,
 ) -> Result<Json<Vec<ConflictDetail>>, ConflictError> {
-    // merge_id corresponds to the source branch ID in a failed merge.
-    // Look up features that differ between source and target.
-    let rows = sqlx::query(
-        "WITH source_latest AS (
-            SELECT DISTINCT ON (fv.feature_id) fv.feature_id, fv.properties, fv.geometry
-            FROM feature_versions fv
-            JOIN changesets c ON c.id = fv.changeset_id
-            WHERE c.branch_id = $1
-            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-        ),
-        target_branch AS (
-            SELECT b.id FROM branches b
-            WHERE b.dataset_id = (SELECT dataset_id FROM branches WHERE id = $1)
-              AND b.name = 'main'
-            LIMIT 1
-        ),
-        target_latest AS (
-            SELECT DISTINCT ON (fv.feature_id) fv.feature_id, fv.properties, fv.geometry
-            FROM feature_versions fv
-            JOIN changesets c ON c.id = fv.changeset_id
-            JOIN target_branch tb ON c.branch_id = tb.id
-            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
-        )
-        SELECT
-            s.feature_id,
-            s.properties as ours,
-            t.properties as theirs
-        FROM source_latest s
-        JOIN target_latest t ON s.feature_id = t.feature_id
-        WHERE s.properties IS DISTINCT FROM t.properties
-           OR ST_AsBinary(s.geometry) IS DISTINCT FROM ST_AsBinary(t.geometry)",
+    // merge_id is the source branch of the merge; its dataset's main branch is
+    // the target
+    let source = store.get_branch(merge_id).await?;
+    let target_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM branches WHERE dataset_id = $1 AND name = 'main' LIMIT 1",
     )
-    .bind(merge_id)
-    .fetch_all(store.read_pool())
+    .bind(source.dataset_id)
+    .fetch_optional(store.read_pool())
     .await?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|row| ConflictDetail {
-                feature_id: row.get("feature_id"),
-                field: None,
-                ours: row.get("ours"),
-                theirs: row.get("theirs"),
-                base: None,
+    let Some(target_id) = target_id else {
+        return Ok(Json(vec![]));
+    };
+    let target = store.get_branch(target_id).await?;
+    let (Some(source_head), Some(target_head)) = (source.head, target.head) else {
+        return Ok(Json(vec![]));
+    };
+
+    let sides = MergeSides::of(&store, source_head, target_head).await?;
+    let mut details = Vec::new();
+    for (feature_id, ours, theirs) in sides.conflicts() {
+        details.push(ConflictDetail {
+            feature_id,
+            field: None,
+            ours: Some(get_op_props(ours)),
+            theirs: Some(get_op_props(theirs)),
+            base: sides.base_properties(feature_id),
+        });
+    }
+    Ok(Json(details))
+}
+
+/// Both sides of a merge, diffed against the base, plus what the base held.
+/// Every route here reads a conflict off this, so what they report is what
+/// [`ptolemy_storage::PgStore::merge`] would do.
+struct MergeSides {
+    ours: ptolemy_core::diff::Diff,
+    theirs: ptolemy_core::diff::Diff,
+    at_base: std::collections::HashMap<Uuid, ptolemy_storage::VersionContent>,
+}
+
+impl MergeSides {
+    async fn of(
+        store: &AppState,
+        source_head: Uuid,
+        target_head: Uuid,
+    ) -> Result<MergeSides, ConflictError> {
+        let base = store.find_merge_base(source_head, target_head).await?;
+        let ours = store.diff(base, target_head).await?;
+        let theirs = store.diff(base, source_head).await?;
+        let at_base = match base {
+            Some(base_id) => {
+                let ids: Vec<Uuid> = ours
+                    .operations
+                    .iter()
+                    .chain(theirs.operations.iter())
+                    .map(diff_op_fid)
+                    .collect();
+                store.contents_at(base_id, &ids).await?
+            }
+            None => std::collections::HashMap::new(),
+        };
+        Ok(MergeSides {
+            ours,
+            theirs,
+            at_base,
+        })
+    }
+
+    /// The merge decision per feature, in feature id order so a client sees a
+    /// stable list.
+    fn choices(&self) -> Vec<(Uuid, ptolemy_storage::MergeChoice<'_>)> {
+        let ours_map = ops_by_feature(&self.ours);
+        let theirs_map = ops_by_feature(&self.theirs);
+        let mut fids: Vec<Uuid> = ours_map
+            .keys()
+            .chain(theirs_map.keys())
+            .copied()
+            .collect::<std::collections::HashSet<Uuid>>()
+            .into_iter()
+            .collect();
+        fids.sort_unstable();
+        fids.into_iter()
+            .map(|fid| {
+                let choice = ptolemy_storage::merge_choice(
+                    ours_map.get(&fid).copied(),
+                    theirs_map.get(&fid).copied(),
+                    self.at_base.get(&fid),
+                );
+                (fid, choice)
             })
-            .collect(),
-    ))
+            .collect()
+    }
+
+    fn conflicts(&self) -> Vec<(Uuid, &DiffOp, &DiffOp)> {
+        self.choices()
+            .into_iter()
+            .filter_map(|(fid, choice)| match choice {
+                ptolemy_storage::MergeChoice::Conflict { ours, theirs } => {
+                    Some((fid, ours, theirs))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn base_properties(&self, feature_id: Uuid) -> Option<serde_json::Value> {
+        self.at_base
+            .get(&feature_id)
+            .map(|c| c.properties().clone())
+    }
+}
+
+type OpsByFeature<'a> = std::collections::HashMap<Uuid, &'a DiffOp>;
+
+fn ops_by_feature(diff: &ptolemy_core::diff::Diff) -> OpsByFeature<'_> {
+    diff.operations
+        .iter()
+        .map(|op| (diff_op_fid(op), op))
+        .collect()
 }
 
 // ─── Visual Merge Preview ───────────────────────────────────────────
@@ -159,102 +232,75 @@ async fn preview_merge_visual(
                 "target has no commits".into(),
             )))?;
 
-    let base = store.find_merge_base(source_head, target_head).await?;
-
-    let diff_ours = store.diff(base, target_head).await?;
-    let diff_theirs = store.diff(base, source_head).await?;
-
-    let ours_map: std::collections::HashMap<Uuid, &DiffOp> = diff_ours
-        .operations
-        .iter()
-        .map(|op| (diff_op_fid(op), op))
-        .collect();
-    let theirs_map: std::collections::HashMap<Uuid, &DiffOp> = diff_theirs
-        .operations
-        .iter()
-        .map(|op| (diff_op_fid(op), op))
-        .collect();
-
-    let all_fids: std::collections::HashSet<Uuid> =
-        ours_map.keys().chain(theirs_map.keys()).copied().collect();
+    let sides = MergeSides::of(&store, source_head, target_head).await?;
+    let choices = sides.choices();
 
     let mut auto_mergeable = 0usize;
     let mut conflicts: Vec<VisualConflict> = Vec::new();
     let mut geojson_features: Vec<serde_json::Value> = Vec::new();
 
-    for fid in &all_fids {
-        match (ours_map.get(fid), theirs_map.get(fid)) {
-            (Some(ours), None) | (None, Some(ours)) => {
-                auto_mergeable += 1;
-                // No conflict - auto merge
-                let _ = ours;
-            }
-            (Some(ours), Some(theirs)) => {
-                if diff_ops_match(ours, theirs) {
-                    auto_mergeable += 1;
-                } else {
-                    // This is a conflict - get visual data
-                    let ours_geom = get_op_geojson(&store, ours).await;
-                    let theirs_geom = get_op_geojson(&store, theirs).await;
-                    let base_geom = get_feature_base_geojson(&store, *fid).await;
+    for (fid, choice) in choices {
+        let ptolemy_storage::MergeChoice::Conflict { ours, theirs } = choice else {
+            auto_mergeable += 1;
+            continue;
+        };
+        let ours_geom = get_op_geojson(&store, ours).await;
+        let theirs_geom = get_op_geojson(&store, theirs).await;
+        let base_geom = get_feature_base_geojson(&store, fid).await;
 
-                    // Determine conflict type and suggestion
-                    let is_delete = matches!(ours, DiffOp::Delete { .. })
-                        || matches!(theirs, DiffOp::Delete { .. });
-                    let geom_differs = ours_geom != theirs_geom;
-                    let props_differ = get_op_props(ours) != get_op_props(theirs);
+        // Determine conflict type and suggestion
+        let is_delete =
+            matches!(ours, DiffOp::Delete { .. }) || matches!(theirs, DiffOp::Delete { .. });
+        let geom_differs = ours_geom != theirs_geom;
+        let props_differ = get_op_props(ours) != get_op_props(theirs);
 
-                    let (conflict_type, suggestion) = if is_delete {
-                        ("delete_modify", "manual_required")
-                    } else if geom_differs && props_differ {
-                        ("full_conflict", "manual_required")
-                    } else if geom_differs {
-                        ("geometry_conflict", "manual_required")
-                    } else {
-                        ("property_conflict", "auto_merge_properties")
-                    };
+        let (conflict_type, suggestion) = if is_delete {
+            ("delete_modify", "manual_required")
+        } else if geom_differs && props_differ {
+            ("full_conflict", "manual_required")
+        } else if geom_differs {
+            ("geometry_conflict", "manual_required")
+        } else {
+            ("property_conflict", "auto_merge_properties")
+        };
 
-                    // Add to GeoJSON FeatureCollection for map rendering
-                    if let Some(ref g) = ours_geom {
-                        geojson_features.push(serde_json::json!({
-                            "type": "Feature",
-                            "id": format!("{fid}-ours"),
-                            "geometry": g,
-                            "properties": {"feature_id": fid, "side": "ours", "conflict_type": conflict_type}
-                        }));
-                    }
-                    if let Some(ref g) = theirs_geom {
-                        geojson_features.push(serde_json::json!({
-                            "type": "Feature",
-                            "id": format!("{fid}-theirs"),
-                            "geometry": g,
-                            "properties": {"feature_id": fid, "side": "theirs", "conflict_type": conflict_type}
-                        }));
-                    }
-                    if let Some(ref g) = base_geom {
-                        geojson_features.push(serde_json::json!({
-                            "type": "Feature",
-                            "id": format!("{fid}-base"),
-                            "geometry": g,
-                            "properties": {"feature_id": fid, "side": "base", "conflict_type": conflict_type}
-                        }));
-                    }
-
-                    conflicts.push(VisualConflict {
-                        feature_id: *fid,
-                        conflict_type,
-                        ours_geometry: ours_geom,
-                        theirs_geometry: theirs_geom,
-                        base_geometry: base_geom,
-                        ours_properties: Some(get_op_props(ours)),
-                        theirs_properties: Some(get_op_props(theirs)),
-                        base_properties: None,
-                        suggestion,
-                    });
-                }
-            }
-            (None, None) => unreachable!(),
+        // Add to GeoJSON FeatureCollection for map rendering
+        if let Some(ref g) = ours_geom {
+            geojson_features.push(serde_json::json!({
+                "type": "Feature",
+                "id": format!("{fid}-ours"),
+                "geometry": g,
+                "properties": {"feature_id": fid, "side": "ours", "conflict_type": conflict_type}
+            }));
         }
+        if let Some(ref g) = theirs_geom {
+            geojson_features.push(serde_json::json!({
+                "type": "Feature",
+                "id": format!("{fid}-theirs"),
+                "geometry": g,
+                "properties": {"feature_id": fid, "side": "theirs", "conflict_type": conflict_type}
+            }));
+        }
+        if let Some(ref g) = base_geom {
+            geojson_features.push(serde_json::json!({
+                "type": "Feature",
+                "id": format!("{fid}-base"),
+                "geometry": g,
+                "properties": {"feature_id": fid, "side": "base", "conflict_type": conflict_type}
+            }));
+        }
+
+        conflicts.push(VisualConflict {
+            feature_id: fid,
+            conflict_type,
+            ours_geometry: ours_geom,
+            theirs_geometry: theirs_geom,
+            base_geometry: base_geom,
+            ours_properties: Some(get_op_props(ours)),
+            theirs_properties: Some(get_op_props(theirs)),
+            base_properties: sides.base_properties(fid),
+            suggestion,
+        });
     }
 
     let conflict_count = conflicts.len();
@@ -328,91 +374,72 @@ async fn resolve_and_merge(
                 "target has no commits".into(),
             )))?;
 
-    let base = store.find_merge_base(source_head, target_head).await?;
-    let diff_ours = store.diff(base, target_head).await?;
-    let diff_theirs = store.diff(base, source_head).await?;
-
-    let ours_map: std::collections::HashMap<Uuid, &DiffOp> = diff_ours
-        .operations
-        .iter()
-        .map(|op| (diff_op_fid(op), op))
-        .collect();
-    let theirs_map: std::collections::HashMap<Uuid, &DiffOp> = diff_theirs
-        .operations
-        .iter()
-        .map(|op| (diff_op_fid(op), op))
-        .collect();
-
-    let all_fids: std::collections::HashSet<Uuid> =
-        ours_map.keys().chain(theirs_map.keys()).copied().collect();
+    let sides = MergeSides::of(&store, source_head, target_head).await?;
 
     let resolution_map: std::collections::HashMap<Uuid, &VisualResolution> =
         req.resolutions.iter().map(|r| (r.feature_id, r)).collect();
 
     let mut final_ops: Vec<DiffOp> = Vec::new();
 
-    for fid in &all_fids {
-        match (ours_map.get(fid), theirs_map.get(fid)) {
-            (Some(ours), None) => final_ops.push((*ours).clone()),
-            (None, Some(theirs)) => final_ops.push((*theirs).clone()),
-            (Some(ours), Some(theirs)) => {
-                if diff_ops_match(ours, theirs) {
-                    final_ops.push((*ours).clone());
-                } else if let Some(res) = resolution_map.get(fid) {
-                    match res.strategy.as_str() {
-                        "ours" => final_ops.push((*ours).clone()),
-                        "theirs" => final_ops.push((*theirs).clone()),
-                        "delete" => final_ops.push(DiffOp::Delete { feature_id: *fid }),
-                        "auto_merge" => {
-                            // Take geometry from theirs, merge properties
-                            let geom = op_wkb(theirs).map(|w| w.to_vec());
-                            let mut merged_props = get_op_props(ours);
-                            if let Some(theirs_obj) = get_op_props(theirs).as_object()
-                                && let Some(ours_obj) = merged_props.as_object_mut()
-                            {
-                                for (k, v) in theirs_obj {
-                                    ours_obj.entry(k.clone()).or_insert_with(|| v.clone());
-                                }
-                            }
-                            final_ops.push(DiffOp::Update {
-                                feature_id: *fid,
-                                geometry_wkb: geom,
-                                properties: Some(merged_props),
-                                // the geometry is theirs wholesale, so its original is too
-                                native: op_native(theirs).cloned(),
-                                valid_from: None,
-                                valid_to: None,
-                            });
-                        }
-                        "custom" => {
-                            let wkb = res
-                                .custom_geometry_wkb_hex
-                                .as_ref()
-                                .and_then(|h| hex::decode(h).ok());
-                            final_ops.push(DiffOp::Update {
-                                feature_id: *fid,
-                                geometry_wkb: wkb,
-                                properties: res.custom_properties.clone(),
-                                // a hand-resolved geometry has no survey original
-                                native: None,
-                                valid_from: None,
-                                valid_to: None,
-                            });
-                        }
-                        _ => {
-                            // Default: take ours
-                            final_ops.push((*ours).clone());
-                        }
-                    }
-                } else {
-                    // No resolution provided — fail
-                    return Ok(Json(serde_json::json!({
-                        "error": format!("no resolution for conflicting feature {fid}"),
-                        "success": false,
-                    })));
-                }
+    for (fid, choice) in sides.choices() {
+        let (ours, theirs) = match choice {
+            ptolemy_storage::MergeChoice::Nothing => continue,
+            ptolemy_storage::MergeChoice::Apply(op) => {
+                final_ops.push(op.clone());
+                continue;
             }
-            (None, None) => unreachable!(),
+            ptolemy_storage::MergeChoice::Conflict { ours, theirs } => (ours, theirs),
+        };
+        let Some(res) = resolution_map.get(&fid) else {
+            return Ok(Json(serde_json::json!({
+                "error": format!("no resolution for conflicting feature {fid}"),
+                "success": false,
+            })));
+        };
+        match res.strategy.as_str() {
+            "ours" => final_ops.push(ours.clone()),
+            "theirs" => final_ops.push(theirs.clone()),
+            "delete" => final_ops.push(DiffOp::Delete { feature_id: fid }),
+            "auto_merge" => {
+                // Take geometry from theirs, merge properties
+                let geom = op_wkb(theirs).map(|w| w.to_vec());
+                let mut merged_props = get_op_props(ours);
+                if let Some(theirs_obj) = get_op_props(theirs).as_object()
+                    && let Some(ours_obj) = merged_props.as_object_mut()
+                {
+                    for (k, v) in theirs_obj {
+                        ours_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                final_ops.push(DiffOp::Update {
+                    feature_id: fid,
+                    geometry_wkb: geom,
+                    properties: Some(merged_props),
+                    // the geometry is theirs wholesale, so its original is too
+                    native: op_native(theirs).cloned(),
+                    valid_from: None,
+                    valid_to: None,
+                });
+            }
+            "custom" => {
+                let wkb = res
+                    .custom_geometry_wkb_hex
+                    .as_ref()
+                    .and_then(|h| hex::decode(h).ok());
+                final_ops.push(DiffOp::Update {
+                    feature_id: fid,
+                    geometry_wkb: wkb,
+                    properties: res.custom_properties.clone(),
+                    // a hand-resolved geometry has no survey original
+                    native: None,
+                    valid_from: None,
+                    valid_to: None,
+                });
+            }
+            _ => {
+                // Default: take ours
+                final_ops.push(ours.clone());
+            }
         }
     }
 
@@ -449,49 +476,6 @@ fn diff_op_fid(op: &DiffOp) -> Uuid {
         DiffOp::Insert { feature_id, .. }
         | DiffOp::Update { feature_id, .. }
         | DiffOp::Delete { feature_id } => *feature_id,
-    }
-}
-
-fn diff_ops_match(a: &DiffOp, b: &DiffOp) -> bool {
-    match (a, b) {
-        (
-            DiffOp::Insert {
-                feature_id: fa,
-                geometry_wkb: ga,
-                properties: pa,
-                native: na,
-                valid_from: vfa,
-                valid_to: vta,
-            },
-            DiffOp::Insert {
-                feature_id: fb,
-                geometry_wkb: gb,
-                properties: pb,
-                native: nb,
-                valid_from: vfb,
-                valid_to: vtb,
-            },
-        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
-        (
-            DiffOp::Update {
-                feature_id: fa,
-                geometry_wkb: ga,
-                properties: pa,
-                native: na,
-                valid_from: vfa,
-                valid_to: vta,
-            },
-            DiffOp::Update {
-                feature_id: fb,
-                geometry_wkb: gb,
-                properties: pb,
-                native: nb,
-                valid_from: vfb,
-                valid_to: vtb,
-            },
-        ) => fa == fb && ga == gb && pa == pb && na == nb && vfa == vfb && vta == vtb,
-        (DiffOp::Delete { feature_id: fa }, DiffOp::Delete { feature_id: fb }) => fa == fb,
-        _ => false,
     }
 }
 

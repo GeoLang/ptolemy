@@ -512,6 +512,108 @@ async fn test_merge_with_nothing_new_is_up_to_date() {
 }
 
 #[tokio::test]
+async fn test_conflict_listing_ignores_a_side_that_matches_the_base() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}},
+            {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "shared-v1"}}
+        ]),
+    )
+    .await;
+
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-1"}},
+            {"type": "update", "feature_id": f2.to_string(), "properties": {"name": "shared-dev"}}
+        ]),
+    )
+    .await;
+    merge_branches(&app, main_id, dev_id).await;
+
+    // Only the source touches f1 after the merge. What main holds for it is the
+    // merge's own copy, which still matches the base, so neither feature is a
+    // conflict and the merge would settle both by itself.
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-2"}}
+        ]),
+    )
+    .await;
+
+    let (status, listed) = get_json(&app, &format!("/api/v1/conflicts/{dev_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        0,
+        "nothing to resolve: {listed}"
+    );
+
+    let (status, preview) = get_json(
+        &app,
+        &format!("/api/v1/branches/{main_id}/merge/{dev_id}/preview"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["conflict_count"], 0, "{preview}");
+
+    let merged = merge_branches(&app, main_id, dev_id).await;
+    assert_eq!(merged["up_to_date"], false, "{merged}");
+
+    // A feature both sides move away from the base is still a conflict
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "main-3"}}
+        ]),
+    )
+    .await;
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-3"}}
+        ]),
+    )
+    .await;
+
+    let (status, listed) = get_json(&app, &format!("/api/v1/conflicts/{dev_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["feature_id"], json!(f1.to_string()), "{listed:?}");
+    assert_eq!(listed[0]["ours"]["name"], "main-3", "{listed:?}");
+    assert_eq!(listed[0]["theirs"]["name"], "dev-3", "{listed:?}");
+    assert_eq!(listed[0]["base"]["name"], "dev-2", "{listed:?}");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main_id}/merge/{dev_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"], "conflicts",
+        "the listing and the merge agree: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_diff_across_a_merge_sees_both_parents() {
     let (app, _) = setup_app().await;
     let ds_id = create_dataset(&app).await;

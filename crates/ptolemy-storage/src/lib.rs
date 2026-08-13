@@ -16,7 +16,7 @@ pub use permission::{
 pub use postgres::LATEST_COLUMNS;
 pub use postgres::{
     Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry, CompactionResult,
-    CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeResult, PgStore,
+    CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeChoice, MergeResult, PgStore,
     ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult, TopologyRepair,
-    TopologyViolation, WriteTarget, branch_features_subquery,
+    TopologyViolation, VersionContent, WriteTarget, branch_features_subquery, merge_choice,
 };

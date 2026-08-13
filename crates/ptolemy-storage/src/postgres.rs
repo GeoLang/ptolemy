@@ -1478,9 +1478,10 @@ impl PgStore {
     }
 
     /// What each of `feature_ids` held at `changeset`, absent where the feature
-    /// did not exist there or was deleted. A merge compares each side against
-    /// this to tell a real edit from a version that carries the base forward.
-    async fn contents_at(
+    /// did not exist there or was deleted. Feed it to [`merge_choice`] with the
+    /// merge base as `changeset`, so a side that only carries the base forward
+    /// is told apart from one that edited the feature.
+    pub async fn contents_at(
         &self,
         changeset: Uuid,
         feature_ids: &[Uuid],
@@ -1590,33 +1591,19 @@ impl PgStore {
         };
 
         for fid in all_features {
-            let at_base = base_contents.get(&fid);
-            match (ours_map.get(&fid), theirs_map.get(&fid)) {
-                (Some(ours), None) => {
-                    // a copy of the base adds nothing the target chain lacks
-                    if !op_matches_content(ours, at_base) {
-                        merged_ops.push((*ours).clone());
-                    }
-                }
-                (None, Some(theirs)) => {
-                    merged_ops.push((*theirs).clone());
-                }
-                (Some(ours), Some(theirs)) => {
-                    if ops_equal(ours, theirs) {
-                        merged_ops.push((*ours).clone());
-                    } else if op_matches_content(ours, at_base) {
-                        merged_ops.push((*theirs).clone());
-                    } else if op_matches_content(theirs, at_base) {
-                        merged_ops.push((*ours).clone());
-                    } else {
-                        conflicts.push(ConflictInfo {
-                            feature_id: fid,
-                            ours: (*ours).clone(),
-                            theirs: (*theirs).clone(),
-                        });
-                    }
-                }
-                (None, None) => unreachable!(),
+            let choice = merge_choice(
+                ours_map.get(&fid).copied(),
+                theirs_map.get(&fid).copied(),
+                base_contents.get(&fid),
+            );
+            match choice {
+                MergeChoice::Nothing => {}
+                MergeChoice::Apply(op) => merged_ops.push(op.clone()),
+                MergeChoice::Conflict { ours, theirs } => conflicts.push(ConflictInfo {
+                    feature_id: fid,
+                    ours: ours.clone(),
+                    theirs: theirs.clone(),
+                }),
             }
         }
 
@@ -3682,12 +3669,65 @@ pub enum MergeResult {
 }
 
 /// One feature version's content, for comparing a merge side against the base.
-struct VersionContent {
+/// Read it with [`PgStore::contents_at`].
+pub struct VersionContent {
     geometry_wkb: Option<Vec<u8>>,
     properties: serde_json::Value,
     native: Option<ptolemy_core::diff::NativeGeometry>,
     valid_from: Option<OffsetDateTime>,
     valid_to: Option<OffsetDateTime>,
+}
+
+impl VersionContent {
+    /// For a conflict report, which shows what the base held alongside the two
+    /// sides.
+    pub fn properties(&self) -> &serde_json::Value {
+        &self.properties
+    }
+}
+
+/// What a three-way merge does with one feature.
+#[derive(Debug, Clone, Copy)]
+pub enum MergeChoice<'a> {
+    /// Nothing to write: the target's own chain already holds this content.
+    Nothing,
+    /// Write this op on the target.
+    Apply(&'a DiffOp),
+    /// Both sides moved the feature away from the base.
+    Conflict {
+        ours: &'a DiffOp,
+        theirs: &'a DiffOp,
+    },
+}
+
+/// The merge decision for one feature: each side's op as its diff from the base
+/// reports it, `None` where that side did not touch the feature, and `at_base`
+/// as the base held it.
+///
+/// The listing and preview routes decide with this too, so what they call a
+/// conflict is what [`PgStore::merge`] calls one. A side whose version still
+/// matches the base did not change the feature and so cannot conflict: that is
+/// what an earlier merge's own copy of the other branch's work looks like.
+pub fn merge_choice<'a>(
+    ours: Option<&'a DiffOp>,
+    theirs: Option<&'a DiffOp>,
+    at_base: Option<&VersionContent>,
+) -> MergeChoice<'a> {
+    match (ours, theirs) {
+        (Some(ours), None) if op_matches_content(ours, at_base) => MergeChoice::Nothing,
+        (Some(ours), None) => MergeChoice::Apply(ours),
+        (None, Some(theirs)) => MergeChoice::Apply(theirs),
+        (Some(ours), Some(theirs)) => {
+            if ops_equal(ours, theirs) || op_matches_content(theirs, at_base) {
+                MergeChoice::Apply(ours)
+            } else if op_matches_content(ours, at_base) {
+                MergeChoice::Apply(theirs)
+            } else {
+                MergeChoice::Conflict { ours, theirs }
+            }
+        }
+        (None, None) => MergeChoice::Nothing,
+    }
 }
 
 /// Whether `op` leaves the feature exactly as `content` had it, `None` meaning
