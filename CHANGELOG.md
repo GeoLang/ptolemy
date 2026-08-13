@@ -437,6 +437,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-08-13: merging a branch that is already merged answers up to date instead
+  of writing another merge changeset. A merge commit now records the source head
+  it brought in (`changesets.merge_parent_id`, migration 030), every lineage walk
+  follows both parents, and the merge base advances, so a re-merge carries only
+  what the source changed since the last one. Conflicts are decided against the
+  base, so a previous merge's own copy of the source's work no longer reads as a
+  conflicting edit. The merge response gains `up_to_date`, with `changeset` null
+  exactly when it is true.
+
 - 2026-07-31: two `applyEdits` batches of adds racing on one layer could be given
   the same object ids. The highest id is read before the commit that raises it, so
   both batches read the same one; nothing downstream refuses a duplicate, because
