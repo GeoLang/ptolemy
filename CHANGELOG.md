@@ -437,6 +437,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-08-13: the conflict listing, merge preview and resolve routes decide a
+  conflict the same way the merge does: a side whose version still matches the
+  merge base did not change the feature, so an earlier merge's own copy of the
+  other branch's work is no longer listed as conflicting or held for a
+  resolution. The listing and preview now report what the base held instead of
+  leaving those fields null.
+
 - 2026-08-13: merging a branch that is already merged answers up to date instead
   of writing another merge changeset. A merge commit now records the source head
   it brought in (`changesets.merge_parent_id`, migration 030), every lineage walk
