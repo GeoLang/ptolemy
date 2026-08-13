@@ -13,6 +13,8 @@ pub struct Changeset {
     pub id: Uuid,
     pub branch_id: Uuid,
     pub parent_id: Option<Uuid>,
+    /// The source branch head a merge brought in. `None` on an ordinary commit.
+    pub merge_parent_id: Option<Uuid>,
     pub message: String,
     pub author: String,
     pub created_at: OffsetDateTime,

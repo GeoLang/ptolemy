@@ -131,7 +131,9 @@ struct MergeReviewRequest {
 
 #[derive(Serialize)]
 struct MergeReviewResponse {
+    /// Absent when the merge was already up to date: nothing was committed.
     changeset_id: Option<Uuid>,
+    up_to_date: bool,
     conflicts: Vec<String>,
 }
 
@@ -166,11 +168,24 @@ async fn merge_review(
                 .await?;
             Ok(Json(MergeReviewResponse {
                 changeset_id: Some(cs.id),
+                up_to_date: false,
+                conflicts: vec![],
+            }))
+        }
+        // the source is already on the target, so the request is satisfied
+        ptolemy_storage::MergeResult::AlreadyUpToDate => {
+            store
+                .update_merge_request_status(id, &MergeRequestStatus::Merged)
+                .await?;
+            Ok(Json(MergeReviewResponse {
+                changeset_id: None,
+                up_to_date: true,
                 conflicts: vec![],
             }))
         }
         ptolemy_storage::MergeResult::Conflicts(conflicts) => Ok(Json(MergeReviewResponse {
             changeset_id: None,
+            up_to_date: false,
             conflicts: conflicts
                 .iter()
                 .map(|c| format!("feature {} conflict", c.feature_id))

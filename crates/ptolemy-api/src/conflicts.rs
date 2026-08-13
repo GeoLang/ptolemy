@@ -424,11 +424,12 @@ async fn resolve_and_merge(
     });
 
     let changeset = store
-        .commit(
+        .commit_merge(
             target_id,
             &message,
             actor.or_body(&req.author),
             &final_ops,
+            Some(source_head),
             &actor.writer(),
         )
         .await?;

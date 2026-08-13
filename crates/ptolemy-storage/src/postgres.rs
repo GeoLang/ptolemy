@@ -106,6 +106,28 @@ pub fn branch_features_subquery(branch_expr: &str) -> String {
     )
 }
 
+/// A recursive CTE named `name` holding the changeset bound to `start` and every
+/// changeset it can reach, following both parents so a merge commit reaches the
+/// source branch it brought in. The caller puts it after `WITH RECURSIVE`.
+///
+/// `UNION` rather than `UNION ALL`: history is a DAG, and a shared ancestor
+/// below two merged lines would otherwise be walked once per path through it.
+///
+/// This answers whether one changeset is reachable from another, which is not
+/// the same question as which versions make up a branch's current state. The
+/// state walks stay on `parent_id`: a merge commit records what it brought in,
+/// so the source's own versions would only add older duplicates.
+fn ancestors_cte(name: &str, start: &str) -> String {
+    format!(
+        "{name} AS (
+            SELECT id, parent_id, merge_parent_id FROM changesets WHERE id = {start}
+          UNION
+            SELECT c.id, c.parent_id, c.merge_parent_id FROM changesets c
+            JOIN {name} a ON c.id = a.parent_id OR c.id = a.merge_parent_id
+        )"
+    )
+}
+
 /// Keeps rows whose valid time covers the instant at `placeholder`, which the
 /// caller always binds: NULL there means no filter, so one query shape serves
 /// both. Half-open, [valid_from, valid_to), and a NULL end is unbounded.
@@ -901,6 +923,22 @@ impl PgStore {
         operations: &[DiffOp],
         writer: &Writer,
     ) -> Result<Changeset, StoreError> {
+        self.commit_merge(branch_id, message, author, operations, None, writer)
+            .await
+    }
+
+    /// A commit that also records `merge_parent`, the source branch head it
+    /// brought in. Every later merge base walk sees that head as reached, so
+    /// merging the same branch again starts from it instead of from the fork.
+    pub async fn commit_merge(
+        &self,
+        branch_id: Uuid,
+        message: &str,
+        author: &str,
+        operations: &[DiffOp],
+        merge_parent: Option<Uuid>,
+        writer: &Writer,
+    ) -> Result<Changeset, StoreError> {
         let mut tx = self.pool.begin().await?;
 
         // Get current branch head. The external and permission checks ride along
@@ -946,13 +984,14 @@ impl PgStore {
         // by whatever they disagreed by.
         let changeset_id = Uuid::now_v7();
         let now: OffsetDateTime = sqlx::query(
-            "INSERT INTO changesets (id, branch_id, parent_id, message, author, created_at)
-             VALUES ($1, $2, $3, $4, $5, now())
+            "INSERT INTO changesets (id, branch_id, parent_id, merge_parent_id, message, author, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
              RETURNING created_at",
         )
         .bind(changeset_id)
         .bind(branch_id)
         .bind(parent_id)
+        .bind(merge_parent)
         .bind(message)
         .bind(author)
         .fetch_one(&mut *tx)
@@ -1104,6 +1143,7 @@ impl PgStore {
             id: changeset_id,
             branch_id,
             parent_id,
+            merge_parent_id: merge_parent,
             message: message.to_string(),
             author: author.to_string(),
             created_at: now,
@@ -1308,18 +1348,10 @@ impl PgStore {
         to_changeset: Uuid,
     ) -> Result<Diff, StoreError> {
         let rows = if let Some(from_id) = from_changeset {
-            sqlx::query(
+            sqlx::query(&format!(
                 "WITH RECURSIVE
-                to_chain AS (
-                    SELECT id, parent_id FROM changesets WHERE id = $2
-                  UNION ALL
-                    SELECT c.id, c.parent_id FROM changesets c JOIN to_chain ch ON ch.parent_id = c.id
-                ),
-                from_chain AS (
-                    SELECT id, parent_id FROM changesets WHERE id = $1
-                  UNION ALL
-                    SELECT c.id, c.parent_id FROM changesets c JOIN from_chain ch ON ch.parent_id = c.id
-                ),
+                {to_chain},
+                {from_chain},
                 new_changesets AS (
                     SELECT id FROM to_chain EXCEPT SELECT id FROM from_chain
                 )
@@ -1333,18 +1365,16 @@ impl PgStore {
                 FROM feature_versions fv
                 JOIN new_changesets nc ON fv.changeset_id = nc.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
-            )
+                to_chain = ancestors_cte("to_chain", "$2"),
+                from_chain = ancestors_cte("from_chain", "$1"),
+            ))
             .bind(from_id)
             .bind(to_changeset)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(
-                "WITH RECURSIVE chain AS (
-                    SELECT id, parent_id FROM changesets WHERE id = $1
-                  UNION ALL
-                    SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
-                )
+            sqlx::query(&format!(
+                "WITH RECURSIVE {chain}
                 SELECT DISTINCT ON (fv.feature_id)
                     fv.feature_id, fv.operation,
                     ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
@@ -1355,7 +1385,8 @@ impl PgStore {
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
-            )
+                chain = ancestors_cte("chain", "$1"),
+            ))
             .bind(to_changeset)
             .fetch_all(&self.pool)
             .await?
@@ -1401,34 +1432,96 @@ impl PgStore {
     // ─── Merge ──────────────────────────────────────────────────────
 
     /// Find the common ancestor of two changesets (merge base).
+    ///
+    /// The newest common ancestor rather than the shallowest: a commit is always
+    /// younger than both its parents, so ordering by time picks a common
+    /// ancestor no other common ancestor descends from, and it stays right where
+    /// merge parents make the two sides different distances apart.
     pub async fn find_merge_base(
         &self,
         changeset_a: Uuid,
         changeset_b: Uuid,
     ) -> Result<Option<Uuid>, StoreError> {
-        let row = sqlx::query(
+        let row = sqlx::query(&format!(
             "WITH RECURSIVE
-            ancestors_a AS (
-                SELECT id, parent_id, 0 AS depth FROM changesets WHERE id = $1
-              UNION ALL
-                SELECT c.id, c.parent_id, a.depth + 1 FROM changesets c JOIN ancestors_a a ON a.parent_id = c.id
-            ),
-            ancestors_b AS (
-                SELECT id, parent_id FROM changesets WHERE id = $2
-              UNION ALL
-                SELECT c.id, c.parent_id FROM changesets c JOIN ancestors_b b ON b.parent_id = c.id
-            )
-            SELECT a.id FROM ancestors_a a
+            {ancestors_a},
+            {ancestors_b}
+            SELECT c.id FROM ancestors_a a
             JOIN ancestors_b b ON a.id = b.id
-            ORDER BY a.depth
+            JOIN changesets c ON c.id = a.id
+            ORDER BY c.created_at DESC, c.id DESC
             LIMIT 1",
-        )
+            ancestors_a = ancestors_cte("ancestors_a", "$1"),
+            ancestors_b = ancestors_cte("ancestors_b", "$2"),
+        ))
         .bind(changeset_a)
         .bind(changeset_b)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(row.map(|r| r.get("id")))
+    }
+
+    /// Whether `changeset` is `head` itself or one of its ancestors, merge
+    /// parents included. This is what makes a merge already up to date.
+    pub async fn is_reachable_from(&self, changeset: Uuid, head: Uuid) -> Result<bool, StoreError> {
+        let reachable: bool = sqlx::query_scalar(&format!(
+            "WITH RECURSIVE {ancestors}
+             SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = $2)",
+            ancestors = ancestors_cte("ancestors", "$1"),
+        ))
+        .bind(head)
+        .bind(changeset)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(reachable)
+    }
+
+    /// What each of `feature_ids` held at `changeset`, absent where the feature
+    /// did not exist there or was deleted. A merge compares each side against
+    /// this to tell a real edit from a version that carries the base forward.
+    async fn contents_at(
+        &self,
+        changeset: Uuid,
+        feature_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, VersionContent>, StoreError> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT id, parent_id FROM changesets WHERE id = $1
+              UNION ALL
+                SELECT c.id, c.parent_id FROM changesets c JOIN chain ch ON ch.parent_id = c.id
+            )
+            SELECT DISTINCT ON (fv.feature_id)
+                fv.feature_id, fv.operation,
+                ST_AsBinary(fv.geometry) as geometry_wkb, fv.properties,
+                fv.valid_from, fv.valid_to,
+                ST_AsBinary(fv.native_geometry) as native_wkb,
+                ST_SRID(fv.native_geometry) as native_srid,
+                fv.native_crs_wkt
+            FROM feature_versions fv
+            JOIN chain ch ON fv.changeset_id = ch.id
+            WHERE fv.feature_id = ANY($2::uuid[])
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC",
+        )
+        .bind(changeset)
+        .bind(feature_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.get::<String, _>("operation") != "delete")
+            .map(|row| {
+                let content = VersionContent {
+                    geometry_wkb: row.get("geometry_wkb"),
+                    properties: row.get("properties"),
+                    native: native_from_row(&row, "native_wkb", "native_srid", "native_crs_wkt"),
+                    valid_from: row.get("valid_from"),
+                    valid_to: row.get("valid_to"),
+                };
+                (row.get("feature_id"), content)
+            })
+            .collect())
     }
 
     /// Three-way merge: merge `source_branch` into `target_branch`.
@@ -1451,6 +1544,12 @@ impl PgStore {
         let target_head = target
             .head
             .ok_or_else(|| StoreError::Conflict("target branch has no commits".into()))?;
+
+        // Everything the source has is already on the target, so there is
+        // nothing to merge and nothing to record.
+        if self.is_reachable_from(source_head, target_head).await? {
+            return Ok(MergeResult::AlreadyUpToDate);
+        }
 
         // Find merge base
         let base = self.find_merge_base(source_head, target_head).await?;
@@ -1478,16 +1577,36 @@ impl PgStore {
         let all_features: std::collections::HashSet<Uuid> =
             ours_map.keys().chain(theirs_map.keys()).copied().collect();
 
+        // What the base held for those features. A side whose version still
+        // matches it did not change the feature, however the diff reports it:
+        // an earlier merge's own copy of the other branch's work reads as a
+        // change against the fork point but is not one.
+        let base_contents = match base {
+            Some(base_id) => {
+                let ids: Vec<Uuid> = all_features.iter().copied().collect();
+                self.contents_at(base_id, &ids).await?
+            }
+            None => std::collections::HashMap::new(),
+        };
+
         for fid in all_features {
+            let at_base = base_contents.get(&fid);
             match (ours_map.get(&fid), theirs_map.get(&fid)) {
                 (Some(ours), None) => {
-                    merged_ops.push((*ours).clone());
+                    // a copy of the base adds nothing the target chain lacks
+                    if !op_matches_content(ours, at_base) {
+                        merged_ops.push((*ours).clone());
+                    }
                 }
                 (None, Some(theirs)) => {
                     merged_ops.push((*theirs).clone());
                 }
                 (Some(ours), Some(theirs)) => {
                     if ops_equal(ours, theirs) {
+                        merged_ops.push((*ours).clone());
+                    } else if op_matches_content(ours, at_base) {
+                        merged_ops.push((*theirs).clone());
+                    } else if op_matches_content(theirs, at_base) {
                         merged_ops.push((*ours).clone());
                     } else {
                         conflicts.push(ConflictInfo {
@@ -1507,11 +1626,12 @@ impl PgStore {
 
         // No conflicts — create merge commit on target branch
         let changeset = self
-            .commit(
+            .commit_merge(
                 target_branch_id,
                 &format!("Merge branch '{}' into '{}'", source.name, target.name),
                 author,
                 &merged_ops,
+                Some(source_head),
                 writer,
             )
             .await?;
@@ -1539,6 +1659,7 @@ impl PgStore {
 
         match result {
             MergeResult::Conflicts(conflicts) => Ok(TopologyMergeResult::MergeConflicts(conflicts)),
+            MergeResult::AlreadyUpToDate => Ok(TopologyMergeResult::AlreadyUpToDate),
             MergeResult::Success(changeset) => {
                 // Now validate topology rules for the dataset
                 let target = self.get_branch(target_branch_id).await?;
@@ -1832,7 +1953,7 @@ impl PgStore {
                 SELECT c.* FROM changesets c
                 JOIN chain ch ON ch.parent_id = c.id
             )
-            SELECT id, branch_id, parent_id, message, author, created_at
+            SELECT id, branch_id, parent_id, merge_parent_id, message, author, created_at
             FROM chain
             LIMIT $2",
         )
@@ -1847,6 +1968,7 @@ impl PgStore {
                 id: row.get("id"),
                 branch_id: row.get("branch_id"),
                 parent_id: row.get("parent_id"),
+                merge_parent_id: row.get("merge_parent_id"),
                 message: row.get("message"),
                 author: row.get("author"),
                 created_at: row.get("created_at"),
@@ -3555,6 +3677,60 @@ pub struct FeatureLock {
 pub enum MergeResult {
     Success(Changeset),
     Conflicts(Vec<ConflictInfo>),
+    /// The source head was already on the target. No changeset was written.
+    AlreadyUpToDate,
+}
+
+/// One feature version's content, for comparing a merge side against the base.
+struct VersionContent {
+    geometry_wkb: Option<Vec<u8>>,
+    properties: serde_json::Value,
+    native: Option<ptolemy_core::diff::NativeGeometry>,
+    valid_from: Option<OffsetDateTime>,
+    valid_to: Option<OffsetDateTime>,
+}
+
+/// Whether `op` leaves the feature exactly as `content` had it, `None` meaning
+/// the feature was not there. A side that matches has nothing to contribute.
+fn op_matches_content(op: &DiffOp, content: Option<&VersionContent>) -> bool {
+    match (op, content) {
+        (DiffOp::Delete { .. }, None) => true,
+        (DiffOp::Delete { .. }, Some(_)) | (_, None) => false,
+        (
+            DiffOp::Insert {
+                geometry_wkb,
+                properties,
+                native,
+                valid_from,
+                valid_to,
+                ..
+            },
+            Some(base),
+        ) => {
+            Some(geometry_wkb) == base.geometry_wkb.as_ref()
+                && *properties == base.properties
+                && *native == base.native
+                && *valid_from == base.valid_from
+                && *valid_to == base.valid_to
+        }
+        (
+            DiffOp::Update {
+                geometry_wkb,
+                properties,
+                native,
+                valid_from,
+                valid_to,
+                ..
+            },
+            Some(base),
+        ) => {
+            geometry_wkb.as_ref() == base.geometry_wkb.as_ref()
+                && properties.as_ref() == Some(&base.properties)
+                && *native == base.native
+                && *valid_from == base.valid_from
+                && *valid_to == base.valid_to
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3574,6 +3750,8 @@ pub enum TopologyMergeResult {
     },
     /// Merge produced feature-level conflicts (same as normal merge).
     MergeConflicts(Vec<ConflictInfo>),
+    /// The source head was already on the target. No changeset was written.
+    AlreadyUpToDate,
     /// Merge succeeded but topology rules are violated.
     TopologyViolations {
         changeset: Changeset,

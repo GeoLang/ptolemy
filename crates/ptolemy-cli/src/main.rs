@@ -407,6 +407,9 @@ async fn main() -> anyhow::Result<()> {
                 ptolemy_storage::MergeResult::Success(cs) => {
                     println!("Merge successful: {}", cs.id);
                 }
+                ptolemy_storage::MergeResult::AlreadyUpToDate => {
+                    println!("Already up to date");
+                }
                 ptolemy_storage::MergeResult::Conflicts(conflicts) => {
                     println!("Merge has {} conflict(s):", conflicts.len());
                     for c in &conflicts {

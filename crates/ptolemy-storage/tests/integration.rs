@@ -658,6 +658,7 @@ async fn test_merge_no_conflicts() {
             assert!(changeset.message.contains("Merge"));
         }
         MergeResult::Conflicts(c) => panic!("Expected no conflicts, got {c:?}"),
+        MergeResult::AlreadyUpToDate => panic!("Expected a merge commit, not up to date"),
     }
 
     // Main should now have both features with latest state
@@ -752,6 +753,7 @@ async fn test_merge_with_conflicts() {
             assert_eq!(conflicts[0].feature_id, f1);
         }
         MergeResult::Success(_) => panic!("Expected conflict!"),
+        MergeResult::AlreadyUpToDate => panic!("Expected conflict, not up to date"),
     }
 }
 
@@ -822,6 +824,7 @@ async fn test_merge_same_change_no_conflict() {
     match result {
         MergeResult::Success(_) => {} // Good — same operation = no conflict
         MergeResult::Conflicts(c) => panic!("Expected no conflict for identical ops, got {c:?}"),
+        MergeResult::AlreadyUpToDate => panic!("Expected a merge commit, not up to date"),
     }
 }
 
@@ -1009,6 +1012,7 @@ async fn test_merge_conflict_geometry_edit_edit() {
             assert!(matches!(conflicts[0].theirs, DiffOp::Update { .. }));
         }
         MergeResult::Success(_) => panic!("Expected geometry edit-edit conflict"),
+        MergeResult::AlreadyUpToDate => panic!("Expected conflict, not up to date"),
     }
 }
 
@@ -1082,6 +1086,7 @@ async fn test_merge_conflict_attribute_edit_edit() {
             assert_eq!(conflicts[0].feature_id, f1);
         }
         MergeResult::Success(_) => panic!("Expected attribute edit-edit conflict"),
+        MergeResult::AlreadyUpToDate => panic!("Expected conflict, not up to date"),
     }
 }
 
@@ -1181,6 +1186,7 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
             }
         }
         MergeResult::Success(_) => panic!("Expected delete-vs-edit conflicts"),
+        MergeResult::AlreadyUpToDate => panic!("Expected conflicts, not up to date"),
     }
 }
 
@@ -1257,6 +1263,7 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
         MergeResult::Success(_) => {
             panic!("Merge is feature-level; disjoint attribute edits must conflict")
         }
+        MergeResult::AlreadyUpToDate => panic!("Expected conflict, not up to date"),
     }
 }
 
@@ -1523,17 +1530,30 @@ async fn test_merge_idempotent_remerge() {
         .unwrap();
 
     let first = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
-    let MergeResult::Success(_) = first else {
+    let MergeResult::Success(merge_cs) = first else {
         panic!("Expected first merge to succeed");
     };
+    assert_eq!(
+        merge_cs.merge_parent_id,
+        store.get_branch(feature.id).await.unwrap().head,
+        "a merge commit records the source head it brought in"
+    );
     let after_first = snapshot(&store, main.id).await;
+    let head_after_first = store.get_branch(main.id).await.unwrap().head;
 
-    // Re-merging an already-merged branch must not conflict or change state
+    // Re-merging an already-merged branch is up to date: no conflict, no state
+    // change, and no changeset
     let second = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
-    let MergeResult::Success(_) = second else {
-        panic!("Re-merge of merged branch must not conflict");
-    };
+    assert!(
+        matches!(second, MergeResult::AlreadyUpToDate),
+        "re-merge of a merged branch must be up to date"
+    );
     assert_eq!(snapshot(&store, main.id).await, after_first);
+    assert_eq!(
+        store.get_branch(main.id).await.unwrap().head,
+        head_after_first,
+        "an up-to-date merge must not commit"
+    );
 }
 
 #[tokio::test]

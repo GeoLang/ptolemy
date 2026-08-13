@@ -375,6 +375,7 @@ fn test_changeset_serialization() {
         id: Uuid::now_v7(),
         branch_id: Uuid::now_v7(),
         parent_id: None,
+        merge_parent_id: None,
         message: "Initial commit".into(),
         author: "user@example.com".into(),
         created_at: OffsetDateTime::now_utc(),
@@ -384,15 +385,18 @@ fn test_changeset_serialization() {
     assert_eq!(cs.id, back.id);
     assert_eq!(cs.message, back.message);
     assert!(back.parent_id.is_none());
+    assert!(back.merge_parent_id.is_none());
 }
 
 #[test]
 fn test_changeset_with_parent() {
     let parent_id = Uuid::now_v7();
+    let merge_parent_id = Uuid::now_v7();
     let cs = Changeset {
         id: Uuid::now_v7(),
         branch_id: Uuid::now_v7(),
         parent_id: Some(parent_id),
+        merge_parent_id: Some(merge_parent_id),
         message: "Second commit".into(),
         author: "user@example.com".into(),
         created_at: OffsetDateTime::now_utc(),
@@ -400,6 +404,7 @@ fn test_changeset_with_parent() {
     let json = serde_json::to_string(&cs).unwrap();
     let back: Changeset = serde_json::from_str(&json).unwrap();
     assert_eq!(back.parent_id, Some(parent_id));
+    assert_eq!(back.merge_parent_id, Some(merge_parent_id));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

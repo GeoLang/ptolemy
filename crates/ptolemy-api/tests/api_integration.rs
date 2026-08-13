@@ -356,6 +356,200 @@ async fn test_merge_branches() {
     );
 }
 
+/// Helper: merge `source_id` into `target_id` and return the response body.
+async fn merge_branches(app: &axum::Router, target_id: Uuid, source_id: Uuid) -> Value {
+    let (status, body) = post_json(
+        app,
+        &format!("/api/v1/branches/{target_id}/merge/{source_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "merge: {body}");
+    assert_eq!(body["status"], "success", "merge: {body}");
+    body
+}
+
+/// Helper: the feature ids the given changeset wrote a version for.
+async fn features_written_by(state: &AppState, changeset_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT feature_id FROM feature_versions WHERE changeset_id = $1",
+    )
+    .bind(changeset_id)
+    .fetch_all(state.read_pool())
+    .await
+    .unwrap()
+}
+
+async fn count_changesets(state: &AppState) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM changesets")
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_remerge_starts_from_the_previous_merge() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+    let f2 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(
+        &app,
+        main_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}},
+            {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "shared-v1"}}
+        ]),
+    )
+    .await;
+
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    let dev_first = commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-1"}},
+            {"type": "update", "feature_id": f2.to_string(), "properties": {"name": "shared-dev"}}
+        ]),
+    )
+    .await;
+
+    let first = merge_branches(&app, main_id, dev_id).await;
+    assert_eq!(first["up_to_date"], false, "first merge: {first}");
+    assert_eq!(
+        first["changeset"]["merge_parent_id"],
+        json!(dev_first.to_string()),
+        "the merge commit records the source head: {first}"
+    );
+
+    // The source moves on, touching only f1
+    let dev_second = commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "dev-2"}}
+        ]),
+    )
+    .await;
+
+    let second = merge_branches(&app, main_id, dev_id).await;
+    assert_eq!(second["up_to_date"], false, "second merge: {second}");
+    assert_eq!(
+        second["changeset"]["merge_parent_id"],
+        json!(dev_second.to_string()),
+        "second merge: {second}"
+    );
+
+    // The base advanced to the first merge's source head, so the second merge
+    // carries the one feature changed since then and nothing already merged
+    let second_id = Uuid::parse_str(second["changeset"]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        features_written_by(&state, second_id).await,
+        vec![f1],
+        "re-merge must not redo the first merge's work: {second}"
+    );
+
+    let (status, body) = get_json(&app, &format!("/api/v1/branches/{main_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names: Vec<&str> = body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["properties"]["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["dev-2", "shared-dev"], "{body}");
+}
+
+#[tokio::test]
+async fn test_merge_with_nothing_new_is_up_to_date() {
+    let (app, state) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}}
+    ])).await;
+
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    let f2 = Uuid::now_v7();
+    commit_features(&app, dev_id, json!([
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "dev-new"}}
+    ])).await;
+
+    let first = merge_branches(&app, main_id, dev_id).await;
+    let merge_id = first["changeset"]["id"].as_str().unwrap().to_string();
+    let changesets_after_first = count_changesets(&state).await;
+
+    let second = merge_branches(&app, main_id, dev_id).await;
+    assert_eq!(second["up_to_date"], true, "second merge: {second}");
+    assert_eq!(second["changeset"], Value::Null, "second merge: {second}");
+    assert_eq!(
+        count_changesets(&state).await,
+        changesets_after_first,
+        "an up-to-date merge must not write a changeset"
+    );
+
+    let (status, history) = get_json(&app, &format!("/api/v1/branches/{main_id}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let with_second_parent: Vec<&Value> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|cs| cs["merge_parent_id"].is_string())
+        .collect();
+    assert_eq!(with_second_parent.len(), 1, "history: {history}");
+    assert_eq!(
+        with_second_parent[0]["id"],
+        json!(merge_id),
+        "history shows the second parent on the merge commit: {history}"
+    );
+}
+
+#[tokio::test]
+async fn test_diff_across_a_merge_sees_both_parents() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "main-v1"}}
+    ])).await;
+
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    let f2 = Uuid::now_v7();
+    commit_features(&app, dev_id, json!([
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "dev-merged"}}
+    ])).await;
+
+    let merged = merge_branches(&app, main_id, dev_id).await;
+    let merge_id = merged["changeset"]["id"].as_str().unwrap();
+
+    let f3 = Uuid::now_v7();
+    let dev_after = commit_features(&app, dev_id, json!([
+        {"type": "insert", "feature_id": f3.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "dev-later"}}
+    ])).await;
+
+    // From the merge commit the whole source branch up to the merge is reached
+    // through the second parent, so only the commit after it is new
+    let (status, body) = get_json(&app, &format!("/api/v1/diff/{merge_id}/{dev_after}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ops = body["operations"].as_array().unwrap();
+    assert_eq!(ops.len(), 1, "diff across the merge: {body}");
+    assert_eq!(
+        ops[0]["Insert"]["feature_id"],
+        json!(f3.to_string()),
+        "{body}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Raster Tests
 // ═══════════════════════════════════════════════════════════════════════

@@ -753,7 +753,9 @@ async fn commit(
 #[serde(tag = "status", rename_all = "snake_case")]
 enum MergeResponse {
     Success {
-        changeset: ptolemy_core::changeset::Changeset,
+        /// Absent when the merge was already up to date: nothing was committed.
+        changeset: Option<ptolemy_core::changeset::Changeset>,
+        up_to_date: bool,
     },
     Conflicts {
         conflicts: Vec<ConflictResponse>,
@@ -776,9 +778,14 @@ async fn merge_branches(
         .merge(source_id, target_id, actor.or_body("api"), &actor.writer())
         .await?;
     match result {
-        ptolemy_storage::MergeResult::Success(changeset) => {
-            Ok(Json(MergeResponse::Success { changeset }))
-        }
+        ptolemy_storage::MergeResult::Success(changeset) => Ok(Json(MergeResponse::Success {
+            changeset: Some(changeset),
+            up_to_date: false,
+        })),
+        ptolemy_storage::MergeResult::AlreadyUpToDate => Ok(Json(MergeResponse::Success {
+            changeset: None,
+            up_to_date: true,
+        })),
         ptolemy_storage::MergeResult::Conflicts(conflicts) => {
             let resp: Vec<ConflictResponse> = conflicts
                 .into_iter()
@@ -809,7 +816,9 @@ fn default_true() -> bool {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum TopologyMergeResponse {
     Success {
-        changeset: ptolemy_core::changeset::Changeset,
+        /// Absent when the merge was already up to date: nothing was committed.
+        changeset: Option<ptolemy_core::changeset::Changeset>,
+        up_to_date: bool,
         auto_repaired: Vec<ptolemy_storage::TopologyRepair>,
     },
     MergeConflicts {
@@ -844,9 +853,17 @@ async fn merge_with_topology(
             auto_repaired,
             ..
         } => Ok(Json(TopologyMergeResponse::Success {
-            changeset,
+            changeset: Some(changeset),
+            up_to_date: false,
             auto_repaired,
         })),
+        ptolemy_storage::TopologyMergeResult::AlreadyUpToDate => {
+            Ok(Json(TopologyMergeResponse::Success {
+                changeset: None,
+                up_to_date: true,
+                auto_repaired: vec![],
+            }))
+        }
         ptolemy_storage::TopologyMergeResult::MergeConflicts(conflicts) => {
             let resp: Vec<ConflictResponse> = conflicts
                 .into_iter()
