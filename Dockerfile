@@ -8,6 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/*
 
+# amazon signs RDS certificates with its own roots, which no public root store
+# carries, so verify-full against RDS needs this bundle named by sslrootcert
+RUN curl -fsSL -o /etc/ssl/rds-global-bundle.pem \
+    https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    && chmod 0644 /etc/ssl/rds-global-bundle.pem
+
 RUN useradd -r -s /bin/false ptolemy
 
 COPY --from=builder /app/target/release/ptolemy /usr/local/bin/ptolemy

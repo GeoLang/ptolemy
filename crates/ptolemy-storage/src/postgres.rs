@@ -3468,45 +3468,34 @@ impl PgStore {
         Ok(())
     }
 
+    /// Whether a user holds at least `required` on a branch.
+    ///
+    /// `write` and `admin` read the scopes the write ladder reads and pick
+    /// between them the same way, so a branch that has rows of its own decides
+    /// and a dataset grant does not reach into it. Answering otherwise would
+    /// promise a write that [`PgStore::ensure_branch_writable`] then refuses.
+    ///
+    /// `read` is dataset visibility, which a grant anywhere on the dataset
+    /// satisfies, so there the dataset scope still stands in.
     pub async fn check_branch_permission(
         &self,
         branch_id: Uuid,
         user_id: &str,
         required: &str,
     ) -> Result<bool, StoreError> {
-        // Check direct branch permission first
-        let row = sqlx::query(
-            "SELECT permission FROM branch_permissions
-             WHERE branch_id = $1 AND user_id = $2",
-        )
-        .bind(branch_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let dataset_id: Uuid = sqlx::query_scalar("SELECT dataset_id FROM branches WHERE id = $1")
+            .bind(branch_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("branch {branch_id}")))?;
 
-        if let Some(r) = row {
-            let perm: String = r.get("permission");
-            return Ok(permission_level(&perm) >= permission_level(required));
-        }
-
-        // Fallback: check dataset-level permission
-        let ds_row = sqlx::query(
-            "SELECT dp.permission FROM dataset_permissions dp
-             JOIN branches b ON b.dataset_id = dp.dataset_id
-             WHERE b.id = $1 AND dp.user_id = $2",
-        )
-        .bind(branch_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match ds_row {
-            Some(r) => {
-                let perm: String = r.get("permission");
-                Ok(permission_level(&perm) >= permission_level(required))
-            }
-            None => Ok(false),
-        }
+        let (branch, dataset) = write_scopes(&self.pool, branch_id, dataset_id, user_id).await?;
+        let mine = match required {
+            "read" => branch.mine.or(dataset.mine),
+            _ if branch.enforced => branch.mine,
+            _ => dataset.mine,
+        };
+        Ok(mine.as_deref().map(permission_level).unwrap_or(0) >= permission_level(required))
     }
 
     // ─── Version Compaction / Garbage Collection ────────────────────────

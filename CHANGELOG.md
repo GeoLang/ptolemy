@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-13: sqlx is built with the `tls-rustls-ring` backend, so Ptolemy can
+  connect to a PostgreSQL server that refuses plaintext, such as an RDS instance
+  with `rds.force_ssl`. Without it sqlx has no TLS at all: under the default
+  `sslmode=prefer` it hands back a plaintext socket and the server closes the
+  connection, and under `require` it fails outright. rustls, webpki-roots and ring
+  were already in the dependency graph through mongodb, reqwest,
+  metrics-exporter-prometheus and jsonwebtoken, so no second TLS stack is
+  introduced. Local and CI databases are unaffected, since `prefer` still falls
+  back to plaintext. A hosted URL needs `sslmode=verify-full`, not `require`:
+  under `require` sqlx accepts any certificate and ignores `sslrootcert`
+  entirely, which is encryption with nothing authenticating the far end. The
+  image now carries the Amazon RDS root bundle at
+  `/etc/ssl/rds-global-bundle.pem` for `sslrootcert` to name.
+
 - 2026-08-11: Every push to master publishes `ghcr.io/geolang/ptolemy`, tagged
   `master` and `sha-<short-sha>`, and a `v*` tag publishes that version plus
   `latest`. The workflow builds the image, starts it against a PostGIS container
@@ -436,6 +450,18 @@ All notable changes to this project will be documented in this file.
   version's original, and a merge carries originals across unchanged.
 
 ### Fixed
+
+- 2026-08-13: `GET /branches/{id}/permissions/{user}/check?required=write` no
+  longer answers allowed for a user the write would refuse. It read the user's
+  branch row and fell back to their dataset row when there was none, while a
+  write stops at the branch scope as soon as that branch has any rows at all, so
+  a dataset write grant was reported as covering a branch that had been given
+  its own grantees. The check now reads the same two scopes the write ladder
+  reads and picks between them the same way. A `read` check still counts a
+  dataset grant, which is what dataset visibility does. Both check routes also
+  reject a `required` that is not `read`, `write` or `admin` with a 400, since
+  any other string ranked below every grant and answered allowed for anyone
+  holding a row.
 
 - 2026-08-13: the conflict listing, merge preview and resolve routes decide a
   conflict the same way the merge does: a side whose version still matches the

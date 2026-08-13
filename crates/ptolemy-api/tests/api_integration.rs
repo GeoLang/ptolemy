@@ -5020,6 +5020,29 @@ async fn grant(
     status
 }
 
+/// What `/permissions/{user}/check` answers, which has to agree with what the
+/// same user's write really does.
+async fn check_allowed(
+    app: &axum::Router,
+    scope: &str,
+    id: Uuid,
+    user: &str,
+    required: &str,
+) -> bool {
+    let (status, body) = request_as(
+        app,
+        "GET",
+        &format!("/api/v1/{scope}/{id}/permissions/{user}/check?required={required}"),
+        Some(&token_for_user("root", Role::Admin)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "check failed: {body}");
+    body["allowed"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("{body}"))
+}
+
 /// No rows is not permission to write: a dataset that never had a grant denies
 /// every enforced editor, whatever the role gate said.
 #[tokio::test]
@@ -5075,6 +5098,39 @@ async fn test_branch_permissions_win_over_dataset() {
 
     let (status, body) = commit_as(&app, branch_id, &token_for_user("bob", Role::Editor)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // and /check has to say the same, or it promises alice a write that 403s
+    assert!(!check_allowed(&app, "branches", branch_id, "alice", "write").await);
+    assert!(check_allowed(&app, "branches", branch_id, "bob", "write").await);
+    // the dataset scope is untouched by the branch rows, and so is its answer
+    assert!(check_allowed(&app, "datasets", dataset_id, "alice", "write").await);
+    assert!(!check_allowed(&app, "datasets", dataset_id, "bob", "write").await);
+    // a read grant anywhere on the dataset still reads every branch
+    assert!(check_allowed(&app, "branches", branch_id, "alice", "read").await);
+}
+
+/// `required` takes the same three levels a grant does. Any other string ranks
+/// below every grant, so without this it answers allowed for anyone with a row.
+#[tokio::test]
+async fn test_permission_check_rejects_an_unknown_level() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (dataset_id, branch_id) = seed_unowned_dataset(&state).await;
+    grant(&app, "datasets", dataset_id, "alice", "read").await;
+
+    for uri in [
+        format!("/api/v1/datasets/{dataset_id}/permissions/alice/check?required=owner"),
+        format!("/api/v1/branches/{branch_id}/permissions/alice/check?required=owner"),
+    ] {
+        let (status, body) = request_as(
+            &app,
+            "GET",
+            &uri,
+            Some(&token_for_user("root", Role::Admin)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
 }
 
 /// The creator of a dataset gets an admin row, which makes the dataset enforced

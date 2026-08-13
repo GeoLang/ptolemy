@@ -236,6 +236,38 @@ Pair it with `postgis/postgis:16-3.4`. The first migration declares a PostGIS
 `geometry` column, so a database without the extension fails to migrate; H3,
 pgRouting, SFCGAL and the rest are created if installed and skipped if not.
 
+## Database TLS
+
+Ptolemy is built with rustls, so it can connect to a PostgreSQL server that
+requires TLS. Which protection you get is decided entirely by the `sslmode`
+parameter on `DATABASE_URL`, and the default is `prefer`: try TLS, and drop back
+to a plaintext socket if the server will not do it. That is what makes the local
+PostGIS container and the test database work with no query string at all.
+
+For anything not on localhost, put `sslmode=verify-full` on the URL. Beware
+`sslmode=require`, which is what most hosting providers tell you to paste: it
+encrypts the connection but accepts any certificate the server offers, including
+one from an attacker in the middle, and it stays that way even if you also set
+`sslrootcert`. Only `verify-ca` and `verify-full` check the certificate, and only
+`verify-full` checks that the hostname matches it.
+
+The Mozilla root bundle is compiled into the binary, so a provider whose
+certificate chains to a public CA needs nothing more than `verify-full`. Neon is
+one of those. Amazon RDS is not: it signs with Amazon's own RDS roots, which no
+public root store carries. Give it the bundle explicitly.
+
+```
+DATABASE_URL=postgres://user:pass@host/ptolemy?sslmode=verify-full&sslrootcert=/etc/ssl/rds-global-bundle.pem
+```
+
+The container image ships that bundle at `/etc/ssl/rds-global-bundle.pem`, pulled
+from `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem` at build
+time. Running the binary outside the image means downloading it yourself and
+pointing `sslrootcert` wherever you put it. `sslrootcert` adds to the compiled-in
+roots rather than replacing them, so the same binary still verifies public CAs.
+`PTOLEMY_EXTERNAL_DATABASE_URL` takes the same parameters and needs its own copy
+of them.
+
 ## Configuration
 
 | Variable | Description | Default |
@@ -469,8 +501,12 @@ connector name), because those are not identities anyone holds a token for:
 those datasets are writable by instance admins only until one of them grants.
 
 Only an explicit grant lets you write, and the `/permissions/{user}/check`
-endpoints answer from the same grants. The unused org layer (`organizations`,
-`org_members`, `datasets.org_id`) was dropped in migration `028`.
+endpoints answer with the same ladder: a `write` or `admin` check on a branch
+that has rows of its own ignores dataset grants, exactly as the write does. A
+`read` check is the visibility question instead, which a grant on the dataset
+answers whatever the branch holds. `required` takes `read`, `write` or `admin`
+and nothing else. The unused org layer (`organizations`, `org_members`,
+`datasets.org_id`) was dropped in migration `028`.
 
 ### Reads: dataset visibility
 

@@ -158,6 +158,7 @@ async fn check_dataset_permission(
     axum::extract::Query(params): axum::extract::Query<CheckParams>,
 ) -> Result<Json<serde_json::Value>, RbacError> {
     require_dataset_admin(&store, &actor, dataset_id).await?;
+    validate_permission(&params.required)?;
     let allowed = store
         .check_dataset_permission(dataset_id, &user_id, &params.required)
         .await?;
@@ -237,6 +238,7 @@ async fn check_branch_permission(
     axum::extract::Query(params): axum::extract::Query<CheckParams>,
 ) -> Result<Json<serde_json::Value>, RbacError> {
     require_branch_dataset_admin(&store, &actor, branch_id).await?;
+    validate_permission(&params.required)?;
     let allowed = store
         .check_branch_permission(branch_id, &user_id, &params.required)
         .await?;
