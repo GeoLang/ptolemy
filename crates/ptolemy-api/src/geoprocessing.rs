@@ -764,7 +764,11 @@ async fn merge_features(
     .await?;
 
     Ok(Json(SingleGeometryResult {
-        geometry: row.get("geojson"),
+        // ids that match nothing union to NULL, which is a merge of nothing
+        // rather than a failure
+        geometry: row
+            .get::<Option<serde_json::Value>, _>("geojson")
+            .unwrap_or(serde_json::Value::Null),
         area_sq_meters: row.get("area"),
     }))
 }
@@ -866,7 +870,7 @@ async fn simplify(
              feature_id,
              ST_AsGeoJSON({fn_name}(geometry, $2))::jsonb as geojson,
              ST_NPoints(geometry) as pts_before,
-             ST_NPoints({fn_name}(geometry, $2)) as pts_after
+             COALESCE(ST_NPoints({fn_name}(geometry, $2)), 0) as pts_after
          FROM live"
     ))
     .bind(branch_id)
@@ -880,7 +884,9 @@ async fn simplify(
             serde_json::json!({
                 "type": "Feature",
                 "id": r.get::<Uuid, _>("feature_id").to_string(),
-                "geometry": r.get::<serde_json::Value, _>("geojson"),
+                // a tolerance wider than the feature simplifies it away, and
+                // PostGIS returns NULL where it did
+                "geometry": r.get::<Option<serde_json::Value>, _>("geojson"),
                 "properties": {
                     "points_before": r.get::<i32, _>("pts_before"),
                     "points_after": r.get::<i32, _>("pts_after")

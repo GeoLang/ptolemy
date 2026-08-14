@@ -236,6 +236,31 @@ Pair it with `postgis/postgis:16-3.4`. The first migration declares a PostGIS
 `geometry` column, so a database without the extension fails to migrate; H3,
 pgRouting, SFCGAL and the rest are created if installed and skipped if not.
 
+## Helm chart
+
+`deploy/helm/ptolemy` runs the image against an in-cluster postgres, whose URL
+it builds from `postgresql.auth`.
+
+```bash
+helm install ptolemy deploy/helm/ptolemy
+```
+
+To use a database outside the cluster instead, put the whole `DATABASE_URL` in a
+secret and name it. The URL is then yours to write, so it can carry the
+`sslmode` and `sslrootcert` a managed database wants, and the password stays out
+of `values.yaml`.
+
+```bash
+kubectl create secret generic ptolemy-database \
+  --from-literal=url='postgres://user:pass@host/ptolemy?sslmode=verify-full'
+
+helm install ptolemy deploy/helm/ptolemy \
+  --set externalDatabase.existingSecret=ptolemy-database
+```
+
+The key defaults to `url`, and `externalDatabase.existingSecretKey` changes it.
+`postgresql.auth` goes unread once the secret is named.
+
 ## Database TLS
 
 Ptolemy is built with rustls, so it can connect to a PostgreSQL server that
@@ -266,7 +291,8 @@ time. Running the binary outside the image means downloading it yourself and
 pointing `sslrootcert` wherever you put it. `sslrootcert` adds to the compiled-in
 roots rather than replacing them, so the same binary still verifies public CAs.
 `PTOLEMY_EXTERNAL_DATABASE_URL` takes the same parameters and needs its own copy
-of them.
+of them. On the Helm chart the URL carrying them is the one in
+`externalDatabase.existingSecret`.
 
 ## Configuration
 

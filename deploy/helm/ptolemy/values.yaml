@@ -20,6 +20,13 @@ ingress:
           pathType: Prefix
   tls: []
 
+# Naming a secret here points DATABASE_URL at a database outside the cluster
+# instead of the in-cluster one below. The secret holds the whole URL, so it
+# carries sslmode and sslrootcert too.
+externalDatabase:
+  existingSecret: ""
+  existingSecretKey: url
+
 postgresql:
   enabled: true
   auth:

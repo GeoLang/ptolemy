@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-13: the Helm chart takes an external database.
+  `externalDatabase.existingSecret` names a secret holding the whole
+  `DATABASE_URL`, and setting it points the deployment there instead of at the
+  in-cluster postgres. The URL was previously built from chart values alone,
+  with no field for `sslmode`, so a chart deployed against a managed database
+  connected under whatever the default `prefer` negotiated. Keeping the URL in a
+  secret keeps the password out of `values.yaml` as well. Leaving the value
+  empty renders exactly the in-cluster URL it rendered before.
+
 - 2026-08-13: sqlx is built with the `tls-rustls-ring` backend, so Ptolemy can
   connect to a PostgreSQL server that refuses plaintext, such as an RDS instance
   with `rds.force_ssl`. Without it sqlx has no TLS at all: under the default
@@ -450,6 +459,19 @@ All notable changes to this project will be documented in this file.
   version's original, and a merge carries originals across unchanged.
 
 ### Fixed
+
+- 2026-08-13: `POST /branches/{id}/geoprocessing/merge` and
+  `POST /branches/{id}/geoprocessing/simplify` no longer panic on a NULL
+  geometry. `ST_Union` over ids that match nothing is NULL rather than an empty
+  geometry, and `ST_Simplify` returns NULL for a feature it simplified away, so
+  a request either way killed the handler mid-response instead of answering.
+  Both now read the geometry as nullable and answer 200 with it null, which is
+  what `convex-hull` already did for a branch with no features. `simplify`
+  reports `points_after` 0 for a feature that collapsed. `contour` has the same
+  latent read, and is left: its query pairs `ST_Dump` with `generate_series`,
+  which pads the shorter side with NULLs, but no PostGIS build has the
+  `ST_ContourLines` the query calls, so the route answers 501 before it can
+  reach the read.
 
 - 2026-08-13: `GET /branches/{id}/permissions/{user}/check?required=write` no
   longer answers allowed for a user the write would refuse. It read the user's

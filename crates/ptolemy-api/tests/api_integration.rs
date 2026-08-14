@@ -1371,6 +1371,69 @@ async fn test_geoprocessing_merge() {
     assert!(area > 1.0e10 && area < 1.0e11, "merge area: {area}");
 }
 
+/// `ST_Union` over no rows at all is NULL rather than an empty geometry, so a
+/// merge whose ids match nothing has to answer the same shape the convex hull
+/// answers for a branch with no features: a 200 carrying a null geometry.
+#[tokio::test]
+async fn test_geoprocessing_merge_of_no_features_is_a_null_geometry() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let sq1 = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": sq1, "properties": {}}
+    ])).await;
+
+    // a live branch, but an id that is not on it
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/merge"),
+        json!({"feature_ids": [Uuid::now_v7().to_string()]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "merge of nothing: {body}");
+    assert!(body["geometry"].is_null(), "merge of nothing: {body}");
+    assert_eq!(body["area_sq_meters"], 0.0, "merge of nothing: {body}");
+}
+
+/// `ST_Simplify` drops a geometry it cannot keep at the given tolerance, and
+/// returns NULL where it did, so a tolerance wider than the feature answers a
+/// feature with no geometry rather than failing the whole request.
+#[tokio::test]
+async fn test_geoprocessing_simplify_past_collapse_is_a_null_geometry() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    // the unit square, against a tolerance ten times wider than it is
+    let sq1 = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": sq1, "properties": {}}
+    ])).await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/simplify"),
+        json!({"tolerance": 10.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "simplify: {body}");
+    let features = body["features"].as_array().expect("a feature array");
+    assert_eq!(features.len(), 1, "simplify: {body}");
+    assert!(features[0]["geometry"].is_null(), "simplify: {body}");
+    assert_eq!(
+        features[0]["properties"]["points_after"], 0,
+        "simplify: {body}"
+    );
+    assert_eq!(
+        features[0]["properties"]["points_before"], 5,
+        "simplify: {body}"
+    );
+}
+
 #[tokio::test]
 async fn test_buffer_analysis() {
     let (app, _) = setup_app().await;
