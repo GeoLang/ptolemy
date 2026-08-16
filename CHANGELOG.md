@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-15: docs drop "∞ features" and the gRPC feature-API claim.
+  Telemetry can still export OTLP over gRPC. The public API is REST,
+  WebSocket and SSE.
 - 2026-08-15: disjoint attribute edits on the same feature auto-merge. Two
   edits of the same key, or both sides moving geometry, still conflict. OGC
   API Features is described as Part 1 only. The v0.7 "QGIS plugin" line is
