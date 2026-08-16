@@ -732,7 +732,7 @@ async fn test_merge_with_conflicts() {
             &[DiffOp::Update {
                 feature_id: f1,
                 geometry_wkb: Some(point_wkb(10.0, 10.0)),
-                properties: Some(json!({"name": "Park", "moved": true})),
+                properties: Some(json!({"name": "Prospect Park", "moved": true})),
                 native: None,
                 valid_from: None,
                 valid_to: None,
