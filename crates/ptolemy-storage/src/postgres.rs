@@ -1599,6 +1599,7 @@ impl PgStore {
             match choice {
                 MergeChoice::Nothing => {}
                 MergeChoice::Apply(op) => merged_ops.push(op.clone()),
+                MergeChoice::ApplyMerged(op) => merged_ops.push(op),
                 MergeChoice::Conflict { ours, theirs } => conflicts.push(ConflictInfo {
                     feature_id: fid,
                     ours: ours.clone(),
@@ -3650,6 +3651,7 @@ pub struct FeatureLock {
 }
 
 // ─── Merge types ────────────────────────────────────────────────────]
+#[derive(Debug)]
 pub enum MergeResult {
     Success(Changeset),
     Conflicts(Vec<ConflictInfo>),
@@ -3676,12 +3678,14 @@ impl VersionContent {
 }
 
 /// What a three-way merge does with one feature.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum MergeChoice<'a> {
     /// Nothing to write: the target's own chain already holds this content.
     Nothing,
     /// Write this op on the target.
     Apply(&'a DiffOp),
+    /// Write a newly combined op (disjoint attribute edits).
+    ApplyMerged(DiffOp),
     /// Both sides moved the feature away from the base.
     Conflict {
         ours: &'a DiffOp,
@@ -3711,6 +3715,8 @@ pub fn merge_choice<'a>(
                 MergeChoice::Apply(ours)
             } else if op_matches_content(ours, at_base) {
                 MergeChoice::Apply(theirs)
+            } else if let Some(merged) = merge_disjoint_updates(ours, theirs, at_base) {
+                MergeChoice::ApplyMerged(merged)
             } else {
                 MergeChoice::Conflict { ours, theirs }
             }
@@ -4068,6 +4074,125 @@ fn native_from_row(
     }
 }
 
+/// Combine two Updates that touched different attributes, or None if they
+/// both changed the same field, the geometry, or something else that cannot
+/// be auto-merged.
+fn merge_disjoint_updates(
+    ours: &DiffOp,
+    theirs: &DiffOp,
+    at_base: Option<&VersionContent>,
+) -> Option<DiffOp> {
+    let (
+        DiffOp::Update {
+            feature_id,
+            geometry_wkb: ours_g,
+            properties: ours_p,
+            native: ours_n,
+            valid_from: ours_vf,
+            valid_to: ours_vt,
+        },
+        DiffOp::Update {
+            geometry_wkb: theirs_g,
+            properties: theirs_p,
+            native: theirs_n,
+            valid_from: theirs_vf,
+            valid_to: theirs_vt,
+            ..
+        },
+    ) = (ours, theirs)
+    else {
+        return None;
+    };
+
+    let base_g = at_base.and_then(|b| b.geometry_wkb.as_ref());
+    let geometry_wkb = pick_side(ours_g.as_ref(), theirs_g.as_ref(), base_g)?.cloned();
+    let native = pick_side(
+        ours_n.as_ref(),
+        theirs_n.as_ref(),
+        at_base.and_then(|b| b.native.as_ref()),
+    )?
+    .cloned();
+    let valid_from = pick_side(
+        ours_vf.as_ref(),
+        theirs_vf.as_ref(),
+        at_base.and_then(|b| b.valid_from.as_ref()),
+    )?
+    .copied();
+    let valid_to = pick_side(
+        ours_vt.as_ref(),
+        theirs_vt.as_ref(),
+        at_base.and_then(|b| b.valid_to.as_ref()),
+    )?
+    .copied();
+
+    let properties = merge_properties(
+        ours_p.as_ref(),
+        theirs_p.as_ref(),
+        at_base.map(|b| &b.properties),
+    )?;
+
+    Some(DiffOp::Update {
+        feature_id: *feature_id,
+        geometry_wkb,
+        properties: Some(properties),
+        native,
+        valid_from,
+        valid_to,
+    })
+}
+
+/// Prefer the side that moved away from `base`. Both moving to different
+/// values is a conflict.
+fn pick_side<'a, T: PartialEq>(
+    ours: Option<&'a T>,
+    theirs: Option<&'a T>,
+    base: Option<&T>,
+) -> Option<Option<&'a T>> {
+    match (ours, theirs) {
+        (a, b) if a == b => Some(a),
+        (a, b) if a == base => Some(b),
+        (a, b) if b == base => Some(a),
+        _ => None,
+    }
+}
+
+fn merge_properties(
+    ours: Option<&serde_json::Value>,
+    theirs: Option<&serde_json::Value>,
+    base: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let ours_obj = ours.and_then(|v| v.as_object());
+    let theirs_obj = theirs.and_then(|v| v.as_object());
+    let base_obj = base.and_then(|v| v.as_object());
+    match (ours_obj, theirs_obj) {
+        (None, None) => Some(base.cloned().unwrap_or(serde_json::json!({}))),
+        (Some(a), None) => Some(serde_json::Value::Object(a.clone())),
+        (None, Some(b)) => Some(serde_json::Value::Object(b.clone())),
+        (Some(a), Some(b)) => {
+            let mut keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            if let Some(base_obj) = base_obj {
+                keys.extend(base_obj.keys());
+            }
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                let ov = a.get(key);
+                let tv = b.get(key);
+                let bv = base_obj.and_then(|o| o.get(key));
+                let chosen = match (ov, tv) {
+                    (a, b) if a == b => ov.or(tv),
+                    (_, b) if ov == bv => b,
+                    (a, _) if tv == bv => a,
+                    _ => return None,
+                };
+                if let Some(v) = chosen {
+                    out.insert(key.clone(), v.clone());
+                }
+            }
+            Some(serde_json::Value::Object(out))
+        }
+    }
+}
+
 fn ops_equal(a: &DiffOp, b: &DiffOp) -> bool {
     match (a, b) {
         (
@@ -4193,5 +4318,58 @@ fn parse_mr_status(s: String) -> MergeRequestStatus {
         "merged" => MergeRequestStatus::Merged,
         "closed" => MergeRequestStatus::Closed,
         _ => MergeRequestStatus::Open,
+    }
+}
+
+#[cfg(test)]
+mod merge_attribute_tests {
+    use super::*;
+    use ptolemy_core::diff::DiffOp;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn upd(props: serde_json::Value) -> DiffOp {
+        DiffOp::Update {
+            feature_id: Uuid::nil(),
+            geometry_wkb: None,
+            properties: Some(props),
+            native: None,
+            valid_from: None,
+            valid_to: None,
+        }
+    }
+
+    #[test]
+    fn disjoint_keys_merge() {
+        let base = VersionContent {
+            geometry_wkb: None,
+            properties: json!({"name": "Park", "capacity": 100}),
+            native: None,
+            valid_from: None,
+            valid_to: None,
+        };
+        let ours = upd(json!({"name": "Central Park", "capacity": 100}));
+        let theirs = upd(json!({"name": "Park", "capacity": 250}));
+        let merged = merge_disjoint_updates(&ours, &theirs, Some(&base)).unwrap();
+        let DiffOp::Update { properties, .. } = merged else {
+            panic!("expected update");
+        };
+        let props = properties.unwrap();
+        assert_eq!(props["name"], "Central Park");
+        assert_eq!(props["capacity"], 250);
+    }
+
+    #[test]
+    fn same_key_conflict() {
+        let base = VersionContent {
+            geometry_wkb: None,
+            properties: json!({"name": "Park"}),
+            native: None,
+            valid_from: None,
+            valid_to: None,
+        };
+        let ours = upd(json!({"name": "A"}));
+        let theirs = upd(json!({"name": "B"}));
+        assert!(merge_disjoint_updates(&ours, &theirs, Some(&base)).is_none());
     }
 }

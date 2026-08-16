@@ -32,7 +32,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 - **STAC 1.0** — SpatioTemporal Asset Catalog for raster discovery
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
-- **OGC API - Features** — Part 1 & 2 compliant
+- **OGC API - Features** — Part 1 (core, GeoJSON, OpenAPI 3.0). Part 2 CRS is not implemented.
 - **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes, attachments and `extractChanges` deltas, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)
@@ -45,7 +45,7 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 | **v0.4** | Auth (JWT/RBAC), WebSocket collaboration, CLI workflows, GeoJSON I/O | ✓ Done |
 | **v0.5** | Prometheus metrics, OIDC SSO, graceful shutdown, connection pool tuning | ✓ Done |
 | **v0.6** | Spatial query API, MVT tile serving, pagination, batch operations | ✓ Done |
-| **v0.7** | QGIS plugin, offline sync protocol, field-to-server workflows | ✓ Done |
+| **v0.7** | QGIS HTTP endpoints, offline sync protocol, field-to-server workflows | ✓ Done |
 | **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
 | **v0.9** | Schema validation, topology rules, data quality reports | ✓ Done |
 | **v1.0** | Webhooks, CDC event stream, change notifications | ✓ Done |

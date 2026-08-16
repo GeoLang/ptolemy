@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-08-15: disjoint attribute edits on the same feature auto-merge. Two
+  edits of the same key, or both sides moving geometry, still conflict. OGC
+  API Features is described as Part 1 only. The v0.7 "QGIS plugin" line is
+  HTTP endpoints.
+
 ### Added
 
 - 2026-08-13: the Helm chart takes an external database.

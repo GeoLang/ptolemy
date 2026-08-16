@@ -388,6 +388,10 @@ async fn resolve_and_merge(
                 final_ops.push(op.clone());
                 continue;
             }
+            ptolemy_storage::MergeChoice::ApplyMerged(op) => {
+                final_ops.push(op);
+                continue;
+            }
             ptolemy_storage::MergeChoice::Conflict { ours, theirs } => (ours, theirs),
         };
         let Some(res) = resolution_map.get(&fid) else {

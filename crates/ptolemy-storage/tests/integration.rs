@@ -1190,10 +1190,9 @@ async fn test_merge_conflict_delete_vs_edit_both_directions() {
     }
 }
 
-/// Edits to DIFFERENT attributes of the same feature still conflict:
-/// merge is feature-level (ops_equal compares whole ops), not attribute-level.
+/// Edits to DIFFERENT attributes of the same feature auto-merge.
 #[tokio::test]
-async fn test_merge_different_attributes_same_feature_conflicts() {
+async fn test_merge_different_attributes_same_feature_merges() {
     let store = setup().await;
     let ds = create_test_dataset(&store).await;
     let main = create_test_branch(&store, ds.id, "main").await;
@@ -1255,16 +1254,16 @@ async fn test_merge_different_attributes_same_feature_conflicts() {
         .unwrap();
 
     let result = store.merge(feature.id, main.id, "alice", &W).await.unwrap();
-    match result {
-        MergeResult::Conflicts(conflicts) => {
-            assert_eq!(conflicts.len(), 1);
-            assert_eq!(conflicts[0].feature_id, f1);
-        }
-        MergeResult::Success(_) => {
-            panic!("Merge is feature-level; disjoint attribute edits must conflict")
-        }
-        MergeResult::AlreadyUpToDate => panic!("Expected conflict, not up to date"),
-    }
+    let MergeResult::Success(cs) = result else {
+        panic!("disjoint attributes should merge, got {result:?}");
+    };
+    let merged = store
+        .get_feature_at(f1, cs.id)
+        .await
+        .unwrap()
+        .expect("feature still on main");
+    assert_eq!(merged.properties["name"], "Central Park");
+    assert_eq!(merged.properties["capacity"], 250);
 }
 
 #[tokio::test]
