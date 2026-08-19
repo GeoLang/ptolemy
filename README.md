@@ -17,15 +17,22 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 
 | Extension | Purpose |
 |-----------|---------|
-| **pgRouting** | Graph routing: Dijkstra, A*, TSP, isochrones, connected components |
+| **pgRouting** | Graph routing: Dijkstra, A*, TSP, connected components, reachable-junction sets with costs |
 | **PostGIS Topology** | Native topology primitives (faces, edges, nodes), validation |
 | **SFCGAL** | 3D geometry operations: extrude, volume, Minkowski sum, straight skeleton |
 | **h3-pg** | Uber H3 hexagonal spatial indexing, aggregation, compaction |
-| **pg_partman** | Automatic time-based partitioning (audit logs) |
-| **pgvector** | Vector similarity search, feature deduplication, distance-ranked bucketing. Without it the `similarity` routes answer `501` |
-| **pg_trgm** | Fuzzy text search for data catalog |
+| **pgvector** | Distance-ranked bucketing over hash embeddings, feature deduplication. Without it the `similarity` routes answer `501` |
+| **pg_trgm** | Substring search (`ILIKE '%…%'`) for the data catalog; no similarity ranking, no typo tolerance |
 | **pointcloud** | LiDAR/point cloud storage and spatial queries |
 | **MobilityDB** | Moving object trajectories, speed/distance analysis. Without it a trajectory is stored as JSONB and the analytics routes answer `501` |
+
+The embeddings behind the `similarity` routes are a SHA-256 hash spread over 256
+floats, so identical text matches and near-identical text does not: it is exact
+string matching expressed as vectors, not semantic search.
+
+None of these extensions is installed in any image Ptolemy ships, so the
+pgRouting, SFCGAL, pgvector, pointcloud and MobilityDB routes are exercised by no
+test beyond their `501` branch. Install them yourself before relying on them.
 
 ### Standards Implemented
 
@@ -42,31 +49,46 @@ Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
 | **v0.1** | Core types, Store trait, API skeleton, CLI | ✓ Done |
 | **v0.2** | SQL migrations, full CRUD, branching, changesets, commit engine | ✓ Done |
 | **v0.3** | Diff engine, three-way merge, conflict detection, REST API | ✓ Done |
-| **v0.4** | Auth (JWT/RBAC), WebSocket collaboration, CLI workflows, GeoJSON I/O | ✓ Done |
+| **v0.4** | Auth (JWT/RBAC), CLI workflows, GeoJSON I/O | ✓ Done |
 | **v0.5** | Prometheus metrics, OIDC SSO, graceful shutdown, connection pool tuning | ✓ Done |
 | **v0.6** | Spatial query API, MVT tile serving, pagination, batch operations | ✓ Done |
 | **v0.7** | QGIS HTTP endpoints, offline sync protocol, field-to-server workflows | ✓ Done |
 | **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
-| **v0.9** | Schema validation, topology rules, data quality reports | ✓ Done |
-| **v1.0** | Webhooks, CDC event stream, change notifications | ✓ Done |
+| **v0.9** | Schema validation, data quality reports | ✓ Done |
+| **v1.0** | Webhook and CDC event CRUD | ✓ Done |
 | **v1.1** | Spatial analytics (buffer, union, clustering, anomaly detection) | ✓ Done |
-| **v1.2** | OGC API - Features compliance, audit logging | ✓ Done |
-| **v1.3** | Webhook delivery engine, schema enforcement, topology gate | ✓ Done |
-| **v1.4** | SSE streaming, feature locking, temporal queries | ✓ Done |
-| **v1.5** | Data catalog, multi-tenancy, rate limiting | ✓ Done |
-| **v1.6** | Background jobs, conflict resolution API | ✓ Done |
+| **v1.2** | OGC API - Features compliance, audit log read API | ✓ Done |
+| **v1.3** | Schema enforcement | ✓ Done |
+| **v1.4** | Feature lock records, temporal queries | ✓ Done |
+| **v1.5** | Data catalog | ✓ Done |
+| **v1.6** | Conflict resolution API | ✓ Done |
+
+Not implemented, whatever the code in the repository suggests:
+
+| Subsystem | State |
+|-----------|-------|
+| Webhook delivery | The delivery worker has no callers and the commit path never reads the webhooks table. Webhook CRUD only, nothing is ever delivered |
+| SSE event stream | `/api/v1/events/stream` emits keep-alives and no events; nothing publishes to it |
+| WebSocket branch events | `/ws/branches/{id}` stays silent; nothing publishes to the event bus |
+| Background jobs | Never started, so lock cleanup, event pruning and quality alerts never run |
+| Rate limiting | The middleware exists but is not layered onto the router |
+| Audit log writes | The writer has no callers, so `audit_log` is always empty. `GET /api/v1/audit` reads it |
+| Feature lock enforcement | Commit never queries locks. Locks are advisory records with a TTL |
+| Topology rule engine | 31 rule types are declared and none is evaluated. Stored rules are never read back and there is no commit-time gate |
+| Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
+| Geometry type constraints | Stored and never checked |
+| Multi-tenancy | Dropped from the product in migration `028` |
 
 ## Architecture
 
 ```
 ┌───────────────────────────────────────────┐
-│  Clients (QGIS Plugin, Web UI, CLI)       │
+│  Clients (Web UI, CLI)                    │
 ├───────────────────────────────────────────┤
 │  ptolemy-api (Axum REST service)          │
 │  - Dataset CRUD                           │
 │  - Branch/commit/merge operations         │
 │  - Feature read/write scoped to branches  │
-│  - Change subscriptions (webhooks/SSE)    │
 ├───────────────────────────────────────────┤
 │  ptolemy-core (domain types & logic)      │
 │  - Changeset DAG                          │
@@ -97,7 +119,8 @@ Three-way merge using the common ancestor changeset:
 1. Compute diff(ancestor → ours) and diff(ancestor → theirs).
 2. Non-conflicting changes (different features, or same feature different attributes) merge automatically.
 3. Conflicting changes (same feature, same attribute modified differently) are surfaced for manual resolution.
-4. Geometry conflicts use spatial comparison (tolerance-based equality).
+4. Geometries are compared as raw WKB bytes, so any difference at all, down to
+   vertex order or precision, counts as a change. There is no tolerance.
 
 ### Your data is just PostGIS
 
@@ -200,11 +223,12 @@ Then the read-only guarantee is enforced by PostgreSQL, not only by Ptolemy.
 createdb ptolemy
 psql ptolemy -c "CREATE EXTENSION postgis;"
 
-# Run migrations
-ptolemy migrate --database-url postgres://localhost/ptolemy
+# Run migrations. --database-url is a top-level flag, so it goes before the
+# subcommand, or set DATABASE_URL in the environment instead.
+ptolemy --database-url postgres://localhost/ptolemy migrate
 
 # Start the server
-ptolemy serve --database-url postgres://localhost/ptolemy
+ptolemy --database-url postgres://localhost/ptolemy serve
 
 # API is now available at http://localhost:3000/api/v1
 # Metrics at http://localhost:3000/metrics
@@ -545,7 +569,7 @@ create, or later with `PATCH /api/v1/datasets/{id}` (instance admin, or an
 For `private`, every read that serves the dataset's content needs an instance
 admin token or a caller holding *any* grant (`read`, `write` or `admin`) on the
 dataset or on one of its branches. That covers feature listing and get, spatial
-and CQL2 queries, OGC items, GeoJSON/CSV/FlatGeobuf export, MVT tiles, history,
+and CQL2 queries, OGC items, GeoJSON/CSV export, MVT tiles, history,
 diff, temporal queries, H3, similarity search, QGIS pull and layer definition,
 geoprocessing and analytics reads, sync pull, and the vertical listings — the
 check runs before the handler, keyed on every id the request names. External
@@ -564,14 +588,21 @@ Raster tiles are not covered: `GET /api/v1/stac/search` returns tile ids and
 bounds from `raster_tiles` without naming a dataset, and raster catalogs have no
 visibility of their own yet.
 
+Two more reads are open to anyone, for the same reason: the check is keyed on the
+ids a request names, and neither request names a dataset. The PostGIS Topology
+reads under `/api/v1/topologies/{name}` are keyed by topology name, and
+`GET /api/v1/replication/peers` names nothing at all.
+
 ## API Endpoints
 
 ### Real-Time Collaboration Relay
 
 Ptolemy includes an ephemeral room-based WebSocket relay at `/ws/rooms/{room_id}` for
 real-time viewer collaboration.  Every JSON message sent by one participant is broadcast
-to all other participants in the same room.  No messages are persisted — rooms are created
-on first connection and dropped when the last client disconnects.
+to every participant in the room, the sender included: a socket subscribes to the same
+channel it sends on, so a client sees its own messages come back and must ignore them.
+No messages are persisted — rooms are created on first connection and dropped when the
+last client disconnects.
 
 **Intended use cases:**
 
@@ -585,7 +616,7 @@ on first connection and dropped when the last client disconnects.
 **Protocol (JSON over WebSocket):**
 
 ```jsonc
-// Client → Server (broadcast to all other clients in the room)
+// Client → Server (broadcast to every client in the room, sender included)
 { "type": "Join", "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
 { "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
 { "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
@@ -593,9 +624,9 @@ on first connection and dropped when the last client disconnects.
 { "type": "Leave", "user_id": "u1", "asset_id": "my-room" }
 ```
 
-Messages are opaque to the server — it simply relays any valid text frame to all other
-subscribers.  The message schema above is a convention used by ViewTopia's collaboration
-client but any JSON structure will work.
+Messages are opaque to the server — it simply relays any valid text frame to every
+subscriber on the room's channel.  The message schema above is a convention used by
+ViewTopia's collaboration client but any JSON structure will work.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -614,7 +645,7 @@ client but any JSON structure will work.
 | POST | `/api/v1/branches/{id}/features/intersects` | Spatial intersects filter |
 | POST | `/api/v1/branches/{id}/features/within` | Spatial within filter |
 | GET | `/api/v1/branches/{id}/features/count` | Feature count |
-| GET | `/api/v1/branches/{id}/tiles/{z}/{x}/{y}.mvt` | MVT vector tiles |
+| GET | `/api/v1/branches/{id}/tiles/{z}/{x}/{y}` | MVT vector tiles |
 | POST | `/api/v1/branches/{id}/commit` | Commit changes |
 | POST | `/api/v1/branches/{id}/batch` | Batch commit (bulk ops) |
 | POST | `/api/v1/branches/{target}/merge/{source}` | Merge branches |
@@ -640,12 +671,12 @@ client but any JSON structure will work.
 | GET | `/api/v1/datasets/{id}/topology` | List topology rules |
 | POST | `/api/v1/datasets/{id}/topology` | Add topology rule |
 | DELETE | `/api/v1/topology/{id}` | Delete topology rule |
-| GET | `/api/v1/branches/{id}/quality` | Data quality report |
+| GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
 | POST | `/api/v1/branches/{id}/repair` | Auto-repair invalid geometries |
-| GET | `/api/v1/datasets/{id}/webhooks` | List webhooks |
-| POST | `/api/v1/datasets/{id}/webhooks` | Create webhook |
+| GET | `/api/v1/datasets/{id}/webhooks` | List webhooks (registration only, nothing is delivered) |
+| POST | `/api/v1/datasets/{id}/webhooks` | Create webhook (registration only, nothing is delivered) |
 | DELETE | `/api/v1/webhooks/{id}` | Delete webhook |
-| GET | `/api/v1/datasets/{id}/events` | List CDC events |
+| GET | `/api/v1/datasets/{id}/events` | List events, `limit` only. Every row was posted by a client |
 | POST | `/api/v1/datasets/{id}/events` | Emit custom event |
 | GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer analysis |
 | GET | `/api/v1/branches/{id}/analytics/union` | Union analysis |
@@ -668,11 +699,11 @@ client but any JSON structure will work.
 | POST | `/arcgis/rest/services/{service}/FeatureServer/extractChanges` | ArcGIS change extraction |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}` | ArcGIS change file |
-| GET | `/api/v1/audit` | Audit log |
-| GET | `/api/v1/branches/{id}/locks` | List feature locks |
-| POST | `/api/v1/branches/{id}/locks` | Lock a feature |
+| GET | `/api/v1/audit` | Audit log. Nothing writes to it, so it is always empty |
+| GET | `/api/v1/branches/{id}/locks` | List feature locks (advisory, commit does not check them) |
+| POST | `/api/v1/branches/{id}/locks` | Lock a feature (advisory, commit does not check it) |
 | DELETE | `/api/v1/branches/{bid}/locks/{fid}` | Unlock a feature |
-| GET | `/api/v1/branches/{id}/features?at=` | Temporal query (features at time) |
+| GET | `/api/v1/branches/{id}/features/at?valid_at=` | Temporal query (features at time) |
 | GET | `/api/v1/catalog/search` | Search datasets (text + tags) |
 | GET | `/api/v1/datasets/{id}/tags` | List dataset tags |
 | POST | `/api/v1/datasets/{id}/tags` | Add tag |
@@ -688,8 +719,8 @@ client but any JSON structure will work.
 | GET | `/api/v1/conflicts/{id}` | List merge conflicts |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
-| GET | `/api/v1/events/stream` | SSE real-time event stream |
-| WS | `/ws/branches/{id}` | Real-time branch events |
+| GET | `/api/v1/events/stream` | SSE endpoint, keep-alives only: nothing publishes events to it |
+| WS | `/ws/branches/{id}` | Branch event socket, silent: nothing publishes to it |
 | WS | `/ws/rooms/{room_id}` | Ephemeral collaboration relay (presence, view sync, chat) |
 | **Networks** | | |
 | GET | `/api/v1/datasets/{id}/networks` | List geometric networks |
