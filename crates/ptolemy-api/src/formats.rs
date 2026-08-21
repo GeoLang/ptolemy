@@ -147,6 +147,38 @@ async fn export_csv(
 
 // ─── Export: FlatGeobuf ─────────────────────────────────────────────
 
+fn encode_flatgeobuf(features: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+    use flatgeobuf::{FgbWriter, FgbWriterOptions, GeometryType};
+    use geozero::GeozeroDatasource;
+    use geozero::geojson::GeoJsonReader;
+
+    let mut fgb = FgbWriter::create_with_options(
+        "export",
+        GeometryType::Unknown,
+        FgbWriterOptions {
+            write_index: true,
+            detect_type: false,
+            promote_to_multi: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    let fc = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": features,
+    });
+    let json = serde_json::to_vec(&fc).map_err(|e| e.to_string())?;
+    let mut input = std::io::Cursor::new(json);
+    GeoJsonReader(&mut input)
+        .process(&mut fgb)
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    fgb.write(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 async fn export_flatgeobuf(
     State(store): State<AppState>,
     Path(branch_id): Path<Uuid>,
@@ -180,19 +212,12 @@ async fn export_flatgeobuf(
         })
         .collect();
 
-    let fc = serde_json::json!({
-        "type": "FeatureCollection",
-        "features": features,
-    });
-
-    let body = serde_json::to_vec(&fc).unwrap_or_default();
+    let count = features.len();
+    let body = encode_flatgeobuf(&features).map_err(FormatError::Encode)?;
     Ok(axum::response::Response::builder()
-        .header("content-type", "application/geo+json")
-        .header(
-            "content-disposition",
-            "attachment; filename=\"export.geojson\"",
-        )
-        .header("x-feature-count", features.len().to_string())
+        .header("content-type", "application/flatgeobuf")
+        .header("content-disposition", "attachment; filename=\"export.fgb\"")
+        .header("x-feature-count", count.to_string())
         .body(axum::body::Body::from(body))
         .unwrap())
 }
@@ -578,6 +603,7 @@ enum FormatError {
     Store(ptolemy_storage::StoreError),
     NotFound,
     Bad(String),
+    Encode(String),
 }
 impl From<sqlx::Error> for FormatError {
     fn from(e: sqlx::Error) -> Self {
@@ -595,11 +621,49 @@ impl IntoResponse for FormatError {
             FormatError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             FormatError::Bad(msg) => (StatusCode::BAD_REQUEST, msg),
             FormatError::Store(e) => crate::errors::store_error_status(&e),
+            FormatError::Encode(e) => {
+                tracing::error!("formats encode error: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+            }
             FormatError::Db(e) => {
                 crate::errors::log_db_error("formats", &e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };
         (s, Json(serde_json::json!({"error": m}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FGB_MAGIC: &[u8] = b"fgb\x03fgb\x00";
+
+    fn point_feature() -> serde_json::Value {
+        serde_json::json!({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+            "properties": {"name": "one"},
+        })
+    }
+
+    #[test]
+    fn encode_flatgeobuf_is_not_a_geojson_feature_collection() {
+        let bytes = encode_flatgeobuf(&[point_feature()]).expect("encode");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+            "body must not be JSON, got {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(bytes.len() >= FGB_MAGIC.len());
+        assert_eq!(&bytes[..FGB_MAGIC.len()], FGB_MAGIC);
+    }
+
+    #[test]
+    fn encode_flatgeobuf_empty_still_has_magic() {
+        let bytes = encode_flatgeobuf(&[]).expect("encode");
+        assert!(bytes.len() >= FGB_MAGIC.len());
+        assert_eq!(&bytes[..FGB_MAGIC.len()], FGB_MAGIC);
     }
 }

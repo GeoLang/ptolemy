@@ -24,7 +24,18 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, broadcast};
+
+#[derive(Clone, Debug)]
+struct RoomMessage {
+    sender_id: u64,
+    text: String,
+}
+
+fn text_for_connection(msg: &RoomMessage, conn_id: u64) -> Option<&str> {
+    (msg.sender_id != conn_id).then_some(msg.text.as_str())
+}
 
 /// Capacity of the per-room broadcast channel.
 const ROOM_CAPACITY: usize = 256;
@@ -32,7 +43,8 @@ const ROOM_CAPACITY: usize = 256;
 /// Shared state holding all active rooms.
 #[derive(Clone, Default)]
 pub struct RoomRelay {
-    rooms: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    rooms: Arc<Mutex<HashMap<String, broadcast::Sender<RoomMessage>>>>,
+    next_conn_id: Arc<AtomicU64>,
 }
 
 impl RoomRelay {
@@ -41,7 +53,7 @@ impl RoomRelay {
     }
 
     /// Get or create the broadcast sender for `room_id`.
-    async fn get_or_create(&self, room_id: &str) -> broadcast::Sender<String> {
+    async fn get_or_create(&self, room_id: &str) -> broadcast::Sender<RoomMessage> {
         let mut map = self.rooms.lock().await;
         if let Some(tx) = map.get(room_id) {
             // If all receivers have been dropped the channel is dead; recreate.
@@ -91,6 +103,7 @@ async fn ws_room_handler(
 }
 
 async fn handle_room_socket(socket: WebSocket, room_id: String, relay: Arc<RoomRelay>) {
+    let conn_id = relay.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let tx = relay.get_or_create(&room_id).await;
     let mut rx = tx.subscribe();
 
@@ -107,7 +120,14 @@ async fn handle_room_socket(socket: WebSocket, room_id: String, relay: Arc<RoomR
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    if sink.send(Message::Text(msg.into())).await.is_err() {
+                    let Some(text) = text_for_connection(&msg, conn_id) else {
+                        continue;
+                    };
+                    if sink
+                        .send(Message::Text(text.to_owned().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -124,12 +144,17 @@ async fn handle_room_socket(socket: WebSocket, room_id: String, relay: Arc<RoomR
     while let Some(Ok(msg)) = stream.next().await {
         match msg {
             Message::Text(text) => {
-                // Broadcast to all other subscribers.
-                let _ = tx.send(text.to_string());
+                let _ = tx.send(RoomMessage {
+                    sender_id: conn_id,
+                    text: text.to_string(),
+                });
             }
             Message::Binary(data) => {
                 if let Ok(text) = String::from_utf8(data.to_vec()) {
-                    let _ = tx.send(text);
+                    let _ = tx.send(RoomMessage {
+                        sender_id: conn_id,
+                        text,
+                    });
                 }
             }
             Message::Close(_) => break,
@@ -186,10 +211,36 @@ mod tests {
         let mut rx1 = tx.subscribe();
         let mut rx2 = tx.subscribe();
 
-        tx.send("hello".to_string()).unwrap();
+        tx.send(RoomMessage {
+            sender_id: 1,
+            text: "hello".to_string(),
+        })
+        .unwrap();
 
-        assert_eq!(rx1.recv().await.unwrap(), "hello");
-        assert_eq!(rx2.recv().await.unwrap(), "hello");
+        assert_eq!(rx1.recv().await.unwrap().text, "hello");
+        assert_eq!(rx2.recv().await.unwrap().text, "hello");
+    }
+
+    #[tokio::test]
+    async fn sender_does_not_receive_own_message() {
+        let relay = RoomRelay::new();
+        let tx = relay.get_or_create("chat").await;
+        let a = 1u64;
+        let b = 2u64;
+        let mut rx_a = tx.subscribe();
+        let mut rx_b = tx.subscribe();
+
+        tx.send(RoomMessage {
+            sender_id: a,
+            text: "hello".to_string(),
+        })
+        .unwrap();
+
+        let got_a = rx_a.recv().await.unwrap();
+        let got_b = rx_b.recv().await.unwrap();
+        assert_eq!(text_for_connection(&got_a, a), None);
+        assert_eq!(text_for_connection(&got_b, b), Some("hello"));
+        assert_eq!(text_for_connection(&got_b, a), None);
     }
 
     #[tokio::test]
@@ -200,9 +251,13 @@ mod tests {
         let mut rx_a = tx_a.subscribe();
         let mut rx_b = tx_b.subscribe();
 
-        tx_a.send("only-a".to_string()).unwrap();
+        tx_a.send(RoomMessage {
+            sender_id: 1,
+            text: "only-a".to_string(),
+        })
+        .unwrap();
 
-        assert_eq!(rx_a.recv().await.unwrap(), "only-a");
+        assert_eq!(rx_a.recv().await.unwrap().text, "only-a");
         // rx_b should have nothing.
         assert!(rx_b.try_recv().is_err());
     }
