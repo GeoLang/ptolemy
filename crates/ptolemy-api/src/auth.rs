@@ -475,8 +475,9 @@ pub fn classify(method: &Method, route: &str) -> Access {
     }
 
     if *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS {
-        // Two reads that are diagnostics and bulk replication, not map data, so
-        // the anonymous-viewer decision does not cover them.
+        // Reads that are diagnostics, bulk replication, or unbound topology
+        // geometry, not map data, so the anonymous-viewer decision does not
+        // cover them.
 
         // dataset event history is webhook delivery diagnostics: it carries the
         // payloads that were sent and the traffic shape. lrs has
@@ -490,13 +491,29 @@ pub fn classify(method: &Method, route: &str) -> Access {
         if route.starts_with("/api/v1/replication/feed") {
             return Access::Admin;
         }
+        // listing peers names endpoints and sync state. this has to sit above
+        // the public return; the POST arm below never runs for GET.
+        if route.starts_with("/api/v1/replication/peers") {
+            return Access::Admin;
+        }
+        // topology geometry is keyed by name, not a dataset id, so visibility
+        // cannot see it. admin until a topology is bound to a dataset.
+        if route.ends_with("/topologies")
+            || (route.starts_with("/api/v1/topologies/")
+                && (route.ends_with("/faces")
+                    || route.ends_with("/edges")
+                    || route.ends_with("/nodes")))
+        {
+            return Access::Admin;
+        }
         return Access::Public;
     }
 
     // A PostGIS topology is a Postgres schema, not rows inside a dataset:
     // CreateTopology issues DDL and the route's `{id}` is discarded. There is no
     // owner for the write ladder to check, so these stay admin-only until a
-    // topology is bound to a dataset. Reads already returned above.
+    // topology is bound to a dataset. Name-keyed reads are gated in the GET
+    // branch for the same reason.
     if route.ends_with("/topologies")
         || route.ends_with("/add-face")
         || (route.starts_with("/api/v1/topologies/") && route.ends_with("/simplify"))
@@ -532,8 +549,7 @@ pub fn classify(method: &Method, route: &str) -> Access {
         return Access::Public;
     }
 
-    // registering a replication peer hands out a data feed, so admin only;
-    // listing peers (GET) stays public under the read rule above
+    // registering a replication peer hands out a data feed, so admin only
     if route.starts_with("/api/v1/replication/peers") {
         return Access::Admin;
     }
@@ -622,6 +638,54 @@ impl AuthConfig {
     }
 }
 
+/// JWT config plus the store `ptk_` bearers are looked up on.
+#[derive(Clone)]
+pub struct AuthState {
+    pub config: AuthConfig,
+    /// Present on the serve path. JWT-only unit tests leave it empty so they
+    /// do not need a database; a `ptk_` bearer then cannot match and is 401.
+    pub store: Option<crate::AppState>,
+}
+
+impl AuthState {
+    pub fn new(config: AuthConfig, store: crate::AppState) -> Self {
+        Self {
+            config,
+            store: Some(store),
+        }
+    }
+}
+
+/// `api_keys.key_hash` holds these strings, so the encoding has to stay byte
+/// for byte what the CLI writes or no stored key matches again.
+fn hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+/// A live `ptk_` row, or `None` when the key is unknown, revoked, or expired.
+/// `Err` is a store failure, not a miss: the caller should not turn that into
+/// 401 and hide an outage as a bad token.
+async fn authenticate_api_key(
+    store: &Option<crate::AppState>,
+    key: &str,
+) -> Result<Option<Claims>, ()> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    let row = store
+        .active_api_key(&hash_api_key(key))
+        .await
+        .map_err(|_| ())?;
+    Ok(row.map(|row| Claims {
+        sub: format!("apikey:{}", row.id),
+        // unused after the row is accepted; a far-future placeholder so the
+        // claim shape stays the same as a JWT
+        exp: 4_102_444_800,
+        role: row.role,
+    }))
+}
+
 fn deny(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({"error": message}))).into_response()
 }
@@ -647,12 +711,15 @@ fn refuse(esri: bool, status: StatusCode, esri_code: u16, message: &str) -> Resp
 /// enforces the role [`classify`] asks for. Claims are put in the request
 /// extensions for handlers that want the caller identity.
 /// If auth is disabled, all requests pass through.
+///
+/// A bearer that starts with `ptk_` is an API key, not a JWT: it is hashed and
+/// looked up, and a miss is 401 rather than falling through to JWT decode.
 pub async fn auth_middleware(
-    State(config): State<AuthConfig>,
+    State(auth): State<AuthState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if !config.enabled {
+    if !auth.config.enabled {
         return next.run(request).await;
     }
 
@@ -670,17 +737,36 @@ pub async fn auth_middleware(
         .to_owned();
     let access = classify(request.method(), &route);
     let token = request_token(request.headers(), request.uri()).map(str::to_owned);
-    let key = DecodingKey::from_secret(config.secret.as_bytes());
-    let verified = token
-        .as_deref()
-        .and_then(|token| verify_token(token, &key).ok());
+    let key = DecodingKey::from_secret(auth.config.secret.as_bytes());
     let esri = request.uri().path().starts_with(ARCGIS_PREFIX);
+    let verified = match token.as_deref() {
+        Some(raw) if raw.starts_with("ptk_") => {
+            match authenticate_api_key(&auth.store, raw).await {
+                Ok(claims) => claims.map(VerifiedToken::Platform),
+                Err(()) => {
+                    return refuse(
+                        esri,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        500,
+                        "internal error",
+                    );
+                }
+            }
+        }
+        Some(raw) => verify_token(raw, &key).ok(),
+        None => None,
+    };
 
     if access == Access::Public {
-        // a public route ignores a bad token rather than rejecting it, keeping
+        // a public route ignores a bad JWT rather than rejecting it, keeping
         // anonymous reads working; a good one still identifies the caller so
-        // private-dataset reads can be allowed
-        if verified.is_none() && token.as_deref().is_some_and(declares_scoped_token) {
+        // private-dataset reads can be allowed. a `ptk_` bearer is not a JWT:
+        // sending one that does not match is 401, not an anonymous read.
+        if verified.is_none()
+            && token
+                .as_deref()
+                .is_some_and(|t| t.starts_with("ptk_") || declares_scoped_token(t))
+        {
             return refuse(
                 esri,
                 StatusCode::UNAUTHORIZED,
@@ -906,7 +992,10 @@ mod tests {
             .route("/api/v1/datasets", get(|| async {}).post(|| async {}))
             .route("/metrics", get(|| async {}))
             .layer(middleware::from_fn_with_state(
-                AuthConfig::enabled(SECRET),
+                AuthState {
+                    config: AuthConfig::enabled(SECRET),
+                    store: None,
+                },
                 auth_middleware,
             ));
         app.oneshot(
@@ -995,6 +1084,28 @@ mod tests {
         assert_eq!(
             middleware_status(Method::GET, "/api/v1/datasets", &expired).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ptk_bearer_that_does_not_match_is_unauthorized() {
+        assert_eq!(
+            middleware_status(Method::POST, "/api/v1/datasets", "ptk_not_a_stored_key").await,
+            StatusCode::UNAUTHORIZED
+        );
+        // public routes still refuse a miss, rather than treating it as anonymous
+        assert_eq!(
+            middleware_status(Method::GET, "/api/v1/datasets", "ptk_not_a_stored_key").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn api_key_hash_matches_the_cli_encoding() {
+        // this digest holds two 0x00 bytes, so a dropped zero pad fails here
+        assert_eq!(
+            hash_api_key("ptk_test_key_12345"),
+            "6c8a16a1b715daad00a766ad25d32d65e8d70d02e64451fa7602590eb8a1368e"
         );
     }
 
@@ -1423,9 +1534,48 @@ mod tests {
             "/api/v1/branches/x/features",
             "/api/v1/branches/x/tiles/1/2/3",
             "/api/v1/branches/x/export/geojson",
-            "/api/v1/replication/peers",
         ] {
             assert_eq!(classify(&Method::GET, path), Access::Public, "GET {path}");
+        }
+    }
+
+    /// Peer listing names endpoints and sync state, so GET is admin too.
+    #[test]
+    fn classify_replication_peers_is_admin() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS, Method::POST] {
+            assert_eq!(
+                classify(&method, "/api/v1/replication/peers"),
+                Access::Admin,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            classify(&Method::POST, "/api/v1/replication/peers/{id}/sync"),
+            Access::Admin
+        );
+    }
+
+    /// Topology reads are keyed by name, so visibility cannot bind them to a
+    /// dataset. Gate the GETs the same way the writes already were.
+    #[test]
+    fn classify_topology_reads_are_admin() {
+        for path in [
+            "/api/v1/datasets/{id}/topologies",
+            "/api/v1/datasets/x/topologies",
+            "/api/v1/topologies/{name}/faces",
+            "/api/v1/topologies/{name}/edges",
+            "/api/v1/topologies/{name}/nodes",
+        ] {
+            for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+                assert_eq!(classify(&method, path), Access::Admin, "{method} {path}");
+            }
+        }
+        for path in [
+            "/api/v1/datasets/{id}/topologies",
+            "/api/v1/topologies/{name}/add-face",
+            "/api/v1/topologies/{name}/simplify",
+        ] {
+            assert_eq!(classify(&Method::POST, path), Access::Admin, "POST {path}");
         }
     }
 

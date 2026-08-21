@@ -3298,6 +3298,28 @@ impl PgStore {
         Ok(())
     }
 
+    /// A live API key for this SHA-256 hex. Revoked and expired rows are a miss
+    /// the same way an unknown hash is, so the auth layer can treat them as 401.
+    pub async fn active_api_key(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<ApiKeyIdentity>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, name, role FROM api_keys
+             WHERE key_hash = $1
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| ApiKeyIdentity {
+            id: row.get("id"),
+            name: row.get("name"),
+            role: row.get("role"),
+        }))
+    }
+
     // ─── RBAC: Per-dataset and Per-branch Permissions ───────────────────
 
     pub async fn grant_dataset_permission(
@@ -3896,6 +3918,14 @@ pub struct ReplicationPeer {
     pub status: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// The fields auth needs from a live `api_keys` row.
+#[derive(Debug, Clone)]
+pub struct ApiKeyIdentity {
+    pub id: Uuid,
+    pub name: String,
+    pub role: String,
 }
 
 // ─── RBAC types ─────────────────────────────────────────────────────

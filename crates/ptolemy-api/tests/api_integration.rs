@@ -3794,6 +3794,73 @@ async fn test_auth_enabled_no_api_key_bypass() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+fn test_hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+async fn seed_api_key(state: &AppState, role: &str) -> String {
+    let key = format!("ptk_{}", Uuid::now_v7().simple());
+    let key_hash = test_hash_api_key(&key);
+    let key_prefix = format!("ptk_{}", &key_hash[..12]);
+    sqlx::query(
+        "INSERT INTO api_keys (id, name, key_hash, key_prefix, role, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())",
+    )
+    .bind(Uuid::now_v7())
+    .bind(format!("test-{role}"))
+    .bind(&key_hash)
+    .bind(&key_prefix)
+    .bind(role)
+    .execute(state.unguarded_pool())
+    .await
+    .unwrap();
+    key
+}
+
+/// A stored `ptk_` bearer authenticates as the row's role; a random `ptk_`
+/// string is 401 rather than a JWT decode miss falling through.
+#[tokio::test]
+async fn test_ptk_bearer_authenticates_as_the_stored_role() {
+    let (app, state) = setup_app_authed_with_state().await;
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some("ptk_not_a_stored_key"),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "unknown ptk_: {body}");
+
+    let viewer = seed_api_key(&state, "viewer").await;
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&viewer),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "viewer ptk_ write: {body}");
+
+    let editor = seed_api_key(&state, "editor").await;
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "editor ptk_ write: {body}");
+
+    let admin = seed_api_key(&state, "admin").await;
+    let (status, body) = request_as(&app, "GET", "/metrics", Some(&admin), None).await;
+    assert_eq!(status, StatusCode::OK, "admin ptk_ metrics: {body}");
+}
+
 // ─── Sensitive reads (config/ACL/membership/audit) are admin-only ───
 //
 // Regression guard: these GETs used to be anonymous because classify()
@@ -3916,6 +3983,13 @@ async fn test_replication_feed_read_is_admin_only() {
     let branch_id = branch["id"].as_str().unwrap();
     let uri = format!("/api/v1/replication/feed/{branch_id}");
     assert_read_is_admin_only(&app, &uri, &admin).await;
+}
+
+#[tokio::test]
+async fn test_replication_peers_read_is_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    assert_read_is_admin_only(&app, "/api/v1/replication/peers", &admin).await;
 }
 
 /// The lrs endpoint that shares the `/events` suffix is map data and stays open.
@@ -9294,8 +9368,9 @@ async fn test_topology_ddl_is_admin_only() {
         assert_eq!(status, StatusCode::FORBIDDEN, "editor {uri}: {response}");
     }
 
-    // reading a topology is unchanged
-    let (status, _) = request_as(
+    // topology reads are admin-only for the same reason: they are keyed by
+    // name, not a dataset the write ladder can own
+    let (status, response) = request_as(
         &app,
         "GET",
         &format!("/api/v1/datasets/{dataset_id}/topologies"),
@@ -9303,7 +9378,38 @@ async fn test_topology_ddl_is_admin_only() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN, "editor GET: {response}");
+}
+
+/// Topology list and name-keyed geometry used to be public GETs because
+/// classify returned Public before the `/topologies` match.
+#[tokio::test]
+async fn test_topology_reads_are_admin_only() {
+    let app = setup_app_authed().await;
+    let admin = token_for(Role::Admin);
+    let dataset_id = create_dataset_authed(&app, &admin).await;
+    assert_read_is_admin_only(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/topologies"),
+        &admin,
+    )
+    .await;
+
+    let name = format!("readtopo_{}", Uuid::now_v7().simple());
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/topologies"),
+        Some(&admin),
+        Some(json!({"name": name, "srid": 4326})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create topology: {body}");
+
+    for suffix in ["faces", "edges", "nodes"] {
+        assert_read_is_admin_only(&app, &format!("/api/v1/topologies/{name}/{suffix}"), &admin)
+            .await;
+    }
 }
 
 // ─── Policy is read off the route template, not the raw path ────────

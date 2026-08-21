@@ -186,7 +186,10 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
             state.clone(),
             visibility::visibility_middleware,
         ))
-        .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            auth::AuthState::new(auth, state.clone()),
+            auth::auth_middleware,
+        ))
         // the default span records the uri as it arrived, which on the arcgis
         // facade carries the caller's token: see traced_uri
         .layer(

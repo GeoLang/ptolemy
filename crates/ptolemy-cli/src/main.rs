@@ -553,6 +553,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let key = generate_api_key();
                 let key_hash = hash_api_key(&key);
+                let key_prefix = api_key_prefix(&key_hash);
                 let role_enum = match role.as_str() {
                     "admin" => "admin",
                     "editor" => "editor",
@@ -570,7 +571,7 @@ async fn main() -> anyhow::Result<()> {
                 .bind(Uuid::now_v7())
                 .bind(&name)
                 .bind(&key_hash)
-                .bind(&key[..8])
+                .bind(&key_prefix)
                 .bind(role_enum)
                 .bind(expires_at)
                 .execute(store.unguarded_pool())
@@ -586,12 +587,12 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .fetch_all(store.read_pool())
                 .await?;
-                println!("{:<10} {:<20} {:<8} EXPIRES", "PREFIX", "NAME", "ROLE");
+                println!("{:<16} {:<20} {:<8} EXPIRES", "PREFIX", "NAME", "ROLE");
                 for (prefix, name, role, expires) in rows {
                     let exp = expires
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "never".into());
-                    println!("{:<10} {:<20} {:<8} {}", prefix, name, role, exp);
+                    println!("{:<16} {:<20} {:<8} {}", prefix, name, role, exp);
                 }
             }
             ApiKeyCmd::Revoke { key } => {
@@ -1155,17 +1156,17 @@ async fn shutdown_signal() {
     }
 }
 
-/// Generate a random 32-byte API key encoded as base62.
+/// Generate a `ptk_` API key from a CSPRNG. The stored prefix is not taken
+/// from this string; callers derive it from the hash so two keys minted in
+/// the same millisecond still revoke independently.
 fn generate_api_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let random: u128 = timestamp ^ 0xdeadbeef_cafebabe_12345678_9abcdef0;
-    // Use UUID v7 for uniqueness + hex encoding for the key
-    let id = Uuid::now_v7();
-    format!("ptk_{}{:016x}", id.simple(), random as u64)
+    format!("ptk_{}", Uuid::new_v4().simple())
+}
+
+/// First 12 hex chars of the key hash, with a `ptk_` prefix. Unique per key
+/// because the hash is.
+fn api_key_prefix(key_hash: &str) -> String {
+    format!("ptk_{}", &key_hash[..12])
 }
 
 /// Hash an API key for storage (SHA-256).
@@ -1177,6 +1178,11 @@ fn hash_api_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+fn api_key_revoke_matches(stored_prefix: &str, stored_hash: &str, given: &str) -> bool {
+    given == stored_prefix || hash_api_key(given) == stored_hash
 }
 
 #[cfg(test)]
@@ -1303,6 +1309,43 @@ mod tests {
         let key = generate_api_key();
         assert!(key.starts_with("ptk_"));
         assert!(key.len() > 20);
+        let other = generate_api_key();
+        assert_ne!(key, other);
+    }
+
+    #[test]
+    fn api_key_generation_is_not_a_clock_function() {
+        let keys: Vec<String> = (0..8).map(|_| generate_api_key()).collect();
+        let unique: std::collections::HashSet<_> = keys.iter().cloned().collect();
+        assert_eq!(unique.len(), keys.len());
+    }
+
+    #[test]
+    fn two_keys_have_different_prefixes() {
+        let a = generate_api_key();
+        let b = generate_api_key();
+        let prefix_a = api_key_prefix(&hash_api_key(&a));
+        let prefix_b = api_key_prefix(&hash_api_key(&b));
+        assert_ne!(prefix_a, prefix_b);
+        assert_eq!(prefix_a.len(), 16);
+        assert_eq!(prefix_a, format!("ptk_{}", &hash_api_key(&a)[..12]));
+        // the stored prefix is not a leading slice of the raw secret
+        assert_ne!(prefix_a, &a[..8]);
+    }
+
+    #[test]
+    fn revoke_by_one_prefix_does_not_match_another_key() {
+        let a = generate_api_key();
+        let b = generate_api_key();
+        let hash_a = hash_api_key(&a);
+        let hash_b = hash_api_key(&b);
+        let prefix_a = api_key_prefix(&hash_a);
+        let prefix_b = api_key_prefix(&hash_b);
+
+        assert!(api_key_revoke_matches(&prefix_a, &hash_a, &prefix_a));
+        assert!(api_key_revoke_matches(&prefix_a, &hash_a, &a));
+        assert!(!api_key_revoke_matches(&prefix_b, &hash_b, &prefix_a));
+        assert!(!api_key_revoke_matches(&prefix_b, &hash_b, &a));
     }
 
     #[test]
