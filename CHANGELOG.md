@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-21: `docs/index.html` and `docs/comparison.html` drop
+  multi-tenancy (gone in migration 028), the 32 topology-rule Esri set,
+  lock-on-commit, webhook delivery, audit writes, rate limiting, and the
+  42/48 full-parity score.
 - 2026-08-15: docs drop "∞ features" and the gRPC feature-API claim.
   Telemetry can still export OTLP over gRPC. The public API is REST,
   WebSocket and SSE.

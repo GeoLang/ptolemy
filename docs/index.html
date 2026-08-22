@@ -113,7 +113,6 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Multi-user concurrent editing</li>
 <li>Named branches per team/task</li>
 <li>Review & merge workflows</li>
-<li>WebSocket real-time branch events</li>
 <li>Three-way merge with conflict detection</li>
 <li>Ephemeral room relay (view sync, cursor sharing, chat)</li>
 <li>Follow mode — sync camera between viewer instances</li>
@@ -155,21 +154,18 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>📏 Schema & Topology</h3>
 <ul>
-<li>Dataset schema definitions (field types)</li>
-<li>Geometry rules (allowed types, bounds, max vertices)</li>
-<li>Topology rules (no overlap, no gaps, must connect)</li>
-<li>Automated data quality reports</li>
+<li>Dataset schema definitions (field types). Stored, not enforced</li>
+<li>PostGIS Topology primitives (faces, edges, nodes)</li>
 <li>Auto-repair invalid geometries (ST_MakeValid)</li>
+<li>Esri-style topology rule engine: 31 types declared, none evaluated</li>
 </ul>
 </div>
 <div class="card">
 <h3>📡 Webhooks & CDC</h3>
 <ul>
-<li>Webhook subscriptions per dataset</li>
-<li>Event types: commit, merge, branch, schema changes</li>
-<li>CDC event log with full payloads</li>
-<li>Queryable event stream (pagination, filtering)</li>
-<li>Custom event emission API</li>
+<li>Webhook CRUD per dataset. Nothing is ever delivered</li>
+<li>CDC event log table. The writer has no callers</li>
+<li>SSE and branch WebSocket stay silent. Nothing publishes to them</li>
 </ul>
 </div>
 <div class="card">
@@ -189,17 +185,15 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>GeoJSON feature collections</li>
 <li>Bbox filtering, pagination</li>
 <li>Conformance declaration</li>
-<li>Enterprise audit logging</li>
+<li>OGC API Features Part 1 only. Part 2 CRS is not implemented</li>
 </ul>
 </div>
 <div class="card">
 <h3>🔒 Feature Locking</h3>
 <ul>
-<li>Pessimistic locking per feature/branch</li>
-<li>Configurable lock duration & auto-expiry</li>
-<li>Lock checks enforced on commit</li>
-<li>Conflict prevention for high-contention edits</li>
-<li>Lock listing & manual release</li>
+<li>Lock records with a TTL</li>
+<li>Lock listing and manual release</li>
+<li>Commit never queries locks. They are advisory</li>
 </ul>
 </div>
 <div class="card">
@@ -221,20 +215,20 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🏢 Multi-Tenancy</h3>
+<h3>Access</h3>
 <ul>
-<li>Organization-level isolation</li>
-<li>Member management & roles</li>
-<li>Per-org dataset scoping</li>
-<li>Rate limiting per IP (token bucket)</li>
+<li>Dataset visibility: public listings vs private 404</li>
+<li>JWT roles Admin / Editor / Viewer</li>
+<li>Multi-tenancy was dropped in migration 028</li>
+<li>Rate-limit middleware exists and is not layered on the router</li>
 </ul>
 </div>
 <div class="card">
-<h3>⚡ Background Jobs</h3>
+<h3>Background Jobs</h3>
 <ul>
-<li>Scheduled lock cleanup & event pruning</li>
-<li>Quality alert background checks</li>
-<li>Conflict resolution API</li>
+<li>Job types exist. The worker is never started</li>
+<li>Lock cleanup, event pruning and quality alerts never run</li>
+<li>Conflict resolution API is real</li>
 <li>OTLP traces (HTTP or collector gRPC)</li>
 </ul>
 </div>
@@ -269,23 +263,21 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>📐 Topology Rules (32)</h3>
+<h3>Topology rules</h3>
 <ul>
-<li>Full Esri-equivalent topology rule set</li>
-<li>Polygon: overlap, gap, coverage, containment</li>
-<li>Line: dangle, pseudonode, self-intersect, single-part</li>
-<li>Point: coverage, boundary, coincident detection</li>
-<li>General: validity, extent, vertex count</li>
+<li>31 rule variants are declared</li>
+<li>Nothing matches on them</li>
+<li>Stored rules are never read back</li>
+<li>There is no commit-time gate</li>
+<li>PostGIS Topology proper is real, this engine is not</li>
 </ul>
 </div>
 <div class="card">
-<h3>🏷️ Domains & Attribute Rules</h3>
+<h3>Domains and attribute rules</h3>
 <ul>
-<li>Coded-value and range domains</li>
-<li>Subtypes with default values & domain assignments</li>
-<li>Attribute rules: constraint, calculation, validation</li>
-<li>Trigger events: insert, update, delete</li>
-<li>Expression-based rule engine</li>
+<li>Coded-value and range domains are stored and served</li>
+<li>Subtypes are stored</li>
+<li>Enforced nowhere. There is no expression engine</li>
 </ul>
 </div>
 <div class="card">

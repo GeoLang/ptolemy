@@ -49,10 +49,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <div class="summary">
-<div class="card"><div class="num">48</div><div class="label">Total capabilities compared</div></div>
-<div class="card"><div class="num" style="color:var(--accent2)">42</div><div class="label">Full parity ✓</div></div>
-<div class="card"><div class="num" style="color:var(--yellow)">5</div><div class="label">Partial / Alternative</div></div>
-<div class="card"><div class="num" style="color:var(--red)">1</div><div class="label">Not applicable</div></div>
+<div class="card"><div class="num">48</div><div class="label">Rows in the table</div></div>
+<div class="card"><div class="num" style="color:var(--yellow)">no score</div><div class="label">The old 42/48 full-parity count was wrong by at least 12 cells</div></div>
 </div>
 
 <div class="legend">
@@ -70,8 +68,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Versioned editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Git-like branching, temporal feature_versions</span></td></tr>
 <tr><td>Full ACID transactions</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostgreSQL transactional guarantee</span></td></tr>
 <tr><td>Spatial indexing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">GiST R-tree + H3 hexagonal</span></td></tr>
-<tr><td>Dataset schema enforcement</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Schema definitions with field types</span></td></tr>
-<tr><td>Geometry type constraints</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Geometry rules (type, bounds, vertex count)</span></td></tr>
+<tr><td>Dataset schema enforcement</td><td class="yes">✓</td><td class="partial">~ <span class="note">Schema is stored and served, not enforced</span></td></tr>
+<tr><td>Geometry type constraints</td><td class="yes">✓</td><td class="no">— <span class="note">Stored and never checked</span></td></tr>
 </table>
 
 <h2>Versioning & History</h2>
@@ -89,8 +87,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Topology & Geometry Rules</h2>
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
-<tr><td>Topology rules (32 rule types)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Full Esri-equivalent rule set implemented</span></td></tr>
-<tr><td>Topology validation</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS Topology + custom rule engine</span></td></tr>
+<tr><td>Topology rules (32 rule types)</td><td class="yes">✓</td><td class="no">— <span class="note">31 variants declared, none evaluated, no commit-time gate</span></td></tr>
+<tr><td>Topology validation</td><td class="yes">✓</td><td class="partial">~ <span class="note">PostGIS Topology primitives are real. The Esri-style rule engine is not</span></td></tr>
 <tr><td>Auto-repair invalid geometry</td><td class="yes">✓</td><td class="yes">✓ <span class="note">ST_MakeValid auto-repair</span></td></tr>
 <tr><td>Geometric networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Junction/edge graph + recursive CTE trace</span></td></tr>
 <tr><td>Utility networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pgRouting powered (Dijkstra, A*, TSP, isochrones)</span></td></tr>
@@ -101,12 +99,12 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Domains & Data Integrity</h2>
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
-<tr><td>Coded-value domains</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Coded-value domains with validation</span></td></tr>
-<tr><td>Range domains</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Min/max range enforcement</span></td></tr>
-<tr><td>Subtypes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Subtypes with default values & domain assignments</span></td></tr>
-<tr><td>Attribute rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Constraint, calculation, validation rules with triggers</span></td></tr>
+<tr><td>Coded-value domains</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored and served, enforced nowhere</span></td></tr>
+<tr><td>Range domains</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored and served, enforced nowhere</span></td></tr>
+<tr><td>Subtypes</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored, enforced nowhere</span></td></tr>
+<tr><td>Attribute rules</td><td class="yes">✓</td><td class="no">— <span class="note">No expression engine</span></td></tr>
 <tr><td>Relationship classes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">1:1, 1:M, M:N with forward/backward navigation</span></td></tr>
-<tr><td>Feature locking</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Pessimistic locks with TTL & auto-expiry</span></td></tr>
+<tr><td>Feature locking</td><td class="yes">✓</td><td class="partial">~ <span class="note">Lock records with a TTL. Commit never queries them</span></td></tr>
 </table>
 
 <h2>Symbology & Cartography</h2>
@@ -129,7 +127,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>GeoJSON export</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Native format</span></td></tr>
 <tr><td>Shapefile export</td><td class="yes">✓</td><td class="partial">~ <span class="note">Via shapefile crate in CLI</span></td></tr>
 <tr><td>CRS transformation (EPSG)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS ST_Transform, any EPSG code</span></td></tr>
-<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST + WebSocket + SSE</span></td></tr>
+<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST. Branch WebSocket and SSE stay silent</span></td></tr>
 </table>
 
 <h2>Advanced Analytics & Extensions</h2>
@@ -139,9 +137,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Network analysis (routing)</td><td class="yes">✓ <span class="note">Network Analyst</span></td><td class="yes">✓ <span class="note">pgRouting: Dijkstra, A*, TSP, isochrones</span></td></tr>
 <tr><td>Point cloud / LiDAR</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pointcloud extension (pcpatch) with elevation profiles</span></td></tr>
 <tr><td>Trajectory / moving objects</td><td class="partial">~ <span class="note">Via Tracker</span></td><td class="yes">✓ <span class="note">MobilityDB (tgeompoint, speed, distance)</span></td></tr>
-<tr><td>Vector similarity search</td><td class="no">—</td><td class="yes">✓ <span class="note">pgvector embeddings, ANN search, duplicate detection</span></td></tr>
+<tr><td>Vector similarity search</td><td class="no">—</td><td class="partial">~ <span class="note">SHA-256 hash spread over 256 floats. Identical text matches. Near-identical does not. 501 without pgvector</span></td></tr>
 <tr><td>Hexagonal spatial indexing</td><td class="no">—</td><td class="yes">✓ <span class="note">Uber H3: multi-resolution hexagonal binning</span></td></tr>
-<tr><td>Fuzzy text search</td><td class="partial">~ <span class="note">SQL LIKE only</span></td><td class="yes">✓ <span class="note">pg_trgm trigram similarity</span></td></tr>
+<tr><td>Fuzzy text search</td><td class="partial">~ <span class="note">SQL LIKE only</span></td><td class="partial">~ <span class="note">pg_trgm substring search. No similarity ranking, no typo tolerance</span></td></tr>
 </table>
 
 <h2>Operations & Security</h2>
@@ -149,10 +147,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
 <tr><td>Authentication (SSO)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OIDC (Keycloak, Auth0) + JWT</span></td></tr>
 <tr><td>Role-based access control</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Admin/Editor/Viewer roles</span></td></tr>
-<tr><td>Multi-tenancy</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Organization isolation + member management</span></td></tr>
-<tr><td>Audit logging</td><td class="yes">✓</td><td class="yes">✓ <span class="note">CDC event log + webhook notifications</span></td></tr>
+<tr><td>Multi-tenancy</td><td class="yes">✓</td><td class="no">— <span class="note">Dropped in migration 028</span></td></tr>
+<tr><td>Audit logging</td><td class="yes">✓</td><td class="partial">~ <span class="note">GET /audit reads a table the writer never fills. Webhook delivery has no callers</span></td></tr>
 <tr><td>Monitoring / metrics</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Prometheus /metrics endpoint</span></td></tr>
-<tr><td>Rate limiting</td><td class="partial">~ <span class="note">Via WAF/proxy</span></td><td class="yes">✓ <span class="note">Built-in token bucket per IP</span></td></tr>
+<tr><td>Rate limiting</td><td class="partial">~ <span class="note">Via WAF/proxy</span></td><td class="no">— <span class="note">Middleware exists, not layered on the router. Fixed-window, not a token bucket</span></td></tr>
 <tr><td>Docker deployment</td><td class="no">— <span class="note">Windows/.NET only</span></td><td class="yes">✓ <span class="note">Single binary + docker-compose</span></td></tr>
 </table>
 
@@ -167,10 +165,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td><strong>Open Source (AGPL-3.0)</strong></td><td>No per-user licensing fees. Full source access. Community-driven.</td></tr>
 <tr><td><strong>Git-like versioning</strong></td><td>True branch/merge workflows vs Esri's limited parent/child versions.</td></tr>
 <tr><td><strong>PostgreSQL ecosystem</strong></td><td>Leverage 9+ proven extensions (pgRouting, pgvector, MobilityDB, H3, SFCGAL, pointcloud, pg_trgm, PostGIS Topology, pg_partman).</td></tr>
-<tr><td><strong>Modern API</strong></td><td>REST + WebSocket + SSE vs Esri's SOAP/REST hybrid.</td></tr>
+<tr><td><strong>Modern API</strong></td><td>REST. Branch WebSocket and SSE stay silent.</td></tr>
 <tr><td><strong>Standards-first</strong></td><td>Native OGC API Features, CQL2, STAC 1.0, OGC Tiles — not proprietary protocols.</td></tr>
 <tr><td><strong>Cloud-native</strong></td><td>Single Rust binary, Docker-ready, sub-millisecond startup. No Windows/.NET requirement.</td></tr>
-<tr><td><strong>AI-ready</strong></td><td>Built-in pgvector for spatial AI/ML workflows — no equivalent in Esri.</td></tr>
+<tr><td><strong>pgvector route</strong></td><td>Exact-string matching expressed as a SHA-256 hash vector. 501 unless you install pgvector yourself.</td></tr>
 <tr><td><strong>Trajectory support</strong></td><td>MobilityDB for moving objects — Esri requires separate Tracker for Location.</td></tr>
 </table>
 </div>
