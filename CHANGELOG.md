@@ -20,6 +20,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-21: OGC API Features Part 2, CRS by reference. The items and single
+  feature routes take `crs`, the items route also takes `bbox-crs`, and both
+  answer with a `Content-Crs` header naming the CRS they returned. A collection
+  now carries `crs` and `storageCrs`. Every collection offers CRS84, EPSG:4326
+  and EPSG:3857, plus the dataset's declared srid where it is none of those.
+  CRS84 is served longitude first and a geographic EPSG code latitude first, and
+  a `bbox-crs` bbox is read the same way. A `crs` or `bbox-crs` value outside
+  that list answers 400, as does a malformed `bbox`, which used to answer 404.
+
 - 2026-08-13: the Helm chart takes an external database.
   `externalDatabase.existingSecret` names a secret holding the whole
   `DATABASE_URL`, and setting it points the deployment there instead of at the

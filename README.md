@@ -39,7 +39,10 @@ test beyond their `501` branch. Install them yourself before relying on them.
 - **STAC 1.0** — SpatioTemporal Asset Catalog for raster discovery
 - **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
 - **CQL2** — Common Query Language for spatial/attribute filtering
-- **OGC API - Features** — Part 1 (core, GeoJSON, OpenAPI 3.0). Part 2 CRS is not implemented.
+- **OGC API - Features** — Part 1 (core, GeoJSON, OpenAPI 3.0) and Part 2 (CRS by
+  reference). Every collection offers CRS84, EPSG:4326 and EPSG:3857, plus the
+  dataset's own srid where it is none of those. CRS84 is served longitude first and a
+  geographic EPSG code latitude first, and `bbox-crs` is read the same way.
 - **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes, attachments and `extractChanges` deltas, so Esri clients connect unchanged
 
 ### Key Features (Roadmap)

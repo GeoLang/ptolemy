@@ -1286,6 +1286,204 @@ async fn test_ogc_collections() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// OGC API - Features Part 2: CRS by reference
+// ═══════════════════════════════════════════════════════════════════════
+
+const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+const EPSG_4326_URI: &str = "http://www.opengis.net/def/crs/EPSG/0/4326";
+const EPSG_3857_URI: &str = "http://www.opengis.net/def/crs/EPSG/0/3857";
+
+/// Helper: GET returning the Content-Crs header beside status and body.
+async fn get_json_with_crs(app: &axum::Router, uri: &str) -> (StatusCode, String, Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", "Bearer test-skip")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let content_crs = resp
+        .headers()
+        .get("content-crs")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, content_crs, value)
+}
+
+/// Helper: a dataset holding one point at longitude 10, latitude 20.
+async fn crs_dataset(app: &axum::Router) -> Uuid {
+    let dataset_id = create_dataset(app).await;
+    let branch_id = create_branch(app, dataset_id, "main").await;
+    // WKB hex for POINT(10 20) — little-endian
+    let point_hex = "010100000000000000000024400000000000003440";
+    commit_features(
+        app,
+        branch_id,
+        json!([{"type": "insert", "geometry_wkb_hex": point_hex, "properties": {"name": "pin"}}]),
+    )
+    .await;
+    dataset_id
+}
+
+#[tokio::test]
+async fn test_ogc_conformance_declares_crs_class() {
+    let (app, _) = setup_app().await;
+
+    let (status, body) = get_json(&app, "/api/v1/ogc/conformance").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let classes = body["conformsTo"].as_array().unwrap();
+    assert!(
+        classes
+            .iter()
+            .any(|c| c == "http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn test_ogc_collection_lists_supported_crs() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+
+    let (status, body) = get_json(&app, &format!("/api/v1/ogc/collections/{dataset_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["storageCrs"], CRS84_URI, "{body}");
+    let supported = body["crs"].as_array().unwrap();
+    for uri in [CRS84_URI, EPSG_4326_URI, EPSG_3857_URI] {
+        assert!(supported.iter().any(|c| c == uri), "missing {uri}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn test_ogc_items_default_crs_is_crs84() {
+    let (app, _) = setup_app().await;
+    let dataset_id = crs_dataset(&app).await;
+
+    let (status, content_crs, body) =
+        get_json_with_crs(&app, &format!("/api/v1/ogc/collections/{dataset_id}/items")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_crs, format!("<{CRS84_URI}>"));
+    let coords = body["features"][0]["geometry"]["coordinates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(coords[0].as_f64().unwrap(), 10.0, "{body}");
+    assert_eq!(coords[1].as_f64().unwrap(), 20.0, "{body}");
+}
+
+#[tokio::test]
+async fn test_ogc_items_epsg_4326_is_latitude_first() {
+    let (app, _) = setup_app().await;
+    let dataset_id = crs_dataset(&app).await;
+
+    let (status, content_crs, body) = get_json_with_crs(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items?crs={EPSG_4326_URI}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_crs, format!("<{EPSG_4326_URI}>"));
+    let coords = body["features"][0]["geometry"]["coordinates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(coords[0].as_f64().unwrap(), 20.0, "{body}");
+    assert_eq!(coords[1].as_f64().unwrap(), 10.0, "{body}");
+}
+
+#[tokio::test]
+async fn test_ogc_items_epsg_3857_is_metres() {
+    let (app, _) = setup_app().await;
+    let dataset_id = crs_dataset(&app).await;
+
+    let (status, content_crs, body) = get_json_with_crs(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items?crs={EPSG_3857_URI}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_crs, format!("<{EPSG_3857_URI}>"));
+    let coords = body["features"][0]["geometry"]["coordinates"]
+        .as_array()
+        .unwrap();
+    let (x, y) = (coords[0].as_f64().unwrap(), coords[1].as_f64().unwrap());
+    assert!((1.10e6..1.13e6).contains(&x), "x {x}: {body}");
+    assert!((2.25e6..2.30e6).contains(&y), "y {y}: {body}");
+
+    // the single feature route reprojects the same way
+    let feature_id = body["features"][0]["id"].as_str().unwrap().to_string();
+    let (status, content_crs, body) = get_json_with_crs(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items/{feature_id}?crs={EPSG_3857_URI}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_crs, format!("<{EPSG_3857_URI}>"));
+    let coords = body["geometry"]["coordinates"].as_array().unwrap();
+    let (x, y) = (coords[0].as_f64().unwrap(), coords[1].as_f64().unwrap());
+    assert!((1.10e6..1.13e6).contains(&x), "x {x}: {body}");
+    assert!((2.25e6..2.30e6).contains(&y), "y {y}: {body}");
+}
+
+#[tokio::test]
+async fn test_ogc_items_bbox_crs() {
+    let (app, _) = setup_app().await;
+    let dataset_id = crs_dataset(&app).await;
+
+    // a metre bbox around the point
+    let (status, _, body) = get_json_with_crs(
+        &app,
+        &format!(
+            "/api/v1/ogc/collections/{dataset_id}/items\
+             ?bbox=1100000,2260000,1130000,2290000&bbox-crs={EPSG_3857_URI}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+
+    // and one nowhere near it
+    let (status, _, body) = get_json_with_crs(
+        &app,
+        &format!(
+            "/api/v1/ogc/collections/{dataset_id}/items\
+             ?bbox=0,0,100000,100000&bbox-crs={EPSG_3857_URI}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 0, "{body}");
+
+    // an EPSG:4326 bbox is latitude first
+    let (status, _, body) = get_json_with_crs(
+        &app,
+        &format!(
+            "/api/v1/ogc/collections/{dataset_id}/items?bbox=19,9,21,11&bbox-crs={EPSG_4326_URI}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn test_ogc_items_rejects_unsupported_crs() {
+    let (app, _) = setup_app().await;
+    let dataset_id = crs_dataset(&app).await;
+
+    for crs in ["http://www.opengis.net/def/crs/EPSG/0/999999", "garbage"] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/ogc/collections/{dataset_id}/items?crs={crs}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{crs}: {body}");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // STAC API Tests
 // ═══════════════════════════════════════════════════════════════════════
 
