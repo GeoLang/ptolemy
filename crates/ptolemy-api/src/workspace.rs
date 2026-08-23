@@ -502,15 +502,33 @@ async fn require_project_owner(
     project_id: Uuid,
     user_id: &str,
 ) -> Result<(), WorkspaceError> {
-    match store.project_role(project_id, user_id).await? {
-        Some(CollaborationRole::Owner) => Ok(()),
-        Some(_) => Err(WorkspaceError::Store(StoreError::Forbidden(
-            "project role is insufficient".into(),
-        ))),
-        None => Err(WorkspaceError::Store(StoreError::NotFound(
-            "project not found".into(),
-        ))),
+    Ok(require_project_role(store, project_id, user_id, CollaborationRole::Owner).await?)
+}
+
+/// The caller's effective project role against the one a route needs.
+///
+/// A project the caller holds no role on answers not-found rather than
+/// forbidden, so its id cannot be confirmed by probing, which is what every
+/// project route here already does.
+pub(crate) async fn require_project_role(
+    store: &AppState,
+    project_id: Uuid,
+    user_id: &str,
+    required: CollaborationRole,
+) -> Result<(), StoreError> {
+    let role = store
+        .project_role(project_id, user_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound("project not found".into()))?;
+    let holds = match required {
+        CollaborationRole::Owner => role.is_owner(),
+        CollaborationRole::Editor => role.can_edit(),
+        CollaborationRole::Viewer => true,
+    };
+    if holds {
+        return Ok(());
     }
+    Err(StoreError::Forbidden("project role is insufficient".into()))
 }
 
 #[derive(Debug)]

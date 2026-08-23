@@ -25,6 +25,6 @@ pub use postgres::{
 pub use postgres::{LATEST_COLUMNS, MVT_TILE_EXTENT, mvt_simplify_tolerance};
 pub use workspace::{
     CollaborationRole, CreatedInvitation, InvitationTarget, Project, ProjectInvitation,
-    ProjectMember, ProjectWithRole, Workspace, WorkspaceInvitation, WorkspaceMember,
-    WorkspaceWithRole, effective_project_role_sql,
+    ProjectMember, ProjectStateEntry, ProjectWithRole, Workspace, WorkspaceInvitation,
+    WorkspaceMember, WorkspaceWithRole, effective_project_role_sql,
 };

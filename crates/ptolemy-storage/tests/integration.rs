@@ -49,7 +49,8 @@ async fn setup_with_analyze_threshold(rows: usize) -> PgStore {
 
     // Clean slate
     sqlx::raw_sql(
-        "DROP TABLE IF EXISTS project_invitations CASCADE;
+        "DROP TABLE IF EXISTS project_state CASCADE;
+         DROP TABLE IF EXISTS project_invitations CASCADE;
          DROP TABLE IF EXISTS project_members CASCADE;
          DROP TABLE IF EXISTS workspace_members CASCADE;
          DROP TABLE IF EXISTS projects CASCADE;
@@ -2431,6 +2432,7 @@ fn attachment_of(
         feature_id: Some(feature_id),
         branch_id: Some(branch_id),
         dataset_id: None,
+        project_id: None,
         name: name.to_string(),
         content_type: "image/png".to_string(),
         size_bytes: size as i64,

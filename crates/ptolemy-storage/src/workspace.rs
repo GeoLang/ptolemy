@@ -147,6 +147,16 @@ pub struct ProjectWithRole {
     pub role: CollaborationRole,
 }
 
+/// One key of a project's shared state. The value is opaque here: the client
+/// that wrote it owns its shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectStateEntry {
+    pub value: serde_json::Value,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub updated_by: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectMember {
     pub project_id: Uuid,
@@ -504,6 +514,51 @@ impl PgStore {
         user_id: &str,
     ) -> Result<Option<CollaborationRole>, StoreError> {
         role_for_project(&self.pool, project_id, user_id).await
+    }
+
+    /// One key of the project's shared state. `NotFound` when nobody has set it.
+    pub async fn project_state(
+        &self,
+        project_id: Uuid,
+        key: &str,
+    ) -> Result<ProjectStateEntry, StoreError> {
+        let row = sqlx::query(
+            "SELECT value, updated_at, updated_by FROM project_state
+             WHERE project_id = $1 AND key = $2",
+        )
+        .bind(project_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("project state {key}")))?;
+        Ok(project_state_from_row(&row))
+    }
+
+    /// Last write wins. Two members editing the same map produce the later
+    /// snapshot, which is what the viewer's own newest-savedAt merge expects.
+    pub async fn set_project_state(
+        &self,
+        project_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+        updated_by: &str,
+    ) -> Result<ProjectStateEntry, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO project_state (project_id, key, value, updated_by)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (project_id, key) DO UPDATE
+                 SET value = EXCLUDED.value,
+                     updated_at = now(),
+                     updated_by = EXCLUDED.updated_by
+             RETURNING value, updated_at, updated_by",
+        )
+        .bind(project_id)
+        .bind(key)
+        .bind(value)
+        .bind(updated_by)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(project_state_from_row(&row))
     }
 
     pub async fn update_project(
@@ -1202,6 +1257,14 @@ fn project_invitation_from_row(row: &sqlx::postgres::PgRow) -> ProjectInvitation
         created_by: row.get("created_by"),
         created_at: row.get("created_at"),
         expires_at: row.get("expires_at"),
+    }
+}
+
+fn project_state_from_row(row: &sqlx::postgres::PgRow) -> ProjectStateEntry {
+    ProjectStateEntry {
+        value: row.get("value"),
+        updated_at: row.get("updated_at"),
+        updated_by: row.get("updated_by"),
     }
 }
 

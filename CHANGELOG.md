@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-23: **a project carries the state its members share**. New
+  `project_state(project_id, key, value jsonb, updated_at, updated_by)` behind
+  `GET` and `PUT /api/v1/projects/{id}/state/{key}`: a viewer reads, an editor
+  writes, an unset key answers 404, and a value over 5 MB answers 413. The reply
+  is `{value, updated_at, updated_by}`, so a client can tell whose write it is
+  looking at. The value is opaque to the server. ViewTopia keeps its map
+  snapshot under `map` and its dashboards under `dashboards`.
+
+- 2026-08-23: **an attachment may belong to a project**. The
+  `attachments_one_owner` CHECK takes `project_id` as a third owner beside a
+  feature on a branch and a dataset, reached through
+  `GET`/`POST /api/v1/projects/{id}/attachments` and
+  `GET`/`DELETE /api/v1/projects/{id}/attachments/{attachment_id}`, an editor
+  for the writes and a viewer for the reads. These carry the overlay bitmaps a
+  project's map names. A project attachment has no dataset for the per-dataset
+  visibility layer or the write ladder to weigh, so `/attachments/{id}` refuses
+  one: the project routes and their role check are the only way to it.
+
 - 2026-08-23: **`GET /branches/{id}/features/{feature_id}`** returns one live
   feature, geometry as hex WKB beside its properties, and 404 for a feature that
   is not live on the branch. A client merging an edit before it commits needs

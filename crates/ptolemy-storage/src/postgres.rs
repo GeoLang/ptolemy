@@ -522,7 +522,7 @@ impl PgStore {
         writer: &Writer,
     ) -> Result<(), StoreError> {
         let row = sqlx::query(
-            "SELECT branch_id, dataset_id FROM attachments
+            "SELECT branch_id, dataset_id, project_id FROM attachments
               WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(attachment_id)
@@ -533,11 +533,15 @@ impl PgStore {
         match (
             row.get::<Option<Uuid>, _>("branch_id"),
             row.get::<Option<Uuid>, _>("dataset_id"),
+            row.get::<Option<Uuid>, _>("project_id"),
         ) {
-            (Some(branch_id), _) => self.ensure_branch_writable(branch_id, writer).await,
-            (None, Some(dataset_id)) => self.ensure_dataset_writable(dataset_id, writer).await,
-            // the attachments_one_owner CHECK leaves no third case
-            (None, None) => Err(StoreError::NotFound(format!("attachment {attachment_id}"))),
+            (Some(branch_id), _, _) => self.ensure_branch_writable(branch_id, writer).await,
+            (None, Some(dataset_id), _) => self.ensure_dataset_writable(dataset_id, writer).await,
+            // a project attachment has no dataset for the ladder to run against.
+            // It is absent here, so `/attachments/{id}` cannot reach it and
+            // `/projects/{id}/attachments/{id}`, which checks the project role,
+            // is the only way to delete one.
+            (None, None, _) => Err(StoreError::NotFound(format!("attachment {attachment_id}"))),
         }
     }
 
@@ -766,11 +770,13 @@ impl PgStore {
                  UNION ALL SELECT pc.dataset_id FROM pointcloud_patches pp
                              JOIN pointcloud_catalogs pc ON pc.id = pp.catalog_id
                             WHERE pp.id = ANY($1)
-                 -- an attachment belongs to a dataset directly or to a feature on
-                 -- a branch, and the CHECK makes it exactly one of the two
+                 -- an attachment belongs to a dataset directly, to a feature on a
+                 -- branch, or to a project, and the CHECK makes it exactly one.
+                 -- A project one names no dataset and is read through routes
+                 -- that check the project role.
                  UNION ALL SELECT COALESCE(a.dataset_id, ab.dataset_id) FROM attachments a
                         LEFT JOIN branches ab ON ab.id = a.branch_id
-                            WHERE a.id = ANY($1)
+                            WHERE a.id = ANY($1) AND a.project_id IS NULL
                  UNION ALL SELECT dataset_id FROM networks WHERE id = ANY($1)
                  UNION ALL SELECT dataset_id FROM routes WHERE id = ANY($1)
                  UNION ALL SELECT dataset_id FROM symbology_rules WHERE id = ANY($1)
@@ -858,8 +864,11 @@ impl PgStore {
                  UNION ALL SELECT NULL::uuid, dataset_id FROM pointcloud_catalogs WHERE id = $1
                  UNION ALL SELECT NULL::uuid, pc.dataset_id FROM pointcloud_patches pp
                              JOIN pointcloud_catalogs pc ON pc.id = pp.catalog_id WHERE pp.id = $1
+                 -- a project attachment resolves to neither, and is guarded by
+                 -- the project role its own routes check instead
                  UNION ALL SELECT a.branch_id, COALESCE(a.dataset_id, ab.dataset_id) FROM attachments a
-                        LEFT JOIN branches ab ON ab.id = a.branch_id WHERE a.id = $1
+                        LEFT JOIN branches ab ON ab.id = a.branch_id
+                        WHERE a.id = $1 AND a.project_id IS NULL
                  UNION ALL SELECT NULL::uuid, dataset_id FROM networks WHERE id = $1
                  UNION ALL SELECT NULL::uuid, dataset_id FROM routes WHERE id = $1
                  UNION ALL SELECT NULL::uuid, dataset_id FROM symbology_rules WHERE id = $1
@@ -3160,13 +3169,14 @@ impl PgStore {
 
     pub async fn create_attachment(&self, attachment: &Attachment) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO attachments (id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO attachments (id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(attachment.id)
         .bind(attachment.feature_id)
         .bind(attachment.branch_id)
         .bind(attachment.dataset_id)
+        .bind(attachment.project_id)
         .bind(&attachment.name)
         .bind(&attachment.content_type)
         .bind(attachment.size_bytes)
@@ -3185,7 +3195,7 @@ impl PgStore {
         branch_id: Uuid,
     ) -> Result<Vec<AttachmentMeta>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
+            "SELECT id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, metadata, created_by, created_at
              FROM attachments
              WHERE feature_id = $1 AND branch_id = $2 AND deleted_at IS NULL
              ORDER BY created_at DESC",
@@ -3205,7 +3215,7 @@ impl PgStore {
         dataset_id: Uuid,
     ) -> Result<Vec<AttachmentMeta>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, metadata, created_by, created_at
+            "SELECT id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, metadata, created_by, created_at
              FROM attachments
              WHERE dataset_id = $1 AND deleted_at IS NULL
              ORDER BY created_at DESC",
@@ -3217,9 +3227,44 @@ impl PgStore {
         Ok(rows.into_iter().map(attachment_meta_from_row).collect())
     }
 
+    /// A project's own attachments: the overlay bitmaps its map names, which
+    /// belong to no dataset.
+    pub async fn list_project_attachments(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<AttachmentMeta>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, metadata, created_by, created_at
+             FROM attachments
+             WHERE project_id = $1 AND deleted_at IS NULL
+             ORDER BY created_at DESC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(attachment_meta_from_row).collect())
+    }
+
+    /// The same as [`PgStore::get_attachment`], refusing one that belongs to
+    /// another project. The project-scoped routes check the caller's role
+    /// against the project in the path, so an attachment reached through the
+    /// wrong path would skip that check.
+    pub async fn get_project_attachment(
+        &self,
+        project_id: Uuid,
+        id: Uuid,
+    ) -> Result<Attachment, StoreError> {
+        let attachment = self.get_attachment(id).await?;
+        if attachment.project_id != Some(project_id) {
+            return Err(StoreError::NotFound(format!("attachment {id}")));
+        }
+        Ok(attachment)
+    }
+
     pub async fn get_attachment(&self, id: Uuid) -> Result<Attachment, StoreError> {
         let row = sqlx::query(
-            "SELECT id, feature_id, branch_id, dataset_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
+            "SELECT id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by, created_at
              FROM attachments WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id)
@@ -3232,6 +3277,7 @@ impl PgStore {
             feature_id: row.get("feature_id"),
             branch_id: row.get("branch_id"),
             dataset_id: row.get("dataset_id"),
+            project_id: row.get("project_id"),
             name: row.get("name"),
             content_type: row.get("content_type"),
             size_bytes: row.get("size_bytes"),
@@ -3241,6 +3287,29 @@ impl PgStore {
             created_by: row.get("created_by"),
             created_at: row.get("created_at"),
         })
+    }
+
+    /// The same soft delete, refusing an attachment that belongs to another
+    /// project. Scoped in the statement rather than by reading the row first, so
+    /// a megabyte bitmap is never loaded to answer who owns it.
+    pub async fn delete_project_attachment(
+        &self,
+        project_id: Uuid,
+        id: Uuid,
+    ) -> Result<(), StoreError> {
+        let deleted = sqlx::query(
+            "UPDATE attachments SET deleted_at = now()
+              WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if deleted == 0 {
+            return Err(StoreError::NotFound(format!("attachment {id}")));
+        }
+        Ok(())
     }
 
     /// Soft delete: the row keeps its bytes and gains a `deleted_at`, so a change
@@ -3964,14 +4033,15 @@ pub struct TopologyRepair {
 
 // ─── Attachment types ───────────────────────────────────────────────
 
-/// Owned by either a feature on a branch or a dataset, never both and never
-/// neither; the `attachments_one_owner` CHECK is the authority.
+/// Owned by a feature on a branch, a dataset, or a project, never more than one
+/// and never none; the `attachments_one_owner` CHECK is the authority.
 #[derive(Debug, Clone, Serialize)]
 pub struct Attachment {
     pub id: Uuid,
     pub feature_id: Option<Uuid>,
     pub branch_id: Option<Uuid>,
     pub dataset_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
     pub name: String,
     pub content_type: String,
     pub size_bytes: i64,
@@ -3992,6 +4062,7 @@ pub struct AttachmentMeta {
     pub feature_id: Option<Uuid>,
     pub branch_id: Option<Uuid>,
     pub dataset_id: Option<Uuid>,
+    pub project_id: Option<Uuid>,
     pub name: String,
     pub content_type: String,
     pub size_bytes: i64,
@@ -4421,6 +4492,7 @@ fn attachment_meta_from_row(row: sqlx::postgres::PgRow) -> AttachmentMeta {
         feature_id: row.get("feature_id"),
         branch_id: row.get("branch_id"),
         dataset_id: row.get("dataset_id"),
+        project_id: row.get("project_id"),
         name: row.get("name"),
         content_type: row.get("content_type"),
         size_bytes: row.get("size_bytes"),

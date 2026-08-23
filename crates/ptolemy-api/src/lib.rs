@@ -25,6 +25,7 @@ pub mod network;
 pub mod ogc;
 pub mod oidc;
 pub mod pointcloud;
+pub mod project_state;
 pub mod qgis;
 pub mod quality;
 pub mod raster;
@@ -164,6 +165,7 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/api/v1", replication::replication_routes())
         .nest("/api/v1", rbac::rbac_routes())
         .nest("/api/v1", workspace::workspace_routes())
+        .nest("/api/v1", project_state::project_state_routes())
         .nest("/api/v1", real_estate::real_estate_routes())
         .nest("/api/v1", verticals::vertical_routes())
         .nest("/api/v1", compaction::compaction_routes())

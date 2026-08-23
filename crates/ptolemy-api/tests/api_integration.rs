@@ -31,6 +31,10 @@ async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
 
+    sqlx::query("DROP TABLE IF EXISTS project_state CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DROP TABLE IF EXISTS project_invitations CASCADE")
         .execute(&pool)
         .await
@@ -16886,5 +16890,361 @@ async fn test_tile_detail_falls_away_with_zoom() {
     assert!(
         zigzag_far < straight_far * 2,
         "zoom 5 kept the zigzag: {zigzag_far} against {straight_far}"
+    );
+}
+
+// ─── Project state and project attachments ──────────────────────────
+
+/// The state key ViewTopia writes its map snapshot under.
+const MAP_KEY: &str = "map";
+
+fn state_path(project_id: Uuid, key: &str) -> String {
+    format!("/api/v1/projects/{project_id}/state/{key}")
+}
+
+/// A bytes response for a route that needs a real token, which `get_bytes`
+/// cannot give: it sends the placeholder the auth-disabled router ignores.
+async fn get_bytes_as(app: &axum::Router, uri: &str, token: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn test_project_state_round_trips_with_who_wrote_it() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+    let editor = token_for_user("project-editor", Role::Editor);
+
+    let snapshot = json!({"app": "viewtopia", "camera": {"lng": 12.5, "lat": 41.9}});
+    let (status, written) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&editor),
+        Some(snapshot.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    assert_eq!(written["value"], snapshot, "{written}");
+    assert_eq!(written["updated_by"], "project-editor", "{written}");
+
+    let viewer = token_for_user("project-viewer", Role::Viewer);
+    let (status, read) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, MAP_KEY),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["value"], snapshot, "{read}");
+    assert_eq!(read["updated_by"], "project-editor", "{read}");
+    assert!(read["updated_at"].is_string(), "{read}");
+
+    // last write wins, and the second writer is the one reported
+    let owner = token_for_user("project-owner", Role::Viewer);
+    let second = json!({"app": "viewtopia", "camera": {"lng": 0.0, "lat": 0.0}});
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&owner),
+        Some(second.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, read) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, MAP_KEY),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["value"], second, "{read}");
+    assert_eq!(read["updated_by"], "project-owner", "{read}");
+}
+
+#[tokio::test]
+async fn test_project_state_role_matrix() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&token_for_user("project-editor", Role::Editor)),
+        Some(json!({"seeded": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "editor writes: {body}");
+
+    // a viewer reads the same key and is refused the write
+    let viewer = token_for_user("project-viewer", Role::Editor);
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, MAP_KEY),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "viewer reads: {body}");
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&viewer),
+        Some(json!({"seeded": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "viewer writes: {body}");
+
+    // a token's instance role does not stand in for project membership
+    let stranger = token_for_user("stranger", Role::Editor);
+    for method in ["GET", "PUT"] {
+        let (status, body) = request_as(
+            &app,
+            method,
+            &state_path(project_id, MAP_KEY),
+            Some(&stranger),
+            (method == "PUT").then(|| json!({"seeded": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "stranger {method}: {body}");
+    }
+
+    // and the write the viewer and the stranger were refused did not land
+    let (status, read) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, MAP_KEY),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["value"]["seeded"], true, "{read}");
+}
+
+#[tokio::test]
+async fn test_project_state_unset_key_is_not_found() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, "dashboards"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // and one key being set does not make its neighbour readable
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&carol),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, "dashboards"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn test_project_state_refuses_a_value_over_the_cap() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+
+    let over_the_cap = json!({"blob": "x".repeat(5 * 1024 * 1024)});
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&carol),
+        Some(over_the_cap),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    // nothing was stored, so the key is still unset
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &state_path(project_id, MAP_KEY),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // a value just under the cap goes through, so the refusal is the size and
+    // not the shape
+    let under_the_cap = json!({"blob": "x".repeat(4 * 1024 * 1024)});
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &state_path(project_id, MAP_KEY),
+        Some(&carol),
+        Some(under_the_cap),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn test_project_attachment_round_trip() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+    let editor = token_for_user("project-editor", Role::Editor);
+    let viewer = token_for_user("project-viewer", Role::Viewer);
+
+    let (status, uploaded) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/attachments"),
+        Some(&editor),
+        Some(upload_body("overlay.png", "overlay-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+    assert_eq!(uploaded["project_id"], project_id.to_string(), "{uploaded}");
+    let attachment_id = uploaded["id"].as_str().unwrap().to_string();
+    let attachment_path = format!("/api/v1/projects/{project_id}/attachments/{attachment_id}");
+
+    let (status, listed) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/projects/{project_id}/attachments"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["name"], "overlay.png", "{listed}");
+
+    let (status, bytes) = get_bytes_as(&app, &attachment_path, &viewer).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"overlay-bytes");
+
+    // the dataset-scoped routes never serve a project attachment, so reaching
+    // one always runs the project role check
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/attachments/{attachment_id}/meta"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, _) = get_bytes_as(
+        &app,
+        &format!("/api/v1/attachments/{attachment_id}"),
+        &carol,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/attachments/{attachment_id}"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // a viewer may not upload or delete, and a stranger sees no project at all
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/attachments"),
+        Some(&viewer),
+        Some(upload_body("second.png", "second-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request_as(&app, "DELETE", &attachment_path, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let stranger = token_for_user("stranger", Role::Editor);
+    let (status, bytes) = get_bytes_as(&app, &attachment_path, &stranger).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let (status, body) = request_as(&app, "DELETE", &attachment_path, Some(&editor), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, _) = get_bytes_as(&app, &attachment_path, &viewer).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_project_attachment_is_scoped_to_its_own_project() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let mine = seed_project_with_members(&app, &carol).await;
+    let theirs = seed_project_with_members(&app, &carol).await;
+
+    let (status, uploaded) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{mine}/attachments"),
+        Some(&carol),
+        Some(upload_body("overlay.png", "overlay-bytes")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{uploaded}");
+    let attachment_id = uploaded["id"].as_str().unwrap().to_string();
+
+    let (status, bytes) = get_bytes_as(
+        &app,
+        &format!("/api/v1/projects/{theirs}/attachments/{attachment_id}"),
+        &carol,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
     );
 }

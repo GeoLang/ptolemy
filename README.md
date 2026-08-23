@@ -639,6 +639,23 @@ invitation is created. It does not send email and has no user directory.
 
 Project roles are not propagated to Agora documents.
 
+### Project state and attachments
+
+A project holds the state its members share, one JSON value per key, at
+`GET` and `PUT /api/v1/projects/{id}/state/{key}`. A viewer reads and an editor
+writes. An unset key answers 404, a value over 5 MB answers 413, and a read
+answers `{value, updated_at, updated_by}` so a client can tell whose write it is
+looking at. Last write wins, and the value is opaque to the server: ViewTopia
+keeps its map snapshot under `map` and its dashboards under `dashboards`.
+
+The binary files that state refers to are project attachments, at
+`GET`/`POST /api/v1/projects/{id}/attachments` and
+`GET`/`DELETE /api/v1/projects/{id}/attachments/{attachment_id}`, again editor
+for the writes and viewer for the reads. A project attachment belongs to no
+dataset, so the per-dataset visibility layer and the write ladder have nothing
+to weigh it against: `/api/v1/attachments/{id}` refuses one, and these routes
+with their project role check are the only way to it.
+
 ### Project grants
 
 A dataset can belong to one project, and every member of that project then
@@ -726,6 +743,9 @@ ViewTopia's collaboration client but any JSON structure will work.
 | PUT DELETE | `/api/v1/projects/{project_id}/members/{user_id}` | Set or remove a project member |
 | GET POST | `/api/v1/projects/{id}/invitations` | List or create project invitations |
 | DELETE | `/api/v1/projects/{project_id}/invitations/{invitation_id}` | Revoke a project invitation |
+| GET PUT | `/api/v1/projects/{id}/state/{key}` | Read or write one key of the project's shared state |
+| GET POST | `/api/v1/projects/{id}/attachments` | List or upload the project's attachments |
+| GET DELETE | `/api/v1/projects/{project_id}/attachments/{id}` | Download or delete one project attachment |
 | POST | `/api/v1/invitations/accept` | Accept an invitation as the authenticated caller |
 | GET | `/api/v1/datasets` | List datasets |
 | POST | `/api/v1/datasets` | Create dataset |

@@ -485,6 +485,10 @@ const BODY: &[(&str, &str)] = &[
     ),
     ("PUT /api/v1/projects/{id}", r#"{"name":"sweep"}"#),
     (
+        "POST /api/v1/projects/{project_id}/attachments",
+        r#"{"name":"sweep","data":"c3dlZXA=","created_by":"sweep"}"#,
+    ),
+    (
         "POST /api/v1/projects/{id}/invitations",
         r#"{"role":"editor","expires_at":"2100-01-01T00:00:00Z"}"#,
     ),
@@ -735,7 +739,8 @@ async fn setup() -> (axum::Router, AppState) {
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
     sqlx::raw_sql(
-        "DROP TABLE IF EXISTS project_invitations CASCADE;
+        "DROP TABLE IF EXISTS project_state CASCADE;
+         DROP TABLE IF EXISTS project_invitations CASCADE;
          DROP TABLE IF EXISTS project_members CASCADE;
          DROP TABLE IF EXISTS workspace_members CASCADE;
          DROP TABLE IF EXISTS projects CASCADE;
