@@ -19,6 +19,9 @@ hex = "0.4"
 hmac.workspace = true
 jsonwebtoken = { workspace = true }
 jung-esri.workspace = true
+# rustls with ring, matching sqlx's tls backend; no pool, an invitation email
+# builds its own transport
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls-tls"] }
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 openidconnect.workspace = true

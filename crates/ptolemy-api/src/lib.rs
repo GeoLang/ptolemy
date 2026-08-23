@@ -13,6 +13,7 @@ pub mod conflicts;
 pub mod cql2;
 pub mod delivery;
 pub mod domains;
+pub mod email;
 pub mod errors;
 pub mod formats;
 pub mod geoprocessing;
@@ -56,7 +57,7 @@ use axum::extract::Request;
 use axum::http::Uri;
 use axum::response::Html;
 use axum::routing::get;
-use axum::{Router, middleware};
+use axum::{Extension, Router, middleware};
 use ptolemy_storage::PgStore;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -66,6 +67,7 @@ pub use auth::{
     generate_token_from_env,
 };
 pub use delivery::{DeliveryJob, DeliverySender, spawn_delivery_worker};
+pub use email::EmailConfig;
 pub use jobs::BackgroundJobs;
 pub use metrics::{init_metrics, record_domain_event};
 pub use oidc::OidcConfig;
@@ -125,6 +127,13 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
+    app_with_auth_and_email(state, auth, EmailConfig::from_env())
+}
+
+/// Same, with invitation mail configured by the caller rather than the
+/// environment. A test points this at an SMTP server whose port it only learns
+/// once that server is listening.
+pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailConfig) -> Router {
     let event_bus = Arc::new(EventBus::new(1024));
     let sse_broadcast = Arc::new(SseBroadcast::new(4096));
     let room_relay = Arc::new(RoomRelay::new());
@@ -177,6 +186,7 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/ws", ws::ws_routes(event_bus))
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
+        .layer(Extension(email))
         .layer(middleware::from_fn(metrics::metrics_middleware))
         // inside visibility, so a caller who cannot read a private dataset gets
         // its 404 rather than a 403 that would confirm the id exists

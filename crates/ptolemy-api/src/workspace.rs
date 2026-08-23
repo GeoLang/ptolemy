@@ -1,5 +1,5 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -16,7 +16,11 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{AppState, auth::Actor};
+use crate::{
+    AppState,
+    auth::Actor,
+    email::{EmailConfig, InvitationEmail, RecipientError},
+};
 
 pub fn workspace_routes() -> Router<AppState> {
     Router::new()
@@ -88,6 +92,9 @@ struct SetMemberRequest {
 struct CreateInvitationRequest {
     role: String,
     expires_at: String,
+    /// Where to mail the link. Omitted leaves the caller to copy it.
+    #[serde(default)]
+    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +106,17 @@ struct AcceptInvitationRequest {
 struct CreatedInvitationResponse {
     id: Uuid,
     token: String,
+    /// Absent when the request named no recipient. The invitation exists either
+    /// way, so a relay that refused the message still leaves a usable token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<EmailDelivery>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum EmailDelivery {
+    Sent,
+    Failed { error: String },
 }
 
 #[derive(Serialize)]
@@ -308,6 +326,7 @@ async fn delete_project_member(
 
 async fn create_workspace_invitation(
     State(store): State<AppState>,
+    Extension(email): Extension<EmailConfig>,
     Path(id): Path<Uuid>,
     actor: Actor,
     Json(request): Json<CreateInvitationRequest>,
@@ -315,15 +334,19 @@ async fn create_workspace_invitation(
     let user_id = authenticated_subject(&actor)?;
     let role = validated_invitation_role(&request.role)?;
     let expires_at = validated_expiry(&request.expires_at)?;
+    let recipient = validated_recipient(&email, request.email.as_deref())?;
     let (token, token_hash) = new_invitation_token()?;
     let invitation = store
         .create_workspace_invitation(id, user_id, role, expires_at, &token_hash, token)
         .await?;
+    let delivery =
+        deliver_invitation(&email, recipient, &invitation.token, "workspace", role).await;
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
             id: invitation.id,
             token: invitation.token,
+            email: delivery,
         }),
     ))
 }
@@ -352,6 +375,7 @@ async fn revoke_workspace_invitation(
 
 async fn create_project_invitation(
     State(store): State<AppState>,
+    Extension(email): Extension<EmailConfig>,
     Path(id): Path<Uuid>,
     actor: Actor,
     Json(request): Json<CreateInvitationRequest>,
@@ -359,15 +383,18 @@ async fn create_project_invitation(
     let user_id = authenticated_subject(&actor)?;
     let role = validated_invitation_role(&request.role)?;
     let expires_at = validated_expiry(&request.expires_at)?;
+    let recipient = validated_recipient(&email, request.email.as_deref())?;
     let (token, token_hash) = new_invitation_token()?;
     let invitation = store
         .create_project_invitation(id, user_id, role, expires_at, &token_hash, token)
         .await?;
+    let delivery = deliver_invitation(&email, recipient, &invitation.token, "project", role).await;
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
             id: invitation.id,
             token: invitation.token,
+            email: delivery,
         }),
     ))
 }
@@ -459,6 +486,56 @@ fn validated_expiry(value: &str) -> Result<OffsetDateTime, WorkspaceError> {
         ));
     }
     Ok(expires_at)
+}
+
+/// The recipient this deployment will mail, refused before the invitation row
+/// exists so a rejected request leaves no token behind.
+fn validated_recipient<'a>(
+    email: &EmailConfig,
+    recipient: Option<&'a str>,
+) -> Result<Option<&'a str>, WorkspaceError> {
+    let Some(recipient) = recipient.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match email.check_recipient(recipient) {
+        Ok(()) => Ok(Some(recipient)),
+        Err(RecipientError::NotConfigured) => Err(WorkspaceError::BadRequest(
+            "this deployment sends no email: omit email and copy the invitation link".into(),
+        )),
+        Err(RecipientError::Malformed(detail)) => Err(WorkspaceError::BadRequest(format!(
+            "email is not an address: {detail}"
+        ))),
+    }
+}
+
+/// Mails the link and reports what happened. The invitation is already stored,
+/// so a relay that refused the message must not take the token away from the
+/// caller who can still copy it.
+async fn deliver_invitation(
+    email: &EmailConfig,
+    recipient: Option<&str>,
+    token: &str,
+    target: &str,
+    role: CollaborationRole,
+) -> Option<EmailDelivery> {
+    let recipient = recipient?;
+    let sent = email
+        .send_invitation(InvitationEmail {
+            recipient,
+            token,
+            target,
+            role: role.as_str(),
+        })
+        .await;
+    Some(match sent {
+        Ok(()) => EmailDelivery::Sent,
+        Err(failure) => {
+            tracing::error!("{target} invitation email failed: {failure}");
+            EmailDelivery::Failed {
+                error: failure.to_string(),
+            }
+        }
+    })
 }
 
 fn new_invitation_token() -> Result<(String, [u8; 32]), WorkspaceError> {

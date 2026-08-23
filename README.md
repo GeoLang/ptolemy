@@ -332,6 +332,9 @@ of them. On the Helm chart the URL carrying them is the one in
 | `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |
 | `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | — |
 | `PTOLEMY_OIDC_REDIRECT_URL` | Callback URL for OIDC flow | — |
+| `SMTP_URL` | SMTP relay for invitation email, e.g. `smtp://user:pass@mail.example.com:587?tls=required` | (no email) |
+| `SMTP_FROM` | Sender address on invitation email | (no email) |
+| `PUBLIC_BASE_URL` | Where the viewer is served, used to build the invitation link | (no email) |
 | `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets; use a read-only role | (primary pool) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
@@ -635,7 +638,16 @@ invitations with `DELETE` on the invitation route. Each invitation token uses
 32 random bytes. The server stores only its SHA-256 hash. Invitations expire
 and can grant `editor` or `viewer`, not `owner`. An authenticated caller accepts
 one with `POST /api/v1/invitations/accept`. The API returns the token when the
-invitation is created. It does not send email and has no user directory.
+invitation is created, and has no user directory.
+
+Set `SMTP_URL`, `SMTP_FROM` and `PUBLIC_BASE_URL` and the create-invitation body
+takes an optional `email`, which is where the link is mailed. The reply then
+carries `email: {"status": "sent"}` or
+`email: {"status": "failed", "error": ...}` beside the token, so a relay that
+refused the message still leaves a link to copy. Sending happens on the request
+path, not in a worker. With any of the three unset, an `email` in the body is a
+400 rather than a silent drop, and `GET /api/v1/capabilities` answers
+`{"email_configured": false}` so a client knows not to offer the field.
 
 Project roles are not propagated to Agora documents.
 
@@ -735,6 +747,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/workspaces/{id}/members` | List workspace members, owner only |
 | PUT DELETE | `/api/v1/workspaces/{workspace_id}/members/{user_id}` | Set or remove a workspace member |
 | GET POST | `/api/v1/workspaces/{id}/projects` | List or create projects in a workspace |
+| GET | `/api/v1/capabilities` | What this deployment can do, currently `email_configured` |
 | GET POST | `/api/v1/workspaces/{id}/invitations` | List or create workspace invitations |
 | DELETE | `/api/v1/workspaces/{workspace_id}/invitations/{invitation_id}` | Revoke a workspace invitation |
 | GET | `/api/v1/projects` | List accessible projects |

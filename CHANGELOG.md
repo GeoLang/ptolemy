@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-23: **an invitation can be mailed**. With `SMTP_URL`, `SMTP_FROM` and
+  `PUBLIC_BASE_URL` set, the create-invitation body takes an optional `email`
+  and the link goes to that address over SMTP, on the request path so a mistyped
+  relay fails the request that used it. The reply carries
+  `email: {"status": "sent"}` or `{"status": "failed", "error": ...}` beside the
+  token, and a refused message still leaves a link to copy. With any of the
+  three unset an `email` in the body answers 400 rather than dropping it, and
+  the new `GET /api/v1/capabilities` answers `{"email_configured": false}` so a
+  client hides the field.
+
 - 2026-08-23: **a project carries the state its members share**. New
   `project_state(project_id, key, value jsonb, updated_at, updated_by)` behind
   `GET` and `PUT /api/v1/projects/{id}/state/{key}`: a viewer reads, an editor

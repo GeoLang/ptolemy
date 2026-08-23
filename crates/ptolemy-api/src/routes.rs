@@ -24,6 +24,7 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/health", get(health))
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
+        .route("/capabilities", get(capabilities))
         // Datasets
         .route("/datasets", get(list_datasets).post(create_dataset))
         .route(
@@ -89,6 +90,21 @@ async fn readiness(State(state): State<AppState>) -> (axum::http::StatusCode, &'
         Ok(_) => (axum::http::StatusCode::OK, "ready"),
         Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
+}
+
+/// What this deployment can do that another cannot, so a client shows only the
+/// controls that will work here.
+#[derive(Serialize)]
+struct Capabilities {
+    email_configured: bool,
+}
+
+async fn capabilities(
+    axum::Extension(email): axum::Extension<crate::email::EmailConfig>,
+) -> Json<Capabilities> {
+    Json(Capabilities {
+        email_configured: email.is_configured(),
+    })
 }
 
 // ─── Datasets ───────────────────────────────────────────────────────

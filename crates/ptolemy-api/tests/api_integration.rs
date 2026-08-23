@@ -17248,3 +17248,243 @@ async fn test_project_attachment_is_scoped_to_its_own_project() {
         String::from_utf8_lossy(&bytes)
     );
 }
+
+// ─── Invitation email ───────────────────────────────────────────────
+
+/// A one-message SMTP server, speaking the least of the protocol lettre needs.
+/// Returns the port it is listening on and the message body the client sent
+/// after DATA.
+async fn smtp_capture() -> (u16, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        writer.write_all(b"220 capture ESMTP\r\n").await.unwrap();
+
+        let mut message = String::new();
+        let mut reading_message = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            if reading_message {
+                if line.trim_end() == "." {
+                    reading_message = false;
+                    writer.write_all(b"250 Ok\r\n").await.unwrap();
+                } else {
+                    message.push_str(&line);
+                }
+                continue;
+            }
+            let command = line.trim_end().to_ascii_uppercase();
+            if command == "DATA" {
+                reading_message = true;
+                writer.write_all(b"354 Go ahead\r\n").await.unwrap();
+            } else if command == "QUIT" {
+                writer.write_all(b"221 Bye\r\n").await.unwrap();
+                break;
+            } else if command.starts_with("EHLO") || command.starts_with("HELO") {
+                // no extensions advertised, so lettre stays on plain SMTP
+                writer.write_all(b"250 capture\r\n").await.unwrap();
+            } else {
+                writer.write_all(b"250 Ok\r\n").await.unwrap();
+            }
+        }
+        message
+    });
+    (port, captured)
+}
+
+/// The captured message with quoted-printable soft breaks and escaped `=`
+/// put back, which is all an ASCII body carries. Without it the `=` in the
+/// link's query string reads as `=3D`.
+fn unfolded(message: &str) -> String {
+    message.replace("=\r\n", "").replace("=3D", "=")
+}
+
+async fn workspace_for_invitation(app: &axum::Router, owner: &str, name: &str) -> String {
+    let (status, workspace) = request_as(
+        app,
+        "POST",
+        "/api/v1/workspaces",
+        Some(owner),
+        Some(json!({"name": name})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    workspace["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn an_invitation_naming_a_recipient_is_mailed_to_them() {
+    let (port, captured) = smtp_capture().await;
+    let state = fresh_state().await;
+    let app = ptolemy_api::app_with_auth_and_email(
+        state,
+        AuthConfig::enabled(TEST_SECRET),
+        ptolemy_api::EmailConfig::new(
+            format!("smtp://127.0.0.1:{port}"),
+            "ptolemy@example.com",
+            "https://maps.example.com",
+        ),
+    );
+    let owner = token_for_subject("mailing-owner");
+    let workspace_id = workspace_for_invitation(&app, &owner, "mailed").await;
+
+    let (status, invitation) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        Some(json!({
+            "role": "editor",
+            "expires_at": invitation_expiry(1),
+            "email": "invitee@example.com",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{invitation}");
+    assert_eq!(invitation["email"]["status"], "sent", "{invitation}");
+    let token = invitation["token"].as_str().unwrap();
+
+    let message = unfolded(&captured.await.unwrap());
+    assert!(message.contains("To: invitee@example.com"), "{message}");
+    assert!(
+        message.contains("Subject: You have been invited to a workspace"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("https://maps.example.com/?invite={token}")),
+        "{message}"
+    );
+    assert!(message.contains("as editor"), "{message}");
+}
+
+/// A deployment with no relay cannot quietly drop the address the caller gave
+/// it: the invitation is refused before it exists.
+#[tokio::test]
+async fn a_recipient_with_no_relay_configured_is_refused() {
+    let state = fresh_state().await;
+    let app = ptolemy_api::app_with_auth_and_email(
+        state.clone(),
+        AuthConfig::enabled(TEST_SECRET),
+        ptolemy_api::EmailConfig::default(),
+    );
+    let owner = token_for_subject("unrelayed-owner");
+    let workspace_id = workspace_for_invitation(&app, &owner, "unrelayed").await;
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        Some(json!({
+            "role": "viewer",
+            "expires_at": invitation_expiry(1),
+            "email": "invitee@example.com",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM project_invitations")
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "a refused request must leave no invitation");
+
+    let (status, invitation) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "viewer", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{invitation}");
+    assert!(invitation["token"].is_string());
+    assert!(invitation["email"].is_null(), "{invitation}");
+}
+
+#[tokio::test]
+async fn a_project_invitation_that_cannot_be_delivered_still_yields_a_token() {
+    // nothing is listening here, so the relay is unreachable
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = unused.local_addr().unwrap().port();
+    drop(unused);
+
+    let state = fresh_state().await;
+    let app = ptolemy_api::app_with_auth_and_email(
+        state,
+        AuthConfig::enabled(TEST_SECRET),
+        ptolemy_api::EmailConfig::new(
+            format!("smtp://127.0.0.1:{port}"),
+            "ptolemy@example.com",
+            "https://maps.example.com",
+        ),
+    );
+    let owner = token_for_subject("undeliverable-owner");
+    let workspace_id = workspace_for_invitation(&app, &owner, "undeliverable").await;
+    let (status, project) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/projects"),
+        Some(&owner),
+        Some(json!({"name": "undeliverable project"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, invitation) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/invitations"),
+        Some(&owner),
+        Some(json!({
+            "role": "viewer",
+            "expires_at": invitation_expiry(1),
+            "email": "invitee@example.com",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{invitation}");
+    assert_eq!(invitation["email"]["status"], "failed", "{invitation}");
+    assert!(
+        !invitation["email"]["error"].as_str().unwrap().is_empty(),
+        "{invitation}"
+    );
+    assert!(invitation["token"].is_string(), "{invitation}");
+}
+
+#[tokio::test]
+async fn capabilities_reports_whether_email_is_configured() {
+    let state = fresh_state().await;
+    let unconfigured = ptolemy_api::app_with_auth_and_email(
+        state.clone(),
+        AuthConfig::disabled(),
+        ptolemy_api::EmailConfig::default(),
+    );
+    let (status, body) = get_json(&unconfigured, "/api/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["email_configured"], false);
+
+    let configured = ptolemy_api::app_with_auth_and_email(
+        state,
+        AuthConfig::disabled(),
+        ptolemy_api::EmailConfig::new(
+            "smtp://127.0.0.1:2525",
+            "ptolemy@example.com",
+            "https://maps.example.com",
+        ),
+    );
+    let (status, body) = get_json(&configured, "/api/v1/capabilities").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["email_configured"], true);
+}
