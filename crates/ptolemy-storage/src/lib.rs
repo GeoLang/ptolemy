@@ -15,7 +15,6 @@ pub use permission::{
     Check, Reader, Scope, Writer, permission_level, stronger_permission, visible_datasets_sql,
     write_allowed,
 };
-pub use postgres::LATEST_COLUMNS;
 pub use postgres::{
     ApiKeyIdentity, Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry,
     CompactionResult, CompactionRun, ConflictInfo, DatasetPermission, FeatureLock, MergeChoice,
@@ -23,6 +22,7 @@ pub use postgres::{
     TopologyRepair, TopologyViolation, VersionContent, WriteTarget, branch_features_subquery,
     merge_choice,
 };
+pub use postgres::{LATEST_COLUMNS, MVT_TILE_EXTENT, mvt_simplify_tolerance};
 pub use workspace::{
     CollaborationRole, CreatedInvitation, InvitationTarget, Project, ProjectInvitation,
     ProjectMember, ProjectWithRole, Workspace, WorkspaceInvitation, WorkspaceMember,

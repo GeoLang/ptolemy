@@ -15,6 +15,8 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
+use ptolemy_storage::{MVT_TILE_EXTENT, mvt_simplify_tolerance};
+
 use crate::AppState;
 
 pub fn cql2_routes() -> Router<AppState> {
@@ -598,22 +600,24 @@ async fn ogc_tile(
         ),
     };
     let sql = format!(
-        "SELECT ST_AsMVT(tile, 'default', 4096, 'geom') as mvt
+        "SELECT ST_AsMVT(tile, 'default', {MVT_TILE_EXTENT}, 'geom') as mvt
          FROM (
             SELECT ST_AsMVTGeom(
-                ST_Transform(f.geometry, 3857),
+                ST_Simplify(ST_Transform(f.geometry, 3857), $5::double precision),
                 ST_TileEnvelope($2, $3, $4),
-                4096, 64, true
+                {MVT_TILE_EXTENT}, 64, true
             ) as geom, f.properties
             FROM {from_clause}
               AND ST_Intersects(f.geometry, {TILE_4326})
-         ) tile"
+         ) tile
+         WHERE geom IS NOT NULL"
     );
     let row = sqlx::query(&sql)
         .bind(dataset_id)
         .bind(z)
         .bind(x)
         .bind(y)
+        .bind(mvt_simplify_tolerance(z))
         .fetch_one(store.source_pool(external.as_ref()).await?)
         .await?;
 

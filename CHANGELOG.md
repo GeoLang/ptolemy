@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-23: **vector tiles simplify to the zoom they are drawn at**. Both MVT
+  paths, `/branches/{id}/tiles/{z}/{x}/{y}` and the OGC
+  `/datasets/{id}/tiles/{tms}/{z}/{x}/{y}`, now run `ST_Simplify` at half a tile
+  unit before `ST_AsMVTGeom`, which transforms and clips but never drops a
+  vertex. A kilometre of line zigzagging fifty metres either side went from 1101
+  bytes to the size of the straight line it reads as at zoom 5, and keeps every
+  vertex at zoom 14. Features whose geometry falls outside the tile no longer
+  ride along with a null geometry.
+
 - 2026-08-21: `docs/index.html` and `docs/comparison.html` drop
   multi-tenancy (gone in migration 028), the 32 topology-rule Esri set,
   lock-on-commit, webhook delivery, audit writes, rate limiting, and the

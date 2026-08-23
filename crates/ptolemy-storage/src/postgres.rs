@@ -43,6 +43,23 @@ pub enum StoreError {
 /// its own query can ask for the same projection.
 pub const LATEST_COLUMNS: &str = "fv.feature_id, fv.dataset_id, fv.operation, fv.geometry, fv.properties, fv.valid_from, fv.valid_to";
 
+/// Tile-space grid an MVT geometry is quantized onto, and the MVT default.
+pub const MVT_TILE_EXTENT: i32 = 4096;
+
+/// Width of the web mercator plane in metres, the span one tile covers at zoom 0.
+const WEB_MERCATOR_SPAN_METRES: f64 = 40_075_016.685_578_5;
+
+/// Douglas-Peucker tolerance for a tile at this zoom, in web mercator metres.
+///
+/// Half a tile unit, so a simplified vertex lands on the same grid cell it would
+/// have without this or the one beside it. ST_AsMVTGeom transforms and clips but
+/// never drops a vertex, so without simplifying first every vertex of a dense
+/// line reaches the tile and rounds onto a coordinate its neighbour already
+/// holds.
+pub fn mvt_simplify_tolerance(z: i32) -> f64 {
+    WEB_MERCATOR_SPAN_METRES / (f64::from(MVT_TILE_EXTENT) * 2f64.powi(z) * 2.0)
+}
+
 /// Latest live version of each feature on the branch bound to `$1`, resolved by
 /// walking the branch head's ancestor chain. Shared by the read queries so the
 /// external variant only has to swap the FROM clause. `columns` is the
@@ -2308,6 +2325,7 @@ impl PgStore {
         x: u32,
         y: u32,
     ) -> Result<Vec<u8>, StoreError> {
+        let zoom = i32::try_from(z).unwrap_or(i32::MAX);
         let (external, prelude, source) = self
             .latest_source_overlapping(
                 branch_id,
@@ -2327,9 +2345,9 @@ impl PgStore {
             ),
             mvtgeom AS (
                 SELECT ST_AsMVTGeom(
-                    ST_Transform(l.geometry, 3857),
+                    ST_Simplify(ST_Transform(l.geometry, 3857), $5::double precision),
                     b.geom,
-                    4096, 64, true
+                    {MVT_TILE_EXTENT}, 64, true
                 ) AS geom,
                 l.feature_id,
                 l.properties
@@ -2338,13 +2356,15 @@ impl PgStore {
                   AND l.geometry IS NOT NULL
                   AND ST_Intersects(l.geometry, ST_Transform(b.geom, 4326))
             )
-            SELECT COALESCE(ST_AsMVT(mvtgeom.*, 'features', 4096, 'geom'), ''::bytea) AS tile
-            FROM mvtgeom"
+            SELECT COALESCE(ST_AsMVT(mvtgeom.*, 'features', {MVT_TILE_EXTENT}, 'geom'), ''::bytea) AS tile
+            FROM mvtgeom
+            WHERE geom IS NOT NULL"
         ))
         .bind(branch_id)
-        .bind(z as i32)
+        .bind(zoom)
         .bind(x as i32)
         .bind(y as i32)
+        .bind(mvt_simplify_tolerance(zoom))
         .fetch_one(self.source_pool(external.as_ref()).await?)
         .await?;
 
@@ -4493,5 +4513,50 @@ mod merge_attribute_tests {
         let ours = upd(json!({"name": "A"}));
         let theirs = upd(json!({"name": "B"}));
         assert!(merge_disjoint_updates(&ours, &theirs, Some(&base)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod mvt_tolerance_tests {
+    use super::*;
+
+    /// One tile unit in metres at this zoom, the grid ST_AsMVTGeom rounds onto.
+    fn tile_unit_metres(z: i32) -> f64 {
+        WEB_MERCATOR_SPAN_METRES / (f64::from(MVT_TILE_EXTENT) * 2f64.powi(z))
+    }
+
+    #[test]
+    fn the_tolerance_is_half_a_tile_unit_at_every_zoom() {
+        for z in 0..=22 {
+            let expected = tile_unit_metres(z) / 2.0;
+            let actual = mvt_simplify_tolerance(z);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON * expected.max(1.0),
+                "zoom {z}: {actual} is not half a tile unit {expected}"
+            );
+            assert!(
+                actual < tile_unit_metres(z),
+                "zoom {z} would move a vertex a whole cell"
+            );
+        }
+    }
+
+    #[test]
+    fn each_zoom_halves_the_tolerance_of_the_one_above_it() {
+        for z in 0..22 {
+            let coarser = mvt_simplify_tolerance(z);
+            let finer = mvt_simplify_tolerance(z + 1);
+            assert!((coarser - finer * 2.0).abs() < f64::EPSILON * coarser);
+        }
+    }
+
+    /// The whole point is that a tile at low zoom drops detail a viewer could
+    /// never see, so the tolerance has to be a real distance, not a rounding
+    /// error, until the zoom is deep enough for it not to be.
+    #[test]
+    fn the_tolerance_spans_metres_when_zoomed_out_and_centimetres_when_zoomed_in() {
+        assert!(mvt_simplify_tolerance(0) > 1000.0);
+        assert!(mvt_simplify_tolerance(10) > 1.0);
+        assert!(mvt_simplify_tolerance(18) < 0.1);
     }
 }

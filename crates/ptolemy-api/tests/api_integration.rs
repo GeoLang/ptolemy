@@ -16687,3 +16687,93 @@ async fn test_a_tombstoned_attachment_is_invisible_on_every_read_route() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// Little endian WKB for a 2D LineString, the geometry format a commit takes.
+fn line_string_wkb_hex(points: &[(f64, f64)]) -> String {
+    let mut wkb = vec![1u8];
+    wkb.extend_from_slice(&2u32.to_le_bytes());
+    wkb.extend_from_slice(&(points.len() as u32).to_le_bytes());
+    for (lon, lat) in points {
+        wkb.extend_from_slice(&lon.to_le_bytes());
+        wkb.extend_from_slice(&lat.to_le_bytes());
+    }
+    wkb.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn branch_holding_line(app: &axum::Router, points: &[(f64, f64)]) -> Uuid {
+    let dataset_id = create_dataset(app).await;
+    let branch_id = create_branch(app, dataset_id, "main").await;
+    commit_features(
+        app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": line_string_wkb_hex(points),
+            "properties": {"name": "line"}
+        }]),
+    )
+    .await;
+    branch_id
+}
+
+/// A zoomed out tile drops detail no one could see at that zoom.
+///
+/// The line is a kilometre long and zigzags fifty metres either side of its
+/// path. At zoom 5 the tolerance is over a hundred metres, so the zigzag has to
+/// go and the line stays. At zoom 14 the tolerance is under a metre, so every
+/// vertex has to survive: without that half the test would pass on a tile that
+/// simply lost the feature.
+#[tokio::test]
+async fn test_tile_detail_falls_away_with_zoom() {
+    let (app, _state) = setup_app().await;
+
+    const VERTICES: usize = 500;
+    const WEST: f64 = 0.001;
+    const EAST: f64 = 0.010;
+    const LATITUDE: f64 = -0.01;
+    // fifty metres, well over the zoom 14 tolerance and well under the zoom 5 one
+    const ZIGZAG_DEGREES: f64 = 0.00045;
+
+    let step = (EAST - WEST) / (VERTICES - 1) as f64;
+    let zigzag: Vec<(f64, f64)> = (0..VERTICES)
+        .map(|index| {
+            let side = if index % 2 == 0 { 1.0 } else { -1.0 };
+            (WEST + step * index as f64, LATITUDE + side * ZIGZAG_DEGREES)
+        })
+        .collect();
+    let straight = [(WEST, LATITUDE), (EAST, LATITUDE)];
+
+    let zigzag_branch = branch_holding_line(&app, &zigzag).await;
+    let straight_branch = branch_holding_line(&app, &straight).await;
+
+    let tile = async |branch: Uuid, z: u32, x: u32, y: u32| {
+        let (status, bytes) = get_bytes(
+            &app,
+            &format!("/api/v1/branches/{branch}/tiles/{z}/{x}/{y}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "tile {z}/{x}/{y} on {branch}");
+        bytes.len()
+    };
+
+    // both lines are inside tile 8192/8192 at zoom 14 and tile 16/16 at zoom 5
+    let zigzag_close = tile(zigzag_branch, 14, 8192, 8192).await;
+    let straight_close = tile(straight_branch, 14, 8192, 8192).await;
+    let zigzag_far = tile(zigzag_branch, 5, 16, 16).await;
+    let straight_far = tile(straight_branch, 5, 16, 16).await;
+
+    assert!(
+        zigzag_close > straight_close * 5,
+        "zoom 14 lost the vertices before the test could measure them: \
+         {zigzag_close} against {straight_close}"
+    );
+    assert!(
+        straight_far > 0,
+        "zoom 5 dropped the plain line, so there is nothing to compare against"
+    );
+    assert!(
+        zigzag_far < straight_far * 2,
+        "zoom 5 kept the zigzag: {zigzag_far} against {straight_far}"
+    );
+}
