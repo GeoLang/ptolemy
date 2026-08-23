@@ -114,6 +114,11 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Named branches per team/task</li>
 <li>Review & merge workflows</li>
 <li>Three-way merge with conflict detection</li>
+<li>Authenticated workspaces and nested projects</li>
+<li>Owner, editor, and viewer roles with inherited access</li>
+<li>Expiring workspace and project invitations</li>
+<li>Invitations grant editor or viewer and require an authenticated acceptance</li>
+<li>Roles currently control metadata authority, not dataset or Agora permissions</li>
 <li>Ephemeral room relay (view sync, cursor sharing, chat)</li>
 <li>Follow mode — sync camera between viewer instances</li>
 </ul>
@@ -145,7 +150,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🔐 Authentication</h3>
 <ul>
 <li>JWT authentication (PTOLEMY_JWT_SECRET)</li>
-<li>Role-based access control (Admin/Editor/Viewer)</li>
+<li>Workspace and project roles: owner, editor, viewer</li>
+<li>Project access inherited from workspace membership</li>
+<li>Direct project membership for project-only access</li>
+<li>Roles currently control metadata authority only</li>
 <li>OIDC Single Sign-On (Keycloak, Auth0, etc.)</li>
 <li>Token exchange & user info retrieval</li>
 <li>Per-endpoint permission checks</li>

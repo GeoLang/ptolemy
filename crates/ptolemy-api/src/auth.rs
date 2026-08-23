@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 const TOOL_TOKEN_USE: &str = "tool";
 const PTOLEMY_READ_SCOPE: &str = "ptolemy:read";
 const PTOLEMY_WRITE_SCOPE: &str = "ptolemy:write";
+const COLLABORATION_PREFIX: &str = "/api/v1/workspaces";
+const PROJECT_PREFIX: &str = "/api/v1/projects";
+const INVITATION_ACCEPT_PATH: &str = "/api/v1/invitations/accept";
 
 /// Shortest HS256 secret we accept, matching collecta.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -140,6 +143,12 @@ fn declares_scoped_token(token: &str) -> bool {
 }
 
 fn tool_scope(method: &Method, route: &str, access: Access) -> Option<&'static str> {
+    if route.starts_with(COLLABORATION_PREFIX)
+        || route.starts_with(PROJECT_PREFIX)
+        || route == INVITATION_ACCEPT_PATH
+    {
+        return None;
+    }
     if access == Access::Admin {
         return None;
     }
@@ -457,6 +466,13 @@ pub fn classify(method: &Method, route: &str) -> Access {
     // instance-admin-or-dataset-admin and answers 403 otherwise. This still has
     // to sit above the read-is-public rule, or an anonymous GET would leak the ACL.
     if route.contains("/permissions") {
+        return Access::Authenticated;
+    }
+
+    if route.starts_with(COLLABORATION_PREFIX)
+        || route.starts_with(PROJECT_PREFIX)
+        || route == INVITATION_ACCEPT_PATH
+    {
         return Access::Authenticated;
     }
 

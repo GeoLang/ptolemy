@@ -6,6 +6,7 @@ pub mod analyze;
 pub mod grant;
 pub mod permission;
 pub mod postgres;
+pub mod workspace;
 pub mod writes;
 
 pub use analyze::{ANALYZE_ROW_THRESHOLD, Analyzer, DEFAULT_ANALYZE_ROW_THRESHOLD};
@@ -20,4 +21,9 @@ pub use postgres::{
     MergeResult, PgStore, ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult,
     TopologyRepair, TopologyViolation, VersionContent, WriteTarget, branch_features_subquery,
     merge_choice,
+};
+pub use workspace::{
+    CollaborationRole, CreatedInvitation, InvitationTarget, Project, ProjectInvitation,
+    ProjectMember, ProjectWithRole, Workspace, WorkspaceInvitation, WorkspaceMember,
+    WorkspaceWithRole,
 };

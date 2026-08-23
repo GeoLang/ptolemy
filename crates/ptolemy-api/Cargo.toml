@@ -12,6 +12,7 @@ axum = { workspace = true, features = ["multipart"] }
 axum-extra.workspace = true
 base64 = "0.22"
 futures = "0.3"
+getrandom.workspace = true
 flatgeobuf = { version = "6.0.1", default-features = false }
 geozero = { version = "0.15.1", default-features = false, features = ["with-geojson"] }
 hex = "0.4"

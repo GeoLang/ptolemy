@@ -596,6 +596,41 @@ ids a request names, and neither request names a dataset. The PostGIS Topology
 reads under `/api/v1/topologies/{name}` are keyed by topology name, and
 `GET /api/v1/replication/peers` names nothing at all.
 
+## Workspaces and projects
+
+The server-backed collaboration API is authenticated. Workspaces are available
+at `/api/v1/workspaces`, and their projects are nested at
+`/api/v1/workspaces/{workspace_id}/projects`. The flat
+`/api/v1/projects` routes list and address projects across the caller's
+workspaces. Workspace and project metadata use `GET`, `POST`, `PUT`, and
+`DELETE` routes as applicable.
+
+Workspace and project members use `/members` routes. Workspace access is
+inherited by its projects. A direct project membership can grant project-only
+access. If both memberships apply, the highest role wins. The roles are
+`owner`, `editor`, and `viewer`.
+
+Owners manage members and invitations and can delete the workspace or project.
+Editors update workspace or project metadata and create projects. Viewers have
+read-only access. Member changes use `PUT` and `DELETE` on
+`/api/v1/workspaces/{workspace_id}/members/{user_id}` or
+`/api/v1/projects/{project_id}/members/{user_id}`.
+
+Workspace invitations use `GET` and `POST` at
+`/api/v1/workspaces/{workspace_id}/invitations`. Project invitations use the
+same methods at `/api/v1/projects/{project_id}/invitations`. Owners revoke
+invitations with `DELETE` on the invitation route. Each invitation token uses
+32 random bytes. The server stores only its SHA-256 hash. Invitations expire
+and can grant `editor` or `viewer`, not `owner`. An authenticated caller accepts
+one with `POST /api/v1/invitations/accept`. The API returns the token when the
+invitation is created. It does not send email and has no user directory.
+
+Workspace and project roles currently control metadata authority only. They are
+not propagated to dataset permissions or Agora documents.
+
+The focused multi-user PostGIS integration test, strict Clippy, and formatting
+passed on 2026-08-22.
+
 ## API Endpoints
 
 ### Real-Time Collaboration Relay
@@ -634,6 +669,20 @@ ViewTopia's collaboration client but any JSON structure will work.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/health` | Health check |
+| GET POST | `/api/v1/workspaces` | List or create authenticated workspaces |
+| GET PUT DELETE | `/api/v1/workspaces/{id}` | Read, update, or delete a workspace |
+| GET | `/api/v1/workspaces/{id}/members` | List workspace members, owner only |
+| PUT DELETE | `/api/v1/workspaces/{workspace_id}/members/{user_id}` | Set or remove a workspace member |
+| GET POST | `/api/v1/workspaces/{id}/projects` | List or create projects in a workspace |
+| GET POST | `/api/v1/workspaces/{id}/invitations` | List or create workspace invitations |
+| DELETE | `/api/v1/workspaces/{workspace_id}/invitations/{invitation_id}` | Revoke a workspace invitation |
+| GET | `/api/v1/projects` | List accessible projects |
+| GET PUT DELETE | `/api/v1/projects/{id}` | Read, update, or delete a project |
+| GET | `/api/v1/projects/{id}/members` | List project members, owner only |
+| PUT DELETE | `/api/v1/projects/{project_id}/members/{user_id}` | Set or remove a project member |
+| GET POST | `/api/v1/projects/{id}/invitations` | List or create project invitations |
+| DELETE | `/api/v1/projects/{project_id}/invitations/{invitation_id}` | Revoke a project invitation |
+| POST | `/api/v1/invitations/accept` | Accept an invitation as the authenticated caller |
 | GET | `/api/v1/datasets` | List datasets |
 | POST | `/api/v1/datasets` | Create dataset |
 | GET | `/api/v1/datasets/{id}` | Get dataset |

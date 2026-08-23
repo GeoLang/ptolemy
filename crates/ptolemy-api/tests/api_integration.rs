@@ -31,6 +31,27 @@ async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
 
+    sqlx::query("DROP TABLE IF EXISTS project_invitations CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS project_members CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS workspace_members CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS projects CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE IF EXISTS workspaces CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     // Clean relevant tables (order matters for FK constraints)
     sqlx::raw_sql(
         "DROP TABLE IF EXISTS conflicts CASCADE;
@@ -3779,6 +3800,395 @@ async fn request_as(
 
 fn token_for(role: Role) -> String {
     generate_token(TEST_SECRET, "test-user", role, 3600)
+}
+
+fn token_for_subject(subject: &str) -> String {
+    generate_token(TEST_SECRET, subject, Role::Viewer, 3600)
+}
+
+fn invitation_expiry(hours: i64) -> String {
+    (time::OffsetDateTime::now_utc() + time::Duration::hours(hours))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn workspace_project_collaboration_enforces_resource_roles() {
+    use sha2::{Digest, Sha256};
+
+    let (app, state) = setup_app_authed_with_state().await;
+    let owner = token_for_subject("workspace-owner");
+    let editor = token_for_subject("workspace-editor");
+    let viewer = token_for_subject("workspace-viewer");
+    let outsider = token_for_subject("workspace-outsider");
+    let direct_editor = token_for_subject("direct-project-editor");
+    let invitee = token_for_subject("workspace-invitee");
+
+    let (status, workspace) = request_as(
+        &app,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&owner),
+        Some(json!({"name": "collaboration", "description": "workspace"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    assert_eq!(workspace["role"], "owner");
+    assert_eq!(workspace["created_by"], "workspace-owner");
+    assert!(workspace["created_at"].is_string());
+    assert!(workspace["updated_at"].is_string());
+    let workspace_id = workspace["id"].as_str().unwrap();
+
+    for (user_id, role) in [
+        ("workspace-editor", "editor"),
+        ("workspace-viewer", "viewer"),
+    ] {
+        let (status, body) = request_as(
+            &app,
+            "PUT",
+            &format!("/api/v1/workspaces/{workspace_id}/members/{user_id}"),
+            Some(&owner),
+            Some(json!({"role": role})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["created_at"].is_string());
+    }
+
+    let (status, body) = request_as(&app, "GET", "/api/v1/workspaces", Some(&editor), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["role"], "editor");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "owner");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "viewer");
+
+    let (status, body) = request_as(&app, "GET", "/api/v1/workspaces", Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.as_array().unwrap().is_empty());
+
+    let (status, _) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&editor),
+        Some(json!({"name": "renamed", "description": "edited"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "editor");
+
+    let (status, _) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&viewer),
+        Some(json!({"name": "blocked"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "owner", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/projects"),
+        Some(&editor),
+        Some(json!({"name": "editor project"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["role"], "owner");
+    let project = body;
+    let project_id = project["id"].as_str().unwrap();
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}"),
+        Some(&editor),
+        Some(json!({"name": "editor update"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "owner");
+
+    let (status, _) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}"),
+        Some(&viewer),
+        Some(json!({"name": "viewer update"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/projects/{project_id}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "viewer");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "viewer", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let workspace_invitation_token = body["token"].as_str().unwrap().to_string();
+    let workspace_invitation_id = body["id"].as_str().unwrap();
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.as_array()
+            .unwrap()
+            .iter()
+            .any(|invitation| invitation["id"] == workspace_invitation_id)
+    );
+
+    let (status, _) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}/invitations"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let stored_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT token_hash FROM project_invitations WHERE id = $1")
+            .bind(Uuid::parse_str(workspace_invitation_id).unwrap())
+            .fetch_one(state.unguarded_pool())
+            .await
+            .unwrap();
+    assert_ne!(stored_hash, workspace_invitation_token.as_bytes());
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(&invitee),
+        Some(json!({"token": workspace_invitation_token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["target"], "workspace");
+
+    let (status, body) = request_as(&app, "GET", "/api/v1/workspaces", Some(&invitee), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["role"], "viewer");
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}/members/workspace-invitee"),
+        Some(&owner),
+        Some(json!({"role": "editor"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "editor");
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}"),
+        Some(&invitee),
+        Some(json!({"name": "highest effective role"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "editor");
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "editor", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let project_invitation_token = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(&direct_editor),
+        Some(json!({"token": project_invitation_token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["target"], "project");
+
+    let (status, _) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{workspace_id}"),
+        Some(&direct_editor),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) =
+        request_as(&app, "GET", "/api/v1/projects", Some(&direct_editor), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["role"], "editor");
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}"),
+        Some(&direct_editor),
+        Some(json!({"name": "effective editor"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], "editor");
+
+    let (status, _) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "owner", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/invitations"),
+        Some(&owner),
+        Some(json!({"role": "viewer", "expires_at": invitation_expiry(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let revoked_invitation_id = body["id"].as_str().unwrap();
+    let revoked_invitation_token = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/projects/{project_id}/invitations/{revoked_invitation_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, _) = request_as(
+        &app,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(&outsider),
+        Some(json!({"token": revoked_invitation_token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let expired_token = "expired-invitation-token";
+    sqlx::query(
+        "INSERT INTO project_invitations (
+             id, project_id, token_hash, role, created_by, expires_at
+         ) VALUES ($1, $2, $3, 'viewer', 'workspace-owner', now() - interval '1 hour')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(Uuid::parse_str(project_id).unwrap())
+    .bind(Sha256::digest(expired_token.as_bytes()).as_slice())
+    .execute(state.unguarded_pool())
+    .await
+    .unwrap();
+
+    let (status, _) = request_as(
+        &app,
+        "POST",
+        "/api/v1/invitations/accept",
+        Some(&outsider),
+        Some(json!({"token": expired_token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/workspaces/{workspace_id}/members/workspace-owner"),
+        Some(&owner),
+        Some(json!({"role": "viewer"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _) = request_as(
+        &app,
+        "DELETE",
+        &format!("/api/v1/workspaces/{workspace_id}/members/workspace-owner"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 /// A correctly signed token whose `exp` is an hour in the past.

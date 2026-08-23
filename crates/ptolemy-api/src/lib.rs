@@ -48,6 +48,7 @@ pub mod vector_search;
 pub mod verticals;
 pub mod visibility;
 pub mod webhook;
+pub mod workspace;
 pub mod ws;
 
 use axum::extract::Request;
@@ -162,6 +163,7 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
         .nest("/api/v1", schema_evolution::schema_routes())
         .nest("/api/v1", replication::replication_routes())
         .nest("/api/v1", rbac::rbac_routes())
+        .nest("/api/v1", workspace::workspace_routes())
         .nest("/api/v1", real_estate::real_estate_routes())
         .nest("/api/v1", verticals::vertical_routes())
         .nest("/api/v1", compaction::compaction_routes())
