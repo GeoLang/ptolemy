@@ -10,6 +10,14 @@
 //!
 //! The branch scope wins over the dataset scope: once a branch has rows, those
 //! rows decide, and a dataset-level grant does not reach into it.
+//!
+//! A dataset attached to a project has a second source of grants: the caller's
+//! effective role on that project, mapped by
+//! [`CollaborationRole::dataset_permission`]. It joins the dataset scope as the
+//! stronger of the two, never the branch scope, so the branch rule above still
+//! holds.
+
+use crate::workspace::{CollaborationRole, effective_project_role_sql};
 
 /// Permission hierarchy: admin > write > read. Anything else is no access.
 pub fn permission_level(perm: &str) -> u8 {
@@ -76,25 +84,58 @@ pub struct Reader {
     pub id: Option<String>,
 }
 
-/// SQL keeping only the datasets a [`Reader`] may see: public ones, plus private
-/// ones the caller holds a grant on, directly or on one of their branches. `AND`
-/// it into every listing that names datasets — the per-request visibility layer
-/// only covers requests that name an id, so a listing has to filter itself.
+/// SQL keeping only the datasets a [`Reader`] may see: public ones, private ones
+/// the caller holds a grant on, directly or on one of their branches, and private
+/// ones attached to a project the caller has any role on. `AND` it into every
+/// listing that names datasets — the per-request visibility layer only covers
+/// requests that name an id, so a listing has to filter itself.
 ///
 /// `alias` is the datasets table's alias in the calling query, and the two
 /// numbers are the 1-based positions of the binds carrying [`Reader::bypass`]
 /// (bool) then [`Reader::id`] (text, NULL when anonymous). All three come from
 /// the calling query, never from request data, so nothing a caller sends is
 /// interpolated here.
+///
+/// The project role is the last term because it is the expensive one: a
+/// correlated subquery per row, where the terms before it are a column test, a
+/// bind and an index lookup. A dataset with no project has nothing to correlate
+/// against and yields no role.
 pub fn visible_datasets_sql(alias: &str, bypass_param: usize, caller_param: usize) -> String {
+    let project_role = effective_project_role_sql(&format!("{alias}.project_id"), caller_param);
     format!(
         "({alias}.visibility = 'public' OR ${bypass_param} OR EXISTS (
              SELECT 1 FROM dataset_permissions dp
               WHERE dp.dataset_id = {alias}.id AND dp.user_id = ${caller_param}
             UNION ALL
              SELECT 1 FROM branch_permissions bp JOIN branches b ON b.id = bp.branch_id
-              WHERE b.dataset_id = {alias}.id AND bp.user_id = ${caller_param}))"
+              WHERE b.dataset_id = {alias}.id AND bp.user_id = ${caller_param})
+          OR {project_role} IS NOT NULL)"
     )
+}
+
+/// The permission a caller holds on one dataset, given their explicit grant row
+/// and the effective role they hold on the project the dataset is attached to.
+///
+/// Grants are additive and nothing denies, so the stronger of the two is what
+/// they hold. `None` on both sides means no access, which is what the write
+/// ladder refuses on.
+pub fn stronger_permission(
+    explicit: Option<String>,
+    project: Option<CollaborationRole>,
+) -> Option<String> {
+    let from_project = project.map(CollaborationRole::dataset_permission);
+    match (explicit, from_project) {
+        (Some(explicit), Some(project)) => {
+            if permission_level(project) > permission_level(&explicit) {
+                Some(project.to_string())
+            } else {
+                Some(explicit)
+            }
+        }
+        (Some(explicit), None) => Some(explicit),
+        (None, Some(project)) => Some(project.to_string()),
+        (None, None) => None,
+    }
 }
 
 /// One permission table's view of a writer, for a single dataset or branch.
@@ -179,6 +220,70 @@ mod tests {
     fn branch_grant_stands_without_a_dataset_row() {
         assert!(write_allowed(&granted("write"), &Scope::empty()));
         assert!(!write_allowed(&enforced_without_me(), &Scope::empty()));
+    }
+
+    #[test]
+    fn a_project_role_grants_on_its_own() {
+        for (role, expected) in [
+            (CollaborationRole::Viewer, "read"),
+            (CollaborationRole::Editor, "write"),
+            (CollaborationRole::Owner, "admin"),
+        ] {
+            assert_eq!(
+                stronger_permission(None, Some(role)).as_deref(),
+                Some(expected)
+            );
+        }
+        assert_eq!(stronger_permission(None, None), None);
+    }
+
+    /// The whole point of taking the stronger: neither side can demote the other,
+    /// whichever way round they are.
+    #[test]
+    fn neither_side_demotes_the_other() {
+        assert_eq!(
+            stronger_permission(Some("read".into()), Some(CollaborationRole::Owner)).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            stronger_permission(Some("admin".into()), Some(CollaborationRole::Viewer)).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            stronger_permission(Some("write".into()), Some(CollaborationRole::Editor)).as_deref(),
+            Some("write")
+        );
+    }
+
+    /// A project role folds into the dataset scope, so it decides a write on its
+    /// own, and it still gives way to a branch that has rows of its own.
+    #[test]
+    fn a_project_role_writes_through_the_dataset_scope() {
+        let editor = Scope {
+            enforced: false,
+            mine: stronger_permission(None, Some(CollaborationRole::Editor)),
+        };
+        assert!(write_allowed(&Scope::empty(), &editor));
+        assert!(!write_allowed(&enforced_without_me(), &editor));
+
+        let viewer = Scope {
+            enforced: false,
+            mine: stronger_permission(None, Some(CollaborationRole::Viewer)),
+        };
+        assert!(!write_allowed(&Scope::empty(), &viewer));
+    }
+
+    /// The two enforcement sites read the same string as the SQL builders, so a
+    /// renamed level would break the mapping loudly rather than granting nothing.
+    #[test]
+    fn every_mapped_permission_is_a_known_level() {
+        for role in [
+            CollaborationRole::Owner,
+            CollaborationRole::Editor,
+            CollaborationRole::Viewer,
+        ] {
+            assert!(permission_level(role.dataset_permission()) > 0, "{role:?}");
+        }
     }
 
     #[test]

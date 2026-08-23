@@ -507,19 +507,25 @@ why that mode is for development only.
 Grants are rows in `dataset_permissions` and `branch_permissions`, one per user
 per scope, with permission `read`, `write` or `admin` (admin > write > read).
 
+A dataset attached to a project has a second source of grants: the caller's
+effective role on that project, mapped `viewer` to `read`, `editor` to `write`,
+`owner` to `admin`. See [project grants](#project-grants). A dataset attached to
+no project decides on its rows alone.
+
 ### Who manages grants
 
 The `/permissions` endpoints need a valid token but not the `admin` role, because
 delegation is per dataset. A caller gets in if it holds the instance `admin` role,
-or an `admin` grant on the dataset in question — which also covers grants on that
-dataset's branches. Anything else is `403` (or `404` if the dataset is private and
-the caller has no grant on it, so ids are not confirmed).
+an `admin` grant on the dataset in question, or the `owner` role on the project
+the dataset is attached to — any of which also covers grants on that dataset's
+branches. Anything else is `403` (or `404` if the dataset is private and the
+caller cannot read it, so ids are not confirmed).
 
 A branch-level `admin` grant does **not** carry delegation: it would let a branch
 grantee widen their own scope.
 
-A dataset with no rows has no dataset admin, so only an instance admin can make
-the first grant. Normally the creator auto-grant supplies one.
+A dataset with no rows and no project has no dataset admin, so only an instance
+admin can make the first grant. Normally the creator auto-grant supplies one.
 
 Revoking the dataset's last `admin` row is refused, for everyone including
 instance admins, because it would leave nobody able to manage its grants. Grant
@@ -529,6 +535,10 @@ in that order.
 Revoking the last row of any other kind is allowed: it leaves the dataset with
 no rows, which denies every write rather than opening one. Branch rows have no
 rule of their own either, removing them all falls back to the dataset scope.
+
+The last-admin rule counts rows only. A project owner who administers the dataset
+through its project does not satisfy it, so revoking the last `admin` row is
+refused even then.
 
 ### Writes
 
@@ -540,10 +550,11 @@ branch creation, repair and compaction:
 2. Otherwise, if the target **branch** has any permission rows, the caller needs
    `write` or `admin` **on that branch**. A dataset-level grant does not reach
    into a branch that has its own rows.
-3. Otherwise the caller needs `write` or `admin` on the **dataset**.
+3. Otherwise the caller needs `write` or `admin` on the **dataset**, either as a
+   row or as what their role on the dataset's project carries.
 
-Denial is `403`. A write needs a grant: a dataset with no rows anywhere denies
-everyone except an `admin` role token, which is who makes its first grant.
+Denial is `403`. A write needs a grant: a dataset with no rows and no project
+denies everyone except an `admin` role token, which is who makes its first grant.
 Creating a dataset with auth on inserts an `admin` row for the creator, so a new
 dataset is owned from the moment it exists.
 
@@ -553,9 +564,10 @@ a `created_by` that is blank or a machine label (`unknown`, `system`, `cli`, a
 connector name), because those are not identities anyone holds a token for:
 those datasets are writable by instance admins only until one of them grants.
 
-Only an explicit grant lets you write, and the `/permissions/{user}/check`
-endpoints answer with the same ladder: a `write` or `admin` check on a branch
-that has rows of its own ignores dataset grants, exactly as the write does. A
+A grant lets you write, whether it is an explicit row or the one a project role
+carries, and the `/permissions/{user}/check` endpoints answer with the same
+ladder: a `write` or `admin` check on a branch that has rows of its own ignores
+dataset grants, exactly as the write does. A
 `read` check is the visibility question instead, which a grant on the dataset
 answers whatever the branch holds. `required` takes `read`, `write` or `admin`
 and nothing else. The unused org layer (`organizations`, `org_members`,
@@ -564,28 +576,28 @@ and nothing else. The unused org layer (`organizations`, `org_members`,
 ### Reads: dataset visibility
 
 Each dataset has `visibility`, `public` (the default) or `private`. Set it on
-create, or later with `PATCH /api/v1/datasets/{id}` (instance admin, or an
-`admin` grant on that dataset).
+create, or later with `PATCH /api/v1/datasets/{id}` (instance admin, an `admin`
+grant on that dataset, or `owner` on its project).
 
 `public` keeps today's behavior: reads are anonymous, no token needed.
 
 For `private`, every read that serves the dataset's content needs an instance
-admin token or a caller holding *any* grant (`read`, `write` or `admin`) on the
-dataset or on one of its branches. That covers feature listing and get, spatial
-and CQL2 queries, OGC items, GeoJSON/CSV export, MVT tiles, history,
-diff, temporal queries, H3, similarity search, QGIS pull and layer definition,
-geoprocessing and analytics reads, sync pull, and the vertical listings — the
-check runs before the handler, keyed on every id the request names. External
-datasets are covered the same way.
+admin token, a caller holding *any* grant (`read`, `write` or `admin`) on the
+dataset or on one of its branches, or any role on the project the dataset is
+attached to. That covers feature listing and get, spatial and CQL2 queries, OGC
+items, GeoJSON/CSV export, MVT tiles, history, diff, temporal queries, H3,
+similarity search, QGIS pull and layer definition, geoprocessing and analytics
+reads, sync pull, and the vertical listings — the check runs before the handler,
+keyed on every id the request names. External datasets are covered the same way.
 
 Unauthorized private reads answer `404`, not `403`, so a dataset id cannot be
 confirmed by probing.
 
 Enumeration is gated by the same rule, so a private dataset is simply absent
 from `GET /api/v1/datasets`, `/api/v1/catalog/search`, `/api/v1/ogc/collections`,
-`/api/v1/stac/collections` and `/api/v1/qgis/datasets`
-for a caller with no grant. The filter is a SQL predicate applied inside each
-query, so a paged search's `limit` counts only rows the caller may see.
+`/api/v1/stac/collections` and `/api/v1/qgis/datasets` for a caller with neither
+a grant nor a role on its project. The filter is a SQL predicate applied inside
+each query, so a paged search's `limit` counts only rows the caller may see.
 
 Raster tiles are not covered: `GET /api/v1/stac/search` returns tile ids and
 bounds from `raster_tiles` without naming a dataset, and raster catalogs have no
@@ -625,11 +637,38 @@ and can grant `editor` or `viewer`, not `owner`. An authenticated caller accepts
 one with `POST /api/v1/invitations/accept`. The API returns the token when the
 invitation is created. It does not send email and has no user directory.
 
-Workspace and project roles currently control metadata authority only. They are
-not propagated to dataset permissions or Agora documents.
+Project roles are not propagated to Agora documents.
+
+### Project grants
+
+A dataset can belong to one project, and every member of that project then
+reaches it without a grant of their own: `viewer` reads, `editor` writes, `owner`
+administers. Where a caller also holds an explicit grant, the stronger of the two
+stands, in both directions: an explicit `write` lets a project viewer commit, and
+an explicit `read` does not stop a project owner from managing grants.
+
+The effective project role is the higher of the caller's project membership and
+the workspace membership they inherit, the same rule the metadata routes use.
+
+`PUT /api/v1/datasets/{id}/project` with `{"project_id": "..."}` attaches, and
+`DELETE` on the same route detaches. Both need an `admin` grant on the dataset
+*and* `editor` or `owner` on the project, so neither half of the change can be
+made alone. A project the caller is not a member of answers `404`.
+
+Attaching sets the dataset's `visibility` to `private` in the same transaction:
+a project's data readable by anyone who asks is not what attaching it meant.
+Detaching leaves it `private`, so losing a project cannot publish its data. A
+dataset admin flips it back with `PATCH /api/v1/datasets/{id}`.
+
+Branch grants are unaffected. A project role joins the dataset scope, never the
+branch scope, so a branch that has rows of its own still decides its own writes,
+and a project owner is not among them unless a row says so.
+
+An external read-only dataset cannot be attached, for the same reason its
+visibility cannot be flipped: the write ladder refuses it first.
 
 The focused multi-user PostGIS integration test, strict Clippy, and formatting
-passed on 2026-08-22.
+passed on 2026-08-23.
 
 ## API Endpoints
 
@@ -765,6 +804,8 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/datasets/{id}/permissions` | List dataset grants (dataset admin) |
 | POST | `/api/v1/datasets/{id}/permissions` | Grant on a dataset (dataset admin) |
 | DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (dataset admin) |
+| PUT | `/api/v1/datasets/{id}/project` | Attach to a project and make it private (dataset admin, project editor) |
+| DELETE | `/api/v1/datasets/{id}/project` | Detach, leaving it private (dataset admin, project editor) |
 | GET | `/api/v1/branches/{id}/permissions` | List branch grants (dataset admin) |
 | POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (dataset admin) |
 | DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (dataset admin) |

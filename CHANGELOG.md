@@ -20,6 +20,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-23: project roles reach dataset grants. `datasets.project_id`
+  (migration `036`, nullable, `ON DELETE SET NULL`) attaches a dataset to one
+  project, and every member of that project then reaches it without a grant of
+  their own: `viewer` reads, `editor` writes, `owner` administers. Where a caller
+  also holds an explicit grant the stronger of the two stands, in both
+  directions. The effective project role is the higher of the caller's project
+  membership and the workspace membership they inherit. `PUT` and `DELETE` on
+  `/api/v1/datasets/{id}/project` attach and detach, each needing an `admin`
+  grant on the dataset *and* `editor` or `owner` on the project. Attaching sets
+  `visibility` to `private` in the same transaction and detaching leaves it
+  private, so neither one can publish a project's data. Branch grants are
+  unchanged: a project role joins the dataset scope, never the branch scope. A
+  dataset attached to no project decides on its rows alone, as before.
+
 - 2026-08-21: OGC API Features Part 2, CRS by reference. The items and single
   feature routes take `crs`, the items route also takes `bbox-crs`, and both
   answer with a `Content-Crs` header naming the CRS they returned. A collection

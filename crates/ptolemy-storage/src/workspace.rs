@@ -37,6 +37,66 @@ impl CollaborationRole {
     pub fn is_owner(self) -> bool {
         matches!(self, Self::Owner)
     }
+
+    /// The dataset permission this role carries on a dataset attached to the
+    /// project. Folded in as the stronger of it and the caller's explicit grant.
+    pub fn dataset_permission(self) -> &'static str {
+        match self {
+            Self::Owner => "admin",
+            Self::Editor => "write",
+            Self::Viewer => "read",
+        }
+    }
+}
+
+/// SQL for a caller's effective role on a project: their own project membership,
+/// the workspace membership they inherit, whichever of the two is higher, and no
+/// row when they hold neither. This is the one definition of that inheritance,
+/// and every access decision that folds a project role in is built on it.
+///
+/// `project_expr` is a SQL expression naming the project: a bind, or a column of
+/// the calling query, which makes this a correlated subquery. `caller_param` is
+/// the 1-based position of the caller-id bind, text and NULL when anonymous. Both
+/// come from the calling query, never from request data, so nothing a caller
+/// sends is interpolated here.
+///
+/// `project_expr` resolves in the calling query's scope, so the table aliases
+/// here are prefixed: a plain `p` would shadow an outer `p` that the expression
+/// meant to name.
+pub fn effective_project_role_sql(project_expr: &str, caller_param: usize) -> String {
+    format!(
+        "(SELECT role FROM (
+              SELECT role_workspace.role AS role,
+                     CASE role_workspace.role
+                         WHEN 'owner' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END AS rank
+                FROM projects role_project
+                JOIN workspace_members role_workspace
+                  ON role_workspace.workspace_id = role_project.workspace_id
+               WHERE role_project.id = {project_expr}
+                 AND role_workspace.user_id = ${caller_param}
+              UNION ALL
+              SELECT role_member.role AS role,
+                     CASE role_member.role
+                         WHEN 'owner' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END AS rank
+                FROM project_members role_member
+               WHERE role_member.project_id = {project_expr}
+                 AND role_member.user_id = ${caller_param}
+          ) roles ORDER BY rank DESC LIMIT 1)"
+    )
+}
+
+/// A role column produced by [`effective_project_role_sql`]. Both member tables
+/// CHECK the value, so anything unparseable means the schema drifted and is
+/// refused rather than read as the weakest role.
+pub(crate) fn parse_effective_role(
+    role: Option<String>,
+) -> Result<Option<CollaborationRole>, StoreError> {
+    match role {
+        Some(role) => CollaborationRole::parse(&role)
+            .map(Some)
+            .ok_or_else(|| StoreError::Conflict("project membership role is invalid".into())),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -796,33 +856,15 @@ async fn role_for_project<'e, E>(
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    let role = sqlx::query_scalar::<_, String>(
-        "SELECT role
-         FROM (
-             SELECT wm.role,
-                    CASE wm.role WHEN 'owner' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END AS rank
-             FROM projects p
-             JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-             WHERE p.id = $1 AND wm.user_id = $2
-             UNION ALL
-             SELECT pm.role,
-                    CASE pm.role WHEN 'owner' THEN 3 WHEN 'editor' THEN 2 ELSE 1 END AS rank
-             FROM project_members pm
-             WHERE pm.project_id = $1 AND pm.user_id = $2
-         ) roles
-         ORDER BY rank DESC
-         LIMIT 1",
-    )
+    let role = sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT {}",
+        effective_project_role_sql("$1", 2)
+    ))
     .bind(project_id)
     .bind(user_id)
-    .fetch_optional(executor)
+    .fetch_one(executor)
     .await?;
-    match role {
-        Some(role) => CollaborationRole::parse(&role)
-            .map(Some)
-            .ok_or_else(|| StoreError::Conflict("project membership role is invalid".into())),
-        None => Ok(None),
-    }
+    parse_effective_role(role)
 }
 
 async fn lock_workspace(

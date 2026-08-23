@@ -375,6 +375,14 @@ const BODY: &[(&str, &str)] = &[
         "POST /api/v1/datasets/{id}/pointclouds",
         r#"{"name":"sweep"}"#,
     ),
+    // creating a project needs a token, and the sweep runs with auth off, so
+    // there is no project fixture to name. The attach answers 404 on the project
+    // lookup, which still runs both of its queries. The update itself is covered
+    // by test_project_role_grants_dataset_access in api_integration.rs.
+    (
+        "PUT /api/v1/datasets/{id}/project",
+        r#"{"project_id":"00000000-0000-7000-8000-000000000000"}"#,
+    ),
     ("POST /api/v1/datasets/{id}/rasters", r#"{"name":"sweep"}"#),
     (
         "POST /api/v1/datasets/{id}/relationships",

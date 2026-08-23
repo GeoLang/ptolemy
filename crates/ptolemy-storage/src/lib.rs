@@ -12,7 +12,8 @@ pub mod writes;
 pub use analyze::{ANALYZE_ROW_THRESHOLD, Analyzer, DEFAULT_ANALYZE_ROW_THRESHOLD};
 pub use grant::WriteGrant;
 pub use permission::{
-    Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
+    Check, Reader, Scope, Writer, permission_level, stronger_permission, visible_datasets_sql,
+    write_allowed,
 };
 pub use postgres::LATEST_COLUMNS;
 pub use postgres::{
@@ -25,5 +26,5 @@ pub use postgres::{
 pub use workspace::{
     CollaborationRole, CreatedInvitation, InvitationTarget, Project, ProjectInvitation,
     ProjectMember, ProjectWithRole, Workspace, WorkspaceInvitation, WorkspaceMember,
-    WorkspaceWithRole,
+    WorkspaceWithRole, effective_project_role_sql,
 };

@@ -12,16 +12,23 @@
 //! it would let a branch grantee widen their own scope. A dataset with no rows
 //! has no dataset admin, so only an instance admin can make the first grant;
 //! normally the creator auto-grant provides one.
+//!
+//! Attaching a dataset to a project is the other way access is handed out here.
+//! It grants no rows: it records the project on the dataset, and from then on the
+//! caller's effective role on that project counts as a dataset grant. So it takes
+//! both halves of the change — admin on the dataset, editor or owner on the
+//! project — and it makes the dataset private on the way, because a project's
+//! data readable by anyone who asks is not what attaching it meant.
 
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, put},
 };
-use ptolemy_storage::{BranchPermission, DatasetPermission};
-use serde::Deserialize;
+use ptolemy_storage::{BranchPermission, DatasetPermission, StoreError};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{AppState, auth::Actor};
@@ -50,6 +57,34 @@ async fn require_dataset_admin(
     }
 }
 
+/// Changing what a project's members reach takes the project's own editor bar. A
+/// project viewer who administers some dataset would otherwise attach it and hand
+/// themselves the write access their viewer role withholds.
+async fn require_project_editor(
+    store: &AppState,
+    actor: &Actor,
+    project_id: Uuid,
+) -> Result<(), RbacError> {
+    if !actor.enforces() || actor.is_instance_admin() {
+        return Ok(());
+    }
+    let Some(user_id) = actor.id() else {
+        return Err(RbacError::Forbidden(
+            "attaching a dataset to a project needs a token".into(),
+        ));
+    };
+    match store.project_role(project_id, user_id).await? {
+        Some(role) if role.can_edit() => Ok(()),
+        Some(_) => Err(RbacError::Forbidden(format!(
+            "attaching a dataset to project {project_id} needs an editor or owner role on it"
+        ))),
+        // a project the caller is not in is not theirs to know about
+        None => Err(RbacError::Store(StoreError::NotFound(format!(
+            "project {project_id}"
+        )))),
+    }
+}
+
 /// Same check for a branch endpoint, resolved through the branch's dataset.
 async fn require_branch_dataset_admin(
     store: &AppState,
@@ -75,6 +110,11 @@ pub fn rbac_routes() -> Router<AppState> {
         .route(
             "/datasets/{dataset_id}/permissions/{user_id}/check",
             get(check_dataset_permission),
+        )
+        // Project membership as a dataset grant
+        .route(
+            "/datasets/{id}/project",
+            put(attach_dataset_project).delete(detach_dataset_project),
         )
         // Branch permissions
         .route(
@@ -168,6 +208,72 @@ async fn check_dataset_permission(
         "required": params.required,
         "allowed": allowed,
     })))
+}
+
+// ─── Dataset Project ────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AttachProjectRequest {
+    project_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct DatasetProjectResponse {
+    dataset_id: Uuid,
+    project_id: Option<Uuid>,
+}
+
+/// Attach a dataset to a project, so the project's members reach it without a
+/// grant each: viewer reads, editor writes, owner administers, and an explicit
+/// grant that is stronger still stands. The dataset becomes private in the same
+/// transaction.
+///
+/// Both halves are required, and each is refused on its own: `admin` on the
+/// dataset, editor or owner on the project.
+///
+/// The write ladder runs ahead of this handler, which means an external read-only
+/// dataset cannot be attached — the same limit the visibility flip already has.
+async fn attach_dataset_project(
+    State(store): State<AppState>,
+    Path(dataset_id): Path<Uuid>,
+    actor: Actor,
+    Json(req): Json<AttachProjectRequest>,
+) -> Result<Json<DatasetProjectResponse>, RbacError> {
+    require_dataset_admin(&store, &actor, dataset_id).await?;
+    require_project_editor(&store, &actor, req.project_id).await?;
+    store
+        .attach_dataset_to_project(dataset_id, req.project_id)
+        .await?;
+    Ok(Json(DatasetProjectResponse {
+        dataset_id,
+        project_id: Some(req.project_id),
+    }))
+}
+
+/// Detach, authorized against the project the dataset is leaving.
+///
+/// Visibility is left private. Attaching made it private, and a detach that
+/// published it would turn losing project access into an accidental release, so
+/// it stays private until an admin flips it back.
+async fn detach_dataset_project(
+    State(store): State<AppState>,
+    Path(dataset_id): Path<Uuid>,
+    actor: Actor,
+) -> Result<Json<DatasetProjectResponse>, RbacError> {
+    require_dataset_admin(&store, &actor, dataset_id).await?;
+    let Some(project_id) = store.dataset_project(dataset_id).await? else {
+        return Err(RbacError::Store(StoreError::NotFound(format!(
+            "dataset {dataset_id} belongs to no project"
+        ))));
+    };
+    require_project_editor(&store, &actor, project_id).await?;
+    store
+        .detach_dataset_from_project(dataset_id, project_id)
+        .await?;
+    Ok(Json(DatasetProjectResponse {
+        dataset_id,
+        project_id: None,
+    }))
 }
 
 // ─── Branch Permissions ─────────────────────────────────────────────

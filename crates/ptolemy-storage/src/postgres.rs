@@ -7,8 +7,10 @@
 use crate::analyze::Analyzer;
 use crate::grant::WriteGrant;
 use crate::permission::{
-    Check, Reader, Scope, Writer, permission_level, visible_datasets_sql, write_allowed,
+    Check, Reader, Scope, Writer, permission_level, stronger_permission, visible_datasets_sql,
+    write_allowed,
 };
+use crate::workspace::{effective_project_role_sql, parse_effective_role};
 use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
@@ -621,17 +623,86 @@ impl PgStore {
         self.get_dataset(id).await
     }
 
-    /// Whether the caller holds an `admin` permission row on a dataset. Used to
-    /// decide who may change its visibility.
+    /// Whether the caller administers a dataset: an `admin` permission row on it,
+    /// or the owner role on the project it is attached to. Used to decide who may
+    /// change its visibility, manage its grants, and attach or detach it.
     pub async fn is_dataset_admin(&self, id: Uuid, user_id: &str) -> Result<bool, StoreError> {
-        let perm: Option<String> = sqlx::query_scalar(
-            "SELECT permission FROM dataset_permissions WHERE dataset_id = $1 AND user_id = $2",
-        )
-        .bind(id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(perm.as_deref().map(permission_level).unwrap_or(0) >= permission_level("admin"))
+        let scope = dataset_scope(&self.pool, id, user_id).await?;
+        let level = scope.mine.as_deref().map(permission_level).unwrap_or(0);
+        Ok(level >= permission_level("admin"))
+    }
+
+    /// The project a dataset is attached to, `None` when it is attached to none.
+    /// The outer `None` is a dataset that does not exist.
+    pub async fn dataset_project(&self, dataset_id: Uuid) -> Result<Option<Uuid>, StoreError> {
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT project_id FROM datasets WHERE id = $1")
+            .bind(dataset_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("dataset {dataset_id}")))
+    }
+
+    /// Attach a dataset to a project and make it private, in one transaction, so
+    /// the dataset is never attached while still readable by anyone who asks.
+    ///
+    /// The caller enforces who may do this: an admin on the dataset who can also
+    /// edit the target project.
+    pub async fn attach_dataset_to_project(
+        &self,
+        dataset_id: Uuid,
+        project_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // lock the dataset row first, so a concurrent attach or visibility flip
+        // cannot land between the project link and the private flag
+        sqlx::query("SELECT id FROM datasets WHERE id = $1 FOR UPDATE")
+            .bind(dataset_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("dataset {dataset_id}")))?;
+        // the foreign key would refuse an unknown project as a database error,
+        // and a missing project is a 404. FOR KEY SHARE is the lock the key
+        // check below takes anyway, and holding it from here means a project
+        // deleted in between cannot turn the 404 into a 500.
+        sqlx::query("SELECT id FROM projects WHERE id = $1 FOR KEY SHARE")
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("project {project_id}")))?;
+        sqlx::query("UPDATE datasets SET project_id = $2, visibility = 'private' WHERE id = $1")
+            .bind(dataset_id)
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drop a dataset's project link. Visibility is left alone: the dataset was
+    /// made private when it was attached and stays private until an admin
+    /// publishes it, so detaching can only ever close access.
+    ///
+    /// `expected_project_id` is the project the caller was authorized against. A
+    /// dataset that moved in the meantime is refused rather than detached from a
+    /// project nobody checked.
+    pub async fn detach_dataset_from_project(
+        &self,
+        dataset_id: Uuid,
+        expected_project_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let affected =
+            sqlx::query("UPDATE datasets SET project_id = NULL WHERE id = $1 AND project_id = $2")
+                .bind(dataset_id)
+                .bind(expected_project_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if affected == 0 {
+            return Err(StoreError::Conflict(format!(
+                "dataset {dataset_id} is no longer attached to project {expected_project_id}"
+            )));
+        }
+        Ok(())
     }
 
     // ─── Visibility enforcement (read paths) ────────────────────────
@@ -710,22 +781,26 @@ impl PgStore {
         Ok(rows.into_iter().map(|r| r.get("id")).collect())
     }
 
-    /// Which of `dataset_ids` this user holds any permission row on, counting a
-    /// row on one of the dataset's branches. Org membership does not count: only
-    /// an explicit grant opens a private dataset.
+    /// Which of `dataset_ids` this user may read: those they hold a permission row
+    /// on, counting a row on one of the dataset's branches, plus those attached to
+    /// a project they hold any effective role on.
     pub async fn readable_datasets(
         &self,
         dataset_ids: &[Uuid],
         user_id: &str,
     ) -> Result<Vec<Uuid>, StoreError> {
-        let rows = sqlx::query(
+        let project_role = effective_project_role_sql("d.project_id", 2);
+        let rows = sqlx::query(&format!(
             "SELECT dataset_id FROM dataset_permissions
               WHERE dataset_id = ANY($1) AND user_id = $2
              UNION
              SELECT b.dataset_id FROM branch_permissions bp
                JOIN branches b ON b.id = bp.branch_id
-              WHERE b.dataset_id = ANY($1) AND bp.user_id = $2",
-        )
+              WHERE b.dataset_id = ANY($1) AND bp.user_id = $2
+             UNION
+             SELECT d.id AS dataset_id FROM datasets d
+              WHERE d.id = ANY($1) AND {project_role} IS NOT NULL"
+        ))
         .bind(dataset_ids)
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -3428,20 +3503,12 @@ impl PgStore {
         user_id: &str,
         required: &str,
     ) -> Result<bool, StoreError> {
-        let row = sqlx::query(
-            "SELECT permission FROM dataset_permissions
-             WHERE dataset_id = $1 AND user_id = $2",
-        )
-        .bind(dataset_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let perm: String = r.get("permission");
-                Ok(permission_level(&perm) >= permission_level(required))
-            }
+        // the same scope the write ladder reads, so a project member is not told
+        // they cannot do what they can. [`PgStore::check_branch_permission`] does
+        // the same through `write_scopes`.
+        let scope = dataset_scope(&self.pool, dataset_id, user_id).await?;
+        match scope.mine {
+            Some(perm) => Ok(permission_level(&perm) >= permission_level(required)),
             None => Ok(false),
         }
     }
@@ -4003,7 +4070,21 @@ async fn insert_creator_admin_grant(
     Ok(())
 }
 
+/// SQL for the caller's effective role on the project a dataset is attached to,
+/// with the dataset named by a bind. No role when the dataset has no project.
+fn project_role_of_dataset_sql(dataset_param: usize, caller_param: usize) -> String {
+    effective_project_role_sql(
+        &format!("(SELECT project_id FROM datasets WHERE id = ${dataset_param})"),
+        caller_param,
+    )
+}
+
 /// The branch and dataset permission scopes for one writer, in one round trip.
+///
+/// The dataset scope carries the stronger of the writer's explicit grant and the
+/// permission their project role maps to. The branch scope is explicit rows only:
+/// a project role is dataset-wide, and letting it reach into a branch would
+/// override the rule that branch rows decide.
 async fn write_scopes<'e, E>(
     exec: E,
     branch_id: Uuid,
@@ -4013,21 +4094,24 @@ async fn write_scopes<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let row = sqlx::query(
+    let project_role = project_role_of_dataset_sql(2, 3);
+    let row = sqlx::query(&format!(
         "SELECT
             (SELECT count(*) FROM branch_permissions WHERE branch_id = $1) AS branch_total,
             (SELECT permission FROM branch_permissions
               WHERE branch_id = $1 AND user_id = $3) AS branch_mine,
             (SELECT count(*) FROM dataset_permissions WHERE dataset_id = $2) AS dataset_total,
             (SELECT permission FROM dataset_permissions
-              WHERE dataset_id = $2 AND user_id = $3) AS dataset_mine",
-    )
+              WHERE dataset_id = $2 AND user_id = $3) AS dataset_mine,
+            {project_role} AS project_role"
+    ))
     .bind(branch_id)
     .bind(dataset_id)
     .bind(user_id)
     .fetch_one(exec)
     .await?;
 
+    let project_role = parse_effective_role(row.get("project_role"))?;
     Ok((
         Scope {
             enforced: row.get::<i64, _>("branch_total") > 0,
@@ -4035,7 +4119,7 @@ where
         },
         Scope {
             enforced: row.get::<i64, _>("dataset_total") > 0,
-            mine: row.get("dataset_mine"),
+            mine: stronger_permission(row.get("dataset_mine"), project_role),
         },
     ))
 }
@@ -4044,20 +4128,23 @@ async fn dataset_scope<'e, E>(exec: E, dataset_id: Uuid, user_id: &str) -> Resul
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let row = sqlx::query(
+    let project_role = project_role_of_dataset_sql(1, 2);
+    let row = sqlx::query(&format!(
         "SELECT
             (SELECT count(*) FROM dataset_permissions WHERE dataset_id = $1) AS total,
             (SELECT permission FROM dataset_permissions
-              WHERE dataset_id = $1 AND user_id = $2) AS mine",
-    )
+              WHERE dataset_id = $1 AND user_id = $2) AS mine,
+            {project_role} AS project_role"
+    ))
     .bind(dataset_id)
     .bind(user_id)
     .fetch_one(exec)
     .await?;
 
+    let project_role = parse_effective_role(row.get("project_role"))?;
     Ok(Scope {
         enforced: row.get::<i64, _>("total") > 0,
-        mine: row.get("mine"),
+        mine: stronger_permission(row.get("mine"), project_role),
     })
 }
 

@@ -7142,6 +7142,544 @@ async fn test_public_dataset_attachments_stay_anonymous() {
     assert_eq!(body["name"], "icon.png", "{body}");
 }
 
+// ─── Project membership as a dataset grant ──────────────────────────
+
+/// A public dataset with one committed feature, whose creator auto-grant makes
+/// `carol` its admin. Returns (dataset id, branch id, carol's token).
+async fn seed_public_dataset(app: &axum::Router) -> (Uuid, Uuid, String) {
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    assert_eq!(dataset["visibility"], "public", "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (status, branch) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&carol),
+        Some(json!({"name": "main", "created_by": "carol"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = commit_as(app, branch_id, &carol).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    (dataset_id, branch_id, carol)
+}
+
+/// A project with one member at each collaboration role, inside a workspace
+/// `carol` owns. Carol inherits owner on the project from the workspace, which is
+/// what lets her set the members.
+async fn seed_project_with_members(app: &axum::Router, carol: &str) -> Uuid {
+    let (status, workspace) = request_as(
+        app,
+        "POST",
+        "/api/v1/workspaces",
+        Some(carol),
+        Some(json!({"name": format!("ws_{}", Uuid::now_v7())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    let workspace_id = workspace["id"].as_str().unwrap().to_string();
+
+    let (status, project) = request_as(
+        app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/projects"),
+        Some(carol),
+        Some(json!({"name": format!("pr_{}", Uuid::now_v7())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let project_id = Uuid::parse_str(project["id"].as_str().unwrap()).unwrap();
+
+    for (user, role) in [
+        ("project-owner", "owner"),
+        ("project-editor", "editor"),
+        ("project-viewer", "viewer"),
+    ] {
+        let (status, body) = request_as(
+            app,
+            "PUT",
+            &format!("/api/v1/projects/{project_id}/members/{user}"),
+            Some(carol),
+            Some(json!({"role": role})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{user} as {role}: {body}");
+    }
+    project_id
+}
+
+async fn attach_project(
+    app: &axum::Router,
+    token: &str,
+    dataset_id: Uuid,
+    project_id: Uuid,
+) -> (StatusCode, Value) {
+    request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset_id}/project"),
+        Some(token),
+        Some(json!({"project_id": project_id})),
+    )
+    .await
+}
+
+async fn detach_project(app: &axum::Router, token: &str, dataset_id: Uuid) -> (StatusCode, Value) {
+    request_as(
+        app,
+        "DELETE",
+        &format!("/api/v1/datasets/{dataset_id}/project"),
+        Some(token),
+        None,
+    )
+    .await
+}
+
+/// A public dataset, its project, and the three member tokens, with the attach
+/// already done. Returns (dataset id, branch id, project id, carol's token).
+async fn seed_attached_dataset(app: &axum::Router) -> (Uuid, Uuid, Uuid, String) {
+    let (dataset_id, branch_id, carol) = seed_public_dataset(app).await;
+    let project_id = seed_project_with_members(app, &carol).await;
+    let (status, body) = attach_project(app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "attach: {body}");
+    (dataset_id, branch_id, project_id, carol)
+}
+
+/// Attaching closes the dataset in the same breath as it opens it to the
+/// project: public reads stop, and the project's members take their place.
+#[tokio::test]
+async fn test_attach_makes_the_dataset_private_to_the_project() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_public_dataset(&app).await;
+    let project_id = seed_project_with_members(&app, &carol).await;
+    let features = format!("/api/v1/branches/{branch_id}/features");
+
+    let (status, body) = request_as(&app, "GET", &features, None, None).await;
+    assert_eq!(status, StatusCode::OK, "public before the attach: {body}");
+
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["project_id"], project_id.to_string(), "{body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}"),
+        Some(&carol),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["visibility"], "private", "the attach did not hide it");
+
+    let (status, body) = request_as(&app, "GET", &features, None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "anonymous read: {body}");
+
+    // the project's members read it with no grant of their own
+    for user in ["project-owner", "project-editor", "project-viewer"] {
+        let (status, body) = request_as(
+            &app,
+            "GET",
+            &features,
+            Some(&token_for_user(user, Role::Viewer)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{user} read: {body}");
+    }
+
+    // and someone in neither the project nor its workspace does not
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &features,
+        Some(&token_for_user("eve", Role::Editor)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-member read: {body}");
+}
+
+/// A workspace role reaches the project's datasets the same way a project role
+/// does, because the effective role is the higher of the two.
+#[tokio::test]
+async fn test_inherited_workspace_role_reaches_an_attached_dataset() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_public_dataset(&app).await;
+
+    let (status, workspace) = request_as(
+        &app,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&carol),
+        Some(json!({"name": format!("ws_{}", Uuid::now_v7())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    let workspace_id = workspace["id"].as_str().unwrap().to_string();
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/workspaces/{workspace_id}/members/workspace-editor"),
+        Some(&carol),
+        Some(json!({"role": "editor"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, project) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/projects"),
+        Some(&carol),
+        Some(json!({"name": format!("pr_{}", Uuid::now_v7())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let project_id = Uuid::parse_str(project["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // never a member of the project itself, and an editor on it all the same
+    let inheritor = token_for_user("workspace-editor", Role::Editor);
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/features"),
+        Some(&inheritor),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &inheritor).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Viewer maps to `read`: enough to see the content, not to change it.
+#[tokio::test]
+async fn test_project_viewer_reads_but_cannot_write() {
+    let app = setup_app_authed().await;
+    let (_, branch_id, _, _) = seed_attached_dataset(&app).await;
+    // an editor role on the instance, so what denies the write is the project
+    // role and not the role gate in front of it
+    let viewer = token_for_user("project-viewer", Role::Editor);
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{branch_id}/features"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = commit_as(&app, branch_id, &viewer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Editor maps to `write`: enough to commit, not to hand out access.
+#[tokio::test]
+async fn test_project_editor_writes_but_cannot_administer() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _, _) = seed_attached_dataset(&app).await;
+    let editor = token_for_user("project-editor", Role::Editor);
+
+    let (status, body) = commit_as(&app, branch_id, &editor).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = grant_as(&app, &editor, "datasets", dataset_id, "eve", "read").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "editor delegating: {body}");
+
+    // /check has to say the same, or it denies a write that then succeeds
+    assert!(check_allowed(&app, "datasets", dataset_id, "project-editor", "write").await);
+    assert!(!check_allowed(&app, "datasets", dataset_id, "project-editor", "admin").await);
+    assert!(check_allowed(&app, "datasets", dataset_id, "project-owner", "admin").await);
+    assert!(!check_allowed(&app, "datasets", dataset_id, "project-viewer", "write").await);
+    assert!(check_allowed(&app, "datasets", dataset_id, "project-viewer", "read").await);
+    assert!(!check_allowed(&app, "datasets", dataset_id, "eve", "read").await);
+
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &format!("/api/v1/datasets/{dataset_id}"),
+        Some(&editor),
+        Some(json!({"visibility": "public"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "editor publishing: {body}");
+}
+
+/// Owner maps to `admin`: grants, visibility, and detaching.
+#[tokio::test]
+async fn test_project_owner_administers_the_dataset() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, _, _) = seed_attached_dataset(&app).await;
+    let owner = token_for_user("project-owner", Role::Editor);
+
+    let (status, body) = grant_as(&app, &owner, "datasets", dataset_id, "eve", "read").await;
+    assert_eq!(status, StatusCode::CREATED, "owner delegating: {body}");
+
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}/permissions"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner reading the acl: {body}");
+
+    let (status, body) = detach_project(&app, &owner, dataset_id).await;
+    assert_eq!(status, StatusCode::OK, "owner detaching: {body}");
+}
+
+/// Grants are additive, so the caller holds the stronger of the two levels. Both
+/// directions: an explicit grant above the project role, and a project role above
+/// an explicit grant.
+#[tokio::test]
+async fn test_the_stronger_of_grant_and_project_role_wins() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _, carol) = seed_attached_dataset(&app).await;
+
+    // the project makes them a reader; an explicit write grant makes them a writer
+    let viewer = token_for_user("project-viewer", Role::Editor);
+    let (status, body) = commit_as(&app, branch_id, &viewer).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    grant(&app, "datasets", dataset_id, "project-viewer", "write").await;
+    let (status, body) = commit_as(&app, branch_id, &viewer).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // and the other way: a weaker explicit grant does not pull an owner down
+    grant(&app, "datasets", dataset_id, "project-owner", "read").await;
+    let owner = token_for_user("project-owner", Role::Editor);
+    let (status, body) = grant_as(&app, &owner, "datasets", dataset_id, "eve", "read").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a read grant demoted a project owner: {body}"
+    );
+
+    // carol's own admin grant is untouched by any of it
+    let (status, body) = grant_as(&app, &carol, "datasets", dataset_id, "dave", "read").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Detaching drops the project's access and leaves the dataset private, so losing
+/// a project can never publish its data.
+#[tokio::test]
+async fn test_detach_leaves_the_dataset_private() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, _, carol) = seed_attached_dataset(&app).await;
+    let features = format!("/api/v1/branches/{branch_id}/features");
+    let viewer = token_for_user("project-viewer", Role::Viewer);
+
+    let (status, body) = request_as(&app, "GET", &features, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = detach_project(&app, &carol, dataset_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["project_id"], Value::Null, "{body}");
+
+    let (status, body) = request_as(&app, "GET", &features, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "member after detach: {body}");
+
+    let (status, body) = request_as(&app, "GET", &features, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the detach published it: {body}"
+    );
+
+    // the dataset's own admin still reaches it, and is who publishes it again
+    let (status, body) = request_as(&app, "GET", &features, Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // detaching twice is not a silent success
+    let (status, body) = detach_project(&app, &carol, dataset_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// Attaching takes both halves. Neither one on its own does.
+#[tokio::test]
+async fn test_attach_needs_dataset_admin_and_project_editor() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, carol) = seed_public_dataset(&app).await;
+    let project_id = seed_project_with_members(&app, &carol).await;
+
+    // no grant at all on the dataset
+    let (status, body) = attach_project(
+        &app,
+        &token_for_user("eve", Role::Editor),
+        dataset_id,
+        project_id,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "outsider attaching: {body}");
+
+    // a write grant is not an admin grant
+    grant(&app, "datasets", dataset_id, "dave", "write").await;
+    let (status, body) = attach_project(
+        &app,
+        &token_for_user("dave", Role::Editor),
+        dataset_id,
+        project_id,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "write grantee: {body}");
+
+    // a dataset admin who is not in the project cannot see the project to attach to
+    grant(&app, "datasets", dataset_id, "mallory", "admin").await;
+    let (status, body) = attach_project(
+        &app,
+        &token_for_user("mallory", Role::Editor),
+        dataset_id,
+        project_id,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "non-member attaching: {body}"
+    );
+
+    // and a dataset admin who is only a viewer on the project cannot either: it
+    // would hand them the write access their viewer role withholds
+    grant(&app, "datasets", dataset_id, "project-viewer", "admin").await;
+    let (status, body) = attach_project(
+        &app,
+        &token_for_user("project-viewer", Role::Editor),
+        dataset_id,
+        project_id,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "project viewer attaching: {body}"
+    );
+
+    // nothing above attached it
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["visibility"], "public", "a denied attach still hid it");
+}
+
+/// An attached private dataset is in the listings for the project's members and
+/// nobody else's, which is the listing filter rather than the per-id layer.
+#[tokio::test]
+async fn test_attached_dataset_is_listed_for_project_members_only() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, _, _) = seed_attached_dataset(&app).await;
+    let id = dataset_id.to_string();
+
+    for uri in DATASET_LISTINGS {
+        assert!(
+            !listing_mentions(&app, uri, None, &id).await,
+            "anonymous GET {uri} leaked the project's dataset"
+        );
+        assert!(
+            !listing_mentions(&app, uri, Some(&token_for_user("eve", Role::Editor)), &id).await,
+            "non-member GET {uri} leaked the project's dataset"
+        );
+    }
+
+    // the listings that cover versioned datasets: stac collections list raster
+    // catalogs, of which this dataset has none
+    let viewer = token_for_user("project-viewer", Role::Viewer);
+    for uri in [
+        "/api/v1/datasets",
+        "/api/v1/ogc/collections",
+        "/api/v1/qgis/datasets",
+    ] {
+        assert!(
+            listing_mentions(&app, uri, Some(&viewer), &id).await,
+            "member GET {uri} hid the project's dataset"
+        );
+    }
+}
+
+/// A dataset attached to no project decides on explicit grants alone, which is
+/// what every dataset did before there were projects.
+#[tokio::test]
+async fn test_dataset_without_a_project_is_unchanged() {
+    let app = setup_app_authed().await;
+    let (public_id, public_branch, carol) = seed_public_dataset(&app).await;
+    seed_project_with_members(&app, &carol).await;
+    let (private_id, private_branch, _) = seed_private_dataset(&app).await;
+
+    // the project's owner is the strongest role there is, and it reaches neither
+    let owner = token_for_user("project-owner", Role::Editor);
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{private_branch}/features"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // 404 rather than 403 on both: the visibility layer sits outside the write
+    // gate, so a private dataset the caller cannot read is not there to refuse
+    let (status, body) = commit_as(&app, private_branch, &owner).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = grant_as(&app, &owner, "datasets", private_id, "eve", "read").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    assert!(
+        !listing_mentions(
+            &app,
+            "/api/v1/datasets",
+            Some(&owner),
+            &private_id.to_string()
+        )
+        .await,
+        "an unattached private dataset was listed for a project owner"
+    );
+
+    // and the public one keeps serving anonymous reads and its own writes
+    let (status, body) = request_as(
+        &app,
+        "GET",
+        &format!("/api/v1/branches/{public_branch}/features"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        listing_mentions(&app, "/api/v1/datasets", None, &public_id.to_string()).await,
+        "an unattached public dataset stopped being listed"
+    );
+    let (status, body) = commit_as(&app, public_branch, &owner).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
 // ─── The remaining dataset-owned id kinds ───────────────────────────
 
 /// One id kind a route names that is neither a dataset nor a branch id, so the
