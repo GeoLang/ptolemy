@@ -38,6 +38,7 @@ pub fn v1_routes() -> Router<AppState> {
         .route("/branches/{id}", get(get_branch))
         .route("/branches/{id}/history", get(get_branch_history))
         .route("/branches/{id}/features", get(list_features))
+        .route("/branches/{id}/features/{feature_id}", get(get_feature))
         .route(
             "/branches/{id}/features/{feature_id}/native",
             get(feature_native),
@@ -338,6 +339,27 @@ async fn list_features(
 struct FeaturePage {
     features: Vec<ptolemy_core::Feature>,
     next_cursor: Option<Uuid>,
+}
+
+/// One live feature, geometry as hex WKB beside its properties. 404 for a
+/// feature that is not live on the branch.
+async fn get_feature(
+    State(store): State<AppState>,
+    Path((id, feature_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<FeatureResponse>, AppError> {
+    let feature = store.feature_on_branch(id, feature_id).await?;
+    Ok(Json(FeatureResponse {
+        feature_id: feature.id,
+        geometry_wkb_hex: hex::encode(&feature.geometry_wkb),
+        properties: feature.properties,
+    }))
+}
+
+#[derive(Serialize)]
+struct FeatureResponse {
+    feature_id: Uuid,
+    geometry_wkb_hex: String,
+    properties: serde_json::Value,
 }
 
 /// The coordinates as the source recorded them, before reprojection to 4326.

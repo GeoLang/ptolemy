@@ -11094,6 +11094,117 @@ async fn test_a_field_alias_survives_the_schema_round_trip() {
     assert!(fields[1]["alias"].is_null(), "{schema}");
 }
 
+// ─── Single feature read ────────────────────────────────────────────
+
+const POINT_HEX: &str = "0101000000000000000000F03F0000000000000040";
+
+#[tokio::test]
+async fn test_get_feature_returns_geometry_and_properties() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": POINT_HEX,
+             "properties": {"name": "hut", "kind": "shed"}}
+        ]),
+    )
+    .await;
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["feature_id"], f1.to_string());
+    assert_eq!(
+        body["geometry_wkb_hex"].as_str().unwrap().to_uppercase(),
+        POINT_HEX
+    );
+    assert_eq!(body["properties"]["name"], "hut");
+    assert_eq!(body["properties"]["kind"], "shed");
+}
+
+/// A sync client reads this as the merge's "theirs", so it must be the branch head.
+#[tokio::test]
+async fn test_get_feature_returns_the_latest_committed_properties() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": POINT_HEX,
+             "properties": {"name": "first"}}
+        ]),
+    )
+    .await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "properties": {"name": "second"}}
+        ]),
+    )
+    .await;
+
+    let (status, body) =
+        get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["properties"]["name"], "second");
+    // an update that omits geometry keeps the one the insert carried
+    assert_eq!(
+        body["geometry_wkb_hex"].as_str().unwrap().to_uppercase(),
+        POINT_HEX
+    );
+}
+
+#[tokio::test]
+async fn test_get_feature_unknown_id_404() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    let (status, _) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/{}", Uuid::now_v7()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_get_feature_deleted_is_404() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    commit_features(
+        &app,
+        branch_id,
+        json!([
+            {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": POINT_HEX,
+             "properties": {}}
+        ]),
+    )
+    .await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([{"type": "delete", "feature_id": f1.to_string()}]),
+    )
+    .await;
+
+    let (status, _) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features/{f1}")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ─── Native geometry ────────────────────────────────────────────────
 
 /// WKB hex for a point with survey-precision coordinates, distinct from the

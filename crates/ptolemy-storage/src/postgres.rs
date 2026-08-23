@@ -1396,6 +1396,41 @@ impl PgStore {
         Ok(native_from_row(&row, "wkb", "srid", "native_crs_wkt"))
     }
 
+    /// One live feature on a branch, geometry and properties together.
+    /// `list_features_paginated` is the alternative and scans the branch for one row.
+    pub async fn feature_on_branch(
+        &self,
+        branch_id: Uuid,
+        feature_id: Uuid,
+    ) -> Result<Feature, StoreError> {
+        let (external, prelude, source) = self.latest_source(branch_id).await?;
+        let pool = self.source_pool(external.as_ref()).await?;
+        let row = sqlx::query(&format!(
+            "{prelude}
+            SELECT feature_id, dataset_id, ST_AsBinary(geometry) as geometry_wkb,
+                   properties, valid_from, valid_to
+            FROM {source}
+            WHERE feature_id = $2 AND operation != 'delete'"
+        ))
+        .bind(branch_id)
+        .bind(feature_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!(
+                "feature {feature_id} on branch {branch_id}"
+            )));
+        };
+        Ok(Feature {
+            id: row.get("feature_id"),
+            dataset_id: row.get("dataset_id"),
+            geometry_wkb: row.get("geometry_wkb"),
+            properties: row.get("properties"),
+            valid_from: row.get("valid_from"),
+            valid_to: row.get("valid_to"),
+        })
+    }
+
     /// Get a single feature's state at a specific changeset.
     pub async fn get_feature_at(
         &self,

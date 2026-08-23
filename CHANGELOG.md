@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-23: **`GET /branches/{id}/features/{feature_id}`** returns one live
+  feature, geometry as hex WKB beside its properties, and 404 for a feature that
+  is not live on the branch. A client merging an edit before it commits needs
+  both halves of the branch head for one feature; `/branches/{id}/features` is a
+  paginated list and `/features/{feature_id}/native` carries only the
+  pre-reprojection geometry.
+
 - 2026-08-23: **vector tiles simplify to the zoom they are drawn at**. Both MVT
   paths, `/branches/{id}/tiles/{z}/{x}/{y}` and the OGC
   `/datasets/{id}/tiles/{tms}/{z}/{x}/{y}`, now run `ST_Simplify` at half a tile
