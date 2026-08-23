@@ -426,6 +426,7 @@ const BODY: &[(&str, &str)] = &[
         "POST /api/v1/incidents/evacuate",
         r#"{"incident_lat":1.0,"incident_lng":1.0,"radius_m":1.0,"assembly_points":[{"id":"sweep","lat":1.0,"lng":1.0,"capacity":1}]}"#,
     ),
+    ("POST /api/v1/invitations/accept", r#"{"token":"sweep"}"#),
     (
         "POST /api/v1/networks/{id}/astar",
         r#"{"from_junction":"{{features}}","to_junction":"{{features}}"}"#,
@@ -473,6 +474,15 @@ const BODY: &[(&str, &str)] = &[
     (
         "POST /api/v1/pointclouds/{id}/query",
         r#"{"min_x":1.0,"min_y":1.0,"max_x":1.0,"max_y":1.0}"#,
+    ),
+    ("PUT /api/v1/projects/{id}", r#"{"name":"sweep"}"#),
+    (
+        "POST /api/v1/projects/{id}/invitations",
+        r#"{"role":"editor","expires_at":"2100-01-01T00:00:00Z"}"#,
+    ),
+    (
+        "PUT /api/v1/projects/{project_id}/members/{user_id}",
+        r#"{"role":"editor"}"#,
     ),
     (
         "POST /api/v1/qgis/branches/{branch_id}/conflicts/resolve",
@@ -523,6 +533,20 @@ const BODY: &[(&str, &str)] = &[
     (
         "POST /api/v1/topologies/{name}/add-face",
         r#"{"geometry_wkb_hex":"010300000001000000050000000000000000000000000000000000000000000000000008400000000000000000000000000000084000000000000008400000000000000000000000000000084000000000000000000000000000000000"}"#,
+    ),
+    ("POST /api/v1/workspaces", r#"{"name":"sweep"}"#),
+    ("PUT /api/v1/workspaces/{id}", r#"{"name":"sweep"}"#),
+    (
+        "POST /api/v1/workspaces/{id}/invitations",
+        r#"{"role":"editor","expires_at":"2100-01-01T00:00:00Z"}"#,
+    ),
+    (
+        "POST /api/v1/workspaces/{id}/projects",
+        r#"{"name":"sweep"}"#,
+    ),
+    (
+        "PUT /api/v1/workspaces/{workspace_id}/members/{user_id}",
+        r#"{"role":"editor"}"#,
     ),
     (
         "POST /arcgis/rest/services/{service}/FeatureServer/{layer}/query",
@@ -703,7 +727,12 @@ async fn setup() -> (axum::Router, AppState) {
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
     sqlx::raw_sql(
-        "DROP TABLE IF EXISTS conflicts CASCADE;
+        "DROP TABLE IF EXISTS project_invitations CASCADE;
+         DROP TABLE IF EXISTS project_members CASCADE;
+         DROP TABLE IF EXISTS workspace_members CASCADE;
+         DROP TABLE IF EXISTS projects CASCADE;
+         DROP TABLE IF EXISTS workspaces CASCADE;
+         DROP TABLE IF EXISTS conflicts CASCADE;
          DROP TABLE IF EXISTS attachments CASCADE;
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
