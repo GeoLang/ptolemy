@@ -49,7 +49,12 @@ async fn setup_with_analyze_threshold(rows: usize) -> PgStore {
 
     // Clean slate
     sqlx::raw_sql(
-        "DROP TABLE IF EXISTS conflicts CASCADE;
+        "DROP TABLE IF EXISTS project_invitations CASCADE;
+         DROP TABLE IF EXISTS project_members CASCADE;
+         DROP TABLE IF EXISTS workspace_members CASCADE;
+         DROP TABLE IF EXISTS projects CASCADE;
+         DROP TABLE IF EXISTS workspaces CASCADE;
+         DROP TABLE IF EXISTS conflicts CASCADE;
          DROP TABLE IF EXISTS attachments CASCADE;
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
