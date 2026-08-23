@@ -655,6 +655,11 @@ the workspace membership they inherit, the same rule the metadata routes use.
 *and* `editor` or `owner` on the project, so neither half of the change can be
 made alone. A project the caller is not a member of answers `404`.
 
+A dataset carries `project_id`, `null` when it belongs to no project, and
+`GET /api/v1/datasets/{id}` and `GET /api/v1/datasets` both report it to anyone
+who may read the dataset. It is read-only: `POST /api/v1/datasets` ignores it, so
+attaching always goes through the route above and its project-role check.
+
 Attaching sets the dataset's `visibility` to `private` in the same transaction:
 a project's data readable by anyone who asks is not what attaching it meant.
 Detaching leaves it `private`, so losing a project cannot publish its data. A

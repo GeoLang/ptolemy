@@ -305,6 +305,7 @@ impl DataStore for ElasticsearchStore {
                     created_by: "elasticsearch".into(),
                     external: None,
                     visibility: Default::default(),
+                    project_id: None,
                 });
             }
             Ok(out)

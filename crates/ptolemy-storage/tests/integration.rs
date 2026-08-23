@@ -81,6 +81,7 @@ async fn create_test_dataset(store: &PgStore) -> Dataset {
         created_by: "test".to_string(),
         external: None,
         visibility: Default::default(),
+        project_id: None,
     };
     store.create_dataset(&ds, None).await.unwrap();
     ds
@@ -2050,6 +2051,7 @@ async fn test_mixed_geometry_dataset_round_trips() {
         created_by: "test".to_string(),
         external: None,
         visibility: Default::default(),
+        project_id: None,
     };
     store.create_dataset(&ds, None).await.unwrap();
 
@@ -2077,6 +2079,7 @@ async fn test_mixed_geometry_dataset_accepts_any_geometry() {
         created_by: "test".to_string(),
         external: None,
         visibility: Default::default(),
+        project_id: None,
     };
     store.create_dataset(&ds, None).await.unwrap();
     let branch = create_test_branch(&store, ds.id, "main").await;

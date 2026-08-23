@@ -23,6 +23,12 @@ pub struct Dataset {
     pub external: Option<ExternalTable>,
     #[serde(default)]
     pub visibility: Visibility,
+    /// The project whose members reach this dataset, `None` for a dataset that
+    /// belongs to none. Read-only here: the store never writes it on create, so
+    /// the attach endpoint stays the only way in and its project-role check
+    /// cannot be sidestepped by naming a project at creation time.
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
 }
 
 /// Who may read a dataset's content. `Private` is enforced only when auth is

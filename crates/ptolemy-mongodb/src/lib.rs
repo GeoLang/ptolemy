@@ -252,6 +252,7 @@ impl DataStore for MongoStore {
                     created_by: "mongodb".into(),
                     external: None,
                     visibility: Default::default(),
+                    project_id: None,
                 });
             }
             Ok(out)

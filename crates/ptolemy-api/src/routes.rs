@@ -163,6 +163,9 @@ async fn create_dataset(
         created_by: actor.or_body(&req.created_by).to_string(),
         external,
         visibility,
+        // a new dataset belongs to no project. Attaching is its own endpoint
+        // because it needs a role on the project, which a create cannot check
+        project_id: None,
     };
     // with auth on the creator gets an admin permission row, which also flips
     // the dataset to enforced: from here on only granted users may write to it

@@ -298,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
                     created_by,
                     external: None,
                     visibility: Default::default(),
+                    project_id: None,
                 };
                 // the CLI runs with database credentials, not a token: it is
                 // always unenforced and grants no creator row

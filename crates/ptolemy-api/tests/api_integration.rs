@@ -5701,6 +5701,7 @@ async fn seed_unowned_dataset(state: &AppState) -> (Uuid, Uuid) {
         created_by: "legacy".into(),
         external: None,
         visibility: Default::default(),
+        project_id: None,
     };
     state.create_dataset(&ds, None).await.unwrap();
     let branch = ptolemy_core::branch::Branch {
@@ -7284,6 +7285,11 @@ async fn test_attach_makes_the_dataset_private_to_the_project() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["visibility"], "private", "the attach did not hide it");
+    assert_eq!(
+        body["project_id"],
+        project_id.to_string(),
+        "the read does not report the project"
+    );
 
     let (status, body) = request_as(&app, "GET", &features, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "anonymous read: {body}");
@@ -7482,20 +7488,53 @@ async fn test_the_stronger_of_grant_and_project_role_wins() {
 }
 
 /// Detaching drops the project's access and leaves the dataset private, so losing
-/// a project can never publish its data.
+/// a project can never publish its data. The dataset read reports the link both
+/// ways round, so a client can tell which project it is looking at.
 #[tokio::test]
 async fn test_detach_leaves_the_dataset_private() {
     let app = setup_app_authed().await;
-    let (dataset_id, branch_id, _, carol) = seed_attached_dataset(&app).await;
+    let (dataset_id, branch_id, project_id, carol) = seed_attached_dataset(&app).await;
     let features = format!("/api/v1/branches/{branch_id}/features");
+    let dataset = format!("/api/v1/datasets/{dataset_id}");
     let viewer = token_for_user("project-viewer", Role::Viewer);
 
     let (status, body) = request_as(&app, "GET", &features, Some(&viewer), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // the read names the project while it is attached, in the single read and in
+    // the listing, and to a member as much as to the dataset's own admin
+    for token in [&carol, &viewer] {
+        let (status, body) = request_as(&app, "GET", &dataset, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["project_id"], project_id.to_string(), "{body}");
+    }
+    let (status, body) = request_as(&app, "GET", "/api/v1/datasets", Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == dataset_id.to_string())
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(listed["project_id"], project_id.to_string(), "{listed}");
+
     let (status, body) = detach_project(&app, &carol, dataset_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["project_id"], Value::Null, "{body}");
+
+    // and reports null once it is gone, rather than leaving the old id behind
+    let (status, body) = request_as(&app, "GET", &dataset, Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["project_id"], Value::Null, "{body}");
+    let (status, body) = request_as(&app, "GET", "/api/v1/datasets", Some(&carol), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == dataset_id.to_string())
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(listed["project_id"], Value::Null, "{listed}");
 
     let (status, body) = request_as(&app, "GET", &features, Some(&viewer), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "member after detach: {body}");

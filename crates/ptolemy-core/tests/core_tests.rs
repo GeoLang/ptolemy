@@ -832,6 +832,7 @@ fn test_dataset_creation() {
         created_by: "admin".into(),
         external: None,
         visibility: Default::default(),
+        project_id: None,
     };
     let json = serde_json::to_string(&ds).unwrap();
     let back: Dataset = serde_json::from_str(&json).unwrap();

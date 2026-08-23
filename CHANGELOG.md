@@ -20,6 +20,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-23: a dataset reports its `project_id`, `null` when it belongs to no
+  project. `GET /api/v1/datasets/{id}` and `GET /api/v1/datasets` both carry it,
+  to anyone who may read the dataset. It is read-only: `POST /api/v1/datasets`
+  ignores it, so a dataset can only be attached through
+  `PUT /api/v1/datasets/{id}/project` and the project-role check it makes.
+
 - 2026-08-23: project roles reach dataset grants. `datasets.project_id`
   (migration `036`, nullable, `ON DELETE SET NULL`) attaches a dataset to one
   project, and every member of that project then reaches it without a grant of

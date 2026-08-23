@@ -234,6 +234,9 @@ impl PgStore {
     ) -> Result<(), StoreError> {
         let geom_type = format!("{:?}", ds.geometry_type).to_lowercase();
         let mut tx = self.pool.begin().await?;
+        // `project_id` is deliberately absent: a create that wrote it would attach
+        // a dataset to a project without the editor-or-owner check the attach
+        // endpoint makes, so the column is left NULL and only attach sets it
         sqlx::query(
             "INSERT INTO datasets (id, name, srid, geometry_type, created_at, created_by,
                                    external_table, external_id_column, external_geometry_column,
@@ -574,7 +577,8 @@ impl PgStore {
     pub async fn get_dataset(&self, id: Uuid) -> Result<Dataset, StoreError> {
         let row = sqlx::query(
             "SELECT id, name, srid, geometry_type, created_at, created_by,
-                    external_table, external_id_column, external_geometry_column, visibility
+                    external_table, external_id_column, external_geometry_column, visibility,
+                    project_id
              FROM datasets WHERE id = $1",
         )
         .bind(id)
@@ -592,7 +596,7 @@ impl PgStore {
         let rows = sqlx::query(&format!(
             "SELECT d.id, d.name, d.srid, d.geometry_type, d.created_at, d.created_by,
                     d.external_table, d.external_id_column, d.external_geometry_column,
-                    d.visibility
+                    d.visibility, d.project_id
              FROM datasets d WHERE {visible} ORDER BY d.name"
         ))
         .bind(reader.bypass)
@@ -4411,6 +4415,7 @@ fn dataset_from_row(row: sqlx::postgres::PgRow) -> Result<Dataset, StoreError> {
         created_by: row.get("created_by"),
         // the column has a CHECK constraint, so an unknown value cannot be stored
         visibility: Visibility::parse(&visibility).unwrap_or_default(),
+        project_id: row.get("project_id"),
     })
 }
 

@@ -466,6 +466,7 @@ impl DataStore for GeoPackageStore {
                         created_by: "geopackage".into(),
                         external: None,
                         visibility: Default::default(),
+                        project_id: None,
                     });
                 }
                 Ok(out)
