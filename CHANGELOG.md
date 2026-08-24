@@ -90,8 +90,11 @@ All notable changes to this project will be documented in this file.
 
 - 2026-08-24: **the audit log records who did what to what**. Every mutation
   that answered 2xx writes one row: the token subject, the method and matched
-  route template, the dataset or branch the write ladder checked it against, and
-  the time. `GET /api/v1/audit` already read this table and now has something to
+  route template, the dataset or branch the write ladder checked it against, the
+  request path, and the time. The path is there because not every target is a
+  uuid: the ArcGIS facade names its layer by service name. The query string is
+  not, because on that facade it carries the caller's token and this table is
+  served over HTTP. `GET /api/v1/audit` already read this table and now has something to
   read. The writer is one layer, `audit::audit_middleware`, sitting inside the
   write gate, so it cannot be forgotten by a handler and the id it records is
   the id the ladder checked. Reads are not recorded, and neither are refused

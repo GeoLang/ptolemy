@@ -17749,3 +17749,53 @@ async fn test_deleted_subsystem_routes_are_not_mounted() {
     let (status, _) = request_as(&app, "GET", "/ws/rooms/design-review", None, None).await;
     assert_ne!(status, StatusCode::NOT_FOUND);
 }
+
+/// The ArcGIS facade takes its credential as `?token=`, and an audit row is read
+/// back over HTTP by an admin, so the query must never reach one. The path must,
+/// because the facade names its layer there and no uuid in it is the target.
+#[tokio::test]
+async fn test_an_arcgis_edit_is_audited_by_path_and_never_by_query() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let (name, carol, _branch) = owned_editable_layer(&app).await;
+    let body = form_body(&[
+        ("f", "json".into()),
+        (
+            "adds",
+            json!([{"attributes": {"name": "audited"}, "geometry": {"x": 4.0, "y": 4.0}}])
+                .to_string(),
+        ),
+    ]);
+
+    let (status, out) = post_form_as(
+        &app,
+        &format!("{}?token={carol}", apply_edits_url(&name)),
+        &body,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["addResults"][0]["success"], true, "{out}");
+
+    let row = sqlx::query(
+        "SELECT actor, resource_type, resource_id, details FROM audit_log
+          WHERE action LIKE 'POST /arcgis%applyEdits'
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+
+    assert_eq!(row.get::<String, _>("actor"), "carol");
+    assert_eq!(row.get::<String, _>("resource_type"), "arcgis");
+    // the facade's first template parameter is a service name, not a uuid
+    assert!(row.get::<Option<Uuid>, _>("resource_id").is_none());
+
+    let details: Value = row.get("details");
+    assert_eq!(details["path"], apply_edits_url(&name), "{details}");
+    let shown = details.to_string();
+    assert!(
+        !shown.contains(&carol),
+        "the token reached the row: {shown}"
+    );
+    assert!(!shown.contains("token"), "{shown}");
+}

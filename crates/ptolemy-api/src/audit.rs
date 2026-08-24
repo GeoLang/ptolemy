@@ -53,6 +53,11 @@ struct Pending {
     action: String,
     resource_type: String,
     resource_id: Option<Uuid>,
+    /// The request path, no query. Not every target is a uuid: the ArcGIS facade
+    /// names its layer by service name and a topology route by topology name, and
+    /// `resource_id` is `None` for both. Without this such a row says an edit
+    /// happened without saying to what.
+    path: String,
 }
 
 /// The kind of thing a route acts on: the first named segment of the matched
@@ -95,6 +100,7 @@ fn pending(request: &Request) -> Option<Pending> {
         action: format!("{} {}", request.method(), template),
         resource_type: resource_type(template).to_owned(),
         resource_id: write_target_id(template, request.uri().path()),
+        path: request.uri().path().to_owned(),
     })
 }
 
@@ -115,10 +121,11 @@ pub async fn audit_middleware(
 }
 
 async fn record(store: &AppState, pending: &Pending, status: StatusCode) {
-    // the status only. The query string is deliberately left out: on the ArcGIS
-    // facade it carries the caller's token, and a bearer credential must not be
-    // copied into a table an admin reads over HTTP
-    let details = serde_json::json!({"status": status.as_u16()});
+    // the query string is deliberately left out. On the ArcGIS facade it carries
+    // the caller's token (see `auth::request_token`), and a bearer credential
+    // must not be copied into a table an admin reads over HTTP. The path is
+    // safe: no route takes a credential in a segment.
+    let details = serde_json::json!({"status": status.as_u16(), "path": &pending.path});
     if let Err(e) = store
         .audit_log(
             &pending.actor,

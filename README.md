@@ -356,9 +356,12 @@ as-is.
 ## Audit log
 
 Every mutation that answered 2xx writes one row: the token subject, the method
-and matched route, the dataset or branch the write ladder checked it against, and
-when. Reads are not recorded. `GET /api/v1/audit` reads it back, `limit` and
-`actor`, instance admin only.
+and matched route, the dataset or branch the write ladder checked it against, the
+request path, and when. Reads are not recorded. `GET /api/v1/audit` reads it
+back, `limit` and `actor`, instance admin only.
+
+The query string is never recorded. On the ArcGIS facade it carries the caller's
+token, and this table is served over HTTP.
 
 The row is written after the response is built, so a database that refuses it
 logs and moves on rather than failing the write that was already made. The
