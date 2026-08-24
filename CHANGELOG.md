@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- 2026-08-24: **the delivery worker retires what it is finished with**. Every
+  commit writes an event row and one delivery row per subscription, and event
+  pruning went with the job scheduler, so both tables grew for as long as an
+  instance ran. Once an hour the worker deletes settled deliveries older than
+  `PTOLEMY_EVENTS_RETENTION_DAYS` (default 30, `0` keeps everything) and then the
+  events no undelivered delivery still refers to. Settled means delivered, or a
+  dead letter out of attempts, dated by the last attempt that gave up; a delivery
+  still in the retry ladder is never touched and neither is its event, which the
+  cascade on `webhook_deliveries.event_id` would otherwise take with it.
+  Deliveries are swept before events so a dead letter stops pinning one in the
+  same pass. Each delete is `LIMIT`-batched, 1000 rows a statement and at most 50
+  statements a table per sweep, so no sweep holds a long transaction and a
+  backlog drains over successive hours rather than in one run.
+
 ### Removed
 
 - 2026-08-24: **five subsystems that were advertised and had no callers are
@@ -25,8 +41,8 @@ All notable changes to this project will be documented in this file.
   Migration `006_locks.sql` is shipped and cannot be un-run, so `feature_locks`
   is left behind as an orphaned table. Nothing reads or writes it. Drop it by
   hand if you want the space. The other four subsystems had no tables of their
-  own: the job scheduler pruned `events` and `feature_locks`, and event pruning
-  went with it, so an `events` row is now kept until an operator removes it.
+  own: the job scheduler pruned `events` and `feature_locks`, and the delivery
+  worker's retention sweep above took over pruning `events`.
 
 ### Changed
 

@@ -334,6 +334,7 @@ of them. On the Helm chart the URL carrying them is the one in
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
 | `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger a planner-statistics refresh; `0` leaves it to autoanalyze | 1000 |
+| `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept; `0` keeps them forever | 30 |
 
 ### Planner statistics after a bulk import
 
@@ -394,6 +395,15 @@ subscription has a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact
 body sent. Verify that before trusting a payload. A failed attempt is retried
 with a doubling backoff, five attempts in all, after which the row stays with its
 last error for an admin to read. The secret is never returned by any endpoint.
+
+Every commit writes an event row and one delivery row per subscription, so the
+worker also retires what it is finished with, once an hour. A delivery goes
+`PTOLEMY_EVENTS_RETENTION_DAYS` after it was delivered, or after the last attempt
+that gave up on it; an event goes once it is that old and no delivery still needs
+it. A delivery still in the retry ladder is never touched, and neither is the
+event behind it. Each sweep deletes in bounded batches, so it never holds a long
+transaction, and what it does not reach waits for the next hour. Set the variable
+to `0` to keep both tables forever, and prune them yourself.
 
 ## ArcGIS FeatureServer
 

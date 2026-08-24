@@ -1170,6 +1170,97 @@ impl PgStore {
         .await?;
         Ok(())
     }
+
+    /// Delete up to `limit` settled deliveries older than `retention`.
+    ///
+    /// Settled means nothing will look at the row again: it was delivered, or it
+    /// is a dead letter, out of attempts. A row still in the retry ladder is
+    /// never touched however old the event is.
+    ///
+    /// `delivered_at` dates a delivered row. A dead letter is dated by
+    /// `next_attempt_at`, which its last attempt pushed past the moment of that
+    /// attempt, so it is the first timestamp after the row stopped moving.
+    ///
+    /// Bounded by `limit` so a sweep never holds a long transaction. Returns how
+    /// many went, which is how a caller knows whether to ask again.
+    pub async fn delete_settled_webhook_deliveries(
+        &self,
+        retention: EventRetentionDays,
+        max_attempts: i32,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM webhook_deliveries
+              WHERE (webhook_id, event_id) IN (
+                  SELECT webhook_id, event_id FROM webhook_deliveries
+                   WHERE (delivered_at IS NOT NULL
+                          AND delivered_at < now() - make_interval(days => $1))
+                      OR (delivered_at IS NULL AND attempts >= $2
+                          AND next_attempt_at < now() - make_interval(days => $1))
+                   LIMIT $3)",
+        )
+        .bind(retention.days())
+        .bind(max_attempts)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete up to `limit` events older than `retention` that no undelivered
+    /// delivery still refers to.
+    ///
+    /// The guard is what keeps this from cutting the ground out from under the
+    /// worker: an event with a delivery still waiting to be sent stays, whatever
+    /// its age, because `webhook_deliveries.event_id` cascades and deleting the
+    /// event would take the pending delivery with it.
+    ///
+    /// A dead letter also counts as undelivered and pins its event, which is why
+    /// [`PgStore::delete_settled_webhook_deliveries`] runs first: with the dead
+    /// letter already gone, the event it was pinning comes free in the same
+    /// sweep.
+    pub async fn delete_unreferenced_events(
+        &self,
+        retention: EventRetentionDays,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM events
+              WHERE id IN (
+                  SELECT e.id FROM events e
+                   WHERE e.created_at < now() - make_interval(days => $1)
+                     AND NOT EXISTS (SELECT 1 FROM webhook_deliveries d
+                                      WHERE d.event_id = e.id
+                                        AND d.delivered_at IS NULL)
+                   LIMIT $2)",
+        )
+        .bind(retention.days())
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// How long a settled delivery and its event are kept, in days, always at least
+/// one.
+///
+/// A newtype because the two sweeps interpolate it into `now() - interval`: a
+/// zero would make that `now()` and take every settled row and every event with
+/// it. Turning retention off is [`EventRetentionDays::new`] answering `None`, so
+/// the off case cannot reach the SQL as a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRetentionDays(i32);
+
+impl EventRetentionDays {
+    /// `None` for zero or less, which means keep everything.
+    pub fn new(days: i32) -> Option<Self> {
+        (days > 0).then_some(EventRetentionDays(days))
+    }
+
+    pub fn days(&self) -> i32 {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -1193,5 +1284,16 @@ mod tests {
         assert!(!shown.contains("the-signing-key"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(shown.contains("https://example.test/hook"), "{shown}");
+    }
+
+    /// Zero is how retention is turned off, and it must not reach the SQL as a
+    /// day count: `now() - interval '0 days'` is `now()`, which would take every
+    /// settled row.
+    #[test]
+    fn retention_off_cannot_become_a_day_count() {
+        assert_eq!(EventRetentionDays::new(0), None);
+        assert_eq!(EventRetentionDays::new(-1), None);
+        assert_eq!(EventRetentionDays::new(30).map(|r| r.days()), Some(30));
+        assert_eq!(EventRetentionDays::new(1).map(|r| r.days()), Some(1));
     }
 }

@@ -56,9 +56,16 @@ async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
         .await
         .unwrap();
 
-    // Clean relevant tables (order matters for FK constraints)
+    // Clean relevant tables (order matters for FK constraints).
+    //
+    // The webhook trio goes because the retention sweep works on the whole
+    // table, not one dataset: a settled row another test left behind would be
+    // counted by this one's sweep.
     sqlx::raw_sql(
-        "DROP TABLE IF EXISTS conflicts CASCADE;
+        "DROP TABLE IF EXISTS webhook_deliveries CASCADE;
+         DROP TABLE IF EXISTS events CASCADE;
+         DROP TABLE IF EXISTS webhooks CASCADE;
+         DROP TABLE IF EXISTS conflicts CASCADE;
          DROP TABLE IF EXISTS attachments CASCADE;
          DROP TABLE IF EXISTS feature_versions CASCADE;
          DROP TABLE IF EXISTS changesets CASCADE;
@@ -17798,4 +17805,185 @@ async fn test_an_arcgis_edit_is_audited_by_path_and_never_by_query() {
         "the token reached the row: {shown}"
     );
     assert!(!shown.contains("token"), "{shown}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Retention sweep
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Every commit writes an event row and one delivery row per subscription, so
+// both tables grow for as long as the instance runs. The delivery worker retires
+// what nothing will look at again. These age rows by hand: waiting out a
+// thirty-day window is not a test.
+
+/// Push a dataset's whole event history and every delivery of it back by `days`,
+/// as if the sweep were looking at them that much later.
+async fn age_dataset_events(state: &AppState, dataset_id: Uuid, days: i32) {
+    sqlx::query(
+        "UPDATE webhook_deliveries
+            SET delivered_at = delivered_at - make_interval(days => $2),
+                next_attempt_at = next_attempt_at - make_interval(days => $2)
+          WHERE event_id IN (SELECT id FROM events WHERE dataset_id = $1)",
+    )
+    .bind(dataset_id)
+    .bind(days)
+    .execute(state.unguarded_pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE events SET created_at = created_at - make_interval(days => $2)
+          WHERE dataset_id = $1",
+    )
+    .bind(dataset_id)
+    .bind(days)
+    .execute(state.unguarded_pool())
+    .await
+    .unwrap();
+}
+
+async fn delivery_count(state: &AppState, webhook_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE webhook_id = $1")
+        .bind(webhook_id)
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap()
+}
+
+async fn event_count(state: &AppState, dataset_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE dataset_id = $1")
+        .bind(dataset_id)
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap()
+}
+
+/// A dataset with one subscription and one commit queued to it.
+async fn subscribed_commit(app: &axum::Router, receiver: &str) -> (Uuid, Uuid) {
+    let dataset_id = create_dataset(app).await;
+    let webhook_id = subscribe(app, dataset_id, receiver, "retention").await;
+    let branch_id = create_branch(app, dataset_id, "main").await;
+    commit_features(
+        app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+            "properties": {}
+        }]),
+    )
+    .await;
+    (dataset_id, webhook_id)
+}
+
+const RETENTION_DAYS: i32 = 30;
+
+fn retention() -> ptolemy_storage::EventRetentionDays {
+    ptolemy_storage::EventRetentionDays::new(RETENTION_DAYS).expect("a positive window")
+}
+
+#[tokio::test]
+async fn test_the_sweep_retires_a_delivered_row_once_it_is_older_than_the_window() {
+    let (receiver, _log) = spawn_receiver(StatusCode::OK).await;
+    let (app, state) = setup_app().await;
+    let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
+
+    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    assert_eq!(worker.run_once().await, 1);
+    assert!(delivery_state(&state, webhook_id).await.1, "delivered");
+
+    // inside the window it stays, however settled it is
+    age_dataset_events(&state, dataset_id, RETENTION_DAYS - 1).await;
+    assert_eq!(worker.sweep_retention(retention()).await, (0, 0));
+    assert_eq!(delivery_count(&state, webhook_id).await, 1);
+    assert_eq!(event_count(&state, dataset_id).await, 2, "branch + commit");
+
+    // past it, the delivery goes, and so do both events: the commit one is no
+    // longer referenced and the branch_created one never had a subscriber
+    age_dataset_events(&state, dataset_id, 2).await;
+    assert_eq!(worker.sweep_retention(retention()).await, (1, 2));
+    assert_eq!(delivery_count(&state, webhook_id).await, 0);
+    assert_eq!(event_count(&state, dataset_id).await, 0);
+}
+
+#[tokio::test]
+async fn test_the_sweep_retires_a_dead_letter_past_its_last_attempt() {
+    let (receiver, _log) = spawn_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (app, state) = setup_app().await;
+    let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
+
+    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    for _ in 0..ptolemy_api::MAX_DELIVERY_ATTEMPTS {
+        worker.run_once().await;
+    }
+    let (attempts, delivered, _) = delivery_state(&state, webhook_id).await;
+    assert_eq!(attempts, ptolemy_api::MAX_DELIVERY_ATTEMPTS);
+    assert!(!delivered, "a dead letter, not a delivery");
+
+    // a dead letter inside the window is kept: it is the only record of why
+    age_dataset_events(&state, dataset_id, RETENTION_DAYS - 1).await;
+    assert_eq!(worker.sweep_retention(retention()).await, (0, 0));
+    assert_eq!(delivery_count(&state, webhook_id).await, 1);
+
+    // past it the dead letter goes, and the event it was pinning goes with it in
+    // the same pass, because the sweep takes deliveries before events
+    age_dataset_events(&state, dataset_id, 2).await;
+    assert_eq!(worker.sweep_retention(retention()).await, (1, 2));
+    assert_eq!(delivery_count(&state, webhook_id).await, 0);
+    assert_eq!(event_count(&state, dataset_id).await, 0);
+}
+
+/// An event with a delivery still waiting must survive, whatever its age: the
+/// foreign key cascades, so deleting it would take the pending delivery with it
+/// and the subscriber would never hear about the commit.
+#[tokio::test]
+async fn test_the_sweep_keeps_an_event_an_undelivered_row_still_needs() {
+    // a receiver that is never asked, so the delivery stays pending
+    let (app, state) = setup_app().await;
+    let (dataset_id, webhook_id) =
+        subscribed_commit(&app, "http://127.0.0.1:9/never-listened").await;
+
+    age_dataset_events(&state, dataset_id, RETENTION_DAYS * 10).await;
+    let (deliveries, events) = worker_for(&state).sweep_retention(retention()).await;
+
+    assert_eq!(deliveries, 0, "a pending delivery is not settled");
+    assert_eq!(delivery_count(&state, webhook_id).await, 1);
+    // the branch_created event had no subscriber, so nothing pins it and it goes
+    assert_eq!(events, 1);
+    // the commit event stays, pinned by the delivery that still needs it
+    assert_eq!(event_count(&state, dataset_id).await, 1);
+    let pinned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events e
+           JOIN webhook_deliveries d ON d.event_id = e.id
+          WHERE e.dataset_id = $1 AND d.delivered_at IS NULL",
+    )
+    .bind(dataset_id)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(pinned, 1);
+}
+
+fn worker_for(state: &AppState) -> ptolemy_api::DeliveryWorker {
+    ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0)
+}
+
+/// Retention off is a window that cannot be built, so the sweep has no window to
+/// run with and nothing is ever deleted. The parse that turns `0` into "off"
+/// is `only_a_positive_day_count_turns_the_sweep_on` in `delivery.rs`.
+#[tokio::test]
+async fn test_retention_off_deletes_nothing() {
+    assert_eq!(ptolemy_storage::EventRetentionDays::new(0), None);
+
+    let (receiver, _log) = spawn_receiver(StatusCode::OK).await;
+    let (app, state) = setup_app().await;
+    let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
+    let worker = worker_for(&state);
+    worker.run_once().await;
+    age_dataset_events(&state, dataset_id, RETENTION_DAYS * 100).await;
+
+    // whatever an operator puts in the variable, `None` means the loop never
+    // calls the sweep, and rows this old would otherwise all have gone
+    assert_eq!(delivery_count(&state, webhook_id).await, 1);
+    assert_eq!(event_count(&state, dataset_id).await, 2);
 }

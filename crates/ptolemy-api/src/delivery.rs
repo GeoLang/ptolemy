@@ -15,12 +15,18 @@
 //! attempt count and pushes the next attempt out by the backoff before this
 //! module makes the request, so a worker that dies mid-delivery costs one
 //! attempt. Two workers on the same database cannot take the same row.
+//!
+//! The worker also retires what it has finished with. Every commit writes an
+//! event row and one delivery row per subscription, so without a sweep both
+//! tables grow for as long as the instance runs. It happens here rather than in
+//! a scheduler of its own because this is the only thing that reads those
+//! tables, and it already runs on a timer.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
-use ptolemy_storage::{DueDelivery, PgStore};
+use ptolemy_storage::{DueDelivery, EventRetentionDays, PgStore};
 use reqwest::Client;
 use sha2::Sha256;
 use tracing::{info, warn};
@@ -44,6 +50,51 @@ const BATCH: i64 = 50;
 
 /// A receiver that never answers must not hold the batch open.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the worker keeps a settled delivery and the event behind it, unless
+/// `PTOLEMY_EVENTS_RETENTION_DAYS` says otherwise. `0` there keeps everything.
+const DEFAULT_EVENTS_RETENTION_DAYS: i32 = 30;
+const EVENTS_RETENTION_DAYS_VAR: &str = "PTOLEMY_EVENTS_RETENTION_DAYS";
+
+/// How often the worker retires what it is done with. Far apart because nothing
+/// waits on it, and a sweep competes with delivery for the same pool.
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Rows one delete statement may take, so no sweep holds a long transaction.
+const RETENTION_BATCH: i64 = 1000;
+
+/// Batches one sweep may run per table. The cap is what keeps a first sweep
+/// against a long-unswept database from running for minutes: whatever is left
+/// over goes on the next pass, an hour later.
+const RETENTION_MAX_BATCHES: usize = 50;
+
+/// The retention window `PTOLEMY_EVENTS_RETENTION_DAYS` asks for. `None` turns
+/// the sweep off: that is `0`, a negative number, or a value that is not a whole
+/// number of days at all, where deleting on a guess is the wrong way to be
+/// wrong. Unset takes the default.
+///
+/// Split from the environment read so it can be tested without mutating the
+/// process environment, which edition 2024 makes unsafe.
+fn parse_retention_days(raw: Option<&str>) -> Option<EventRetentionDays> {
+    let days = match raw {
+        None => DEFAULT_EVENTS_RETENTION_DAYS,
+        Some(raw) => match raw.trim().parse::<i32>() {
+            Ok(days) => days,
+            Err(_) => {
+                warn!(
+                    value = %raw,
+                    "{EVENTS_RETENTION_DAYS_VAR} is not a whole number of days, keeping everything"
+                );
+                0
+            }
+        },
+    };
+    EventRetentionDays::new(days)
+}
+
+fn retention_from_env() -> Option<EventRetentionDays> {
+    parse_retention_days(std::env::var(EVENTS_RETENTION_DAYS_VAR).ok().as_deref())
+}
 
 /// The `X-Ptolemy-Signature` value for a body, `None` when the secret cannot key
 /// an HMAC. Receivers verify this string, so it is a wire contract.
@@ -78,6 +129,65 @@ impl DeliveryWorker {
     pub fn with_backoff_base_secs(mut self, secs: f64) -> Self {
         self.backoff_base_secs = secs;
         self
+    }
+
+    /// Retire what nothing will look at again: settled deliveries, then the
+    /// events no undelivered delivery still refers to. Returns the two counts.
+    ///
+    /// Order matters. A dead letter counts as undelivered and pins its event, so
+    /// the deliveries have to go first for the events behind them to come free.
+    /// Each table is swept in `RETENTION_BATCH` batches up to
+    /// `RETENTION_MAX_BATCHES`, and a short batch means there is no more to take.
+    pub async fn sweep_retention(&self, retention: EventRetentionDays) -> (u64, u64) {
+        let deliveries = self
+            .sweep_batches(|| {
+                self.store.delete_settled_webhook_deliveries(
+                    retention,
+                    MAX_DELIVERY_ATTEMPTS,
+                    RETENTION_BATCH,
+                )
+            })
+            .await;
+        let events = self
+            .sweep_batches(|| {
+                self.store
+                    .delete_unreferenced_events(retention, RETENTION_BATCH)
+            })
+            .await;
+        if deliveries > 0 || events > 0 {
+            info!(
+                deliveries,
+                events,
+                retention_days = retention.days(),
+                "retired settled webhook deliveries and their events"
+            );
+        }
+        (deliveries, events)
+    }
+
+    /// Run one delete until it stops finding rows, or the batch cap stops it.
+    async fn sweep_batches<F, Fut>(&self, delete: F) -> u64
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<u64, ptolemy_storage::StoreError>>,
+    {
+        let mut total = 0;
+        for _ in 0..RETENTION_MAX_BATCHES {
+            match delete().await {
+                Ok(0) => break,
+                Ok(gone) => {
+                    total += gone;
+                    if gone < RETENTION_BATCH as u64 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "retention sweep failed");
+                    break;
+                }
+            }
+        }
+        total
     }
 
     /// One pass: claim what is due and deliver it. Returns how many were tried,
@@ -168,8 +278,26 @@ impl DeliveryWorker {
 pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let worker = DeliveryWorker::new(store);
-        info!("webhook delivery worker started");
+        let retention = retention_from_env();
+        match retention {
+            Some(days) => info!(
+                retention_days = days.days(),
+                "webhook delivery worker started"
+            ),
+            None => {
+                info!("webhook delivery worker started, events and deliveries kept indefinitely")
+            }
+        }
+        // never swept, so the first pass sweeps: a server that was down for a
+        // week has a backlog waiting, and there is no reason to sit on it
+        let mut last_sweep: Option<Instant> = None;
         loop {
+            if let Some(retention) = retention
+                && last_sweep.is_none_or(|at| at.elapsed() >= RETENTION_SWEEP_INTERVAL)
+            {
+                worker.sweep_retention(retention).await;
+                last_sweep = Some(Instant::now());
+            }
             if worker.run_once().await == 0 {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
@@ -180,6 +308,27 @@ pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0` is how an operator turns the sweep off, and nothing but a positive
+    /// whole number may switch it on.
+    #[test]
+    fn only_a_positive_day_count_turns_the_sweep_on() {
+        assert_eq!(parse_retention_days(Some("0")), None);
+        assert_eq!(parse_retention_days(Some("-7")), None);
+        // a value nobody meant must not be read as "delete after 0 days"
+        for junk in ["", "  ", "thirty", "7.5", "30d"] {
+            assert_eq!(parse_retention_days(Some(junk)), None, "{junk}");
+        }
+        assert_eq!(parse_retention_days(Some("7")).map(|r| r.days()), Some(7));
+        assert_eq!(
+            parse_retention_days(Some(" 90 ")).map(|r| r.days()),
+            Some(90)
+        );
+        assert_eq!(
+            parse_retention_days(None).map(|r| r.days()),
+            Some(DEFAULT_EVENTS_RETENTION_DAYS)
+        );
+    }
 
     // this digest holds a byte below 0x10, so a dropped zero pad fails here
     #[test]

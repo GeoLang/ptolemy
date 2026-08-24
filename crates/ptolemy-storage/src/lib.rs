@@ -27,4 +27,4 @@ pub use workspace::{
     ProjectMember, ProjectStateEntry, ProjectWithRole, Workspace, WorkspaceInvitation,
     WorkspaceMember, WorkspaceWithRole, effective_project_role_sql,
 };
-pub use writes::{DueDelivery, WebhookInput};
+pub use writes::{DueDelivery, EventRetentionDays, WebhookInput};
