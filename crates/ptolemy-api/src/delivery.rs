@@ -34,7 +34,7 @@ use tracing::{info, warn};
 type HmacSha256 = Hmac<Sha256>;
 
 /// How many times one event is offered to one subscriber before it is left as a
-/// dead letter. Attempts are spaced 1s, 2s, 4s, 8s by [`BACKOFF_BASE_SECS`].
+/// dead letter. Attempts are spaced 1s, 2s, 4s, 8s by `BACKOFF_BASE_SECS`.
 pub const MAX_DELIVERY_ATTEMPTS: i32 = 5;
 
 /// First retry gap. Each later one doubles, up to [`BACKOFF_CAP_SECS`].

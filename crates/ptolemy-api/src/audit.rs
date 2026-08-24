@@ -9,7 +9,7 @@
 //! is: a write happens in dozens of handlers, and what they share is the request
 //! that reached them. It sits inside the write gate, so a request the ladder
 //! refused never gets here and the audited target is the id the ladder checked
-//! (both read it with [`crate::visibility::write_target_id`]).
+//! (both read it with `visibility::write_target_id`).
 //!
 //! Only mutations that answered 2xx are recorded. Recording refusals as well
 //! would let an unauthenticated caller fill the table by being refused in a
