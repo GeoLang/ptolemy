@@ -104,7 +104,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Subtypes</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored, enforced nowhere</span></td></tr>
 <tr><td>Attribute rules</td><td class="yes">✓</td><td class="no">— <span class="note">No expression engine</span></td></tr>
 <tr><td>Relationship classes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">1:1, 1:M, M:N with forward/backward navigation</span></td></tr>
-<tr><td>Feature locking</td><td class="yes">✓</td><td class="partial">~ <span class="note">Lock records with a TTL. Commit never queries them</span></td></tr>
+<tr><td>Feature locking</td><td class="yes">✓</td><td class="no">— <span class="note">Branches and the merge conflict flow instead</span></td></tr>
 </table>
 
 <h2>Symbology & Cartography</h2>
@@ -127,7 +127,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>GeoJSON export</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Native format</span></td></tr>
 <tr><td>Shapefile export</td><td class="yes">✓</td><td class="partial">~ <span class="note">Via shapefile crate in CLI</span></td></tr>
 <tr><td>CRS transformation (EPSG)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS ST_Transform, any EPSG code</span></td></tr>
-<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST. Branch WebSocket and SSE stay silent</span></td></tr>
+<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST, plus signed webhooks and a collaboration WebSocket relay</span></td></tr>
 </table>
 
 <h2>Advanced Analytics & Extensions</h2>
@@ -148,9 +148,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Authentication (SSO)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OIDC (Keycloak, Auth0) + JWT</span></td></tr>
 <tr><td>Role-based access control</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Admin/Editor/Viewer roles</span></td></tr>
 <tr><td>Multi-tenancy</td><td class="yes">✓</td><td class="no">— <span class="note">Dropped in migration 028</span></td></tr>
-<tr><td>Audit logging</td><td class="yes">✓</td><td class="partial">~ <span class="note">GET /audit reads a table the writer never fills. Webhook delivery has no callers</span></td></tr>
+<tr><td>Audit logging</td><td class="yes">✓</td><td class="yes">✓ <span class="note">One row per mutation: subject, route, target, time. Reads are not recorded</span></td></tr>
 <tr><td>Monitoring / metrics</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Prometheus /metrics endpoint</span></td></tr>
-<tr><td>Rate limiting</td><td class="partial">~ <span class="note">Via WAF/proxy</span></td><td class="no">— <span class="note">Middleware exists, not layered on the router. Fixed-window, not a token bucket</span></td></tr>
+<tr><td>Rate limiting</td><td class="partial">~ <span class="note">Via WAF/proxy</span></td><td class="no">— <span class="note">Not in the server. Put a proxy in front</span></td></tr>
 <tr><td>Docker deployment</td><td class="no">— <span class="note">Windows/.NET only</span></td><td class="yes">✓ <span class="note">Single binary + docker-compose</span></td></tr>
 </table>
 
@@ -165,7 +165,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td><strong>Open Source (AGPL-3.0)</strong></td><td>No per-user licensing fees. Full source access. Community-driven.</td></tr>
 <tr><td><strong>Git-like versioning</strong></td><td>True branch/merge workflows vs Esri's limited parent/child versions.</td></tr>
 <tr><td><strong>PostgreSQL ecosystem</strong></td><td>Leverage 9+ proven extensions (pgRouting, pgvector, MobilityDB, H3, SFCGAL, pointcloud, pg_trgm, PostGIS Topology, pg_partman).</td></tr>
-<tr><td><strong>Modern API</strong></td><td>REST. Branch WebSocket and SSE stay silent.</td></tr>
+<tr><td><strong>Modern API</strong></td><td>REST, signed webhooks, a collaboration WebSocket relay.</td></tr>
 <tr><td><strong>Standards-first</strong></td><td>Native OGC API Features, CQL2, STAC 1.0, OGC Tiles — not proprietary protocols.</td></tr>
 <tr><td><strong>Cloud-native</strong></td><td>Single Rust binary, Docker-ready, sub-millisecond startup. No Windows/.NET requirement.</td></tr>
 <tr><td><strong>pgvector route</strong></td><td>Exact-string matching expressed as a SHA-256 hash vector. 501 unless you install pgvector yourself.</td></tr>

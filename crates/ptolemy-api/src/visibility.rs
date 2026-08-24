@@ -155,10 +155,13 @@ pub async fn ensure_readable(
 ///
 /// This rests on a convention the route tables follow throughout, and only that
 /// one: the resource being written is the first parameter in the template. Later
-/// ones are sub-resources of the same dataset (a feature, a lock) or read-only
-/// inputs, which is what keeps `/branches/{target_id}/merge/{source_id}` from
-/// demanding a write grant on the branch it is merging *from*.
-fn write_target_id(template: &str, path: &str) -> Option<Uuid> {
+/// ones are sub-resources of the same dataset (a feature, an attachment) or
+/// read-only inputs, which is what keeps `/branches/{target_id}/merge/{source_id}`
+/// from demanding a write grant on the branch it is merging *from*.
+///
+/// [`crate::audit`] reads the same function, so the audited target and the
+/// checked target cannot drift apart.
+pub(crate) fn write_target_id(template: &str, path: &str) -> Option<Uuid> {
     let at = template
         .split('/')
         .position(|segment| segment.starts_with('{'))?;
@@ -382,7 +385,6 @@ mod tests {
             ("POST", "/api/v1/datasets/{id}/events"),
             ("POST", "/api/v1/branches/{id}/h3/index"),
             ("POST", "/api/v1/branches/{id}/similarity/embed"),
-            ("POST", "/api/v1/branches/{id}/locks"),
             ("POST", "/api/v1/datasets/{id}/trajectories"),
             (
                 "POST",

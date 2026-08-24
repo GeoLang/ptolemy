@@ -58,11 +58,11 @@ test beyond their `501` branch. Install them yourself before relying on them.
 | **v0.7** | QGIS HTTP endpoints, offline sync protocol, field-to-server workflows | ✓ Done |
 | **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
 | **v0.9** | Schema validation, data quality reports | ✓ Done |
-| **v1.0** | Webhook and CDC event CRUD | ✓ Done |
+| **v1.0** | Webhook subscriptions and signed CDC event delivery | ✓ Done |
 | **v1.1** | Spatial analytics (buffer, union, clustering, anomaly detection) | ✓ Done |
-| **v1.2** | OGC API - Features compliance, audit log read API | ✓ Done |
+| **v1.2** | OGC API - Features compliance, audit log | ✓ Done |
 | **v1.3** | Schema enforcement | ✓ Done |
-| **v1.4** | Feature lock records, temporal queries | ✓ Done |
+| **v1.4** | Temporal queries | ✓ Done |
 | **v1.5** | Data catalog | ✓ Done |
 | **v1.6** | Conflict resolution API | ✓ Done |
 
@@ -70,13 +70,8 @@ Not implemented, whatever the code in the repository suggests:
 
 | Subsystem | State |
 |-----------|-------|
-| Webhook delivery | The delivery worker has no callers and the commit path never reads the webhooks table. Webhook CRUD only, nothing is ever delivered |
-| SSE event stream | `/api/v1/events/stream` emits keep-alives and no events; nothing publishes to it |
-| WebSocket branch events | `/ws/branches/{id}` stays silent; nothing publishes to the event bus |
-| Background jobs | Never started, so lock cleanup, event pruning and quality alerts never run |
-| Rate limiting | The middleware exists but is not layered onto the router |
-| Audit log writes | The writer has no callers, so `audit_log` is always empty. `GET /api/v1/audit` reads it |
-| Feature lock enforcement | Commit never queries locks. Locks are advisory records with a TTL |
+| Rate limiting | Nothing limits request rate. Put a proxy in front |
+| Feature locking | Removed. Use branches and the merge conflict flow for concurrent editing |
 | Topology rule engine | 31 rule types are declared and none is evaluated. Stored rules are never read back and there is no commit-time gate |
 | Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
 | Geometry type constraints | Stored and never checked |
@@ -353,10 +348,49 @@ concurrent bulk writes share one run. It cannot fail or delay a write: if the
 database refuses the `ANALYZE`, for instance because the connecting role does
 not own the tables, the failure is logged and autoanalyze takes over.
 
-With auth on, audit fields (`author`, `created_by`, `granted_by`, `locked_by`)
-are taken from the token subject and the value in the request body is ignored.
-With `PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is
-recorded as-is.
+With auth on, attribution fields (`author`, `created_by`, `granted_by`) are taken
+from the token subject and the value in the request body is ignored. With
+`PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is recorded
+as-is.
+
+## Audit log
+
+Every mutation that answered 2xx writes one row: the token subject, the method
+and matched route, the dataset or branch the write ladder checked it against, and
+when. Reads are not recorded. `GET /api/v1/audit` reads it back, `limit` and
+`actor`, instance admin only.
+
+The row is written after the response is built, so a database that refuses it
+logs and moves on rather than failing the write that was already made. The
+`ip_address` column is left empty: the only source would be a caller-settable
+header, and a spoofable value in an audit column is worse than none.
+
+## Webhooks
+
+`POST /api/v1/datasets/{id}/webhooks` subscribes a url to a dataset's events,
+instance admin only, because a subscription takes dataset content to a url of the
+subscriber's choosing. `events` selects the types to receive and an empty array
+takes all of them:
+
+| Event | Raised by |
+|-------|-----------|
+| `commit` | a commit on any branch of the dataset |
+| `merge` | the merge commit a three-way merge lands |
+| `branch_created` | a new branch |
+| `schema_changed` | `PUT /api/v1/datasets/{id}/schema` |
+
+`POST /api/v1/datasets/{id}/events` emits a custom type, delivered the same way.
+The four above are refused there with 400: a `commit` on the wire always came
+from a real commit.
+
+An event row is written in the same transaction as the change that raised it,
+together with one queued delivery per matching subscription, so a subscriber is
+told about exactly what committed. The worker starts with the server and drains
+that queue: `POST` with `X-Ptolemy-Event`, `X-Ptolemy-Delivery` and, where the
+subscription has a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact
+body sent. Verify that before trusting a payload. A failed attempt is retried
+with a doubling backoff, five attempts in all, after which the row stays with its
+last error for an admin to read. The secret is never returned by any endpoint.
 
 ## ArcGIS FeatureServer
 
@@ -803,11 +837,11 @@ ViewTopia's collaboration client but any JSON structure will work.
 | DELETE | `/api/v1/topology/{id}` | Delete topology rule |
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
 | POST | `/api/v1/branches/{id}/repair` | Auto-repair invalid geometries |
-| GET | `/api/v1/datasets/{id}/webhooks` | List webhooks (registration only, nothing is delivered) |
-| POST | `/api/v1/datasets/{id}/webhooks` | Create webhook (registration only, nothing is delivered) |
-| DELETE | `/api/v1/webhooks/{id}` | Delete webhook |
-| GET | `/api/v1/datasets/{id}/events` | List events, `limit` only. Every row was posted by a client |
-| POST | `/api/v1/datasets/{id}/events` | Emit custom event |
+| GET | `/api/v1/datasets/{id}/webhooks` | List webhook subscriptions (instance admin) |
+| POST | `/api/v1/datasets/{id}/webhooks` | Subscribe, `url` must be http or https (instance admin) |
+| DELETE | `/api/v1/webhooks/{id}` | Delete subscription (instance admin) |
+| GET | `/api/v1/datasets/{id}/events` | List events, `limit` only |
+| POST | `/api/v1/datasets/{id}/events` | Emit a custom event, delivered like the built-in ones |
 | GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer analysis |
 | GET | `/api/v1/branches/{id}/analytics/union` | Union analysis |
 | GET | `/api/v1/branches/{id}/analytics/clusters` | DBSCAN clustering |
@@ -829,10 +863,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/arcgis/rest/services/{service}/FeatureServer/extractChanges` | ArcGIS change extraction |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}` | ArcGIS change file |
-| GET | `/api/v1/audit` | Audit log. Nothing writes to it, so it is always empty |
-| GET | `/api/v1/branches/{id}/locks` | List feature locks (advisory, commit does not check them) |
-| POST | `/api/v1/branches/{id}/locks` | Lock a feature (advisory, commit does not check it) |
-| DELETE | `/api/v1/branches/{bid}/locks/{fid}` | Unlock a feature |
+| GET | `/api/v1/audit` | Audit log, `limit` and `actor` (instance admin) |
 | GET | `/api/v1/branches/{id}/features/at?valid_at=` | Temporal query (features at time) |
 | GET | `/api/v1/catalog/search` | Search datasets (text + tags) |
 | GET | `/api/v1/datasets/{id}/tags` | List dataset tags |
@@ -851,8 +882,6 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/conflicts/{id}` | List merge conflicts |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
-| GET | `/api/v1/events/stream` | SSE endpoint, keep-alives only: nothing publishes events to it |
-| WS | `/ws/branches/{id}` | Branch event socket, silent: nothing publishes to it |
 | WS | `/ws/rooms/{room_id}` | Ephemeral collaboration relay (presence, view sync, chat) |
 | **Networks** | | |
 | GET | `/api/v1/datasets/{id}/networks` | List geometric networks |

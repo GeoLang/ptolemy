@@ -268,12 +268,16 @@ async fn main() -> anyhow::Result<()> {
             // can never come up against an unmigrated database
             store.migrate().await?;
             let app = ptolemy_api::app_with_auth(store.clone(), auth);
+            // drains webhook_deliveries; the queue is in the database, so a
+            // restart picks up whatever the last run did not send
+            let deliveries = ptolemy_api::spawn_delivery_worker(store.clone());
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!("Ptolemy listening on {bind}");
             tracing::info!("Metrics available at http://{bind}/metrics");
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
+            deliveries.abort();
             tracing::info!("Server shut down gracefully");
         }
 

@@ -39,16 +39,8 @@ use uuid::Uuid;
 /// One line per route, and the reason. Nothing else may be left out.
 const SKIPPED: &[(&str, &str)] = &[
     (
-        "GET /api/v1/events/stream",
-        "an sse stream that never ends, and the handler runs no sql",
-    ),
-    (
-        "GET /ws/branches/{branch_id}",
-        "needs a websocket handshake, which oneshot cannot do: api_integration.rs drives a real one",
-    ),
-    (
         "GET /ws/rooms/{room_id}",
-        "needs a websocket handshake, same as above",
+        "needs a websocket handshake, which oneshot cannot do: api_integration.rs drives a real one",
     ),
     (
         "GET /auth/oidc/login",
@@ -306,10 +298,6 @@ const BODY: &[(&str, &str)] = &[
         r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{"name":"sweep"}}]}"#,
     ),
     (
-        "POST /api/v1/branches/{id}/locks",
-        r#"{"feature_id":"{{features}}","locked_by":"sweep"}"#,
-    ),
-    (
         "POST /api/v1/branches/{id}/permissions",
         r#"{"user_id":"sweep","permission":"read","granted_by":"sweep"}"#,
     ),
@@ -425,7 +413,12 @@ const BODY: &[(&str, &str)] = &[
         "POST /api/v1/datasets/{id}/trajectories/nearest",
         r#"{"trajectory_a":"{{features}}","trajectory_b":"{{features}}"}"#,
     ),
-    ("POST /api/v1/datasets/{id}/webhooks", r#"{"url":"sweep"}"#),
+    // a url the delivery worker could actually post to: anything else is
+    // refused before the sweep reaches any sql
+    (
+        "POST /api/v1/datasets/{id}/webhooks",
+        r#"{"url":"https://example.test/sweep"}"#,
+    ),
     (
         "POST /api/v1/incidents",
         r#"{"branch_id":"{{branches}}","incident_type":"sweep","severity":"sweep","lat":1.0,"lng":1.0,"description":"sweep","author":"sweep"}"#,

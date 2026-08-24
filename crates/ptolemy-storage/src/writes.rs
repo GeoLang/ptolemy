@@ -13,7 +13,9 @@
 //! this is the crate's whole guarded write surface, and it is easier to audit as
 //! one list than as forty methods scattered by feature.
 
+use ptolemy_core::event::{Event, Webhook};
 use serde_json::Value;
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::grant::WriteGrant;
@@ -913,30 +915,283 @@ impl PgStore {
     }
 }
 
+// ─── Webhooks ───────────────────────────────────────────────────────
+
+pub struct WebhookInput<'a> {
+    pub url: &'a str,
+    pub events: &'a [String],
+    pub secret: Option<&'a str>,
+}
+
+impl PgStore {
+    /// `grant` is on the dataset the subscription belongs to, so a subscription
+    /// can only ever be aimed at a dataset the caller was checked against. A
+    /// webhook takes dataset content to a url of the subscriber's choosing, which
+    /// is why it is not enough for the route to be the only guard.
+    pub async fn create_webhook(
+        &self,
+        grant: &WriteGrant,
+        input: &WebhookInput<'_>,
+    ) -> Result<Webhook, StoreError> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO webhooks (id, dataset_id, url, events, secret, active)
+             VALUES ($1, $2, $3, $4, $5, TRUE)",
+        )
+        .bind(id)
+        .bind(grant.id())
+        .bind(input.url)
+        .bind(input.events)
+        .bind(input.secret)
+        .execute(&self.pool)
+        .await?;
+        Ok(Webhook {
+            id,
+            dataset_id: grant.id(),
+            url: input.url.to_string(),
+            events: input.events.to_vec(),
+            secret: input.secret.map(str::to_owned),
+            active: true,
+        })
+    }
+
+    /// `grant` is on the webhook itself, which the ladder resolved to its
+    /// dataset.
+    pub async fn delete_webhook(&self, grant: &WriteGrant) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM webhooks WHERE id = $1")
+            .bind(grant.id())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A caller-emitted event, queued to the dataset's subscriptions like one the
+    /// store raises itself. `grant` is on the dataset, and the event type is
+    /// whatever the caller named: this is the custom-event door, and a
+    /// subscription filter is matched against it as-is.
+    pub async fn emit_event(
+        &self,
+        grant: &WriteGrant,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<Event, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let id =
+            crate::postgres::queue_named_event(&mut tx, grant.id(), event_type, payload).await?;
+        let created_at = sqlx::query("SELECT created_at FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("created_at");
+        tx.commit().await?;
+        Ok(Event {
+            id,
+            dataset_id: grant.id(),
+            event_type: event_type.to_string(),
+            payload: payload.clone(),
+            created_at,
+        })
+    }
+}
+
 // ─── Writes with no grant, and why ──────────────────────────────────
 //
-// These two have no dataset or branch behind them, so there is no ladder to
+// None of these has a dataset or branch a caller named, so there is no ladder to
 // run and no grant to demand. They live here rather than in `ptolemy-api` so
 // that `ci/no-raw-writes.sh` needs no allowlist entry for them and the reason
 // each one is ungrantable sits next to its SQL.
 
+/// A delivery the worker has claimed: the row, plus everything the HTTP call
+/// needs, read once so the worker holds no transaction while it waits on a
+/// receiver. `secret` keys the signature and never leaves the process.
+#[derive(Clone)]
+pub struct DueDelivery {
+    pub webhook_id: Uuid,
+    pub event_id: Uuid,
+    pub url: String,
+    pub secret: Option<String>,
+    pub event_type: String,
+    pub payload: Value,
+    /// Which attempt this is, counting from 1, after the claim bumped it.
+    pub attempt: i32,
+}
+
+/// Written by hand so `secret` cannot reach a log line through a `{:?}` on the
+/// whole struct. It is a signing key: whoever reads it can forge a delivery the
+/// subscriber will accept.
+impl std::fmt::Debug for DueDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DueDelivery")
+            .field("webhook_id", &self.webhook_id)
+            .field("event_id", &self.event_id)
+            .field("url", &self.url)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("event_type", &self.event_type)
+            .field("attempt", &self.attempt)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PgStore {
-    /// Background maintenance: no request, no caller, no target. Deletes locks
-    /// whose expiry has already passed, which is the row's own decision.
-    pub async fn delete_expired_feature_locks(&self) -> Result<u64, StoreError> {
-        let result = sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+    /// Record who did what to what. There is no grant because there is no
+    /// caller-named target: the row describes a request that has already been
+    /// through the ladder, and the audit log is not a resource anyone writes to
+    /// by asking.
+    ///
+    /// `ip_address` is left `None` by the request path on purpose. The only
+    /// header a proxy would put it in is caller-settable, and a spoofable value
+    /// in an audit column is worse than an empty one.
+    pub async fn audit_log(
+        &self,
+        actor: &str,
+        action: &str,
+        resource_type: &str,
+        resource_id: Option<Uuid>,
+        details: &Value,
+        ip_address: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO audit_log (id, actor, action, resource_type, resource_id, details, ip_address)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(actor)
+        .bind(action)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(details)
+        .bind(ip_address)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
-    /// Background maintenance, as above: the retention window is fixed here and
-    /// nothing about it comes from a caller.
-    pub async fn delete_events_older_than_retention(&self) -> Result<u64, StoreError> {
-        let result =
-            sqlx::query("DELETE FROM events WHERE created_at < now() - interval '30 days'")
-                .execute(&self.pool)
-                .await?;
-        Ok(result.rows_affected())
+    /// Take up to `limit` deliveries that are due, and schedule their next
+    /// attempt in the same statement.
+    ///
+    /// Claiming is the scheduling: `attempts` goes up and `next_attempt_at` moves
+    /// out by the backoff before the HTTP call happens, so a worker that dies
+    /// holding a delivery costs one attempt rather than a stuck row, and two
+    /// workers cannot take the same row (`FOR UPDATE SKIP LOCKED`).
+    ///
+    /// A row at `max_attempts` is never selected again, which is the retry bound.
+    /// `backoff_base_secs` is a parameter only so a test can drive the retry
+    /// ladder without waiting for it.
+    pub async fn claim_due_webhook_deliveries(
+        &self,
+        max_attempts: i32,
+        backoff_base_secs: f64,
+        backoff_cap_secs: f64,
+        limit: i64,
+    ) -> Result<Vec<DueDelivery>, StoreError> {
+        let rows = sqlx::query(
+            // the `active` test is in `due`, not after the claim: filtering a
+            // claimed row out would spend an attempt on a request never made
+            "WITH due AS (
+                 SELECT d.webhook_id, d.event_id FROM webhook_deliveries d
+                  WHERE d.delivered_at IS NULL
+                    AND d.attempts < $1
+                    AND d.next_attempt_at <= now()
+                    AND EXISTS (SELECT 1 FROM webhooks w
+                                 WHERE w.id = d.webhook_id AND w.active)
+                  ORDER BY d.next_attempt_at
+                  LIMIT $4
+                  FOR UPDATE SKIP LOCKED
+             ),
+             claimed AS (
+                 UPDATE webhook_deliveries d
+                    SET attempts = d.attempts + 1,
+                        next_attempt_at = now() + make_interval(
+                            secs => least(power(2, d.attempts) * $2, $3))
+                   FROM due
+                  WHERE d.webhook_id = due.webhook_id AND d.event_id = due.event_id
+                  RETURNING d.webhook_id, d.event_id, d.attempts
+             )
+             SELECT c.webhook_id, c.event_id, c.attempts, w.url, w.secret,
+                    e.event_type, e.payload
+               FROM claimed c
+               JOIN webhooks w ON w.id = c.webhook_id
+               JOIN events e ON e.id = c.event_id",
+        )
+        .bind(max_attempts)
+        .bind(backoff_base_secs)
+        .bind(backoff_cap_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| DueDelivery {
+                webhook_id: row.get("webhook_id"),
+                event_id: row.get("event_id"),
+                url: row.get("url"),
+                secret: row.get("secret"),
+                event_type: row.get("event_type"),
+                payload: row.get("payload"),
+                attempt: row.get("attempts"),
+            })
+            .collect())
+    }
+
+    /// Delivered: the row is finished and no later pass looks at it.
+    pub async fn mark_webhook_delivered(
+        &self,
+        webhook_id: Uuid,
+        event_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET delivered_at = now(), last_error = NULL
+              WHERE webhook_id = $1 AND event_id = $2",
+        )
+        .bind(webhook_id)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The attempt failed. The claim already scheduled the retry, so this only
+    /// records why, and on the last attempt it is the dead letter's reason.
+    pub async fn record_webhook_delivery_failure(
+        &self,
+        webhook_id: Uuid,
+        event_id: Uuid,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET last_error = $3
+              WHERE webhook_id = $1 AND event_id = $2",
+        )
+        .bind(webhook_id)
+        .bind(event_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A signing key in a log line is a delivery anyone who reads that log can
+    /// forge, so the whole-struct format must not carry it.
+    #[test]
+    fn the_signing_secret_never_reaches_a_debug_line() {
+        let delivery = DueDelivery {
+            webhook_id: Uuid::now_v7(),
+            event_id: Uuid::now_v7(),
+            url: "https://example.test/hook".into(),
+            secret: Some("the-signing-key".into()),
+            event_type: "commit".into(),
+            payload: Value::Null,
+            attempt: 1,
+        };
+        let shown = format!("{delivery:?}");
+        assert!(!shown.contains("the-signing-key"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("https://example.test/hook"), "{shown}");
     }
 }

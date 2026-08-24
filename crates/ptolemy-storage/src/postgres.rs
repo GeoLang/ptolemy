@@ -16,7 +16,7 @@ use ptolemy_core::branch::Branch;
 use ptolemy_core::changeset::Changeset;
 use ptolemy_core::dataset::{Dataset, GeometryType, Visibility};
 use ptolemy_core::diff::{Diff, DiffOp, NativeGeometry};
-use ptolemy_core::event::{Event, Webhook};
+use ptolemy_core::event::{Event, EventType, Webhook};
 use ptolemy_core::external::{ExternalSource, ExternalTable};
 use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
 use ptolemy_core::schema::{
@@ -318,6 +318,8 @@ impl PgStore {
         .execute(&mut *tx)
         .await?;
 
+        // no branch_created event: the dataset is being created here, so it has
+        // no subscriptions yet and nobody could be told
         sqlx::query(
             "INSERT INTO branches (id, dataset_id, name, head, created_at, created_by)
              VALUES ($1, $2, 'main', NULL, $3, $4)",
@@ -928,6 +930,7 @@ impl PgStore {
     pub async fn create_branch(&self, branch: &Branch, writer: &Writer) -> Result<(), StoreError> {
         self.ensure_dataset_writable(branch.dataset_id, writer)
             .await?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO branches (id, dataset_id, name, head, created_at, created_by)
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -938,8 +941,22 @@ impl PgStore {
         .bind(branch.head)
         .bind(branch.created_at)
         .bind(&branch.created_by)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        queue_event(
+            &mut tx,
+            branch.dataset_id,
+            EventType::BranchCreated,
+            &serde_json::json!({
+                "dataset_id": branch.dataset_id,
+                "branch_id": branch.id,
+                "name": branch.name,
+                "head": branch.head,
+                "created_by": branch.created_by,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1240,6 +1257,29 @@ impl PgStore {
             .bind(branch_id)
             .execute(&mut *tx)
             .await?;
+
+        // `merge_parent` is what tells the two apart: `merge` is the only caller
+        // that passes one, and it passes the source head it brought in.
+        let event_type = match merge_parent {
+            Some(_) => EventType::Merge,
+            None => EventType::Commit,
+        };
+        queue_event(
+            &mut tx,
+            dataset_id,
+            event_type,
+            &serde_json::json!({
+                "dataset_id": dataset_id,
+                "branch_id": branch_id,
+                "changeset_id": changeset_id,
+                "parent_id": parent_id,
+                "merge_parent_id": merge_parent,
+                "message": message,
+                "author": author,
+                "operations": operations.len(),
+            }),
+        )
+        .await?;
 
         tx.commit().await?;
         self.analyzer.after_write(operations.len());
@@ -2573,6 +2613,7 @@ impl PgStore {
     pub async fn set_dataset_schema(&self, schema: &DatasetSchema) -> Result<(), StoreError> {
         let fields_json = serde_json::to_value(&schema.fields).unwrap();
         let rules_json = serde_json::to_value(&schema.geometry_rules).unwrap();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO dataset_schemas (dataset_id, fields, geometry_rules)
              VALUES ($1, $2, $3)
@@ -2581,8 +2622,22 @@ impl PgStore {
         .bind(schema.dataset_id)
         .bind(&fields_json)
         .bind(&rules_json)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // field names only: a subscriber learns the shape changed without the
+        // payload carrying the whole schema to an arbitrary url
+        let field_names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        queue_event(
+            &mut tx,
+            schema.dataset_id,
+            EventType::SchemaChanged,
+            &serde_json::json!({
+                "dataset_id": schema.dataset_id,
+                "fields": field_names,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2773,22 +2828,9 @@ impl PgStore {
     }
 
     // ─── Webhooks & Events (CDC) ────────────────────────────────────
-
-    pub async fn create_webhook(&self, wh: &Webhook) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO webhooks (id, dataset_id, url, events, secret, active)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(wh.id)
-        .bind(wh.dataset_id)
-        .bind(&wh.url)
-        .bind(&wh.events)
-        .bind(&wh.secret)
-        .bind(wh.active)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
+    //
+    // The writes are in `writes` behind a grant, and the events a change raises
+    // are queued by `queue_event` inside the transaction that made the change.
 
     pub async fn list_webhooks(&self, dataset_id: Uuid) -> Result<Vec<Webhook>, StoreError> {
         let rows = sqlx::query(
@@ -2809,46 +2851,6 @@ impl PgStore {
                 active: row.get("active"),
             })
             .collect())
-    }
-
-    pub async fn delete_webhook(&self, id: Uuid) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM webhooks WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn emit_event(
-        &self,
-        dataset_id: Uuid,
-        event_type: &str,
-        payload: &serde_json::Value,
-    ) -> Result<Event, StoreError> {
-        let id = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO events (id, dataset_id, event_type, payload)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(dataset_id)
-        .bind(event_type)
-        .bind(payload)
-        .execute(&self.pool)
-        .await?;
-
-        let row = sqlx::query("SELECT created_at FROM events WHERE id = $1")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
-
-        Ok(Event {
-            id,
-            dataset_id,
-            event_type: event_type.to_string(),
-            payload: payload.clone(),
-            created_at: row.get("created_at"),
-        })
     }
 
     pub async fn list_events(
@@ -2881,32 +2883,6 @@ impl PgStore {
     }
 
     // ─── Audit Log ──────────────────────────────────────────────────
-
-    pub async fn audit_log(
-        &self,
-        actor: &str,
-        action: &str,
-        resource_type: &str,
-        resource_id: Option<Uuid>,
-        details: &serde_json::Value,
-        ip_address: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let id = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO audit_log (id, actor, action, resource_type, resource_id, details, ip_address)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(id)
-        .bind(actor)
-        .bind(action)
-        .bind(resource_type)
-        .bind(resource_id)
-        .bind(details)
-        .bind(ip_address)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
 
     pub async fn list_audit_log(
         &self,
@@ -3006,154 +2982,6 @@ impl PgStore {
                 }
             })
             .collect())
-    }
-
-    // ─── Feature Locks ──────────────────────────────────────────────
-
-    pub async fn lock_feature(
-        &self,
-        feature_id: Uuid,
-        branch_id: Uuid,
-        locked_by: &str,
-        duration_minutes: i64,
-        reason: Option<&str>,
-    ) -> Result<(), StoreError> {
-        // make_interval's mins is int4, and a lock is short-lived by design, so
-        // clamp rather than let a caller's duration overflow the interval
-        let mins = duration_minutes.clamp(1, 60 * 24 * 30) as i32;
-
-        // Clean up expired locks first
-        sqlx::query("DELETE FROM feature_locks WHERE expires_at < now()")
-            .execute(&self.pool)
-            .await?;
-
-        // Check if already locked by someone else
-        let existing = sqlx::query(
-            "SELECT locked_by FROM feature_locks WHERE feature_id = $1 AND branch_id = $2 AND expires_at > now()",
-        )
-        .bind(feature_id)
-        .bind(branch_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = existing {
-            let owner: String = row.get("locked_by");
-            if owner != locked_by {
-                return Err(StoreError::Conflict(format!(
-                    "feature {} is locked by '{}'",
-                    feature_id, owner
-                )));
-            }
-            // Refresh lock
-            sqlx::query(
-                "UPDATE feature_locks SET expires_at = now() + make_interval(mins => $3), reason = $4
-                 WHERE feature_id = $1 AND branch_id = $2",
-            )
-            .bind(feature_id)
-            .bind(branch_id)
-            .bind(mins)
-            .bind(reason)
-            .execute(&self.pool)
-            .await?;
-        } else {
-            sqlx::query(
-                "INSERT INTO feature_locks (feature_id, branch_id, locked_by, expires_at, reason)
-                 VALUES ($1, $2, $3, now() + make_interval(mins => $4), $5)",
-            )
-            .bind(feature_id)
-            .bind(branch_id)
-            .bind(locked_by)
-            .bind(mins)
-            .bind(reason)
-            .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn unlock_feature(
-        &self,
-        feature_id: Uuid,
-        branch_id: Uuid,
-        actor: &str,
-    ) -> Result<(), StoreError> {
-        let existing = sqlx::query(
-            "SELECT locked_by FROM feature_locks WHERE feature_id = $1 AND branch_id = $2",
-        )
-        .bind(feature_id)
-        .bind(branch_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = existing {
-            let owner: String = row.get("locked_by");
-            if owner != actor {
-                return Err(StoreError::Conflict(format!(
-                    "cannot unlock: feature {} is locked by '{}'",
-                    feature_id, owner
-                )));
-            }
-        }
-
-        sqlx::query("DELETE FROM feature_locks WHERE feature_id = $1 AND branch_id = $2")
-            .bind(feature_id)
-            .bind(branch_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn list_locks(&self, branch_id: Uuid) -> Result<Vec<FeatureLock>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT feature_id, branch_id, locked_by, locked_at, expires_at, reason
-             FROM feature_locks WHERE branch_id = $1 AND expires_at > now()",
-        )
-        .bind(branch_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| FeatureLock {
-                feature_id: row.get("feature_id"),
-                branch_id: row.get("branch_id"),
-                locked_by: row.get("locked_by"),
-                locked_at: row.get("locked_at"),
-                expires_at: row.get("expires_at"),
-                reason: row.get("reason"),
-            })
-            .collect())
-    }
-
-    /// Check if any operations touch locked features.
-    pub async fn check_locks(
-        &self,
-        branch_id: Uuid,
-        actor: &str,
-        operations: &[DiffOp],
-    ) -> Result<Vec<Uuid>, StoreError> {
-        let mut blocked = Vec::new();
-        for op in operations {
-            let fid = match op {
-                DiffOp::Update { feature_id, .. } | DiffOp::Delete { feature_id } => *feature_id,
-                DiffOp::Insert { .. } => continue,
-            };
-            let row = sqlx::query(
-                "SELECT locked_by FROM feature_locks
-                 WHERE feature_id = $1 AND branch_id = $2 AND expires_at > now()",
-            )
-            .bind(fid)
-            .bind(branch_id)
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(r) = row {
-                let owner: String = r.get("locked_by");
-                if owner != actor {
-                    blocked.push(fid);
-                }
-            }
-        }
-        Ok(blocked)
     }
 
     // ─── Feature Attachments ────────────────────────────────────────────
@@ -3853,20 +3681,6 @@ pub struct AuditEntry {
     pub created_at: OffsetDateTime,
 }
 
-// ─── Lock types ─────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FeatureLock {
-    pub feature_id: Uuid,
-    pub branch_id: Uuid,
-    pub locked_by: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub locked_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
-    pub reason: Option<String>,
-}
-
 // ─── Merge types ────────────────────────────────────────────────────]
 #[derive(Debug)]
 pub enum MergeResult {
@@ -4180,7 +3994,55 @@ pub struct CompactionRun {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-/// Permission level: higher = more access.
+/// Record an event and queue it to every active webhook that subscribes to its
+/// type, inside the caller's transaction.
+///
+/// Being in the same transaction as the change is the point: an event exists
+/// exactly when the commit it describes does, so no restart or failed commit can
+/// leave a subscriber told about something that did not happen, or not told about
+/// something that did.
+///
+/// A subscription with an empty `events` array takes every type. Returns the
+/// event id.
+async fn queue_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dataset_id: Uuid,
+    event_type: EventType,
+    payload: &serde_json::Value,
+) -> Result<Uuid, StoreError> {
+    queue_named_event(tx, dataset_id, &event_type.to_string(), payload).await
+}
+
+/// The same, for the one event type that is not one of ours: what the
+/// caller-facing emit route was given. See [`PgStore::emit_event`].
+pub(crate) async fn queue_named_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dataset_id: Uuid,
+    name: &str,
+    payload: &serde_json::Value,
+) -> Result<Uuid, StoreError> {
+    let event_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO events (id, dataset_id, event_type, payload) VALUES ($1, $2, $3, $4)")
+        .bind(event_id)
+        .bind(dataset_id)
+        .bind(name)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO webhook_deliveries (webhook_id, event_id)
+         SELECT w.id, $1 FROM webhooks w
+          WHERE w.dataset_id = $2 AND w.active
+            AND (cardinality(w.events) = 0 OR $3 = ANY(w.events))",
+    )
+    .bind(event_id)
+    .bind(dataset_id)
+    .bind(name)
+    .execute(&mut **tx)
+    .await?;
+    Ok(event_id)
+}
+
 /// Give the creator an admin row so a dataset created with auth on always has an
 /// owner who can grant to others.
 async fn insert_creator_admin_grant(

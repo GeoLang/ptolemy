@@ -603,22 +603,12 @@ fn test_event_type_display() {
     assert_eq!(EventType::Commit.to_string(), "commit");
     assert_eq!(EventType::Merge.to_string(), "merge");
     assert_eq!(EventType::BranchCreated.to_string(), "branch_created");
-    assert_eq!(EventType::BranchDeleted.to_string(), "branch_deleted");
     assert_eq!(EventType::SchemaChanged.to_string(), "schema_changed");
-    assert_eq!(EventType::QualityAlert.to_string(), "quality_alert");
 }
 
 #[test]
 fn test_event_type_serde_roundtrip() {
-    let types = vec![
-        EventType::Commit,
-        EventType::Merge,
-        EventType::BranchCreated,
-        EventType::BranchDeleted,
-        EventType::SchemaChanged,
-        EventType::QualityAlert,
-    ];
-    for et in types {
+    for et in EventType::ALL {
         let json = serde_json::to_string(&et).unwrap();
         let back: EventType = serde_json::from_str(&json).unwrap();
         assert_eq!(et, back);

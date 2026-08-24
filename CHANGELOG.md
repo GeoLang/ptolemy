@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- 2026-08-24: **five subsystems that were advertised and had no callers are
+  gone**. The SSE stream `GET /api/v1/events/stream`, the branch event socket
+  `GET /ws/branches/{id}` with its event bus, the background job scheduler, the
+  rate-limit middleware, and feature locking (`GET`/`POST
+  /api/v1/branches/{id}/locks` and `DELETE
+  /api/v1/branches/{bid}/locks/{fid}`, with `check_locks`). None of them was
+  reachable from anything: nothing published to either socket, the scheduler was
+  never started, the middleware was never layered onto the router, and commit
+  never queried a lock, so a lock stopped nobody. Use branches and the merge
+  conflict flow for concurrent editing, and a proxy for rate limiting. The
+  collaboration relay at `/ws/rooms/{room_id}` is untouched.
+
+  The rate limiter would not have worked as written: it keyed a fixed window on
+  `X-Forwarded-For` and fell back to `127.0.0.1`, so every direct caller shared
+  one bucket and any caller could pick their own by setting the header.
+
+  Migration `006_locks.sql` is shipped and cannot be un-run, so `feature_locks`
+  is left behind as an orphaned table. Nothing reads or writes it. Drop it by
+  hand if you want the space. The other four subsystems had no tables of their
+  own: the job scheduler pruned `events` and `feature_locks`, and event pruning
+  went with it, so an `events` row is now kept until an operator removes it.
+
 ### Changed
 
 - 2026-08-23: **an invitation can be mailed**. With `SMTP_URL`, `SMTP_FROM` and
@@ -63,6 +87,47 @@ All notable changes to this project will be documented in this file.
   HTTP endpoints.
 
 ### Added
+
+- 2026-08-24: **the audit log records who did what to what**. Every mutation
+  that answered 2xx writes one row: the token subject, the method and matched
+  route template, the dataset or branch the write ladder checked it against, and
+  the time. `GET /api/v1/audit` already read this table and now has something to
+  read. The writer is one layer, `audit::audit_middleware`, sitting inside the
+  write gate, so it cannot be forgotten by a handler and the id it records is
+  the id the ladder checked. Reads are not recorded, and neither are refused
+  mutations: a row per refusal would let an unauthenticated caller fill the
+  table by being refused in a loop. The row is written after the response is
+  built, so a database that refuses it logs and moves on rather than failing a
+  write that already happened. `ip_address` is left empty on purpose: the only
+  source would be a caller-settable header, and a spoofable value in an audit
+  column is worse than none.
+
+- 2026-08-24: **webhooks deliver**. `POST /api/v1/datasets/{id}/webhooks`
+  subscribes a url, filtered by event type, empty for all of them, instance
+  admin like the rest of the webhook routes because a subscription takes dataset
+  content to a url of the subscriber's choosing. The url must be http or https.
+  The event set is `commit`, `merge`, `branch_created` and `schema_changed`, each
+  with a real emission point, and `POST /api/v1/datasets/{id}/events` still
+  emits a custom type, delivered the same way. That route now refuses those four
+  names with 400, so a `commit` on the wire always came from a real commit
+  rather than from an editor who typed the word.
+
+  The queue is a new `webhook_deliveries` table, one row per (subscription,
+  event), written in the same transaction as the change that raised the event, so
+  a subscriber is told about exactly what committed and a restart loses nothing.
+  A worker started with the server drains it: `POST` with `X-Ptolemy-Event`,
+  `X-Ptolemy-Delivery` and, where the subscription has a `secret`,
+  `X-Ptolemy-Signature: sha256=<hmac>` over the bytes as sent. A failed attempt
+  is retried with a doubling backoff to a five-minute cap, five attempts in all,
+  after which the row keeps its last error for an admin to read. Claiming a row
+  is what schedules its retry, so two workers cannot take the same one and a
+  worker that dies mid-delivery costs one attempt.
+
+  The three webhook writes now take a `WriteGrant`, so a subscription can only
+  be aimed at a dataset the ladder checked, not at whatever the body named.
+  `EventType` lost `BranchDeleted` and `QualityAlert`, which had no producer:
+  `test_every_advertised_event_type_is_emitted` now holds the advertised set to
+  what a live server writes.
 
 - 2026-08-23: a dataset reports its `project_id`, `null` when it belongs to no
   project. `GET /api/v1/datasets/{id}` and `GET /api/v1/datasets` both carry it,

@@ -5,6 +5,7 @@
 pub mod analytics;
 pub mod arcgis;
 pub mod attachments;
+pub mod audit;
 pub mod auth;
 pub mod cartography;
 pub mod catalog;
@@ -18,8 +19,6 @@ pub mod errors;
 pub mod formats;
 pub mod geoprocessing;
 pub mod h3;
-pub mod jobs;
-pub mod locks;
 pub mod lrs;
 pub mod metrics;
 pub mod network;
@@ -30,7 +29,6 @@ pub mod project_state;
 pub mod qgis;
 pub mod quality;
 pub mod raster;
-pub mod rate_limit;
 pub mod rbac;
 pub mod real_estate;
 pub mod relationships;
@@ -40,7 +38,6 @@ pub mod room_relay;
 pub mod routes;
 pub mod schema_evolution;
 pub mod sfcgal;
-pub mod sse;
 pub mod stac;
 pub mod sync;
 pub mod telemetry;
@@ -51,7 +48,6 @@ pub mod verticals;
 pub mod visibility;
 pub mod webhook;
 pub mod workspace;
-pub mod ws;
 
 use axum::extract::Request;
 use axum::http::Uri;
@@ -66,15 +62,12 @@ pub use auth::{
     Access, Actor, AuthConfig, AuthEnabled, Claims, Role, classify, generate_token,
     generate_token_from_env,
 };
-pub use delivery::{DeliveryJob, DeliverySender, spawn_delivery_worker};
+pub use delivery::{DeliveryWorker, MAX_DELIVERY_ATTEMPTS, spawn_delivery_worker};
 pub use email::EmailConfig;
-pub use jobs::BackgroundJobs;
 pub use metrics::{init_metrics, record_domain_event};
 pub use oidc::OidcConfig;
 pub use room_relay::RoomRelay;
-pub use sse::SseBroadcast;
 pub use telemetry::init_telemetry;
-pub use ws::EventBus;
 
 pub type AppState = Arc<PgStore>;
 
@@ -134,8 +127,6 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
 /// environment. A test points this at an SMTP server whose port it only learns
 /// once that server is listening.
 pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailConfig) -> Router {
-    let event_bus = Arc::new(EventBus::new(1024));
-    let sse_broadcast = Arc::new(SseBroadcast::new(4096));
     let room_relay = Arc::new(RoomRelay::new());
     let prom_handle = init_metrics();
 
@@ -150,7 +141,6 @@ pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailCo
         .nest("/api/v1", analytics::analytics_routes())
         .nest("/api/v1", geoprocessing::geoprocessing_routes())
         .nest("/api/v1", ogc::ogc_routes())
-        .nest("/api/v1", locks::lock_routes())
         .nest("/api/v1", catalog::catalog_routes())
         .nest("/api/v1", conflicts::conflict_routes())
         .nest("/api/v1", network::network_routes())
@@ -178,16 +168,20 @@ pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailCo
         .nest("/api/v1", real_estate::real_estate_routes())
         .nest("/api/v1", verticals::vertical_routes())
         .nest("/api/v1", compaction::compaction_routes())
-        .nest("/api/v1", sse::sse_routes(sse_broadcast))
         // not under /api/v1: an Esri client builds every URL from
         // /arcgis/rest/services, which is where it expects to find it
         .merge(arcgis::arcgis_routes())
         .merge(oidc::oidc_routes())
-        .nest("/ws", ws::ws_routes(event_bus))
         .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
         .layer(Extension(email))
         .layer(middleware::from_fn(metrics::metrics_middleware))
+        // inside the write gate, so a mutation the ladder refused is not recorded
+        // as one that happened, and the audited target is the checked one
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit::audit_middleware,
+        ))
         // inside visibility, so a caller who cannot read a private dataset gets
         // its 404 rather than a 403 that would confirm the id exists
         .layer(middleware::from_fn_with_state(

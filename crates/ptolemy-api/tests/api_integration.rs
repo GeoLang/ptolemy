@@ -3076,51 +3076,6 @@ async fn test_webhook_crud() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Lock Tests
-// ═══════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn test_feature_locking() {
-    let (app, _) = setup_app().await;
-    let ds_id = create_dataset(&app).await;
-    let branch_id = create_branch(&app, ds_id, "main").await;
-    let f1 = Uuid::now_v7();
-
-    let point_hex = "0101000000000000000000F03F0000000000000040";
-    commit_features(&app, branch_id, json!([
-        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
-    ])).await;
-
-    // Acquire lock
-    let (status, body) = post_json(
-        &app,
-        &format!("/api/v1/branches/{branch_id}/locks"),
-        json!({"feature_id": f1.to_string(), "locked_by": "alice"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "lock: {body}");
-
-    // List locks
-    let (status, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/locks")).await;
-    assert_eq!(status, StatusCode::OK, "list locks: {body}");
-    assert_eq!(body[0]["locked_by"], "alice", "{body}");
-
-    // With auth off the query param is the actor, so alice can release her lock
-    let (status, body) = request_as(
-        &app,
-        "DELETE",
-        &format!("/api/v1/branches/{branch_id}/locks/{f1}?actor=alice"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "unlock: {body}");
-
-    let (_, body) = get_json(&app, &format!("/api/v1/branches/{branch_id}/locks")).await;
-    assert_eq!(body.as_array().unwrap().len(), 0, "{body}");
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Catalog / Metadata Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -5321,165 +5276,6 @@ async fn test_no_auth_keeps_body_author() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{commit}");
     assert_eq!(commit["author"], "field-surveyor", "{commit}");
-}
-
-// ─── Feature locks are owned by the token subject ────────────────────
-//
-// unlock_feature used to send a hardcoded "system" actor, and the storage layer
-// refuses to unlock when it does not match `locked_by`, so nobody could release
-// their own lock over HTTP.
-
-/// Dataset, branch and one committed feature in an auth-enabled app.
-async fn locked_branch(app: &axum::Router, token: &str) -> (Uuid, Uuid) {
-    let (_, dataset) = request_as(
-        app,
-        "POST",
-        "/api/v1/datasets",
-        Some(token),
-        Some(new_dataset_body()),
-    )
-    .await;
-    let dataset_id = dataset["id"].as_str().unwrap();
-    let (_, branch) = request_as(
-        app,
-        "POST",
-        &format!("/api/v1/datasets/{dataset_id}/branches"),
-        Some(token),
-        Some(json!({"name": "main", "created_by": "x"})),
-    )
-    .await;
-    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
-
-    let feature_id = Uuid::now_v7();
-    let (status, commit) = request_as(
-        app,
-        "POST",
-        &format!("/api/v1/branches/{branch_id}/commit"),
-        Some(token),
-        Some(json!({
-            "message": "seed",
-            "author": "x",
-            "operations": [{
-                "type": "insert",
-                "feature_id": feature_id,
-                "geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f",
-                "properties": {"name": "one"}
-            }]
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{commit}");
-
-    (branch_id, feature_id)
-}
-
-/// Take a lock as `token`'s subject. The body `locked_by` is deliberately wrong,
-/// to prove the token subject is what gets recorded.
-async fn take_lock(app: &axum::Router, branch_id: Uuid, feature_id: Uuid, token: &str) {
-    let (status, body) = request_as(
-        app,
-        "POST",
-        &format!("/api/v1/branches/{branch_id}/locks"),
-        Some(token),
-        Some(json!({"feature_id": feature_id, "locked_by": "someone-else"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "lock: {body}");
-}
-
-#[tokio::test]
-async fn test_lock_owner_can_unlock_own_lock() {
-    let app = setup_app_authed().await;
-    let owner = token_for_sub("lock-owner", Role::Editor);
-    let (branch_id, feature_id) = locked_branch(&app, &owner).await;
-    take_lock(&app, branch_id, feature_id, &owner).await;
-
-    let (status, locks) = request_as(
-        &app,
-        "GET",
-        &format!("/api/v1/branches/{branch_id}/locks"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{locks}");
-    assert_eq!(locks[0]["locked_by"], "lock-owner", "{locks}");
-
-    let (status, body) = request_as(
-        &app,
-        "DELETE",
-        &format!("/api/v1/branches/{branch_id}/locks/{feature_id}"),
-        Some(&owner),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "unlock: {body}");
-
-    let (_, locks) = request_as(
-        &app,
-        "GET",
-        &format!("/api/v1/branches/{branch_id}/locks"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(locks.as_array().unwrap().len(), 0, "{locks}");
-}
-
-#[tokio::test]
-async fn test_lock_cannot_be_released_by_another_user() {
-    let app = setup_app_authed().await;
-    let owner = token_for_sub("lock-owner", Role::Editor);
-    let intruder = token_for_sub("intruder", Role::Editor);
-    let (branch_id, feature_id) = locked_branch(&app, &owner).await;
-    take_lock(&app, branch_id, feature_id, &owner).await;
-
-    let uri = format!("/api/v1/branches/{branch_id}/locks/{feature_id}");
-
-    // an editor with no grant on the dataset never reaches the lock rule: the
-    // write layer refuses the branch first
-    let (status, body) = request_as(&app, "DELETE", &uri, Some(&intruder), None).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "ungranted unlock: {body}");
-
-    // with a grant they clear the write layer, and the lock is still not theirs
-    let (_, branch) = request_as(
-        &app,
-        "GET",
-        &format!("/api/v1/branches/{branch_id}"),
-        None,
-        None,
-    )
-    .await;
-    let dataset_id = Uuid::parse_str(branch["dataset_id"].as_str().unwrap()).unwrap();
-    grant(&app, "datasets", dataset_id, "intruder", "write").await;
-
-    let (status, body) = request_as(&app, "DELETE", &uri, Some(&intruder), None).await;
-    assert_eq!(status, StatusCode::CONFLICT, "intruder unlock: {body}");
-
-    // and the query param cannot be used to claim the owner's name
-    let (status, body) = request_as(
-        &app,
-        "DELETE",
-        &format!("{uri}?actor=lock-owner"),
-        Some(&intruder),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "spoofed actor unlock: {body}");
-
-    let (_, locks) = request_as(
-        &app,
-        "GET",
-        &format!("/api/v1/branches/{branch_id}/locks"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(
-        locks.as_array().unwrap().len(),
-        1,
-        "lock must survive: {locks}"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -9378,13 +9174,9 @@ async fn ws_connect(
     }
 }
 
-/// Both socket paths. The branch one parses its id as a UUID, so it needs a
-/// real one to get past the extractor once auth lets the request through.
-fn ws_paths() -> [String; 2] {
-    [
-        "/ws/branches/6f1c2d3e-0000-4000-8000-000000000001".to_string(),
-        "/ws/rooms/design-review".to_string(),
-    ]
+/// The socket paths. `/ws/rooms/{id}` is the only one left: the room relay.
+fn ws_paths() -> [String; 1] {
+    ["/ws/rooms/design-review".to_string()]
 }
 
 #[tokio::test]
@@ -10265,11 +10057,6 @@ fn gated_writes(dataset_id: Uuid, branch_id: Uuid) -> Vec<(&'static str, String,
             "POST",
             format!("/api/v1/datasets/{dataset_id}/events"),
             json!({"event_type": "custom", "payload": {}}),
-        ),
-        (
-            "POST",
-            format!("/api/v1/branches/{branch_id}/locks"),
-            json!({"feature_id": Uuid::now_v7(), "locked_by": "ignored"}),
         ),
         // the two bulk feature writers: these rewrite rows on someone else's
         // branch, so they are the ones that mattered most
@@ -17487,4 +17274,478 @@ async fn capabilities_reports_whether_email_is_configured() {
     let (status, body) = get_json(&configured, "/api/v1/capabilities").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["email_configured"], true);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audit log
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The writer is one layer, `audit::audit_middleware`, sitting inside the write
+// gate. These check what it records rather than that it was called.
+
+/// `(actor, action, resource_type)` for every row naming this target.
+async fn audit_rows_for(state: &AppState, resource_id: Uuid) -> Vec<(String, String, String)> {
+    sqlx::query(
+        "SELECT actor, action, resource_type FROM audit_log
+          WHERE resource_id = $1 ORDER BY created_at",
+    )
+    .bind(resource_id)
+    .fetch_all(state.read_pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get("actor"),
+            row.get("action"),
+            row.get("resource_type"),
+        )
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn test_audit_records_a_commit_with_its_actor_and_target() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let editor = generate_token(TEST_SECRET, "audit-editor", Role::Editor, 3600);
+
+    let (_, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    let (_, branch) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        Some(&editor),
+        Some(json!({"name": "main", "created_by": "ignored"})),
+    )
+    .await;
+    let branch_id = Uuid::parse_str(branch["id"].as_str().unwrap()).unwrap();
+
+    let feature_id = Uuid::now_v7();
+    let (status, commit) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        Some(&editor),
+        Some(json!({
+            "message": "audited",
+            "author": "ignored",
+            "operations": [{
+                "type": "insert",
+                "feature_id": feature_id,
+                "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+                "properties": {}
+            }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{commit}");
+
+    // the branch create is attributed to the dataset it was created under, the
+    // commit to the branch: both are the id the write gate ran the ladder on
+    assert_eq!(
+        audit_rows_for(&state, dataset_id).await,
+        vec![(
+            "audit-editor".to_string(),
+            "POST /api/v1/datasets/{dataset_id}/branches".to_string(),
+            "datasets".to_string(),
+        )],
+    );
+    assert_eq!(
+        audit_rows_for(&state, branch_id).await,
+        vec![(
+            "audit-editor".to_string(),
+            "POST /api/v1/branches/{id}/commit".to_string(),
+            "branches".to_string(),
+        )],
+    );
+
+    // the token subject, never the body: `author` and `created_by` said
+    // "ignored" on both writes above
+    let forged =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_log WHERE actor = 'ignored'")
+            .fetch_one(state.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(forged, 0);
+}
+
+#[tokio::test]
+async fn test_audit_does_not_record_reads() {
+    let (app, state) = setup_app_authed_with_state().await;
+    let editor = generate_token(TEST_SECRET, "audit-reader", Role::Editor, 3600);
+    let (_, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(new_dataset_body()),
+    )
+    .await;
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+
+    for uri in [
+        format!("/api/v1/datasets/{dataset_id}"),
+        format!("/api/v1/datasets/{dataset_id}/branches"),
+        format!("/api/v1/datasets/{dataset_id}/schema"),
+    ] {
+        let (status, body) = request_as(&app, "GET", &uri, Some(&editor), None).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+
+    // the dataset was created, so it has rows: none of them is a read
+    let reads = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM audit_log WHERE action LIKE 'GET %' OR action LIKE 'HEAD %'",
+    )
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(reads, 0, "a read reached the audit log");
+    assert!(
+        audit_rows_for(&state, dataset_id).await.is_empty(),
+        "reading a dataset must leave no row against it"
+    );
+}
+
+/// The audit write is the last thing to happen and the response is already
+/// built, so it has nothing left to fail. Proved by taking the table away.
+#[tokio::test]
+async fn test_a_failed_audit_write_does_not_fail_the_user_write() {
+    let (app, state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+
+    sqlx::query("ALTER TABLE audit_log RENAME TO audit_log_hidden")
+        .execute(state.unguarded_pool())
+        .await
+        .unwrap();
+    // nothing may assert between the rename and its undo, or a failure here
+    // leaves the table renamed for every later test
+    let commit = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        None,
+        Some(json!({
+            "message": "unaudited",
+            "author": "test",
+            "operations": [{
+                "type": "insert",
+                "feature_id": Uuid::now_v7(),
+                "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+                "properties": {}
+            }],
+        })),
+    )
+    .await;
+    sqlx::query("ALTER TABLE audit_log_hidden RENAME TO audit_log")
+        .execute(state.unguarded_pool())
+        .await
+        .unwrap();
+
+    assert_eq!(commit.0, StatusCode::CREATED, "{}", commit.1);
+    assert!(
+        audit_rows_for(&state, branch_id).await.is_empty(),
+        "the row could not have been written"
+    );
+    // and the commit is really there
+    let (status, history) = get_json(&app, &format!("/api/v1/branches/{branch_id}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history.as_array().unwrap().len(), 1, "{history}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Webhook delivery
+// ═══════════════════════════════════════════════════════════════════════
+
+/// What one delivery arrived as: the signature header and the exact bytes it
+/// was computed over.
+type Received = (Option<String>, Option<String>, Vec<u8>);
+
+/// A loopback receiver answering `status`, recording every request it got.
+/// Returns its base url and the shared log.
+async fn spawn_receiver(status: StatusCode) -> (String, Arc<tokio::sync::Mutex<Vec<Received>>>) {
+    let log: Arc<tokio::sync::Mutex<Vec<Received>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let sink = log.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = sink.clone();
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    sink.lock().await.push((
+                        header("x-ptolemy-signature"),
+                        header("x-ptolemy-event"),
+                        body.to_vec(),
+                    ));
+                    status
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), log)
+}
+
+fn expected_signature(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// `(attempts, delivered, last_error)` for a subscription's one delivery.
+async fn delivery_state(state: &AppState, webhook_id: Uuid) -> (i32, bool, Option<String>) {
+    let row = sqlx::query(
+        "SELECT attempts, delivered_at IS NOT NULL AS delivered, last_error
+           FROM webhook_deliveries WHERE webhook_id = $1",
+    )
+    .bind(webhook_id)
+    .fetch_one(state.read_pool())
+    .await
+    .unwrap();
+    (
+        row.get("attempts"),
+        row.get("delivered"),
+        row.get("last_error"),
+    )
+}
+
+async fn subscribe(app: &axum::Router, dataset_id: Uuid, url: &str, secret: &str) -> Uuid {
+    let (status, body) = post_json(
+        app,
+        &format!("/api/v1/datasets/{dataset_id}/webhooks"),
+        json!({"url": url, "events": ["commit"], "secret": secret}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "subscribe: {body}");
+    // the signing secret must never come back out
+    assert!(body.get("secret").is_none(), "{body}");
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_webhook_subscribe_then_deliver_signs_what_it_sends() {
+    let (receiver, log) = spawn_receiver(StatusCode::OK).await;
+    let (app, state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let secret = "delivery-round-trip-secret";
+    let webhook_id = subscribe(&app, dataset_id, &format!("{receiver}/hook"), secret).await;
+
+    // subscribed to commit only, so the branch create must not be delivered
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let changeset_id = commit_features(
+        &app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+            "properties": {}
+        }]),
+    )
+    .await;
+
+    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    assert_eq!(worker.run_once().await, 1, "one commit, one subscriber");
+
+    let received = log.lock().await;
+    assert_eq!(received.len(), 1, "exactly the commit");
+    let (signature, event, body) = &received[0];
+    assert_eq!(event.as_deref(), Some("commit"));
+    assert_eq!(
+        signature.as_deref(),
+        Some(expected_signature(secret, body).as_str()),
+        "the signature must verify over the bytes as sent"
+    );
+    let sent: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(sent["event_type"], "commit", "{sent}");
+    assert_eq!(sent["webhook_id"], webhook_id.to_string(), "{sent}");
+    assert_eq!(
+        sent["payload"]["changeset_id"],
+        changeset_id.to_string(),
+        "{sent}"
+    );
+    drop(received);
+
+    assert_eq!(delivery_state(&state, webhook_id).await, (1, true, None));
+    // nothing is left due
+    assert_eq!(worker.run_once().await, 0);
+}
+
+#[tokio::test]
+async fn test_a_wrong_secret_does_not_verify() {
+    let body = br#"{"event":"commit"}"#;
+    assert_ne!(
+        expected_signature("right", body),
+        expected_signature("wrong", body)
+    );
+}
+
+#[tokio::test]
+async fn test_delivery_retries_stop_at_the_bound() {
+    let (receiver, log) = spawn_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let (app, state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let webhook_id = subscribe(&app, dataset_id, &format!("{receiver}/hook"), "s").await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+            "properties": {}
+        }]),
+    )
+    .await;
+
+    // zero backoff, so every pass finds the row due until the bound stops it
+    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    let mut passes = 0;
+    for _ in 0..(ptolemy_api::MAX_DELIVERY_ATTEMPTS + 3) {
+        passes += worker.run_once().await;
+    }
+
+    assert_eq!(
+        passes as i32,
+        ptolemy_api::MAX_DELIVERY_ATTEMPTS,
+        "a failing receiver must be tried exactly MAX_DELIVERY_ATTEMPTS times"
+    );
+    assert_eq!(
+        log.lock().await.len() as i32,
+        ptolemy_api::MAX_DELIVERY_ATTEMPTS,
+        "and get exactly that many requests"
+    );
+    let (attempts, delivered, last_error) = delivery_state(&state, webhook_id).await;
+    assert_eq!(attempts, ptolemy_api::MAX_DELIVERY_ATTEMPTS);
+    assert!(!delivered);
+    assert_eq!(
+        last_error.as_deref(),
+        Some("HTTP 500 Internal Server Error")
+    );
+}
+
+/// Every type in `EventType::ALL` has an emission point, and nothing else is
+/// emitted. A variant with no producer is a subscription filter that can never
+/// match.
+#[tokio::test]
+async fn test_every_advertised_event_type_is_emitted() {
+    let (app, state) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+
+    // branch_created, twice
+    let main = create_branch(&app, dataset_id, "main").await;
+    let side = create_branch(&app, dataset_id, "side").await;
+    let point = "0101000000000000000000F03F0000000000000040";
+    // commit, on each branch, so the merge below has something to bring over
+    commit_features(
+        &app,
+        main,
+        json!([{
+            "type": "insert", "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": point, "properties": {}
+        }]),
+    )
+    .await;
+    commit_features(
+        &app,
+        side,
+        json!([{
+            "type": "insert", "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": point, "properties": {}
+        }]),
+    )
+    .await;
+    // merge
+    let (status, merged) = post_json(
+        &app,
+        &format!("/api/v1/branches/{main}/merge/{side}"),
+        json!({"author": "test"}),
+    )
+    .await;
+    assert!(status.is_success(), "merge: {status} {merged}");
+    // schema_changed
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset_id}/schema"),
+        None,
+        Some(json!({"fields": [{"name": "pop", "field_type": "integer", "required": false}]})),
+    )
+    .await;
+    assert!(status.is_success(), "schema: {status} {body}");
+
+    let mut emitted: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT event_type FROM events WHERE dataset_id = $1 ORDER BY event_type",
+    )
+    .bind(dataset_id)
+    .fetch_all(state.read_pool())
+    .await
+    .unwrap();
+    emitted.sort();
+
+    let mut advertised: Vec<String> = ptolemy_core::EventType::ALL
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    advertised.sort();
+    assert_eq!(emitted, advertised);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The deleted subsystems are gone from the router
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Compiling proves the modules are gone; only the router proves the paths are.
+
+#[tokio::test]
+async fn test_deleted_subsystem_routes_are_not_mounted() {
+    let (app, _) = setup_app().await;
+    let branch_id = Uuid::now_v7();
+    let feature_id = Uuid::now_v7();
+    for (method, uri) in [
+        // sse
+        ("GET", "/api/v1/events/stream".to_string()),
+        // websocket branch events
+        ("GET", format!("/ws/branches/{branch_id}")),
+        // feature locks
+        ("GET", format!("/api/v1/branches/{branch_id}/locks")),
+        ("POST", format!("/api/v1/branches/{branch_id}/locks")),
+        (
+            "DELETE",
+            format!("/api/v1/branches/{branch_id}/locks/{feature_id}"),
+        ),
+    ] {
+        let (status, body) = request_as(&app, method, &uri, None, None).await;
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri} answered {status}: {body}"
+        );
+    }
+
+    // and the relay that shares the /ws prefix is still mounted: a plain GET on
+    // it is refused as a failed upgrade, not as a missing route
+    let (status, _) = request_as(&app, "GET", "/ws/rooms/design-review", None, None).await;
+    assert_ne!(status, StatusCode::NOT_FOUND);
 }

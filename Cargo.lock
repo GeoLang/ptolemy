@@ -2877,7 +2877,6 @@ dependencies = [
  "sqlx",
  "time",
  "tokio",
- "tokio-stream",
  "tokio-tungstenite",
  "tower",
  "tower-http",
@@ -4332,7 +4331,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]

@@ -172,9 +172,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>📡 Webhooks & CDC</h3>
 <ul>
-<li>Webhook CRUD per dataset. Nothing is ever delivered</li>
-<li>CDC event log table. The writer has no callers</li>
-<li>SSE and branch WebSocket stay silent. Nothing publishes to them</li>
+<li>Subscribe a url per dataset, filtered by event type</li>
+<li>commit, merge, branch_created, schema_changed, plus custom events</li>
+<li>HMAC-SHA256 signed delivery, retried with a backoff, five attempts</li>
+<li>Events are queued in the commit's own transaction, so a restart loses none</li>
 </ul>
 </div>
 <div class="card">
@@ -199,11 +200,11 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔒 Feature Locking</h3>
+<h3>🔎 Audit Log</h3>
 <ul>
-<li>Lock records with a TTL</li>
-<li>Lock listing and manual release</li>
-<li>Commit never queries locks. They are advisory</li>
+<li>One row per mutation: subject, route, target, time</li>
+<li>Reads are not recorded</li>
+<li>Read back at <code>GET /api/v1/audit</code>, instance admin only</li>
 </ul>
 </div>
 <div class="card">
@@ -230,14 +231,13 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Dataset visibility: public listings vs private 404</li>
 <li>JWT roles Admin / Editor / Viewer</li>
 <li>Multi-tenancy was dropped in migration 028</li>
-<li>Rate-limit middleware exists and is not layered on the router</li>
+<li>No rate limiting. Put a proxy in front</li>
 </ul>
 </div>
 <div class="card">
-<h3>Background Jobs</h3>
+<h3>Operations</h3>
 <ul>
-<li>Job types exist. The worker is never started</li>
-<li>Lock cleanup, event pruning and quality alerts never run</li>
+<li>Webhook delivery worker starts with the server</li>
 <li>Conflict resolution API is real</li>
 <li>OTLP traces (HTTP or collector gRPC)</li>
 </ul>
