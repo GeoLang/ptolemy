@@ -43,7 +43,7 @@ geozero = { version = "0.14", features = ["with-wkb", "with-geojson"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 tower = { version = "0.5", features = ["limit", "buffer"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 hmac = "0.13"
 sha2 = "0.11"
 getrandom = "0.4"

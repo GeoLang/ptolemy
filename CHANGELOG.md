@@ -54,6 +54,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-25: **jsonwebtoken 9 to 11 on the `aws_lc_rs` backend**, a crate the
+  lockfile already resolved. Only HS256 `encode`, `decode`, `from_secret` and
+  `Validation::default()` are used, and 11 keeps `validate_aud` on by default,
+  so a token carrying `aud` is still refused.
 - 2026-08-23: **an invitation can be mailed**. With `SMTP_URL`, `SMTP_FROM` and
   `PUBLIC_BASE_URL` set, the create-invitation body takes an optional `email`
   and the link goes to that address over SMTP, on the request path so a mistyped
