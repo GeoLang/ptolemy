@@ -116,6 +116,10 @@ const QUERY: &[(&str, &str)] = &[
         "GET /api/v1/branches/{id}/analytics/buffer",
         "feature_id={{features}}&distance=10",
     ),
+    (
+        "GET /api/v1/branches/{id}/analytics/coverage",
+        "distance=10",
+    ),
     ("GET /api/v1/branches/{id}/h3/hexagons", "resolution=7"),
     ("GET /api/v1/branches/{id}/h3/aggregate", "resolution=7"),
     (

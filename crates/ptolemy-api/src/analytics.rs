@@ -21,6 +21,7 @@ pub fn analytics_routes() -> Router<AppState> {
     Router::new()
         .route("/branches/{id}/analytics/buffer", get(buffer_analysis))
         .route("/branches/{id}/analytics/union", get(union_analysis))
+        .route("/branches/{id}/analytics/coverage", get(coverage_analysis))
         .route("/branches/{id}/analytics/clusters", get(cluster_analysis))
         .route("/branches/{id}/analytics/anomalies", get(anomaly_detection))
         .route("/branches/{id}/analytics/stats", get(spatial_stats))
@@ -111,6 +112,79 @@ async fn union_analysis(
         feature_count: row.get("cnt"),
         union_geojson: row.get("geojson"),
         total_area_sq_meters: row.get("area"),
+    }))
+}
+
+// ─── Coverage Analysis ──────────────────────────────────────────────
+
+/// Without a cap one request can buffer every live feature by any radius it
+/// names.
+const MAX_COVERAGE_DISTANCE_METERS: f64 = 100_000.0;
+
+#[derive(Deserialize)]
+struct CoverageQuery {
+    distance: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct CoverageResult {
+    feature_count: i64,
+    distance_meters: f64,
+    coverage_geojson: Option<serde_json::Value>,
+    coverage_sq_meters: f64,
+}
+
+async fn coverage_analysis(
+    State(store): State<AppState>,
+    Path(branch_id): Path<Uuid>,
+    Query(q): Query<CoverageQuery>,
+) -> Result<Json<CoverageResult>, AnalyticsError> {
+    let distance = q
+        .distance
+        .filter(|d| *d > 0.0 && *d <= MAX_COVERAGE_DISTANCE_METERS)
+        .ok_or_else(|| {
+            AnalyticsError::BadRequest(format!(
+                "distance is required, in meters, greater than 0 and at most \
+                 {MAX_COVERAGE_DISTANCE_METERS}"
+            ))
+        })?;
+
+    let row = sqlx::query(
+        "WITH RECURSIVE chain AS (
+            SELECT c.id, c.parent_id FROM changesets c
+            JOIN branches b ON b.head = c.id WHERE b.id = $1
+          UNION ALL
+            SELECT c.id, c.parent_id FROM changesets c
+            JOIN chain ch ON ch.parent_id = c.id
+        ),
+        latest AS (
+            SELECT DISTINCT ON (fv.feature_id) fv.geometry, fv.operation
+            FROM feature_versions fv
+            JOIN chain ch ON fv.changeset_id = ch.id
+            ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
+        ),
+        live AS (
+            SELECT geometry FROM latest WHERE operation != 'delete' AND geometry IS NOT NULL
+        ),
+        covered AS (
+            SELECT ST_Union(ST_Buffer(geometry::geography, $2)::geometry) as shape FROM live
+        )
+        SELECT
+            (SELECT COUNT(*) FROM live) as cnt,
+            ST_AsGeoJSON(shape)::jsonb as geojson,
+            COALESCE(ST_Area(shape::geography), 0) as area
+        FROM covered",
+    )
+    .bind(branch_id)
+    .bind(distance)
+    .fetch_one(store.read_pool())
+    .await?;
+
+    Ok(Json(CoverageResult {
+        feature_count: row.get("cnt"),
+        distance_meters: distance,
+        coverage_geojson: row.get("geojson"),
+        coverage_sq_meters: row.get("area"),
     }))
 }
 
@@ -312,6 +386,7 @@ async fn spatial_stats(
 enum AnalyticsError {
     Store(sqlx::Error),
     NotFound(String),
+    BadRequest(String),
 }
 
 impl From<sqlx::Error> for AnalyticsError {
@@ -324,6 +399,7 @@ impl IntoResponse for AnalyticsError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             AnalyticsError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AnalyticsError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AnalyticsError::Store(e) => {
                 crate::errors::log_db_error("analytics", &e);
                 (

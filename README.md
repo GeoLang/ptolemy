@@ -59,7 +59,7 @@ test beyond their `501` branch. Install them yourself before relying on them.
 | **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
 | **v0.9** | Schema validation, data quality reports | ✓ Done |
 | **v1.0** | Webhook subscriptions and signed CDC event delivery | ✓ Done |
-| **v1.1** | Spatial analytics (buffer, union, clustering, anomaly detection) | ✓ Done |
+| **v1.1** | Spatial analytics (buffer, union, coverage, clustering, anomaly detection) | ✓ Done |
 | **v1.2** | OGC API - Features compliance, audit log | ✓ Done |
 | **v1.3** | Schema enforcement | ✓ Done |
 | **v1.4** | Temporal queries | ✓ Done |
@@ -854,6 +854,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/api/v1/datasets/{id}/events` | Emit a custom event, delivered like the built-in ones |
 | GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer analysis |
 | GET | `/api/v1/branches/{id}/analytics/union` | Union analysis |
+| GET | `/api/v1/branches/{id}/analytics/coverage` | Area covered by the live features buffered by `distance` meters, required, over 0 and at most 100000 |
 | GET | `/api/v1/branches/{id}/analytics/clusters` | DBSCAN clustering |
 | GET | `/api/v1/branches/{id}/analytics/anomalies` | Spatial anomaly detection |
 | GET | `/api/v1/branches/{id}/analytics/stats` | Spatial statistics |

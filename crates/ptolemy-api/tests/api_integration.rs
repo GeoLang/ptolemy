@@ -1728,6 +1728,140 @@ async fn test_union_and_convex_hull_report_area_in_square_meters() {
     assert!(area > 1.0e10 && area < 1.0e11, "convex hull area: {area}");
 }
 
+/// Two sensors 100 m apart. Buffered by 30 m their circles do not touch, so the
+/// coverage is both of them and its area is the sum. Buffered by 100 m they
+/// overlap, and the union counts the shared ground once.
+#[tokio::test]
+async fn test_coverage_unions_the_buffers_of_live_features() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    // 0.000898315 degrees of longitude at the equator is 100 m
+    let west = point_wkb(0.0, 0.0);
+    let east = point_wkb(0.000898315, 0.0);
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": west, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": east, "properties": {}}
+    ])).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/coverage?distance=30"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "coverage at 30 m: {body}");
+    assert_eq!(body["feature_count"], 2, "coverage at 30 m: {body}");
+    assert_eq!(body["distance_meters"], 30.0, "coverage at 30 m: {body}");
+    assert_eq!(
+        body["coverage_geojson"]["type"], "MultiPolygon",
+        "coverage at 30 m: {body}"
+    );
+    let two_circles = 2.0 * std::f64::consts::PI * 30.0 * 30.0;
+    let area = body["coverage_sq_meters"].as_f64().unwrap();
+    assert!(
+        (area - two_circles).abs() / two_circles < 0.03,
+        "coverage at 30 m is {area}, expected about {two_circles}"
+    );
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/coverage?distance=100"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "coverage at 100 m: {body}");
+    assert_eq!(
+        body["coverage_geojson"]["type"], "Polygon",
+        "coverage at 100 m: {body}"
+    );
+    let one_circle = std::f64::consts::PI * 100.0 * 100.0;
+    let area = body["coverage_sq_meters"].as_f64().unwrap();
+    assert!(
+        area > one_circle && area < 2.0 * one_circle,
+        "coverage at 100 m is {area}, expected between {one_circle} and {}",
+        2.0 * one_circle
+    );
+}
+
+#[tokio::test]
+async fn test_coverage_leaves_out_a_deleted_feature() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    let west = point_wkb(0.0, 0.0);
+    let east = point_wkb(0.000898315, 0.0);
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": west, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": east, "properties": {}}
+    ])).await;
+    commit_features(
+        &app,
+        branch_id,
+        json!([{"type": "delete", "feature_id": f2.to_string()}]),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/coverage?distance=30"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "coverage: {body}");
+    assert_eq!(body["feature_count"], 1, "coverage: {body}");
+    assert_eq!(
+        body["coverage_geojson"]["type"], "Polygon",
+        "coverage: {body}"
+    );
+    let one_circle = std::f64::consts::PI * 30.0 * 30.0;
+    let area = body["coverage_sq_meters"].as_f64().unwrap();
+    assert!(
+        (area - one_circle).abs() / one_circle < 0.03,
+        "coverage is {area}, expected about {one_circle}"
+    );
+}
+
+/// A branch with nothing committed has nothing to buffer, and `ST_Union` over
+/// no rows is NULL rather than an empty geometry.
+#[tokio::test]
+async fn test_coverage_of_an_empty_branch_is_zero() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/analytics/coverage?distance=30"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "empty branch: {body}");
+    assert_eq!(body["feature_count"], 0, "empty branch: {body}");
+    assert!(body["coverage_geojson"].is_null(), "empty branch: {body}");
+    assert_eq!(body["coverage_sq_meters"], 0.0, "empty branch: {body}");
+}
+
+#[tokio::test]
+async fn test_coverage_needs_a_distance_within_the_bound() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    for query in ["", "?distance=0", "?distance=100001"] {
+        let (status, body) = get_json(
+            &app,
+            &format!("/api/v1/branches/{branch_id}/analytics/coverage{query}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("100000"),
+            "{query:?} should name the bound: {body}"
+        );
+    }
+}
+
 /// The outlier arm measures each feature against the centroid of the whole
 /// branch, which needs one aggregate's result inside another and so has to be
 /// computed a CTE earlier. Two points sit equally far from the midpoint between

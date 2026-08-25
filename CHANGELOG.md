@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-25: **coverage analytics**. `GET
+  /api/v1/branches/{id}/analytics/coverage?distance=<meters>` buffers every live
+  feature on the branch by `distance` in geography, unions the buffers and
+  reports the union's geometry and its area in square meters, so ground two
+  features both reach is counted once. It is the number a scenario comparison
+  shows per side. `distance` is required, over 0 and at most 100000 meters, and
+  anything else is a 400 naming the bound. A branch with no live features
+  answers a count of 0, a null geometry and an area of 0.
 - 2026-08-24: **the delivery worker retires what it is finished with**. Every
   commit writes an event row and one delivery row per subscription, and event
   pruning went with the job scheduler, so both tables grew for as long as an
