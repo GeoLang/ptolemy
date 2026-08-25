@@ -20,7 +20,7 @@ use ptolemy_core::event::{Event, EventType, Webhook};
 use ptolemy_core::external::{ExternalSource, ExternalTable};
 use ptolemy_core::review::{MergeRequest, MergeRequestStatus, ReviewComment};
 use ptolemy_core::schema::{
-    DatasetSchema, FieldDef, GeometryRules, QualityReport, QualityStatistics, TopologyRule,
+    DatasetSchema, FieldDef, GeometryRules, QualityReport, QualityStatistics,
 };
 use serde::Serialize;
 use sqlx::{PgPool, Row};
@@ -738,9 +738,9 @@ impl PgStore {
     /// name resolves here: a dataset, a branch, a changeset, a merge request, a
     /// feature, a raster catalog or tile, a point cloud catalog or patch, an
     /// attachment, a network, an LRS route, a symbology or label rule, a domain,
-    /// a subtype, an attribute rule, a trajectory, a topology rule, a webhook, a
-    /// relationship class or a relationship record. Public datasets are left out,
-    /// so an empty result means nothing to enforce.
+    /// a subtype, an attribute rule, a trajectory, a webhook, a relationship
+    /// class or a relationship record. Public datasets are left out, so an empty
+    /// result means nothing to enforce.
     ///
     /// An id kind missing from this query is an unguarded read of private
     /// content, so a new dataset-owned table belongs here at the same time as its
@@ -787,7 +787,6 @@ impl PgStore {
                  UNION ALL SELECT dataset_id FROM subtypes WHERE id = ANY($1)
                  UNION ALL SELECT dataset_id FROM attribute_rules WHERE id = ANY($1)
                  UNION ALL SELECT dataset_id FROM trajectories WHERE id = ANY($1)
-                 UNION ALL SELECT dataset_id FROM topology_rules WHERE id = ANY($1)
                  UNION ALL SELECT dataset_id FROM webhooks WHERE id = ANY($1)
                  -- a relationship class spans two datasets, and both of them have
                  -- to be readable, so both go in the result
@@ -879,7 +878,6 @@ impl PgStore {
                  UNION ALL SELECT NULL::uuid, dataset_id FROM subtypes WHERE id = $1
                  UNION ALL SELECT NULL::uuid, dataset_id FROM attribute_rules WHERE id = $1
                  UNION ALL SELECT NULL::uuid, dataset_id FROM trajectories WHERE id = $1
-                 UNION ALL SELECT NULL::uuid, dataset_id FROM topology_rules WHERE id = $1
                  UNION ALL SELECT NULL::uuid, dataset_id FROM webhooks WHERE id = $1
                  UNION ALL SELECT NULL::uuid, unnest(ARRAY[origin_dataset_id, destination_dataset_id])
                              FROM relationship_classes WHERE id = $1
@@ -1807,304 +1805,6 @@ impl PgStore {
         Ok(MergeResult::Success(changeset))
     }
 
-    /// Topology-aware merge: performs three-way merge with topology validation.
-    ///
-    /// After computing the merge, validates topology rules for the dataset.
-    /// If topology violations are found, attempts auto-repair (e.g., snapping
-    /// shared boundaries). Returns violations that cannot be auto-fixed.
-    pub async fn merge_with_topology(
-        &self,
-        source_branch_id: Uuid,
-        target_branch_id: Uuid,
-        author: &str,
-        auto_repair: bool,
-        writer: &Writer,
-    ) -> Result<TopologyMergeResult, StoreError> {
-        // First, do the normal merge
-        let result = self
-            .merge(source_branch_id, target_branch_id, author, writer)
-            .await?;
-
-        match result {
-            MergeResult::Conflicts(conflicts) => Ok(TopologyMergeResult::MergeConflicts(conflicts)),
-            MergeResult::AlreadyUpToDate => Ok(TopologyMergeResult::AlreadyUpToDate),
-            MergeResult::Success(changeset) => {
-                // Now validate topology rules for the dataset
-                let target = self.get_branch(target_branch_id).await?;
-                let violations = self
-                    .validate_topology_rules(target.dataset_id, target_branch_id)
-                    .await?;
-
-                if violations.is_empty() {
-                    return Ok(TopologyMergeResult::Success {
-                        changeset,
-                        topology_violations: vec![],
-                        auto_repaired: vec![],
-                    });
-                }
-
-                if auto_repair {
-                    // Attempt to auto-repair topology violations
-                    let (repaired, remaining) = self
-                        .auto_repair_topology(target_branch_id, &violations, author, writer)
-                        .await?;
-
-                    if remaining.is_empty() {
-                        Ok(TopologyMergeResult::Success {
-                            changeset,
-                            topology_violations: vec![],
-                            auto_repaired: repaired,
-                        })
-                    } else {
-                        Ok(TopologyMergeResult::TopologyViolations {
-                            changeset,
-                            violations: remaining,
-                            auto_repaired: repaired,
-                        })
-                    }
-                } else {
-                    Ok(TopologyMergeResult::TopologyViolations {
-                        changeset,
-                        violations,
-                        auto_repaired: vec![],
-                    })
-                }
-            }
-        }
-    }
-
-    /// Validate topology rules defined for a dataset against current features.
-    pub async fn validate_topology_rules(
-        &self,
-        _dataset_id: Uuid,
-        branch_id: Uuid,
-    ) -> Result<Vec<TopologyViolation>, StoreError> {
-        let mut violations = Vec::new();
-
-        // Check for overlapping polygons (MustNotOverlap rule)
-        let overlaps = sqlx::query(
-            "SELECT a.feature_id as fid_a, b.feature_id as fid_b,
-                    ST_AsGeoJSON(ST_Intersection(a.geometry, b.geometry))::jsonb as overlap_geom,
-                    ST_Area(ST_Intersection(a.geometry, b.geometry)) as overlap_area
-             FROM feature_versions a
-             JOIN feature_versions b ON a.feature_id < b.feature_id
-              AND a.branch_id = b.branch_id
-              AND ST_Overlaps(a.geometry, b.geometry)
-             WHERE a.branch_id = $1 AND a.is_deleted = false AND b.is_deleted = false
-             LIMIT 100",
-        )
-        .bind(branch_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        for row in &overlaps {
-            violations.push(TopologyViolation {
-                rule: "must_not_overlap".into(),
-                feature_a: row.get("fid_a"),
-                feature_b: Some(row.get("fid_b")),
-                description: format!(
-                    "Features overlap with area {}",
-                    row.get::<f64, _>("overlap_area")
-                ),
-                overlap_geometry: row.get("overlap_geom"),
-                auto_repairable: true,
-            });
-        }
-
-        // Check for gaps between adjacent polygons (NoGaps)
-        let gaps = sqlx::query(
-            "WITH all_geom AS (
-                SELECT ST_Union(geometry) as merged
-                FROM feature_versions
-                WHERE branch_id = $1 AND is_deleted = false
-                  AND GeometryType(geometry) IN ('POLYGON', 'MULTIPOLYGON')
-            )
-            SELECT ST_AsGeoJSON(
-                ST_Difference(
-                    ST_ConvexHull(merged),
-                    merged
-                )
-            )::jsonb as gap_geom,
-            ST_Area(ST_Difference(ST_ConvexHull(merged), merged)) as gap_area
-            FROM all_geom
-            WHERE ST_Area(ST_Difference(ST_ConvexHull(merged), merged)) > 0.000001",
-        )
-        .bind(branch_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(gap_row) = gaps {
-            let gap_area: f64 = gap_row.get("gap_area");
-            if gap_area > 0.0 {
-                violations.push(TopologyViolation {
-                    rule: "no_gaps".into(),
-                    feature_a: Uuid::nil(),
-                    feature_b: None,
-                    description: format!("Gap detected with area {gap_area}"),
-                    overlap_geometry: gap_row.get("gap_geom"),
-                    auto_repairable: false,
-                });
-            }
-        }
-
-        // Check for shared boundary consistency
-        let boundary_issues = sqlx::query(
-            "SELECT a.feature_id as fid_a, b.feature_id as fid_b,
-                    ST_AsGeoJSON(ST_Intersection(ST_Boundary(a.geometry), ST_Boundary(b.geometry)))::jsonb as shared_boundary,
-                    ST_Length(ST_Intersection(ST_Boundary(a.geometry), ST_Boundary(b.geometry))) as shared_length
-             FROM feature_versions a
-             JOIN feature_versions b ON a.feature_id < b.feature_id
-              AND a.branch_id = b.branch_id
-              AND ST_Touches(a.geometry, b.geometry)
-             WHERE a.branch_id = $1 AND a.is_deleted = false AND b.is_deleted = false
-               AND NOT ST_Equals(
-                   ST_Snap(ST_Intersection(ST_Boundary(a.geometry), ST_Boundary(b.geometry)), a.geometry, 0.00001),
-                   ST_Intersection(ST_Boundary(a.geometry), ST_Boundary(b.geometry))
-               )
-             LIMIT 50",
-        )
-        .bind(branch_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        for row in &boundary_issues {
-            violations.push(TopologyViolation {
-                rule: "shared_boundary_consistency".into(),
-                feature_a: row.get("fid_a"),
-                feature_b: Some(row.get("fid_b")),
-                description: "Shared boundary has vertex mismatch (needs snapping)".into(),
-                overlap_geometry: row.get("shared_boundary"),
-                auto_repairable: true,
-            });
-        }
-
-        Ok(violations)
-    }
-
-    /// Auto-repair topology violations where possible.
-    ///
-    /// - Overlapping polygons: compute difference to remove overlap from the newer feature
-    /// - Boundary mismatches: snap vertices to shared boundary
-    async fn auto_repair_topology(
-        &self,
-        branch_id: Uuid,
-        violations: &[TopologyViolation],
-        author: &str,
-        writer: &Writer,
-    ) -> Result<(Vec<TopologyRepair>, Vec<TopologyViolation>), StoreError> {
-        let mut repaired: Vec<TopologyRepair> = Vec::new();
-        let mut remaining: Vec<TopologyViolation> = Vec::new();
-        let mut repair_ops: Vec<DiffOp> = Vec::new();
-
-        for violation in violations {
-            if !violation.auto_repairable {
-                remaining.push(violation.clone());
-                continue;
-            }
-
-            match violation.rule.as_str() {
-                "must_not_overlap" => {
-                    // Fix overlap by computing ST_Difference on the second feature
-                    if let Some(fid_b) = violation.feature_b {
-                        let row = sqlx::query(
-                            "SELECT ST_AsBinary(
-                                ST_Difference(b.geometry, a.geometry)
-                            ) as fixed_geom
-                            FROM feature_versions a
-                            JOIN feature_versions b ON b.feature_id = $2
-                            WHERE a.feature_id = $1 AND a.branch_id = $3
-                              AND b.branch_id = $3
-                              AND a.is_deleted = false AND b.is_deleted = false
-                            LIMIT 1",
-                        )
-                        .bind(violation.feature_a)
-                        .bind(fid_b)
-                        .bind(branch_id)
-                        .fetch_optional(&self.pool)
-                        .await?;
-
-                        if let Some(r) = row {
-                            let fixed_wkb: Vec<u8> = r.get("fixed_geom");
-                            repair_ops.push(DiffOp::Update {
-                                feature_id: fid_b,
-                                geometry_wkb: Some(fixed_wkb),
-                                properties: None,
-                                // recomputed geometry, no survey original
-                                native: None,
-                                valid_from: None,
-                                valid_to: None,
-                            });
-                            repaired.push(TopologyRepair {
-                                feature_id: fid_b,
-                                rule: violation.rule.clone(),
-                                action: "removed overlap via ST_Difference".into(),
-                            });
-                        } else {
-                            remaining.push(violation.clone());
-                        }
-                    }
-                }
-                "shared_boundary_consistency" => {
-                    // Fix by snapping the second feature to the first
-                    if let Some(fid_b) = violation.feature_b {
-                        let row = sqlx::query(
-                            "SELECT ST_AsBinary(
-                                ST_Snap(b.geometry, a.geometry, 0.00001)
-                            ) as snapped_geom
-                            FROM feature_versions a
-                            JOIN feature_versions b ON b.feature_id = $2
-                            WHERE a.feature_id = $1 AND a.branch_id = $3
-                              AND b.branch_id = $3
-                              AND a.is_deleted = false AND b.is_deleted = false
-                            LIMIT 1",
-                        )
-                        .bind(violation.feature_a)
-                        .bind(fid_b)
-                        .bind(branch_id)
-                        .fetch_optional(&self.pool)
-                        .await?;
-
-                        if let Some(r) = row {
-                            let snapped_wkb: Vec<u8> = r.get("snapped_geom");
-                            repair_ops.push(DiffOp::Update {
-                                feature_id: fid_b,
-                                geometry_wkb: Some(snapped_wkb),
-                                properties: None,
-                                native: None,
-                                valid_from: None,
-                                valid_to: None,
-                            });
-                            repaired.push(TopologyRepair {
-                                feature_id: fid_b,
-                                rule: violation.rule.clone(),
-                                action: "snapped to shared boundary".into(),
-                            });
-                        } else {
-                            remaining.push(violation.clone());
-                        }
-                    }
-                }
-                _ => {
-                    remaining.push(violation.clone());
-                }
-            }
-        }
-
-        // Commit repairs as a separate changeset
-        if !repair_ops.is_empty() {
-            self.commit(
-                branch_id,
-                "auto-repair topology violations",
-                author,
-                &repair_ops,
-                writer,
-            )
-            .await?;
-        }
-
-        Ok((repaired, remaining))
-    }
-
     // ─── History ────────────────────────────────────────────────────
 
     pub async fn get_branch_history(
@@ -2608,7 +2308,7 @@ impl PgStore {
             .collect())
     }
 
-    // ─── Schema & Topology ──────────────────────────────────────────
+    // ─── Schema ─────────────────────────────────────────────────────
 
     pub async fn set_dataset_schema(&self, schema: &DatasetSchema) -> Result<(), StoreError> {
         let fields_json = serde_json::to_value(&schema.fields).unwrap();
@@ -2666,54 +2366,6 @@ impl PgStore {
                 geometry_rules,
             }
         }))
-    }
-
-    pub async fn add_topology_rule(&self, rule: &TopologyRule) -> Result<(), StoreError> {
-        let rule_type_json = serde_json::to_value(&rule.rule_type).unwrap();
-        sqlx::query(
-            "INSERT INTO topology_rules (id, dataset_id, rule_type, description)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(rule.id)
-        .bind(rule.dataset_id)
-        .bind(&rule_type_json)
-        .bind(&rule.description)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_topology_rules(
-        &self,
-        dataset_id: Uuid,
-    ) -> Result<Vec<TopologyRule>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT id, dataset_id, rule_type, description FROM topology_rules WHERE dataset_id = $1",
-        )
-        .bind(dataset_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let rule_type = serde_json::from_value(row.get("rule_type")).unwrap();
-                TopologyRule {
-                    id: row.get("id"),
-                    dataset_id: row.get("dataset_id"),
-                    rule_type,
-                    description: row.get("description"),
-                }
-            })
-            .collect())
-    }
-
-    pub async fn delete_topology_rule(&self, id: Uuid) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM topology_rules WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     /// Run data quality checks on a branch and return a report.
@@ -3804,45 +3456,6 @@ pub struct ConflictInfo {
     pub feature_id: Uuid,
     pub ours: DiffOp,
     pub theirs: DiffOp,
-}
-
-/// Result of a topology-aware merge.
-pub enum TopologyMergeResult {
-    /// Merge succeeded with no topology violations.
-    Success {
-        changeset: Changeset,
-        topology_violations: Vec<TopologyViolation>,
-        auto_repaired: Vec<TopologyRepair>,
-    },
-    /// Merge produced feature-level conflicts (same as normal merge).
-    MergeConflicts(Vec<ConflictInfo>),
-    /// The source head was already on the target. No changeset was written.
-    AlreadyUpToDate,
-    /// Merge succeeded but topology rules are violated.
-    TopologyViolations {
-        changeset: Changeset,
-        violations: Vec<TopologyViolation>,
-        auto_repaired: Vec<TopologyRepair>,
-    },
-}
-
-/// A topology rule violation detected after merge.
-#[derive(Debug, Clone, Serialize)]
-pub struct TopologyViolation {
-    pub rule: String,
-    pub feature_a: Uuid,
-    pub feature_b: Option<Uuid>,
-    pub description: String,
-    pub overlap_geometry: Option<serde_json::Value>,
-    pub auto_repairable: bool,
-}
-
-/// Record of an auto-repair applied to fix a topology violation.
-#[derive(Debug, Clone, Serialize)]
-pub struct TopologyRepair {
-    pub feature_id: Uuid,
-    pub rule: String,
-    pub action: String,
 }
 
 // ─── Attachment types ───────────────────────────────────────────────

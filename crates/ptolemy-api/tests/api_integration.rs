@@ -7601,16 +7601,9 @@ const CHILD_ID_KINDS: &[ChildIdKind] = &[
 /// a grant on the dataset can reach the row. A webhook id is not in here: every
 /// method on `/webhooks/{id}` is admin-only, and an instance admin skips
 /// visibility, so nothing it decides is observable there.
-const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[
-    ChildIdKind {
-        name: "topology rule",
-        insert: "INSERT INTO topology_rules (id, dataset_id, rule_type, description)
-                 VALUES ($1, $2, '\"must_not_overlap\"', '')",
-        paths: &["/topology/{id}"],
-    },
-    ChildIdKind {
-        name: "relationship record",
-        insert: "WITH c AS (
+const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[ChildIdKind {
+    name: "relationship record",
+    insert: "WITH c AS (
                      INSERT INTO relationship_classes
                          (id, name, origin_dataset_id, destination_dataset_id, origin_foreign_key)
                      VALUES (gen_random_uuid(), 'rel', $2, $2, 'fk')
@@ -7619,9 +7612,8 @@ const DELETE_ONLY_ID_KINDS: &[ChildIdKind] = &[
                  INSERT INTO relationship_records
                      (id, relationship_class_id, origin_feature_id, destination_feature_id)
                  SELECT $1, c.id, gen_random_uuid(), gen_random_uuid() FROM c",
-        paths: &["/relationship-records/{id}"],
-    },
-];
+    paths: &["/relationship-records/{id}"],
+}];
 
 async fn seed_child_id(state: &AppState, kind: &ChildIdKind, dataset_id: Uuid) -> Uuid {
     let id = Uuid::now_v7();
@@ -9999,11 +9991,6 @@ fn gated_writes(dataset_id: Uuid, branch_id: Uuid) -> Vec<(&'static str, String,
             "PUT",
             format!("/api/v1/datasets/{dataset_id}/schema"),
             json!({"fields": []}),
-        ),
-        (
-            "POST",
-            format!("/api/v1/datasets/{dataset_id}/topology"),
-            json!({"rule_type": "no_overlap", "description": "none"}),
         ),
         (
             "POST",

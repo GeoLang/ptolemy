@@ -634,41 +634,6 @@ fn test_webhook_serialization() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Topology rule type tests
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn test_topology_rule_type_serde() {
-    let rule = TopologyRuleType::NoOverlap;
-    let json = serde_json::to_string(&rule).unwrap();
-    let back: TopologyRuleType = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, TopologyRuleType::NoOverlap);
-}
-
-#[test]
-fn test_topology_rule_with_reference() {
-    let ref_id = Uuid::now_v7();
-    let rule = TopologyRuleType::MustBeCoveredBy {
-        reference_dataset_id: ref_id,
-    };
-    let json = serde_json::to_string(&rule).unwrap();
-    let back: TopologyRuleType = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, rule);
-}
-
-#[test]
-fn test_topology_rule_vertex_count() {
-    let rule = TopologyRuleType::MaxVertexCount { max: 500 };
-    let json = serde_json::to_string(&rule).unwrap();
-    let back: TopologyRuleType = serde_json::from_str(&json).unwrap();
-    if let TopologyRuleType::MaxVertexCount { max } = back {
-        assert_eq!(max, 500);
-    } else {
-        panic!("wrong variant");
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Quality report tests
 // ═══════════════════════════════════════════════════════════════════════════
 

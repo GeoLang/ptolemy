@@ -27,6 +27,5 @@ pub use external::{ExternalError, ExternalSource, ExternalTable};
 pub use feature::Feature;
 pub use review::{MergeRequest, MergeRequestStatus, ReviewComment};
 pub use schema::{
-    DatasetSchema, FieldDef, FieldType, GeometryRules, QualityReport, TopologyRule,
-    TopologyRuleType, ValidationError,
+    DatasetSchema, FieldDef, FieldType, GeometryRules, QualityReport, ValidationError,
 };

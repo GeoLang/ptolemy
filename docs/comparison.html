@@ -87,8 +87,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Topology & Geometry Rules</h2>
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
-<tr><td>Topology rules (32 rule types)</td><td class="yes">✓</td><td class="no">— <span class="note">31 variants declared, none evaluated, no commit-time gate</span></td></tr>
-<tr><td>Topology validation</td><td class="yes">✓</td><td class="partial">~ <span class="note">PostGIS Topology primitives are real. The Esri-style rule engine is not</span></td></tr>
+<tr><td>Topology rules (32 rule types)</td><td class="yes">✓</td><td class="no">— <span class="note">No rule engine</span></td></tr>
+<tr><td>Topology validation</td><td class="yes">✓</td><td class="partial">~ <span class="note">PostGIS Topology primitives: faces, edges, nodes, ValidateTopology</span></td></tr>
 <tr><td>Auto-repair invalid geometry</td><td class="yes">✓</td><td class="yes">✓ <span class="note">ST_MakeValid auto-repair</span></td></tr>
 <tr><td>Geometric networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Junction/edge graph + recursive CTE trace</span></td></tr>
 <tr><td>Utility networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pgRouting powered (Dijkstra, A*, TSP, isochrones)</span></td></tr>

@@ -57,7 +57,6 @@ struct Capabilities {
     supports_branching: bool,
     supports_offline_sync: bool,
     supports_conflict_resolution: bool,
-    supports_topology_rules: bool,
     sync_endpoint: &'static str,
     wfs_t_endpoint: &'static str,
 }
@@ -90,7 +89,6 @@ async fn capabilities() -> Json<Capabilities> {
         supports_branching: true,
         supports_offline_sync: true,
         supports_conflict_resolution: true,
-        supports_topology_rules: true,
         sync_endpoint: "/api/v1/qgis/branches/{branch_id}/sync",
         wfs_t_endpoint: "/api/v1/qgis/branches/{branch_id}/transaction",
     })

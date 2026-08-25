@@ -18,8 +18,8 @@ pub use permission::{
 pub use postgres::{
     ApiKeyIdentity, Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry,
     CompactionResult, CompactionRun, ConflictInfo, DatasetPermission, MergeChoice, MergeResult,
-    PgStore, ReplicationPeer, SchemaMigration, StoreError, TopologyMergeResult, TopologyRepair,
-    TopologyViolation, VersionContent, WriteTarget, branch_features_subquery, merge_choice,
+    PgStore, ReplicationPeer, SchemaMigration, StoreError, VersionContent, WriteTarget,
+    branch_features_subquery, merge_choice,
 };
 pub use postgres::{LATEST_COLUMNS, MVT_TILE_EXTENT, mvt_simplify_tolerance};
 pub use workspace::{

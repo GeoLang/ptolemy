@@ -15,8 +15,8 @@
 //! An id may name a dataset or any of the things that belong to one: a branch, a
 //! changeset, a merge request, a feature, a raster or point cloud catalog and its
 //! tiles or patches, an attachment, a network, an LRS route, a symbology or label
-//! rule, a domain, a subtype, an attribute rule, a trajectory, a topology rule, a
-//! webhook, a relationship class or record. The store's
+//! rule, a domain, a subtype, an attribute rule, a trajectory, a webhook, a
+//! relationship class or record. The store's
 //! `private_datasets_for_ids` resolves all of them to a dataset. A request that
 //! names none of them has no dataset in scope and passes, and so does a request
 //! that names only public ones.

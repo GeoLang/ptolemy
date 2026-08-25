@@ -72,7 +72,7 @@ Not implemented, whatever the code in the repository suggests:
 |-----------|-------|
 | Rate limiting | Nothing limits request rate. Put a proxy in front |
 | Feature locking | Removed. Use branches and the merge conflict flow for concurrent editing |
-| Topology rule engine | 31 rule types are declared and none is evaluated. Stored rules are never read back and there is no commit-time gate |
+| Topology rule engine | Removed in migration `039`. PostGIS Topology under `/api/v1/topologies` is a different subsystem and stays |
 | Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
 | Geometry type constraints | Stored and never checked |
 | Multi-tenancy | Dropped from the product in migration `028` |
@@ -592,9 +592,9 @@ refused even then.
 
 ### Writes
 
-On commit, batch commit, merge (plain, topology-aware, review and
-conflict-resolving), GeoJSON/CSV import, QGIS push, WFS transaction, sync push,
-branch creation, repair and compaction:
+On commit, batch commit, merge (plain, review and conflict-resolving),
+GeoJSON/CSV import, QGIS push, WFS transaction, sync push, branch creation,
+repair and compaction:
 
 1. An `admin` role token bypasses per-dataset grants.
 2. Otherwise, if the target **branch** has any permission rows, the caller needs
@@ -845,9 +845,6 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/review` | Web review UI |
 | GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
 | PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
-| GET | `/api/v1/datasets/{id}/topology` | List topology rules |
-| POST | `/api/v1/datasets/{id}/topology` | Add topology rule |
-| DELETE | `/api/v1/topology/{id}` | Delete topology rule |
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
 | POST | `/api/v1/branches/{id}/repair` | Auto-repair invalid geometries |
 | GET | `/api/v1/datasets/{id}/webhooks` | List webhook subscriptions (instance admin) |

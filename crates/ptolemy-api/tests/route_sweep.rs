@@ -90,7 +90,6 @@ const PARAM_BY_NAME: &[(&str, &str)] = &[
     ("source_id", "other_branches"),
     ("feature_id", "features"),
     ("fid", "features"),
-    ("rule_id", "topology"),
     ("item_id", "tiles"),
 ];
 
@@ -400,10 +399,6 @@ const BODY: &[(&str, &str)] = &[
     (
         "POST /api/v1/datasets/{id}/topologies",
         r#"{"name":"sweep_{{unique}}","srid":4326}"#,
-    ),
-    (
-        "POST /api/v1/datasets/{id}/topology",
-        r#"{"rule_type":"must_not_overlap","name":"sweep"}"#,
     ),
     (
         "POST /api/v1/datasets/{id}/trajectories",

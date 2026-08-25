@@ -64,11 +64,6 @@ pub fn v1_routes() -> Router<AppState> {
             "/branches/{target_id}/merge/{source_id}",
             post(merge_branches),
         )
-        // Topology-aware merge
-        .route(
-            "/branches/{target_id}/merge/{source_id}/topology",
-            post(merge_with_topology),
-        )
         // Diff
         .route("/diff/{from_id}/{to_id}", get(diff_changesets))
 }
@@ -838,95 +833,6 @@ async fn merge_branches(
                 .collect();
             Ok(Json(MergeResponse::Conflicts { conflicts: resp }))
         }
-    }
-}
-
-// ─── Topology-Aware Merge ───────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct TopologyMergeParams {
-    #[serde(default = "default_true")]
-    auto_repair: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum TopologyMergeResponse {
-    Success {
-        /// Absent when the merge was already up to date: nothing was committed.
-        changeset: Option<ptolemy_core::changeset::Changeset>,
-        up_to_date: bool,
-        auto_repaired: Vec<ptolemy_storage::TopologyRepair>,
-    },
-    MergeConflicts {
-        conflicts: Vec<ConflictResponse>,
-    },
-    TopologyViolations {
-        changeset: ptolemy_core::changeset::Changeset,
-        violations: Vec<ptolemy_storage::TopologyViolation>,
-        auto_repaired: Vec<ptolemy_storage::TopologyRepair>,
-    },
-}
-
-async fn merge_with_topology(
-    State(store): State<AppState>,
-    Path((target_id, source_id)): Path<(Uuid, Uuid)>,
-    Query(params): Query<TopologyMergeParams>,
-    actor: Actor,
-) -> Result<Json<TopologyMergeResponse>, AppError> {
-    let result = store
-        .merge_with_topology(
-            source_id,
-            target_id,
-            actor.or_body("api"),
-            params.auto_repair,
-            &actor.writer(),
-        )
-        .await?;
-
-    match result {
-        ptolemy_storage::TopologyMergeResult::Success {
-            changeset,
-            auto_repaired,
-            ..
-        } => Ok(Json(TopologyMergeResponse::Success {
-            changeset: Some(changeset),
-            up_to_date: false,
-            auto_repaired,
-        })),
-        ptolemy_storage::TopologyMergeResult::AlreadyUpToDate => {
-            Ok(Json(TopologyMergeResponse::Success {
-                changeset: None,
-                up_to_date: true,
-                auto_repaired: vec![],
-            }))
-        }
-        ptolemy_storage::TopologyMergeResult::MergeConflicts(conflicts) => {
-            let resp: Vec<ConflictResponse> = conflicts
-                .into_iter()
-                .map(|c| ConflictResponse {
-                    feature_id: c.feature_id,
-                    ours: format!("{:?}", c.ours),
-                    theirs: format!("{:?}", c.theirs),
-                })
-                .collect();
-            Ok(Json(TopologyMergeResponse::MergeConflicts {
-                conflicts: resp,
-            }))
-        }
-        ptolemy_storage::TopologyMergeResult::TopologyViolations {
-            changeset,
-            violations,
-            auto_repaired,
-        } => Ok(Json(TopologyMergeResponse::TopologyViolations {
-            changeset,
-            violations,
-            auto_repaired,
-        })),
     }
 }
 
