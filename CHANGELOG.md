@@ -22,6 +22,14 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- 2026-08-24: **the Esri-style topology rule engine is gone** (migration 039
+  drops `topology_rules`). 31 rule variants nothing matched on, stored rules
+  nothing read back, and a validator that queried `branch_id` and
+  `is_deleted` on `feature_versions`, which has neither, so it errored on
+  every call. The topology-aware merge route went with it as the validator's
+  only caller. PostGIS Topology under `/api/v1/topologies` is untouched.
+  Commit-time topology rules are recorded under Wait for demand in the
+  platform backlog.
 - 2026-08-24: **five subsystems that were advertised and had no callers are
   gone**. The SSE stream `GET /api/v1/events/stream`, the branch event socket
   `GET /ws/branches/{id}` with its event bus, the background job scheduler, the
