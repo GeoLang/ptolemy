@@ -875,7 +875,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}` | ArcGIS change file |
 | GET | `/api/v1/audit` | Audit log, `limit` and `actor` (instance admin) |
-| GET | `/api/v1/branches/{id}/features/at?valid_at=` | Temporal query (features at time) |
+| GET | `/api/v1/branches/{id}/features/at?at=` | Temporal query (features at time) |
 | GET | `/api/v1/catalog/search` | Search datasets (text + tags) |
 | GET | `/api/v1/datasets/{id}/tags` | List dataset tags |
 | POST | `/api/v1/datasets/{id}/tags` | Add tag |

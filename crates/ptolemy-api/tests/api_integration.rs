@@ -6013,6 +6013,47 @@ async fn test_auth_disabled_ignores_permission_rows() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// The temporal read has to serve the same bytes as the list read: WKB, not
+/// GeoJSON text.
+#[tokio::test]
+async fn test_features_at_time_geometry_is_wkb() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040"; // POINT(1 2)
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {"name": "Park"}}
+    ])).await;
+
+    let (status, listed) = get_json(&app, &format!("/api/v1/branches/{branch_id}/features")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let from_list = &listed["features"][0];
+    assert_eq!(from_list["id"], f1.to_string(), "{listed}");
+
+    let (status, temporal) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/features/at?at=2100-01-01T00:00:00Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{temporal}");
+    let at_time = &temporal["features"][0];
+    assert_eq!(at_time["id"], f1.to_string(), "{temporal}");
+
+    assert_eq!(
+        at_time["geometry_wkb"], from_list["geometry_wkb"],
+        "temporal read differs from list read: {temporal}"
+    );
+    assert_eq!(at_time["dataset_id"], from_list["dataset_id"], "{temporal}");
+
+    let first_byte = at_time["geometry_wkb"][0].as_u64().unwrap();
+    assert!(
+        first_byte == 0 || first_byte == 1,
+        "geometry_wkb must open with a WKB byte-order marker, got {first_byte}"
+    );
+}
+
 // ─── Per-dataset read visibility ────────────────────────────────────
 
 /// A private dataset owned by "carol", with one feature committed and the branch

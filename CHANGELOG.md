@@ -651,6 +651,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-08-25: `GET /api/v1/branches/{id}/features/at?at=<RFC3339>` answers
+  `geometry_wkb` as WKB. It held the bytes of GeoJSON text, so a client that
+  parsed the list route's answer got a parse error from the temporal route for
+  the same feature. Each row also carries its real `dataset_id` now instead of
+  an all-zero UUID. The README route table said the parameter was `valid_at`,
+  and the handler has always read `at`.
+
 - 2026-08-13: `POST /branches/{id}/geoprocessing/merge` and
   `POST /branches/{id}/geoprocessing/simplify` no longer panic on a NULL
   geometry. `ST_Union` over ids that match nothing is NULL rather than an empty

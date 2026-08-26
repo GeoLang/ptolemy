@@ -2599,15 +2599,15 @@ impl PgStore {
             ),
             latest AS (
                 SELECT DISTINCT ON (fv.feature_id)
-                    fv.feature_id, fv.operation,
-                    ST_AsGeoJSON(fv.geometry)::jsonb as geojson,
+                    fv.feature_id, fv.dataset_id, fv.operation,
+                    ST_AsBinary(fv.geometry) as geometry_wkb,
                     fv.properties, fv.valid_from, fv.valid_to
                 FROM feature_versions fv
                 JOIN chain ch ON fv.changeset_id = ch.id
                 WHERE fv.created_at <= $2
                 ORDER BY fv.feature_id, fv.created_at DESC, fv.id DESC
             )
-            SELECT feature_id, geojson, properties, valid_from, valid_to
+            SELECT feature_id, dataset_id, geometry_wkb, properties, valid_from, valid_to
             FROM latest
             WHERE operation != 'delete'
             LIMIT $3 OFFSET $4",
@@ -2621,17 +2621,13 @@ impl PgStore {
 
         Ok(rows
             .into_iter()
-            .map(|row| {
-                let geojson: Option<serde_json::Value> = row.get("geojson");
-                let geom_str = geojson.map(|g| g.to_string()).unwrap_or_default();
-                Feature {
-                    id: row.get("feature_id"),
-                    dataset_id: Uuid::nil(),
-                    geometry_wkb: geom_str.into_bytes(),
-                    properties: row.get("properties"),
-                    valid_from: row.get("valid_from"),
-                    valid_to: row.get("valid_to"),
-                }
+            .map(|row| Feature {
+                id: row.get("feature_id"),
+                dataset_id: row.get("dataset_id"),
+                geometry_wkb: row.get("geometry_wkb"),
+                properties: row.get("properties"),
+                valid_from: row.get("valid_from"),
+                valid_to: row.get("valid_to"),
             })
             .collect())
     }
