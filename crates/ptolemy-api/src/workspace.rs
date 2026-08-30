@@ -70,6 +70,7 @@ pub fn workspace_routes() -> Router<AppState> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateWorkspaceRequest {
     name: String,
     #[serde(default)]
@@ -77,6 +78,7 @@ struct CreateWorkspaceRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateMetadataRequest {
     name: String,
     #[serde(default)]
@@ -84,11 +86,13 @@ struct UpdateMetadataRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetMemberRequest {
     role: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateInvitationRequest {
     role: String,
     expires_at: String,
@@ -98,6 +102,7 @@ struct CreateInvitationRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcceptInvitationRequest {
     token: String,
 }

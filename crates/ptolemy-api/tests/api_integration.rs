@@ -2323,17 +2323,30 @@ async fn test_vector_routes_report_missing_pgvector() {
     let branch_id = create_branch(&app, ds_id, "main").await;
     let installed = has_extension(&state, "vector").await;
 
+    // each route takes its own body, and a key another one of them declares is
+    // refused here rather than dropped
     let reads = [
-        format!("/api/v1/branches/{branch_id}/similarity/duplicates"),
-        format!("/api/v1/branches/{branch_id}/similarity/search"),
-        format!("/api/v1/branches/{branch_id}/similarity/embed"),
-        format!("/api/v1/branches/{branch_id}/similarity/cluster"),
+        (
+            format!("/api/v1/branches/{branch_id}/similarity/duplicates"),
+            None,
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/similarity/search"),
+            Some(json!({"embedding": [0.0]})),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/similarity/embed"),
+            Some(json!({"fields": ["name"]})),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/similarity/cluster"),
+            Some(json!({})),
+        ),
     ];
-    for (i, uri) in reads.iter().enumerate() {
-        let (status, body) = if i == 0 {
-            get_json(&app, uri).await
-        } else {
-            post_json(&app, uri, json!({"embedding": [0.0], "fields": ["name"]})).await
+    for (uri, request) in reads.iter() {
+        let (status, body) = match request {
+            None => get_json(&app, uri).await,
+            Some(request) => post_json(&app, uri, request.clone()).await,
         };
         if installed {
             assert_ne!(status, StatusCode::NOT_IMPLEMENTED, "{uri}: {body}");
@@ -18431,4 +18444,384 @@ async fn test_retention_off_deletes_nothing() {
     // calls the sweep, and rows this old would otherwise all have gone
     assert_eq!(delivery_count(&state, webhook_id).await, 1);
     assert_eq!(event_count(&state, dataset_id).await, 2);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Unknown request keys
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Every request struct carries `#[serde(deny_unknown_fields)]`, so a key the
+// route does not declare is refused instead of dropped. The two extractors
+// refuse with different statuses: axum's `Json` maps a serde error to 422 and
+// its `Query` maps one to 400. Each test below sends the documented body first,
+// so a refusal proves the extra key caused it and not the rest of the request.
+
+/// What `Json` answers when the body carries a key the struct does not declare.
+const UNKNOWN_BODY_KEY: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
+
+/// What `Query` answers for the same in a query string.
+const UNKNOWN_QUERY_KEY: StatusCode = StatusCode::BAD_REQUEST;
+
+/// The key no route declares, used for every case here.
+const UNKNOWN_KEY: &str = "not_a_field";
+
+/// Bearer value for the routers [`setup_app`] builds, which enforce nothing.
+const NO_AUTH: &str = "test-skip";
+
+/// Status and body text, so a test can read a rejection message that is not JSON.
+/// `token` is ignored where the router was built with auth disabled.
+async fn send_text(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<Value>,
+) -> (StatusCode, String) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"));
+    let req = match body {
+        Some(value) => builder
+            .body(Body::from(serde_json::to_vec(&value).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Assert a body refused for the unknown key and nothing else.
+async fn assert_body_key_refused(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    mut body: Value,
+) {
+    body[UNKNOWN_KEY] = json!(1);
+    let (status, text) = send_text(app, method, uri, token, Some(body)).await;
+    assert_eq!(status, UNKNOWN_BODY_KEY, "{method} {uri}: {text}");
+    assert!(
+        text.contains(UNKNOWN_KEY),
+        "{method} {uri} refused without naming the key: {text}"
+    );
+}
+
+/// Same for a query string, appended to whatever the uri already asks for.
+async fn assert_query_key_refused(app: &axum::Router, uri: &str) {
+    let joiner = if uri.contains('?') { '&' } else { '?' };
+    let with_key = format!("{uri}{joiner}{UNKNOWN_KEY}=1");
+    let (status, text) = send_text(app, "GET", &with_key, NO_AUTH, None).await;
+    assert_eq!(status, UNKNOWN_QUERY_KEY, "GET {with_key}: {text}");
+}
+
+/// A branch holding one point, the fixture the route families below need.
+async fn branch_with_one_point(app: &axum::Router) -> (Uuid, Uuid, Uuid) {
+    let dataset_id = create_dataset(app).await;
+    let branch_id = create_branch(app, dataset_id, "main").await;
+    let feature_id = Uuid::now_v7();
+    commit_features(
+        app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": feature_id.to_string(),
+            "geometry_wkb_hex": point_wkb(1.0, 2.0),
+            "properties": {},
+        }]),
+    )
+    .await;
+    (dataset_id, branch_id, feature_id)
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_datasets() {
+    let (app, _) = setup_app().await;
+    let valid = json!({
+        "name": format!("deny_{}", Uuid::now_v7()),
+        "geometry_type": "point",
+        "srid": 4326,
+        "created_by": "test",
+    });
+    let (status, body) = post_json(&app, "/api/v1/datasets", valid.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_body_key_refused(&app, "POST", "/api/v1/datasets", NO_AUTH, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_branches() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/branches");
+    let valid = json!({"name": "main", "created_by": "test"});
+
+    let (status, body) = post_json(&app, &uri, valid).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_body_key_refused(
+        &app,
+        "POST",
+        &uri,
+        NO_AUTH,
+        json!({"name": "second", "created_by": "test"}),
+    )
+    .await;
+}
+
+/// The commit body and the operations inside it are separate structs, and the
+/// operation is an internally tagged enum, where serde buffers the content
+/// before it reaches the variant. Both levels are checked.
+#[tokio::test]
+async fn unknown_key_refused_on_commit() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let uri = format!("/api/v1/branches/{branch_id}/commit");
+    let insert = json!({
+        "type": "insert",
+        "feature_id": Uuid::now_v7().to_string(),
+        "geometry_wkb_hex": point_wkb(1.0, 2.0),
+        "properties": {"name": "park"},
+    });
+    let valid = json!({"message": "m", "author": "test", "operations": [insert.clone()]});
+
+    let (status, body) = post_json(&app, &uri, valid.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_body_key_refused(&app, "POST", &uri, NO_AUTH, valid).await;
+
+    let mut op = insert;
+    op[UNKNOWN_KEY] = json!(1);
+    let (status, text) = send_text(
+        &app,
+        "POST",
+        &uri,
+        NO_AUTH,
+        Some(json!({"message": "m", "author": "test", "operations": [op]})),
+    )
+    .await;
+    assert_eq!(status, UNKNOWN_BODY_KEY, "{text}");
+    assert!(text.contains(UNKNOWN_KEY), "{text}");
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_feature_queries() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+
+    let listing = format!("/api/v1/branches/{branch_id}/features?limit=10");
+    let (status, body) = get_json(&app, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, &listing).await;
+
+    let bbox =
+        format!("/api/v1/branches/{branch_id}/features/bbox?min_x=-1&min_y=-1&max_x=9&max_y=9");
+    let (status, body) = get_json(&app, &bbox).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, &bbox).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_geoprocessing() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/geoprocessing/simplify");
+    let valid = json!({"tolerance": 1.0});
+
+    let (status, body) = post_json(&app, &uri, valid.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_body_key_refused(&app, "POST", &uri, NO_AUTH, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_cql2_filter() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+    let uri = format!("/api/v1/branches/{branch_id}/features/filter");
+    let valid = json!({"filter": {"op": "isNull", "args": [{"property": "name"}]}});
+
+    let (status, body) = post_json(&app, &uri, valid.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_body_key_refused(&app, "POST", &uri, NO_AUTH, valid.clone()).await;
+
+    // the OGC spelling of `filter_lang` is `filter-lang`, and it is now refused
+    // rather than dropped
+    let mut ogc_spelling = valid;
+    ogc_spelling["filter-lang"] = json!("cql2-json");
+    let (status, text) = send_text(&app, "POST", &uri, NO_AUTH, Some(ogc_spelling)).await;
+    assert_eq!(status, UNKNOWN_BODY_KEY, "{text}");
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_schema() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/schema");
+    let valid = json!({"fields": [{"name": "n", "field_type": "string", "required": false}]});
+
+    let (status, text) = send_text(&app, "PUT", &uri, NO_AUTH, Some(valid.clone())).await;
+    assert!(status.is_success(), "{status}: {text}");
+
+    assert_body_key_refused(&app, "PUT", &uri, NO_AUTH, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_sync_push() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+    let operation = json!({
+        "type": "insert",
+        "feature_id": Uuid::now_v7().to_string(),
+        "geometry_wkb_hex": point_wkb(3.0, 4.0),
+        "properties": {},
+    });
+    let valid = json!({
+        "branch_id": branch_id.to_string(),
+        "message": "m",
+        "author": "test",
+        "operations": [operation],
+    });
+
+    let (status, text) = send_text(
+        &app,
+        "POST",
+        "/api/v1/sync/push",
+        NO_AUTH,
+        Some(valid.clone()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {text}");
+
+    assert_body_key_refused(&app, "POST", "/api/v1/sync/push", NO_AUTH, valid).await;
+
+    let pull = format!("/api/v1/sync/pull?branch_id={branch_id}");
+    let (status, body) = get_json(&app, &pull).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, &pull).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_qgis_transaction() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+    let uri = format!("/api/v1/qgis/branches/{branch_id}/transaction");
+    let valid = json!({
+        "author": "test",
+        "operations": [{
+            "action": "insert",
+            "geometry_wkb_hex": point_wkb(5.0, 6.0),
+            "properties": {},
+        }],
+    });
+
+    let (status, body) = post_json(&app, &uri, valid.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_body_key_refused(&app, "POST", &uri, NO_AUTH, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_reviews() {
+    let (app, _) = setup_app().await;
+    let (dataset_id, source_id, _) = branch_with_one_point(&app).await;
+    let target_id = create_branch(&app, dataset_id, "target").await;
+    let valid = json!({
+        "dataset_id": dataset_id.to_string(),
+        "source_branch_id": source_id.to_string(),
+        "target_branch_id": target_id.to_string(),
+        "title": "t",
+        "author": "test",
+    });
+
+    let (status, body) = post_json(&app, "/api/v1/reviews", valid.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_body_key_refused(&app, "POST", "/api/v1/reviews", NO_AUTH, valid).await;
+
+    let listing = format!("/api/v1/reviews?dataset_id={dataset_id}");
+    let (status, body) = get_json(&app, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, &listing).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_workspaces() {
+    let app = setup_app_authed().await;
+    let owner = token_for_subject("deny-workspace-owner");
+    let valid = json!({"name": "w", "description": "d"});
+
+    let (status, text) = send_text(
+        &app,
+        "POST",
+        "/api/v1/workspaces",
+        &owner,
+        Some(valid.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+
+    assert_body_key_refused(&app, "POST", "/api/v1/workspaces", &owner, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_attachments() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let uri = format!("/api/v1/datasets/{dataset_id}/attachments");
+    let valid = json!({"name": "a.txt", "data": "c3dlZXA=", "created_by": "test"});
+
+    let (status, text) = send_text(&app, "POST", &uri, NO_AUTH, Some(valid.clone())).await;
+    assert!(status.is_success(), "{status}: {text}");
+
+    assert_body_key_refused(&app, "POST", &uri, NO_AUTH, valid).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_catalog_search() {
+    let (app, _) = setup_app().await;
+    create_dataset(&app).await;
+
+    let uri = "/api/v1/catalog/search?q=deny";
+    let (status, body) = get_json(&app, uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, uri).await;
+}
+
+#[tokio::test]
+async fn unknown_key_refused_on_verticals() {
+    let (app, _) = setup_app().await;
+    let (_, branch_id, _) = branch_with_one_point(&app).await;
+
+    let sensors = format!("/api/v1/sensors?branch_id={branch_id}");
+    let (status, body) = get_json(&app, &sensors).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_query_key_refused(&app, &sensors).await;
+
+    let valid = json!({
+        "branch_id": branch_id.to_string(),
+        "incident_type": "fire",
+        "severity": "high",
+        "lat": 1.0,
+        "lng": 2.0,
+        "description": "d",
+        "author": "test",
+    });
+    let (status, text) = send_text(
+        &app,
+        "POST",
+        "/api/v1/incidents",
+        NO_AUTH,
+        Some(valid.clone()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {text}");
+
+    assert_body_key_refused(&app, "POST", "/api/v1/incidents", NO_AUTH, valid).await;
 }

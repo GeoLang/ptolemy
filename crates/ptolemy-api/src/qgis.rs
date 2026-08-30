@@ -262,6 +262,7 @@ async fn layer_definition(
 // ─── WFS-T Transaction ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WfsTransaction {
     /// Operations in this transaction
     operations: Vec<WfsOperation>,
@@ -280,7 +281,7 @@ fn default_message() -> String {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum WfsOperation {
     Insert {
         feature_id: Option<Uuid>,
@@ -425,6 +426,7 @@ async fn wfs_transaction(
 // ─── QGIS Pull/Push (simplified sync) ──────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QgisPullParams {
     /// Client's last known changeset (for incremental sync)
     #[serde(default)]
@@ -522,6 +524,7 @@ async fn qgis_pull(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QgisPushRequest {
     /// The changeset the client was synced to
     base_changeset: Option<Uuid>,
@@ -690,6 +693,7 @@ async fn list_conflicts(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResolveConflictRequest {
     conflict_id: Uuid,
     /// Which version to keep: "ours", "theirs", or "custom"

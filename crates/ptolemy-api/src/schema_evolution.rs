@@ -50,6 +50,7 @@ async fn get_version(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApplyMigrationRequest {
     description: String,
     /// "add_field", "remove_field", "rename_field", "change_type"

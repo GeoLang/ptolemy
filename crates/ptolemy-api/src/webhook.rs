@@ -48,6 +48,7 @@ async fn list_webhooks(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateWebhookRequest {
     url: String,
     #[serde(default)]
@@ -94,6 +95,7 @@ async fn delete_webhook(
 // ─── Events ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventQuery {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -113,6 +115,7 @@ async fn list_events(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmitEventRequest {
     event_type: String,
     #[serde(default)]

@@ -776,6 +776,17 @@ passed on 2026-08-23.
 
 ## API Endpoints
 
+A key a route does not declare is refused, not dropped. A JSON body carrying one
+answers `422` and a query string carrying one answers `400`, both naming the key.
+A misspelled field used to leave the request looking successful while the value
+went nowhere.
+
+Four surfaces are exempt because their callers are not ours: the OIDC callback,
+whose parameters the identity provider chooses, `/api/v1/ogc/collections/{id}/items`
+and `/api/v1/stac/search`, which any conforming OGC or STAC client may call with
+spec parameters Ptolemy does not implement, and the replication endpoints, whose
+caller is a peer running another version.
+
 ### Real-Time Collaboration Relay
 
 Ptolemy includes an ephemeral room-based WebSocket relay at `/ws/rooms/{room_id}` for

@@ -37,6 +37,7 @@ async fn get_schema(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetSchemaRequest {
     fields: Vec<FieldDef>,
     #[serde(default)]

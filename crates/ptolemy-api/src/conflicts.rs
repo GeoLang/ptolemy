@@ -334,6 +334,7 @@ async fn preview_merge_visual(
 // ─── Resolve and Merge ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VisualResolveRequest {
     resolutions: Vec<VisualResolution>,
     author: String,
@@ -342,6 +343,7 @@ struct VisualResolveRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VisualResolution {
     feature_id: Uuid,
     /// "ours", "theirs", "custom", "delete", "auto_merge"

@@ -30,6 +30,7 @@ pub fn analytics_routes() -> Router<AppState> {
 // ─── Buffer Analysis ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BufferQuery {
     feature_id: Uuid,
     distance: f64,
@@ -122,6 +123,7 @@ async fn union_analysis(
 const MAX_COVERAGE_DISTANCE_METERS: f64 = 100_000.0;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CoverageQuery {
     distance: Option<f64>,
 }
@@ -191,6 +193,7 @@ async fn coverage_analysis(
 // ─── Cluster Analysis ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClusterQuery {
     #[serde(default = "default_eps")]
     eps: f64,

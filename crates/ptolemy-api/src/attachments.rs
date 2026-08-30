@@ -260,6 +260,7 @@ async fn delete_project_attachment(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UploadAttachmentRequest {
     name: String,
     #[serde(default)]

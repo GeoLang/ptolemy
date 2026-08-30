@@ -82,6 +82,7 @@ async fn list_classes(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateClassRequest {
     name: String,
     origin_dataset_id: Uuid,
@@ -199,6 +200,7 @@ async fn list_records(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRecordRequest {
     origin_feature_id: Uuid,
     destination_feature_id: Uuid,
@@ -232,6 +234,7 @@ async fn delete_record(
 
 /// Navigate relationships from a feature.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RelatedQuery {
     direction: Option<String>, // forward, backward, both
 }

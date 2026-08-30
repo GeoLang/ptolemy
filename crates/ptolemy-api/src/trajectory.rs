@@ -90,6 +90,7 @@ async fn list_trajectories(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTrajectoryRequest {
     name: String,
     /// Array of [lng, lat, timestamp_iso] points
@@ -97,6 +98,7 @@ struct CreateTrajectoryRequest {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TrajectoryPoint {
     lng: f64,
     lat: f64,
@@ -173,6 +175,7 @@ async fn get_trajectory(
 
 /// Get position at a specific time.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PositionAtQuery {
     timestamp: String,
 }
@@ -247,6 +250,7 @@ async fn trajectory_distance(
 
 /// Simplify trajectory using Douglas-Peucker.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimplifyRequest {
     #[serde(default = "default_tolerance")]
     tolerance: f64,
@@ -281,6 +285,7 @@ async fn simplify_trajectory(
 
 /// Find nearest approach between two trajectories.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NearestApproachRequest {
     trajectory_a: Uuid,
     trajectory_b: Uuid,

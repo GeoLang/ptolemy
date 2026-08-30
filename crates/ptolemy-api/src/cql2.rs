@@ -35,6 +35,7 @@ const MAX_LIMIT: i64 = 10_000;
 
 /// CQL2 filter request. Only CQL2-JSON is parsed, see [`check_filter_lang`].
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cql2FilterRequest {
     /// CQL2-JSON filter object
     filter: serde_json::Value,

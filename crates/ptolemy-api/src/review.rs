@@ -41,6 +41,7 @@ pub fn review_routes() -> Router<AppState> {
 // ─── List / Create ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListReviewsParams {
     dataset_id: Uuid,
     #[serde(default)]
@@ -58,6 +59,7 @@ async fn list_reviews(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateReviewRequest {
     dataset_id: Uuid,
     source_branch_id: Uuid,
@@ -125,6 +127,7 @@ async fn close_review(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergeReviewRequest {
     author: String,
 }
@@ -224,6 +227,7 @@ async fn list_comments(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddCommentRequest {
     author: String,
     body: String,

@@ -49,6 +49,7 @@ async fn require_sfcgal(store: &AppState) -> Result<(), SfcgalError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExtrudeRequest {
     feature_id: Uuid,
     height: f64,
@@ -75,6 +76,7 @@ async fn extrude_3d(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VolumeRequest {
     feature_id: Uuid,
 }
@@ -102,6 +104,7 @@ async fn compute_volume(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Intersection3DRequest {
     feature_a: Uuid,
     feature_b: Uuid,
@@ -130,6 +133,7 @@ async fn intersection_3d(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkeletonRequest {
     feature_id: Uuid,
 }
@@ -154,6 +158,7 @@ async fn straight_skeleton(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MinkowskiRequest {
     feature_id: Uuid,
     buffer_geometry_wkb_hex: String,
@@ -198,6 +203,7 @@ fn unsummable_or_internal(error: sqlx::Error) -> SfcgalError {
 const MINKOWSKI_REFUSAL: &str = "minkowski_sum()";
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TesselateRequest {
     feature_id: Uuid,
 }
@@ -222,6 +228,7 @@ async fn tesselate(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VisibilityRequest {
     observer_x: f64,
     observer_y: f64,

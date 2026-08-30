@@ -27,6 +27,7 @@ pub fn real_estate_routes() -> Router<AppState> {
 // ─── Parcel Search ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParcelSearchParams {
     /// Branch holding parcel data
     branch_id: Uuid,
@@ -132,6 +133,7 @@ async fn parcel_search(
 // ─── Comparable Sales Search ────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompsSearchParams {
     /// Branch holding sales data
     branch_id: Uuid,
@@ -306,6 +308,7 @@ struct CompsSummary {
 // ─── Parcel Split ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParcelSplitRequest {
     branch_id: Uuid,
     feature_id: Uuid,
@@ -352,6 +355,7 @@ async fn parcel_split(
 // ─── Parcel Merge ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParcelMergeRequest {
     branch_id: Uuid,
     feature_ids: Vec<Uuid>,

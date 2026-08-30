@@ -35,6 +35,7 @@ pub fn catalog_routes() -> Router<AppState> {
 // ─── Search ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchQuery {
     #[serde(default)]
     q: String,
@@ -129,6 +130,7 @@ async fn list_tags(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddTagRequest {
     tag: String,
 }
@@ -156,6 +158,7 @@ async fn remove_tag(
 // ─── Metadata ───────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DatasetMetadata {
     description: String,
     #[serde(default)]

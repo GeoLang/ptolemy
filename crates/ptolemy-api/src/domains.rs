@@ -85,6 +85,7 @@ async fn list_domains(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateDomainRequest {
     name: String,
     domain_type: String,
@@ -184,6 +185,7 @@ async fn list_subtypes(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSubtypeRequest {
     subtype_field: String,
     name: String,
@@ -283,6 +285,7 @@ async fn list_rules(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRuleRequest {
     name: String,
     rule_type: String,
@@ -335,6 +338,7 @@ async fn get_rule(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateRuleRequest {
     expression: Option<String>,
     error_message: Option<String>,

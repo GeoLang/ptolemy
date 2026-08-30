@@ -47,6 +47,7 @@ async fn require_pgvector(store: &AppState) -> Result<(), VectorError> {
 
 /// Search for features similar to a given embedding vector.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimilaritySearchRequest {
     embedding: Vec<f32>,
     #[serde(default = "default_limit")]
@@ -111,6 +112,7 @@ async fn similarity_search(
 
 /// Find potential duplicate features based on embedding similarity.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DuplicateQuery {
     #[serde(default = "dup_threshold")]
     threshold: f64,
@@ -169,6 +171,7 @@ async fn find_duplicates(
 /// Generate embeddings for features based on their properties (simplified).
 /// Uses pgcrypto digest to create deterministic property-based vectors.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmbedRequest {
     /// Which property fields to embed
     fields: Vec<String>,
@@ -189,6 +192,7 @@ async fn generate_embeddings(
 
 /// Cluster features by embedding similarity using k-means (via pgvector).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClusterRequest {
     #[serde(default = "default_clusters")]
     num_clusters: i32,

@@ -105,6 +105,7 @@ async fn list_networks(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateNetworkRequest {
     name: String,
     #[serde(default = "default_network_type")]
@@ -170,6 +171,7 @@ async fn list_junctions(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddJunctionRequest {
     feature_id: Option<Uuid>,
     lng: f64,
@@ -216,6 +218,7 @@ async fn list_edges(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddEdgeRequest {
     feature_id: Uuid,
     from_junction: Option<Uuid>,
@@ -248,6 +251,7 @@ async fn add_edge(
 // ─── Network Analysis ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TraceRequest {
     start_junction: Uuid,
     /// Max hops (default unlimited)
@@ -339,6 +343,7 @@ async fn trace_network(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShortestPathRequest {
     from_junction: Uuid,
     to_junction: Uuid,
@@ -468,6 +473,7 @@ async fn shortest_path(
 // ─── A* (heuristic shortest path) ──────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AstarRequest {
     from_junction: Uuid,
     to_junction: Uuid,
@@ -498,6 +504,7 @@ async fn astar_path(
 // ─── Driving Distance / Isochrone ───────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DrivingDistanceRequest {
     start_junction: Uuid,
     max_cost: f64,
@@ -553,6 +560,7 @@ async fn driving_distance(
 // ─── TSP (Traveling Salesman Problem) ───────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TspRequest {
     junction_ids: Vec<Uuid>,
     start_junction: Option<Uuid>,

@@ -78,6 +78,7 @@ live AS (
 // ─── Clip ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClipRequest {
     /// GeoJSON polygon to clip features by.
     clip_geometry: serde_json::Value,
@@ -131,6 +132,7 @@ async fn clip(
 // ─── Intersect ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IntersectRequest {
     /// GeoJSON polygon to intersect with.
     overlay_geometry: serde_json::Value,
@@ -180,6 +182,7 @@ async fn intersect(
 // ─── Difference ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DifferenceRequest {
     /// GeoJSON polygon to subtract from features.
     subtract_geometry: serde_json::Value,
@@ -228,6 +231,7 @@ async fn difference(
 // ─── Dissolve ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DissolveRequest {
     /// Property key to dissolve/group by.
     group_by: String,
@@ -294,6 +298,7 @@ async fn dissolve(
 // ─── Spatial Join ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpatialJoinRequest {
     /// Feature IDs to join attributes to.
     target_ids: Vec<Uuid>,
@@ -381,6 +386,7 @@ async fn spatial_join(
 // ─── Voronoi Polygons ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VoronoiRequest {
     /// Optional bounding envelope as GeoJSON polygon. If omitted, uses extent of features.
     envelope: Option<serde_json::Value>,
@@ -442,6 +448,7 @@ async fn voronoi(
 // ─── Convex Hull ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConvexHullRequest {
     /// If provided, compute hull for these feature IDs only.
     feature_ids: Option<Vec<Uuid>>,
@@ -527,6 +534,7 @@ async fn centroid(
 // ─── Nearest Neighbor ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NearestNeighborRequest {
     /// Feature ID to find neighbors for.
     feature_id: Uuid,
@@ -595,6 +603,7 @@ async fn nearest_neighbor(
 // ─── Distance Matrix ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DistanceMatrixRequest {
     /// Feature IDs to compute distances between.
     feature_ids: Vec<Uuid>,
@@ -651,6 +660,7 @@ async fn distance_matrix(
 // ─── Contour ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContourRequest {
     /// Property name containing the elevation/value.
     value_property: String,
@@ -738,6 +748,7 @@ const CONTOUR_FUNCTION: &str = "st_contourlines";
 // ─── Merge Features ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MergeRequest {
     /// Feature IDs to merge into a single geometry.
     feature_ids: Vec<Uuid>,
@@ -776,6 +787,7 @@ async fn merge_features(
 // ─── Split Features ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SplitRequest {
     /// Feature ID to split.
     feature_id: Uuid,
@@ -845,6 +857,7 @@ const SPLIT_REFUSAL: &str = "Splitting ";
 // ─── Simplify ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimplifyRequest {
     /// Tolerance in map units (degrees for 4326, meters for projected).
     tolerance: f64,
@@ -904,6 +917,7 @@ async fn simplify(
 // ─── Densify ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DensifyRequest {
     /// Maximum segment length.
     max_segment_length: f64,

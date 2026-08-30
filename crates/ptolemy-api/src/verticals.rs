@@ -42,6 +42,7 @@ pub fn vertical_routes() -> Router<AppState> {
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SensorListParams {
     branch_id: Uuid,
     #[serde(default)]
@@ -104,6 +105,7 @@ async fn list_sensors(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SensorReadingsParams {
     branch_id: Uuid,
     sensor_id: Uuid,
@@ -159,6 +161,7 @@ async fn sensor_readings(
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SurveyCompareRequest {
     branch_id: Uuid,
     /// Feature IDs of two surveys to compare
@@ -246,6 +249,7 @@ async fn survey_compare(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SurveyListParams {
     branch_id: Uuid,
     #[serde(default = "default_limit")]
@@ -295,6 +299,7 @@ async fn list_surveys(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MilestoneParams {
     branch_id: Uuid,
     #[serde(default = "default_limit")]
@@ -347,6 +352,7 @@ async fn list_milestones(
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FieldListParams {
     branch_id: Uuid,
     #[serde(default = "default_limit")]
@@ -394,6 +400,7 @@ async fn list_fields(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NdviParams {
     branch_id: Uuid,
     field_id: Uuid,
@@ -450,6 +457,7 @@ async fn field_ndvi(
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TowerListParams {
     branch_id: Uuid,
     #[serde(default)]
@@ -513,6 +521,7 @@ async fn list_towers(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CoverageSimRequest {
     tower_lat: f64,
     tower_lng: f64,
@@ -592,6 +601,7 @@ async fn coverage_simulate(
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IncidentListParams {
     branch_id: Uuid,
     #[serde(default)]
@@ -669,6 +679,7 @@ async fn list_incidents(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateIncidentRequest {
     branch_id: Uuid,
     incident_type: String,
@@ -741,6 +752,7 @@ async fn create_incident(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvacuationRequest {
     incident_lat: f64,
     incident_lng: f64,
@@ -751,6 +763,7 @@ struct EvacuationRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AssemblyPoint {
     id: String,
     lat: f64,

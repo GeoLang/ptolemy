@@ -115,6 +115,7 @@ async fn list_symbology(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSymbologyRequest {
     name: String,
     min_scale: Option<f64>,
@@ -170,6 +171,7 @@ async fn get_symbology(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct UpdateSymbologyRequest {
     symbol: Option<serde_json::Value>,
@@ -211,6 +213,7 @@ async fn delete_symbology(
 const DEFAULT_SOURCE: &str = "ptolemy";
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StyleQuery {
     /// source name in the caller's own style document
     source: Option<String>,
@@ -353,6 +356,7 @@ async fn list_labels(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateLabelRequest {
     name: String,
     min_scale: Option<f64>,
@@ -419,6 +423,7 @@ async fn get_label(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateLabelRequest {
     field_expression: Option<String>,
     placement: Option<serde_json::Value>,

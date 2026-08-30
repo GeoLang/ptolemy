@@ -19,6 +19,16 @@ All notable changes to this project will be documented in this file.
   `/api/v1/projects` route already gave one. Moving a dataset between projects
   still asks nothing of the project it leaves, now written down in the README
   and on the handler.
+- 2026-08-30: **an undeclared request key is refused**. 136 request structs
+  across `ptolemy-api` carry `#[serde(deny_unknown_fields)]`, so a body or query
+  string naming a field the route does not have answers `422` (JSON body) or
+  `400` (query string) with the key named, instead of parsing and silently
+  dropping the value. That covers the operations nested inside a commit, a sync
+  push and a WFS transaction, each an internally tagged enum where the variant's
+  own fields are checked too. Four surfaces are left as they were, because a
+  caller outside this codebase decides what they send: the OIDC callback,
+  `/api/v1/ogc/collections/{id}/items`, `/api/v1/stac/search`, and the
+  replication feed and peer routes.
 - 2026-08-25: **coverage analytics**. `GET
   /api/v1/branches/{id}/analytics/coverage?distance=<meters>` buffers every live
   feature on the branch by `distance` in geography, unions the buffers and

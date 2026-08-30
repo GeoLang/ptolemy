@@ -489,6 +489,7 @@ async fn item(
 // ─── Audit Log ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuditQuery {
     #[serde(default = "default_audit_limit")]
     limit: i64,

@@ -43,6 +43,7 @@ async fn require_h3(store: &AppState) -> Result<(), H3Error> {
 
 /// Index all features on a branch with H3 cells at given resolution.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexH3Request {
     #[serde(default = "default_resolution")]
     resolution: i32,
@@ -69,6 +70,7 @@ async fn index_features_h3(
 
 /// Get H3 hexagons covering features.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HexQuery {
     #[serde(default = "default_resolution")]
     resolution: i32,
@@ -144,6 +146,7 @@ async fn aggregate_by_hex(
 
 /// Get neighbors (k-ring) of a hex cell.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NeighborQuery {
     cell: String,
     #[serde(default = "default_k")]
@@ -176,6 +179,7 @@ async fn hex_neighbors(
 
 /// Compact a set of hexagons to the minimal representation.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompactRequest {
     cells: Vec<String>,
 }
@@ -199,6 +203,7 @@ async fn compact_hexes(
 
 /// Convert a lat/lng point to an H3 cell.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PointToCellQuery {
     lng: f64,
     lat: f64,
@@ -222,6 +227,7 @@ async fn point_to_cell(
 
 /// Get the boundary polygon of an H3 cell.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CellBoundaryQuery {
     cell: String,
 }

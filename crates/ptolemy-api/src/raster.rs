@@ -74,6 +74,7 @@ async fn list_catalogs(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateCatalogRequest {
     name: String,
     #[serde(default = "default_srid")]
@@ -171,6 +172,7 @@ async fn list_tiles(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UploadTileRequest {
     zoom_level: i32,
     bounds_wkb_hex: String,
@@ -233,6 +235,7 @@ const RASTER_WKB_DECODER: &str = "rt_raster_from_wkb";
 
 /// Get pixel value at a point.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PointValueQuery {
     lng: f64,
     lat: f64,

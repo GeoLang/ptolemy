@@ -33,6 +33,7 @@ pub fn format_routes() -> Router<AppState> {
 // ─── Export: GeoJSON ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExportQuery {
     limit: Option<i64>,
     offset: Option<i64>,
@@ -349,6 +350,7 @@ async fn import_geojson(
 // ─── Import: CSV ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImportCsvRequest {
     /// CSV content as a string.
     csv: String,
@@ -506,6 +508,7 @@ async fn import_csv(
 // ─── CRS Transform ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransformRequest {
     from_srid: i32,
     to_srid: i32,
@@ -540,6 +543,7 @@ async fn transform_crs(
 // ─── CRS Lookup ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CrsSearchQuery {
     q: String,
     limit: Option<i64>,

@@ -26,6 +26,7 @@ pub fn compaction_routes() -> Router<AppState> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompactRequest {
     /// Number of most recent versions to keep per feature. Default: 1.
     #[serde(default = "default_keep")]

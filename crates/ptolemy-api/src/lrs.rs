@@ -70,6 +70,7 @@ async fn list_routes(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateRouteRequest {
     name: String,
     geometry_wkb_hex: String,
@@ -129,6 +130,7 @@ async fn list_events(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateEventRequest {
     event_type: String,
     from_measure: f64,
@@ -160,6 +162,7 @@ async fn create_event(
 
 /// Locate a point along a route (return measure value for a coordinate).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LocateQuery {
     lng: f64,
     lat: f64,
@@ -194,6 +197,7 @@ async fn locate_point(
 
 /// Get a sub-line between two measures.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SublineQuery {
     from_measure: f64,
     to_measure: f64,

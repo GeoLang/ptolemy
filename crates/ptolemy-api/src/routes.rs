@@ -113,6 +113,7 @@ async fn list_datasets(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateDatasetRequest {
     name: String,
     #[serde(default = "default_srid")]
@@ -210,6 +211,7 @@ async fn get_dataset(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateDatasetRequest {
     visibility: String,
 }
@@ -249,6 +251,7 @@ async fn list_branches(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateBranchRequest {
     name: String,
     created_by: String,
@@ -301,6 +304,7 @@ async fn get_branch_history(
 // ─── Features ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FeatureListParams {
     /// Cursor for pagination (feature UUID)
     #[serde(default)]
@@ -402,6 +406,7 @@ struct NativeGeometryResponse {
 // ─── Spatial Queries ────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BboxParams {
     min_x: f64,
     min_y: f64,
@@ -431,6 +436,7 @@ async fn features_bbox(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpatialFilterRequest {
     /// GeoJSON geometry to test against
     geometry: serde_json::Value,
@@ -477,6 +483,7 @@ async fn features_count(
 // ─── Temporal Query ─────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TemporalParams {
     /// ISO 8601 timestamp to query features "as of"
     at: String,
@@ -529,6 +536,7 @@ async fn mvt_tile(
 // ─── Batch Operations ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BatchCommitRequest {
     message: String,
     author: String,
@@ -622,6 +630,7 @@ struct BatchCommitResponse {
 // ─── Commit ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommitRequest {
     message: String,
     author: String,
@@ -629,7 +638,7 @@ struct CommitRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DiffOpRequest {
     Insert {
         feature_id: Option<Uuid>,

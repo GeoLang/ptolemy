@@ -59,6 +59,7 @@ async fn list_topologies(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTopologyRequest {
     name: String,
     #[serde(default = "default_srid")]
@@ -191,6 +192,7 @@ async fn list_topo_nodes(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddFaceRequest {
     geometry_wkb_hex: String,
 }
@@ -246,6 +248,7 @@ const ADD_FACE_REFUSALS: [&str; 4] = [
 ];
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SimplifyRequest {
     #[serde(default = "default_precision")]
     tolerance: f64,

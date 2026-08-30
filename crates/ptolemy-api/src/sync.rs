@@ -34,6 +34,7 @@ pub fn sync_routes() -> Router<AppState> {
 // ─── Pull ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PullParams {
     branch_id: Uuid,
     /// If provided, only return changes since this changeset (incremental sync).
@@ -62,7 +63,7 @@ struct SyncFeature {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum SyncDiffOp {
     Insert {
         feature_id: Uuid,
@@ -182,6 +183,7 @@ async fn sync_pull(
 // ─── Push ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PushRequest {
     branch_id: Uuid,
     /// The changeset the client was synced to when making these edits.
@@ -295,6 +297,7 @@ async fn sync_push(
 // ─── Status ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StatusParams {
     branch_id: Uuid,
     /// Client's current changeset

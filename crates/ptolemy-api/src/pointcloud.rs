@@ -86,6 +86,7 @@ async fn list_catalogs(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateCatalogRequest {
     name: String,
     #[serde(default = "default_srid")]
@@ -163,6 +164,7 @@ async fn list_patches(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddPatchRequest {
     bounds_wkb_hex: String,
     num_points: i32,
@@ -209,6 +211,7 @@ async fn add_patch(
 
 /// Spatial query: find patches within a bounding box.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpatialQueryRequest {
     min_x: f64,
     min_y: f64,
@@ -281,6 +284,7 @@ async fn catalog_stats(
 
 /// Extract an elevation profile along a line.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileRequest {
     line_wkb_hex: String,
     #[serde(default = "default_samples")]
