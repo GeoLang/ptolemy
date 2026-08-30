@@ -671,22 +671,45 @@ impl PgStore {
 
     /// Attach a dataset to a project and make it private, in one transaction, so
     /// the dataset is never attached while still readable by anyone who asks.
+    /// Re-attaching to the project the dataset is already in keeps its
+    /// visibility, so a deliberately published project dataset is not hidden by
+    /// a repeated attach.
+    ///
+    /// An external dataset is refused here rather than by the caller, so the
+    /// rule holds with `PTOLEMY_AUTH_DISABLED=true` as well.
     ///
     /// The caller enforces who may do this: an admin on the dataset who can also
     /// edit the target project.
+    ///
+    /// `expected_project_id` is the project the caller believes the dataset is
+    /// in. `Some` refuses a dataset that moved since the caller read it, `None`
+    /// attaches whatever it currently belongs to.
     pub async fn attach_dataset_to_project(
         &self,
         dataset_id: Uuid,
         project_id: Uuid,
+        expected_project_id: Option<Uuid>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         // lock the dataset row first, so a concurrent attach or visibility flip
-        // cannot land between the project link and the private flag
-        sqlx::query("SELECT id FROM datasets WHERE id = $1 FOR UPDATE")
-            .bind(dataset_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("dataset {dataset_id}")))?;
+        // cannot land between the checks below and the update
+        let row =
+            sqlx::query("SELECT external_table, project_id FROM datasets WHERE id = $1 FOR UPDATE")
+                .bind(dataset_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("dataset {dataset_id}")))?;
+        if row.get::<Option<String>, _>("external_table").is_some() {
+            return Err(StoreError::Conflict(EXTERNAL_READ_ONLY.into()));
+        }
+        let current_project_id: Option<Uuid> = row.get("project_id");
+        if let Some(expected) = expected_project_id
+            && current_project_id != Some(expected)
+        {
+            return Err(StoreError::Conflict(format!(
+                "dataset {dataset_id} is no longer attached to project {expected}"
+            )));
+        }
         // the foreign key would refuse an unknown project as a database error,
         // and a missing project is a 404. FOR KEY SHARE is the lock the key
         // check below takes anyway, and holding it from here means a project
@@ -696,11 +719,17 @@ impl PgStore {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("project {project_id}")))?;
-        sqlx::query("UPDATE datasets SET project_id = $2, visibility = 'private' WHERE id = $1")
-            .bind(dataset_id)
-            .bind(project_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE datasets
+                SET project_id = $2,
+                    visibility = CASE WHEN project_id IS NOT DISTINCT FROM $2
+                                      THEN visibility ELSE 'private' END
+              WHERE id = $1",
+        )
+        .bind(dataset_id)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

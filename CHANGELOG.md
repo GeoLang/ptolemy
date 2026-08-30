@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-08-30: **dataset attach and detach close six review findings**. Detaching
+  now takes either half of what attaching took, an `admin` grant on the dataset
+  or `editor` on the project it is leaving, so a dataset admin outside the
+  project can revoke the access their own attach handed out. Attaching takes an
+  optional `expected_project_id` and answers `409` when the dataset moved since
+  the caller read it. The store refuses an external dataset outright, which holds
+  with `PTOLEMY_AUTH_DISABLED=true` where both role checks pass by definition.
+  Re-attaching to the project a dataset is already in keeps its visibility
+  instead of re-hiding a published dataset. `PUT` and `DELETE
+  /api/v1/datasets/{id}/project` refuse a tool token, the refusal every
+  `/api/v1/projects` route already gave one. Moving a dataset between projects
+  still asks nothing of the project it leaves, now written down in the README
+  and on the handler.
 - 2026-08-25: **coverage analytics**. `GET
   /api/v1/branches/{id}/analytics/coverage?distance=<meters>` buffers every live
   feature on the branch by `distance` in geography, unions the buffers and

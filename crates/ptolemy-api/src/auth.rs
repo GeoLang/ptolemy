@@ -31,6 +31,11 @@ const COLLABORATION_PREFIX: &str = "/api/v1/workspaces";
 const PROJECT_PREFIX: &str = "/api/v1/projects";
 const INVITATION_ACCEPT_PATH: &str = "/api/v1/invitations/accept";
 
+/// Attach and detach. Both hand a project's whole membership a grant on the
+/// dataset, or take it away, which is the same change the `/api/v1/projects`
+/// routes refuse a tool token.
+const DATASET_PROJECT_PATH: &str = "/api/v1/datasets/{id}/project";
+
 /// Shortest HS256 secret we accept, matching collecta.
 pub const MIN_SECRET_LEN: usize = 32;
 
@@ -146,6 +151,7 @@ fn tool_scope(method: &Method, route: &str, access: Access) -> Option<&'static s
     if route.starts_with(COLLABORATION_PREFIX)
         || route.starts_with(PROJECT_PREFIX)
         || route == INVITATION_ACCEPT_PATH
+        || route == DATASET_PROJECT_PATH
     {
         return None;
     }

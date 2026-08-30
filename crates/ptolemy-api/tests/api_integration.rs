@@ -7220,6 +7220,28 @@ async fn attach_project(
     .await
 }
 
+/// Attach naming the project the caller believes the dataset is in, which is
+/// refused when it moved in the meantime.
+async fn attach_project_expecting(
+    app: &axum::Router,
+    token: &str,
+    dataset_id: Uuid,
+    project_id: Uuid,
+    expected_project_id: Uuid,
+) -> (StatusCode, Value) {
+    request_as(
+        app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset_id}/project"),
+        Some(token),
+        Some(json!({
+            "project_id": project_id,
+            "expected_project_id": expected_project_id,
+        })),
+    )
+    .await
+}
+
 async fn detach_project(app: &axum::Router, token: &str, dataset_id: Uuid) -> (StatusCode, Value) {
     request_as(
         app,
@@ -7229,6 +7251,68 @@ async fn detach_project(app: &axum::Router, token: &str, dataset_id: Uuid) -> (S
         None,
     )
     .await
+}
+
+/// A workspace and a project written straight to the pool, for the auth-off
+/// tests: creating either one through the API needs a token.
+async fn seed_project_row(state: &AppState) -> Uuid {
+    let workspace_id = Uuid::now_v7();
+    let project_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO workspaces (id, name, created_by) VALUES ($1, $2, 'test')")
+        .bind(workspace_id)
+        .bind(format!("ws_{workspace_id}"))
+        .execute(state.unguarded_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO projects (id, workspace_id, name, created_by) VALUES ($1, $2, $3, 'test')",
+    )
+    .bind(project_id)
+    .bind(workspace_id)
+    .bind(format!("pr_{project_id}"))
+    .execute(state.unguarded_pool())
+    .await
+    .unwrap();
+    project_id
+}
+
+/// The scope an MCP-minted tool token carries for every ptolemy write.
+const PTOLEMY_WRITE_SCOPE: &str = "ptolemy:write";
+
+/// A tool token of the shape the platform mint issues: `token_use` and a scope
+/// array, and no role at all.
+fn tool_write_token() -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &json!({
+            "sub": "mcp-tool",
+            "exp": exp,
+            "token_use": "tool",
+            "scope": [PTOLEMY_WRITE_SCOPE],
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+/// The dataset as the API reports it, for the `project_id` and `visibility` an
+/// attach is supposed to have set or left alone.
+async fn read_dataset(app: &axum::Router, token: &str, dataset_id: Uuid) -> Value {
+    let (status, body) = request_as(
+        app,
+        "GET",
+        &format!("/api/v1/datasets/{dataset_id}"),
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
 }
 
 /// A public dataset, its project, and the three member tokens, with the attach
@@ -7607,6 +7691,205 @@ async fn test_attach_needs_dataset_admin_and_project_editor() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["visibility"], "public", "a denied attach still hid it");
+}
+
+/// Detaching takes either half of what attaching took. A dataset admin who never
+/// joined the project undoes their own attach, and so does an editor on the
+/// project who holds no grant on the dataset.
+#[tokio::test]
+async fn test_detach_takes_either_dataset_admin_or_project_editor() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, project_id, carol) = seed_attached_dataset(&app).await;
+
+    // an admin grant on the dataset and no role in the project at all
+    grant(&app, "datasets", dataset_id, "mallory", "admin").await;
+    let (status, body) =
+        detach_project(&app, &token_for_user("mallory", Role::Editor), dataset_id).await;
+    assert_eq!(status, StatusCode::OK, "outside dataset admin: {body}");
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        Value::Null,
+        "the detach did not land"
+    );
+
+    // and the other half: editor on the project, nothing on the dataset. Their
+    // project role maps to `write`, which is not the `admin` attaching took.
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "re-attach: {body}");
+    let editor = token_for_user("project-editor", Role::Editor);
+    assert!(!check_allowed(&app, "datasets", dataset_id, "project-editor", "admin").await);
+    let (status, body) = detach_project(&app, &editor, dataset_id).await;
+    assert_eq!(status, StatusCode::OK, "project editor: {body}");
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        Value::Null,
+        "the detach did not land"
+    );
+
+    // neither half is still neither half
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "re-attach: {body}");
+    grant(&app, "datasets", dataset_id, "eve", "read").await;
+    let (status, body) =
+        detach_project(&app, &token_for_user("eve", Role::Editor), dataset_id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a reader detaching: {body}");
+}
+
+/// Attach and detach hand a whole project membership a grant on the dataset, or
+/// take it away, so they are refused a tool token the way the project routes are.
+#[tokio::test]
+async fn test_tool_tokens_cannot_attach_or_detach() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, project_id, carol) = seed_attached_dataset(&app).await;
+    let tool = tool_write_token();
+
+    let (status, body) = attach_project(&app, &tool, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "tool attaching: {body}");
+
+    let (status, body) = detach_project(&app, &tool, dataset_id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "tool detaching: {body}");
+
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        project_id.to_string(),
+        "a refused tool call changed the link"
+    );
+
+    // the same token is a working write everywhere the route rule does not name
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&tool),
+        Some(new_dataset_body()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "tool creating a dataset: {body}"
+    );
+}
+
+/// An external dataset is a view over a relation ptolemy does not own, so there
+/// is no visibility to flip and nothing for a project to administer. The store
+/// refuses it, not the role checks, so the refusal survives auth being off.
+#[tokio::test]
+async fn test_external_dataset_cannot_be_attached() {
+    let (app, state) = setup_app_authed_with_state().await;
+    create_external_fixture(&state).await;
+    let carol = token_for_user("carol", Role::Editor);
+    let (status, dataset) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&carol),
+        Some(json!({
+            "name": format!("ext_{}", Uuid::now_v7()),
+            "created_by": "carol",
+            "external_table": "ext_parcels",
+            "external_id_column": "parcel_id",
+            "external_geometry_column": "geom",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    let dataset_id = Uuid::parse_str(dataset["id"].as_str().unwrap()).unwrap();
+    let project_id = seed_project_with_members(&app, &carol).await;
+
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        Value::Null,
+        "the refused attach still linked it"
+    );
+}
+
+/// The same refusal with `PTOLEMY_AUTH_DISABLED`, where both role checks pass by
+/// definition and the store is the only thing left to say no.
+#[tokio::test]
+async fn test_external_dataset_cannot_be_attached_with_auth_off() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, _) = setup_external(&app, &state).await;
+    let project_id = seed_project_row(&state).await;
+
+    let (status, body) = request_as(
+        &app,
+        "PUT",
+        &format!("/api/v1/datasets/{dataset_id}/project"),
+        None,
+        Some(json!({"project_id": project_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let (status, body) = get_json(&app, &format!("/api/v1/datasets/{dataset_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["project_id"],
+        Value::Null,
+        "the refused attach still linked it"
+    );
+}
+
+/// Attaching a dataset to the project it is already in is not a fresh attach:
+/// re-hiding a dataset an admin deliberately published would undo a decision
+/// nobody asked to revisit.
+#[tokio::test]
+async fn test_reattaching_to_the_same_project_keeps_the_visibility() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, project_id, carol) = seed_attached_dataset(&app).await;
+
+    let (status, body) = request_as(
+        &app,
+        "PATCH",
+        &format!("/api/v1/datasets/{dataset_id}"),
+        Some(&carol),
+        Some(json!({"visibility": "public"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "publishing: {body}");
+
+    let (status, body) = attach_project(&app, &carol, dataset_id, project_id).await;
+    assert_eq!(status, StatusCode::OK, "re-attach: {body}");
+
+    let dataset = read_dataset(&app, &carol, dataset_id).await;
+    assert_eq!(
+        dataset["visibility"], "public",
+        "the re-attach re-hid a published dataset"
+    );
+    assert_eq!(dataset["project_id"], project_id.to_string(), "{dataset}");
+}
+
+/// `expected_project_id` refuses an attach onto a dataset that moved since the
+/// caller read it. Moving it needs no consent from the project it leaves: the
+/// destination's editor role and an admin grant on the dataset are the whole bar.
+#[tokio::test]
+async fn test_attach_refuses_a_dataset_that_moved() {
+    let app = setup_app_authed().await;
+    let (dataset_id, _, first_project, carol) = seed_attached_dataset(&app).await;
+    let second_project = seed_project_with_members(&app, &carol).await;
+
+    // naming a project it is not in refuses, and leaves the link where it was
+    let (status, body) =
+        attach_project_expecting(&app, &carol, dataset_id, second_project, second_project).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        first_project.to_string(),
+        "a refused attach moved it anyway"
+    );
+
+    // naming the project it is in moves it, with nothing asked of that project
+    let (status, body) =
+        attach_project_expecting(&app, &carol, dataset_id, second_project, first_project).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        read_dataset(&app, &carol, dataset_id).await["project_id"],
+        second_project.to_string(),
+        "the move did not land"
+    );
 }
 
 /// An attached private dataset is in the listings for the project's members and

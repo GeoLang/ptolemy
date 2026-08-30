@@ -727,9 +727,27 @@ The effective project role is the higher of the caller's project membership and
 the workspace membership they inherit, the same rule the metadata routes use.
 
 `PUT /api/v1/datasets/{id}/project` with `{"project_id": "..."}` attaches, and
-`DELETE` on the same route detaches. Both need an `admin` grant on the dataset
-*and* `editor` or `owner` on the project, so neither half of the change can be
-made alone. A project the caller is not a member of answers `404`.
+`DELETE` on the same route detaches. Attaching needs an `admin` grant on the
+dataset *and* `editor` or `owner` on the project, so neither half of the change
+can be made alone. A project the caller is not a member of answers `404`.
+Detaching needs either half: the dataset's own admin undoes an attach without
+joining the project, and an editor on the project drops a dataset without a
+grant on it.
+
+Moving a dataset from one project to another asks nothing of the project it
+leaves. An `admin` grant on the dataset and `editor` on the destination is the
+whole bar, and the losing project is told by the dataset's `project_id`
+changing.
+
+The attach body takes an optional `expected_project_id`: the project the caller
+believes the dataset is in right now. Naming it refuses the attach with `409`
+when the dataset moved in between, so two callers racing to place the same
+dataset cannot silently overwrite each other. Leaving it out attaches whatever
+the dataset currently belongs to.
+
+Both methods refuse a tool token, the same refusal every `/api/v1/projects`
+route gives one: handing a project's whole membership a grant is not a
+delegated-agent operation.
 
 A dataset carries `project_id`, `null` when it belongs to no project, and
 `GET /api/v1/datasets/{id}` and `GET /api/v1/datasets` both report it to anyone
@@ -738,15 +756,20 @@ attaching always goes through the route above and its project-role check.
 
 Attaching sets the dataset's `visibility` to `private` in the same transaction:
 a project's data readable by anyone who asks is not what attaching it meant.
-Detaching leaves it `private`, so losing a project cannot publish its data. A
-dataset admin flips it back with `PATCH /api/v1/datasets/{id}`.
+Attaching a dataset to the project it is already in leaves the visibility alone,
+so a project dataset an admin deliberately published is not re-hidden by a
+repeated attach. Detaching leaves it `private`, so losing a project cannot
+publish its data. A dataset admin flips it back with
+`PATCH /api/v1/datasets/{id}`.
 
 Branch grants are unaffected. A project role joins the dataset scope, never the
 branch scope, so a branch that has rows of its own still decides its own writes,
 and a project owner is not among them unless a row says so.
 
-An external read-only dataset cannot be attached, for the same reason its
-visibility cannot be flipped: the write ladder refuses it first.
+An external read-only dataset cannot be attached: there is no visibility to flip
+and no rows for a project role to administer. The store refuses it, not the role
+checks, so the rule holds with `PTOLEMY_AUTH_DISABLED=true` as well. The answer
+is `409`, the same one every other write aimed at an external dataset gets.
 
 The focused multi-user PostGIS integration test, strict Clippy, and formatting
 passed on 2026-08-23.
