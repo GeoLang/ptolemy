@@ -85,6 +85,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-08-31: **dataset listings skip the project-role subquery on datasets
+  with no project**, halving listing time at 5000 datasets (150 ms to 73 ms
+  median). `idx_datasets_project` stays: no listing uses it, but the
+  `ON DELETE SET NULL` action on `datasets.project_id` scans it on project
+  delete.
 - 2026-08-25: **jsonwebtoken 9 to 11 on the `aws_lc_rs` backend**, a crate the
   lockfile already resolved. Only HS256 `encode`, `decode`, `from_secret` and
   `Validation::default()` are used, and 11 keeps `validate_aud` on by default,
