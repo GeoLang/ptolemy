@@ -98,8 +98,9 @@ pub struct Reader {
 ///
 /// The project role is the last term because it is the expensive one: a
 /// correlated subquery per row, where the terms before it are a column test, a
-/// bind and an index lookup. A dataset with no project has nothing to correlate
-/// against and yields no role.
+/// bind and an index lookup. The `project_id IS NOT NULL` test in front of it
+/// keeps that subquery from running on the datasets that have no project: it
+/// would match no row and yield NULL for those anyway.
 pub fn visible_datasets_sql(alias: &str, bypass_param: usize, caller_param: usize) -> String {
     let project_role = effective_project_role_sql(&format!("{alias}.project_id"), caller_param);
     format!(
@@ -109,7 +110,7 @@ pub fn visible_datasets_sql(alias: &str, bypass_param: usize, caller_param: usiz
             UNION ALL
              SELECT 1 FROM branch_permissions bp JOIN branches b ON b.id = bp.branch_id
               WHERE b.dataset_id = {alias}.id AND bp.user_id = ${caller_param})
-          OR {project_role} IS NOT NULL)"
+          OR ({alias}.project_id IS NOT NULL AND {project_role} IS NOT NULL))"
     )
 }
 
