@@ -32,10 +32,6 @@ uuid = { version = "1", features = ["v7", "serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 geo-types = "0.7"

@@ -53,6 +53,13 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- 2026-09-02: **the OpenTelemetry setup helper is gone**. `ptolemy_api::telemetry`
+  offered `init_telemetry`, `TelemetryConfig` and `OtlpProtocol`, and nothing
+  called any of them: the CLI sets up logging with
+  `tracing_subscriber::fmt::init()` itself, and the helper never exported a span
+  either, it only logged that an endpoint was configured. The four
+  `opentelemetry` workspace dependency entries went with it, no crate had
+  declared them.
 - 2026-08-24: **the Esri-style topology rule engine is gone** (migration 039
   drops `topology_rules`). 31 rule variants nothing matched on, stored rules
   nothing read back, and a validator that queried `branch_id` and

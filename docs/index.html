@@ -60,7 +60,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </div>
 <div class="stats">
 <div class="stat"><div class="num">7</div><div class="label">Rust crates</div></div>
-<div class="stat"><div class="num">606</div><div class="label">Rust tests</div></div>
+<div class="stat"><div class="num">703</div><div class="label">Rust tests</div></div>
 <div class="stat"><div class="num">10+</div><div class="label">CLI commands</div></div>
 <div class="stat"><div class="num">PostGIS</div><div class="label">Feature store</div></div>
 </div>
@@ -85,7 +85,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🗄️ PostGIS Backend</h3>
 <ul>
 <li>PostgreSQL + PostGIS for spatial indexing</li>
-<li>GeoJSON feature storage</li>
+<li>A GIST-indexed geometry column and a JSONB properties column per feature version</li>
 <li>Spatial queries (intersect, within, buffer)</li>
 <li>Full ACID transactions</li>
 <li>Connection pooling (sqlx)</li>
@@ -105,6 +105,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Cursor-based pagination</li>
 <li>Batch commit operations</li>
 <li>Health checks & readiness probes</li>
+<li>A body or query string naming a field the route does not declare is refused, 422 or 400, with the key named</li>
 </ul>
 </div>
 <div class="card">
@@ -155,7 +156,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Project access inherited from workspace membership</li>
 <li>Direct project membership for project-only access</li>
 <li>A dataset attached to a project is reached by its members: viewer reads, editor writes, owner administers</li>
-<li>OIDC Single Sign-On (Keycloak, Auth0, etc.)</li>
+<li>OIDC Single Sign-On against Keycloak: the three endpoint URLs are built from the issuer as <code>/protocol/openid-connect/…</code>, so a provider that spells them differently does not work</li>
 <li>Token exchange & user info retrieval</li>
 <li>Per-endpoint permission checks</li>
 </ul>
@@ -175,6 +176,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>commit, merge, branch_created, schema_changed, plus custom events</li>
 <li>HMAC-SHA256 signed delivery, retried with a backoff, five attempts</li>
 <li>Events are queued in the commit's own transaction, so a restart loses none</li>
+<li>The worker also deletes settled deliveries and the events behind them, hourly, after PTOLEMY_EVENTS_RETENTION_DAYS</li>
 </ul>
 </div>
 <div class="card">
@@ -182,6 +184,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Buffer analysis (per-feature, configurable distance)</li>
 <li>Union analysis (aggregate geometry)</li>
+<li>Coverage: the area a branch's features reach when buffered, counted once where they overlap</li>
 <li>DBSCAN spatial clustering</li>
 <li>Anomaly detection (outliers, self-intersections)</li>
 <li>Branch-level spatial statistics</li>
@@ -196,6 +199,29 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Conformance declaration</li>
 <li>Part 2 CRS by reference: CRS84, EPSG:4326, EPSG:3857 and the dataset srid</li>
 <li>CRS84 is longitude first, a geographic EPSG code latitude first</li>
+</ul>
+</div>
+<div class="card">
+<h3>ArcGIS FeatureServer</h3>
+<ul>
+<li>Every dataset is a single-layer FeatureServer under <code>/arcgis/rest/services</code>, so Esri clients connect unchanged</li>
+<li><code>query</code> takes the SQL-92 <code>where</code> subset those clients send, paging, <code>outSR</code>/<code>inSR</code>, an envelope filter and <code>f=json</code>, <code>pjson</code> or <code>geojson</code></li>
+<li><code>returnDistinctValues</code>, <code>outStatistics</code> with <code>groupByFieldsForStatistics</code>, and <code>having</code> over the same seven functions</li>
+<li><code>applyEdits</code> lands the whole batch as one commit on <code>main</code>, or refuses all of it</li>
+<li>Attachments, and <code>extractChanges</code> deltas against a generation the client holds</li>
+<li>A stored Esri drawing document is served back as <code>drawingInfo</code>, or translated to Mapbox GL layers at <code>/api/v1/datasets/{id}/style</code></li>
+<li>A token may arrive in <code>X-Esri-Authorization</code> or a <code>token</code> parameter, read under this prefix and nowhere else</li>
+</ul>
+</div>
+<div class="card">
+<h3>Your existing PostGIS, read-only</h3>
+<ul>
+<li>Register a table or view as an external dataset and read it through the normal API without copying it</li>
+<li>Feature listing, bbox, CQL2, OGC items, GeoJSON and CSV export, vector tiles</li>
+<li>Commits, merges, imports, QGIS push and branch creation answer 409</li>
+<li>Geometry is served in EPSG:4326, and spatial reads also push an index-served predicate onto the relation's own column in its own SRID</li>
+<li>An ordinary GiST index on the geometry column is all it needs</li>
+<li>PTOLEMY_EXTERNAL_DATABASE_URL points this at a second database, where a SELECT-only role makes the read-only part PostgreSQL's job</li>
 </ul>
 </div>
 <div class="card">
@@ -218,10 +244,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>📂 Data Catalog</h3>
 <ul>
-<li>Full-text search across datasets</li>
+<li>Substring search over dataset name and description, case-insensitive</li>
 <li>Tag-based organization & filtering</li>
 <li>Rich metadata (source, license, attribution)</li>
-<li>Keyword indexing</li>
+<li>No ranking and no typo tolerance: it is ILIKE, not a text index</li>
 </ul>
 </div>
 <div class="card">
@@ -238,7 +264,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Webhook delivery worker starts with the server</li>
 <li>Conflict resolution API is real</li>
-<li>OTLP traces (HTTP or collector gRPC)</li>
+<li>Console logging through tracing-subscriber, filtered by RUST_LOG</li>
+<li>Prometheus metrics at /metrics for an admin token</li>
+<li>No trace export. There is no OTLP exporter in the binary</li>
 </ul>
 </div>
 <div class="card">
@@ -292,11 +320,11 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🎨 Cartographic Representations</h3>
 <ul>
-<li>Symbology rules with scale ranges</li>
-<li>Expression-based feature filters</li>
+<li>Symbology rules with scale ranges, listed in priority order</li>
+<li>A rule's filter expression is stored and served back, never evaluated here</li>
 <li>Label rules with font & placement config</li>
-<li>Priority-based rule ordering</li>
 <li>JSON-based symbol definitions</li>
+<li>An Esri drawing document stored as a symbol is translated to Mapbox GL layers at <code>/api/v1/datasets/{id}/style</code></li>
 </ul>
 </div>
 <div class="card">
@@ -340,9 +368,11 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🔍 pgvector Similarity</h3>
 <ul>
 <li>Feature embedding & similarity search</li>
-<li>Automatic duplicate detection</li>
+<li>The embedding is a SHA-256 hash spread over 256 floats, so identical text matches and near-identical text does not</li>
+<li>Duplicate detection on that basis</li>
 <li>Bucketing by distance to the mean vector</li>
-<li>IVFFlat indexing for fast ANN</li>
+<li>IVFFlat index, created when pgvector is installed</li>
+<li>Without pgvector these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -403,29 +433,32 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Domain types: Dataset, Branch, Changeset, Feature, Diff</li>
 <li>Serialization with serde</li>
-<li>Zero external runtime deps</li>
+<li>WKB and GeoJSON conversion through geozero</li>
+<li>The DataStore trait a backend crate implements</li>
 </ul>
 </div>
 <div class="card">
 <h3>ptolemy-storage</h3>
 <ul>
-<li>Abstract Store trait</li>
-<li>PostgreSQL/PostGIS implementation</li>
-<li>Pluggable backend architecture</li>
+<li>PgStore, the one store the server and CLI use</li>
+<li>SQL migrations, run on every serve</li>
+<li>Reads and writes go through a Reader or Writer that carries the permission decision</li>
 </ul>
 </div>
 <div class="card">
 <h3>ptolemy-geopackage / -mongodb / -elasticsearch</h3>
 <ul>
-<li>GeoPackage import/export for offline editing</li>
-<li>MongoDB and Elasticsearch storage backends</li>
+<li>Each implements the DataStore trait from ptolemy-core</li>
+<li>No binary depends on them: the server and the CLI use PgStore</li>
+<li>The CLI reads shapefiles and writes GeoPackage itself, through shapefile and rusqlite</li>
 </ul>
 </div>
 <div class="card">
 <h3>ptolemy-api</h3>
 <ul>
 <li>Axum 0.8 HTTP router</li>
-<li>Tower middleware (tracing, CORS)</li>
+<li>Layers: tracing, auth, dataset visibility, the write gate, audit, metrics</li>
+<li>Permissive CORS on the ArcGIS routes, which real ArcGIS servers answer, and nowhere else</li>
 <li>Typed JSON responses</li>
 </ul>
 </div>
@@ -455,7 +488,7 @@ connection and dropped when the last client disconnects.</p>
 <ul>
 <li>Broadcast camera state (lat, lng, zoom, bearing, pitch)</li>
 <li>Follower's viewer mirrors the leader's view in real-time</li>
-<li>Throttled at 200ms, delta-only to minimise bandwidth</li>
+<li>The server relays every frame it is given, so throttling is the client's job</li>
 </ul>
 </div>
 <div class="card">
@@ -463,7 +496,6 @@ connection and dropped when the last client disconnects.</p>
 <ul>
 <li>Share mouse position on the map between collaborators</li>
 <li>See other users' cursors as coloured dots</li>
-<li>Configurable throttle rate</li>
 </ul>
 </div>
 <div class="card">
@@ -477,10 +509,12 @@ connection and dropped when the last client disconnects.</p>
 </div>
 
 <h3 style="margin-top:28px;color:var(--heading)">Protocol (JSON over WebSocket)</h3>
-<pre><code>// Connect to a room
+<pre><code>// Connect to a room. The handshake needs a token, and a browser cannot set
+// the Authorization header on a WebSocket, so it goes in the subprotocol:
+// new WebSocket("ws://localhost:3000/ws/rooms/my-room", ["bearer", jwt])
 ws://localhost:3000/ws/rooms/my-room
 
-// Client → Server (relayed to all other clients)
+// Client → Server (relayed to every other client in the room, never back to the sender)
 { "type": "Join",   "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
 { "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
 { "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
@@ -499,12 +533,15 @@ git clone https://github.com/GeoLang/ptolemy.git
 cd ptolemy
 cargo build --release
 
-# Start with a PostGIS database
+# Start with a PostGIS database. serve refuses to start without a signing
+# secret of 32 bytes or more, and applies migrations before it binds.
 export DATABASE_URL="postgres://user:pass@localhost/ptolemy"
+export PTOLEMY_JWT_SECRET="$(openssl rand -hex 32)"
 ./target/release/ptolemy serve --bind 0.0.0.0:3000
 
 # Check health
-curl http://localhost:3000/health</code></pre>
+curl http://localhost:3000/api/v1/healthz
+curl http://localhost:3000/api/v1/readyz</code></pre>
 </div>
 </section>
 

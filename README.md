@@ -76,6 +76,8 @@ Not implemented, whatever the code in the repository suggests:
 | Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
 | Geometry type constraints | Stored and never checked |
 | Multi-tenancy | Dropped from the product in migration `028` |
+| Parcel split and merge | `POST /api/v1/parcels/split` and `/parcels/merge` answer the input geometry as hex WKB and a message telling the caller to do the operation elsewhere. The geoprocessing `split` and `merge` routes do compute a geometry |
+| Pluggable storage backends | `DataStore` in `ptolemy-core` is implemented by `ptolemy-geopackage`, `ptolemy-mongodb` and `ptolemy-elasticsearch`, and no binary depends on any of them. The server and the CLI use `PgStore` only, which does not implement the trait |
 
 ## Architecture
 
@@ -323,7 +325,7 @@ of them. On the Helm chart the URL carrying them is the one in
 | `DATABASE_URL` | PostgreSQL connection URL | (required) |
 | `PTOLEMY_JWT_SECRET` | JWT signing secret, 32+ bytes (required to serve) | (required) |
 | `PTOLEMY_AUTH_DISABLED` | Set to `true` to serve with auth off | `false` |
-| `PTOLEMY_OIDC_ISSUER_URL` | OIDC provider URL (e.g. Keycloak realm) | (disabled) |
+| `PTOLEMY_OIDC_ISSUER_URL` | Keycloak realm URL. The authorize, token and userinfo URLs are built from it as `{issuer}/protocol/openid-connect/…`, with no discovery document read, so a provider that spells those paths differently does not work | (disabled) |
 | `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |
 | `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | — |
 | `PTOLEMY_OIDC_REDIRECT_URL` | Callback URL for OIDC flow | — |
@@ -562,6 +564,22 @@ effective role on that project, mapped `viewer` to `read`, `editor` to `write`,
 `owner` to `admin`. See [project grants](#project-grants). A dataset attached to
 no project decides on its rows alone.
 
+### Tool tokens
+
+A token with `token_use: "tool"` carries no `role` claim and a `scope` array
+instead. `ptolemy:read` passes a read and `ptolemy:write` passes a write, and a
+route that needs the instance `admin` role is refused whatever the scopes say,
+as are `/api/v1/workspaces`, `/api/v1/projects`,
+`/api/v1/invitations/accept` and `/api/v1/datasets/{id}/project`. That is what a
+delegated agent holds: it can read and write the datasets its subject has grants
+on, and it cannot hand a project's whole membership a grant. A token carrying
+both `role` and `token_use`, or a `token_use` this service does not know, is
+refused. Missing scope is `403`.
+
+An API key from `ptolemy api-key create` is the other non-JWT bearer. It is sent
+as `Authorization: Bearer ptk_...`, its subject is `apikey:<row id>`, and it
+runs with the role stored on the row.
+
 ### Who manages grants
 
 The `/permissions` endpoints need a valid token but not the `admin` role, because
@@ -791,10 +809,15 @@ caller is a peer running another version.
 
 Ptolemy includes an ephemeral room-based WebSocket relay at `/ws/rooms/{room_id}` for
 real-time viewer collaboration.  Every JSON message sent by one participant is broadcast
-to every participant in the room, the sender included: a socket subscribes to the same
-channel it sends on, so a client sees its own messages come back and must ignore them.
+to every other participant in the room. The sender does not get its own message back.
 No messages are persisted — rooms are created on first connection and dropped when the
 last client disconnects.
+
+The handshake needs a token, like every other route. A browser cannot set the
+`Authorization` header on a WebSocket, so the socket may carry it as
+`Sec-WebSocket-Protocol: bearer, <jwt>`, which is what
+`new WebSocket(url, ["bearer", jwt])` sends. The server echoes the `bearer` marker
+and never the token. That form is read on `/ws/` paths and nowhere else.
 
 **Intended use cases:**
 
@@ -808,7 +831,7 @@ last client disconnects.
 **Protocol (JSON over WebSocket):**
 
 ```jsonc
-// Client → Server (broadcast to every client in the room, sender included)
+// Client → Server (broadcast to every other client in the room)
 { "type": "Join", "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
 { "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
 { "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
@@ -817,12 +840,14 @@ last client disconnects.
 ```
 
 Messages are opaque to the server — it simply relays any valid text frame to every
-subscriber on the room's channel.  The message schema above is a convention used by
+other subscriber on the room's channel.  The message schema above is a convention used by
 ViewTopia's collaboration client but any JSON structure will work.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/health` | Health check |
+| GET | `/api/v1/healthz` | Liveness, 200 as soon as the process is up |
+| GET | `/api/v1/readyz` | Readiness, 200 once the database answers |
 | GET POST | `/api/v1/workspaces` | List or create authenticated workspaces |
 | GET PUT DELETE | `/api/v1/workspaces/{id}` | Read, update, or delete a workspace |
 | GET | `/api/v1/workspaces/{id}/members` | List workspace members, owner only |
@@ -876,7 +901,9 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/metrics` | Prometheus metrics (admin token) |
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
+| GET | `/auth/oidc/config` | Whether OIDC is enabled, and the issuer URL when it is |
 | GET | `/review` | Web review UI |
+| GET | `/conflicts` | Web conflict resolution UI |
 | GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
 | PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
@@ -895,6 +922,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/ogc` | OGC landing page |
 | GET | `/api/v1/ogc/conformance` | OGC conformance |
 | GET | `/api/v1/ogc/collections` | OGC collections |
+| GET | `/api/v1/ogc/collections/{id}` | One OGC collection |
 | GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items |
 | GET | `/api/v1/ogc/collections/{id}/items/{fid}` | OGC single feature |
 | GET | `/arcgis/rest/services` | ArcGIS service catalog |
@@ -904,6 +932,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/arcgis/rest/services/{service}/FeatureServer/0/applyEdits` | ArcGIS batch edits |
 | GET POST | `/arcgis/rest/services/{service}/FeatureServer/0/queryAttachments` | ArcGIS attachment listing |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/0/{oid}/attachments` | ArcGIS feature attachments |
+| GET | `.../0/{oid}/attachments/{attachmentId}` | Download one ArcGIS attachment |
 | POST | `.../0/{oid}/addAttachment`, `updateAttachment`, `deleteAttachments` | ArcGIS attachment edits |
 | POST | `/arcgis/rest/services/{service}/FeatureServer/extractChanges` | ArcGIS change extraction |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
@@ -919,11 +948,13 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/datasets/{id}/permissions` | List dataset grants (dataset admin) |
 | POST | `/api/v1/datasets/{id}/permissions` | Grant on a dataset (dataset admin) |
 | DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (dataset admin) |
+| GET | `/api/v1/datasets/{id}/permissions/{user}/check` | Whether that user holds `required` on the dataset |
 | PUT | `/api/v1/datasets/{id}/project` | Attach to a project and make it private (dataset admin, project editor) |
 | DELETE | `/api/v1/datasets/{id}/project` | Detach, leaving it private (dataset admin, project editor) |
 | GET | `/api/v1/branches/{id}/permissions` | List branch grants (dataset admin) |
 | POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (dataset admin) |
 | DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (dataset admin) |
+| GET | `/api/v1/branches/{id}/permissions/{user}/check` | Whether that user holds `required` on the branch |
 | GET | `/api/v1/conflicts/{id}` | List merge conflicts |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
@@ -937,8 +968,11 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/networks/{id}/edges` | List edges |
 | POST | `/api/v1/networks/{id}/edges` | Add edge |
 | POST | `/api/v1/networks/{id}/trace` | Network trace (upstream/downstream) |
-| POST | `/api/v1/networks/{id}/shortest-path` | Dijkstra shortest path |
-| GET | `/api/v1/networks/{id}/connectivity` | Connectivity report |
+| POST | `/api/v1/networks/{id}/shortest-path` | Dijkstra shortest path, needs pgRouting |
+| POST | `/api/v1/networks/{id}/astar` | A* shortest path, needs pgRouting |
+| POST | `/api/v1/networks/{id}/isochrone` | Driving distance from a junction, needs pgRouting |
+| POST | `/api/v1/networks/{id}/tsp` | Traveling-salesman tour, needs pgRouting |
+| GET | `/api/v1/networks/{id}/connectivity` | Connected components report, needs pgRouting |
 | **Linear Referencing** | | |
 | GET | `/api/v1/datasets/{id}/routes` | List LRS routes |
 | POST | `/api/v1/datasets/{id}/routes` | Create route |
@@ -1060,6 +1094,72 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/api/v1/branches/{id}/import/csv` | Import point rows from CSV |
 | GET | `/api/v1/crs/search?q=` | Search coordinate systems |
 | GET | `/api/v1/crs/{srid}` | Get CRS details |
+| **Geoprocessing** | | |
+| POST | `/api/v1/branches/{id}/geoprocessing/clip` | Clip features by a GeoJSON polygon |
+| POST | `/api/v1/branches/{id}/geoprocessing/intersect` | Pairwise intersection |
+| POST | `/api/v1/branches/{id}/geoprocessing/difference` | Difference of two feature sets |
+| POST | `/api/v1/branches/{id}/geoprocessing/dissolve` | Dissolve by an attribute |
+| POST | `/api/v1/branches/{id}/geoprocessing/spatial-join` | Join attributes by spatial relation |
+| POST | `/api/v1/branches/{id}/geoprocessing/voronoi` | Voronoi polygons |
+| POST | `/api/v1/branches/{id}/geoprocessing/convex-hull` | Convex hull |
+| POST | `/api/v1/branches/{id}/geoprocessing/centroid` | Centroids |
+| POST | `/api/v1/branches/{id}/geoprocessing/nearest-neighbor` | Nearest neighbours |
+| POST | `/api/v1/branches/{id}/geoprocessing/distance-matrix` | Pairwise distances |
+| POST | `/api/v1/branches/{id}/geoprocessing/contour` | Contour lines from point values |
+| POST | `/api/v1/branches/{id}/geoprocessing/merge` | Union named features into one geometry |
+| POST | `/api/v1/branches/{id}/geoprocessing/split` | Split one feature by a GeoJSON line |
+| POST | `/api/v1/branches/{id}/geoprocessing/simplify` | Simplify geometries |
+| POST | `/api/v1/branches/{id}/geoprocessing/densify` | Add vertices along segments |
+| **QGIS** | | |
+| GET | `/api/v1/qgis/capabilities` | What the QGIS integration offers |
+| GET | `/api/v1/qgis/datasets` | Datasets a QGIS client may load |
+| GET | `/api/v1/qgis/branches/{id}/layer` | Layer definition for one branch |
+| POST | `/api/v1/qgis/branches/{id}/transaction` | WFS-T style transaction |
+| GET POST | `/api/v1/qgis/branches/{id}/sync` | Pull a snapshot, or push local edits |
+| GET | `/api/v1/qgis/branches/{id}/conflicts` | Conflicts waiting on this branch |
+| POST | `/api/v1/qgis/branches/{id}/conflicts/resolve` | Resolve one of them |
+| **Attachments** | | |
+| GET POST | `/api/v1/branches/{id}/features/{feature_id}/attachments` | List or upload a feature's attachments |
+| GET POST | `/api/v1/datasets/{id}/attachments` | List or upload a dataset's attachments |
+| GET DELETE | `/api/v1/attachments/{id}` | Download or delete one attachment |
+| GET | `/api/v1/attachments/{id}/meta` | Attachment metadata without the bytes |
+| **Schema evolution** | | |
+| GET POST | `/api/v1/datasets/{id}/schema/migrations` | List schema migrations, or apply one |
+| GET | `/api/v1/datasets/{id}/schema/version` | Current schema version |
+| **Compaction** | | |
+| POST | `/api/v1/branches/{id}/compact` | Prune old feature versions, keeping the most recent per feature |
+| GET | `/api/v1/datasets/{id}/compaction-history` | What past compactions removed |
+| **Replication** | | |
+| GET | `/api/v1/replication/feed/{branch_id}` | Ordered change feed a replica consumes |
+| GET POST | `/api/v1/replication/peers` | List or register peers |
+| POST | `/api/v1/replication/peers/{id}/sync` | Record how far a peer has consumed |
+| **Industry verticals** | | |
+| GET | `/api/v1/sensors` | A branch's features read as sensors |
+| GET | `/api/v1/sensors/readings` | Features read as readings of one sensor |
+| POST | `/api/v1/surveys/compare` | Cut, fill and net volume from two features' `mean_elevation` |
+| GET | `/api/v1/construction/surveys` | Features read as surveys |
+| GET | `/api/v1/construction/milestones` | Features read as milestones |
+| GET | `/api/v1/fields` | Features read as agricultural fields |
+| GET | `/api/v1/fields/ndvi` | NDVI held on one field's properties, classified |
+| GET | `/api/v1/towers` | Features read as towers |
+| POST | `/api/v1/coverage/simulate` | Hata path loss and a coverage circle for one tower |
+| GET POST | `/api/v1/incidents` | Features read as incidents, or commit one |
+| POST | `/api/v1/incidents/evacuate` | Danger-zone circle and the caller's assembly points by distance |
+| GET | `/api/v1/parcels/search` | Search a branch by bbox, apn, address or owner |
+| GET | `/api/v1/comps/search` | Comparable parcels within a radius of a point |
+| POST | `/api/v1/parcels/split` | Answers the parcel geometry, does not split it |
+| POST | `/api/v1/parcels/merge` | Answers the parcels' geometries, does not merge them |
+
+The geoprocessing routes compute and answer GeoJSON. None of them writes a
+changeset, so keeping a result means committing it yourself. The vertical routes
+are conventions over feature `properties` on a branch rather than tables of their
+own: `/api/v1/sensors` is a feature list filtered on a `sensor_type` property, and
+the rest read `mean_elevation`, `ndvi_mean` and the like off whatever a client
+wrote there. `POST /api/v1/incidents` is the one of them that commits.
+
+Replication is the change feed plus a peer table, and the caller drives it. The
+only background worker the server starts is the webhook delivery worker, so
+nothing here pulls from a registered peer on its own.
 
 Both imports answer `{imported, skipped, changeset_id, errors}`. Rows that
 cannot be parsed are skipped and named in `errors`; the rest land as one
@@ -1068,46 +1168,70 @@ rows all fail answers 422 and writes no changeset.
 
 ## CLI Commands
 
+`serve`, `migrate`, `dataset` (`create`, `list`, `show`), `branch` (`create`,
+`list`, `show`), `commit`, `merge`, `log`, `features`, `diff`, `import`, `export`,
+`gpkg-export`, `backup`, `restore` and `api-key` (`create`, `list`, `revoke`).
+`--database-url`, `--db-max-connections` and `--db-min-connections` are
+top-level flags, so they go before the subcommand, and each reads its
+environment variable from [Configuration](#configuration) when left out.
+
+`export` writes a GeoJSON FeatureCollection to `--output` or to stdout.
+`gpkg-export --branch <uuid> --output out.gpkg` writes a GeoPackage for offline
+editing, with the layer named by `--layer` (`features` by default).
+
 ### Data Import
 
-Import geospatial data from multiple formats (auto-detected by file extension):
+Import geospatial data from multiple formats, picked by file extension. The file
+path is positional and the branch is named by uuid, not by branch name.
+Everything lands as one commit, so `--author` is required and `--message`
+defaults to `Import features`.
 
 ```bash
 # Import GeoJSON
-ptolemy import --dataset <id> --branch main --file data.geojson
+ptolemy import --branch <branch-uuid> --author you data.geojson
 
 # Import Shapefile (reads .shp + .dbf)
-ptolemy import --dataset <id> --branch main --file parcels.shp
+ptolemy import --branch <branch-uuid> --author you parcels.shp
 
 # Import GeoPackage
-ptolemy import --dataset <id> --branch main --file terrain.gpkg
+ptolemy import --branch <branch-uuid> --author you terrain.gpkg
 ```
+
+Any other extension is read as GeoJSON.
 
 ### API Keys
 
-Manage programmatic access keys (SHA-256 hashed, never stored in plaintext):
+Manage programmatic access keys, SHA-256 hashed and never stored in plaintext.
 
 ```bash
-# Create a new key (shown only once!)
-ptolemy apikey create --name "CI Pipeline" --role editor
+# Create a new key, printed once and never again
+ptolemy api-key create "CI Pipeline" --role editor --expires-days 365
 
 # List active keys (shows prefix only)
-ptolemy apikey list
+ptolemy api-key list
 
 # Revoke by prefix or full key
-ptolemy apikey revoke ptk_abc123
+ptolemy api-key revoke ptk_abc123
 ```
+
+`--role` takes `admin`, `editor` or `viewer` and anything else is read as
+`viewer`. `--expires-days` defaults to 365, and `0` means never. A key is sent
+the way a JWT is, `Authorization: Bearer ptk_...`, and the role on the row is
+the role the request runs with.
 
 ### Backup & Restore
 
-Database backup/restore using PostgreSQL native tools:
+Both paths are positional. `backup` runs `pg_dump`, plain SQL by default and
+`pg_dump -Fc` with `--custom`. `restore` tries `pg_restore` and falls back to
+running the file as plain SQL, so it takes either format. `--clean` drops the
+existing objects first.
 
 ```bash
-# Backup to a compressed dump
-ptolemy backup --output ptolemy_backup.dump
+# Backup to a custom-format dump
+ptolemy backup --custom ptolemy_backup.dump
 
 # Restore from dump
-ptolemy restore --input ptolemy_backup.dump
+ptolemy restore ptolemy_backup.dump
 ```
 
 ## Building
@@ -1139,12 +1263,16 @@ test with a reason each.
 crates/
 ├── ptolemy-core/          # Domain types, merge logic, diff algorithms
 ├── ptolemy-storage/       # PostGIS storage backend
-├── ptolemy-geopackage/    # GeoPackage import/export for offline editing
-├── ptolemy-mongodb/       # MongoDB storage backend
-├── ptolemy-elasticsearch/ # Elasticsearch indexing backend
+├── ptolemy-geopackage/    # GeoPackage DataStore, unused by the binaries
+├── ptolemy-mongodb/       # MongoDB DataStore, unused by the binaries
+├── ptolemy-elasticsearch/ # Elasticsearch DataStore, unused by the binaries
 ├── ptolemy-api/           # Axum REST API server
 └── ptolemy-cli/           # CLI binary (server + admin commands)
 ```
+
+`ptolemy-cli` reads and writes GeoPackage through `rusqlite` and shapefiles
+through the `shapefile` crate, so `import` and `gpkg-export` do not go through
+`ptolemy-geopackage`.
 
 ## License
 

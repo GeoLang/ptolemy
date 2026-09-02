@@ -40,7 +40,6 @@ pub mod schema_evolution;
 pub mod sfcgal;
 pub mod stac;
 pub mod sync;
-pub mod telemetry;
 pub mod topology;
 pub mod trajectory;
 pub mod vector_search;
@@ -67,7 +66,6 @@ pub use email::EmailConfig;
 pub use metrics::{init_metrics, record_domain_event};
 pub use oidc::OidcConfig;
 pub use room_relay::RoomRelay;
-pub use telemetry::init_telemetry;
 
 pub type AppState = Arc<PgStore>;
 
