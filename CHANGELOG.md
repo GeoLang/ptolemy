@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-16: **the public docs say what the code does**. `docs/comparison.html`
+  claimed pessimistic feature locking, shapefile export, evaluated symbology
+  filter expressions, a full CQL2 parser, OIDC against Auth0, sub-millisecond
+  startup, pg_partman among the extensions it leverages, and 48 rows in a table
+  that holds 55. Every capability that needs pgRouting, SFCGAL, h3-pg,
+  pointcloud or MobilityDB was marked full support with no mention that those
+  routes answer `501` until the extension is installed, which no image here
+  does; those rows now say so, in `docs/index.html` as well. Also gone:
+  "Dijkstra shortest path via recursive CTE", which calls `pgr_dijkstra` (the
+  recursive CTE walks a trace), a batch reprojection route that does not exist,
+  raster zoom-level pyramids nothing builds, and relationship cardinality
+  presented as enforced when it is a stored column. The README's merge
+  description said "same feature different attributes" merges, without saying a
+  geometry or validity change on either side makes it a conflict.
+  `docs/kart-rust-plan.md` now opens by saying none of it is built and that it
+  designs a separate tool.
+
 - 2026-09-16: **the aarch64 release binary builds again**. `cross build
   --release -p ptolemy-cli --target aarch64-unknown-linux-gnu` stopped in
   `openssl-sys` with "Could not find directory of OpenSSL installation", because

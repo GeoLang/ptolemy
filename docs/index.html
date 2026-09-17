@@ -238,7 +238,6 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Query features at any point in time</li>
 <li>Time-travel across branch history</li>
 <li>Historical state reconstruction</li>
-<li>Audit-friendly snapshotting</li>
 </ul>
 </div>
 <div class="card">
@@ -273,10 +272,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🕸️ Geometric Networks</h3>
 <ul>
 <li>Graph topology: junctions + edges</li>
-<li>Upstream/downstream/bidirectional trace</li>
-<li>Dijkstra shortest path via recursive CTE</li>
-<li>Connectivity analysis & isolated node detection</li>
-<li>Utility network support</li>
+<li>Upstream/downstream/bidirectional trace, walked by a recursive CTE</li>
+<li>Shortest path, A*, isochrone, TSP and connectivity call pgRouting</li>
+<li>Those five answer 501 where pgRouting is not installed, which no image here installs</li>
 </ul>
 </div>
 <div class="card">
@@ -293,10 +291,11 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🛰️ Raster & Imagery</h3>
 <ul>
 <li>Raster catalogs per dataset</li>
-<li>Tile-based storage (configurable resolution)</li>
+<li>Tiles are uploaded as WKB hex, each carrying the zoom level the uploader gives it</li>
 <li>Point value extraction (ST_Value)</li>
-<li>Band statistics & zoom-level pyramids</li>
+<li>Band statistics over a catalog's tiles</li>
 <li>Configurable pixel type & SRID</li>
+<li>Nothing builds an overview pyramid: every level is uploaded</li>
 </ul>
 </div>
 <div class="card">
@@ -311,10 +310,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🔗 Relationship Classes</h3>
 <ul>
 <li>Simple & composite relationships</li>
-<li>1:1, 1:M, M:N cardinality</li>
-<li>Forward/backward label navigation</li>
+<li>Forward/backward label navigation at <code>/api/v1/features/{id}/related</code></li>
 <li>Cross-dataset feature linking</li>
-<li>Typed relationship records</li>
+<li>Cardinality is a stored column. Nothing checks a record against it</li>
 </ul>
 </div>
 <div class="card">
@@ -334,7 +332,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Driving distance / isochrones</li>
 <li>Traveling Salesman (TSP)</li>
 <li>Connected components analysis</li>
-<li>Battle-proven C engine</li>
+<li>Install pgRouting yourself. No image here does, and without it these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -353,6 +351,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>3D intersection & Minkowski sum</li>
 <li>Straight skeleton, tesselation</li>
 <li>Visibility / line-of-sight analysis</li>
+<li>Without SFCGAL installed these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -362,6 +361,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Hex-based spatial aggregation</li>
 <li>K-ring neighbors & compaction</li>
 <li>Multi-resolution analysis (0-15)</li>
+<li>Without h3-pg installed these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -381,7 +381,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>pointcloud extension (pcpatch)</li>
 <li>Spatial patch queries & elevation profiles</li>
 <li>Catalog management</li>
-<li>Billions of points via chunked patches</li>
+<li>Points arrive in patches, one row each</li>
+<li>Without the pointcloud extension installed these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -391,6 +392,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Speed, distance, nearest approach</li>
 <li>Position at any timestamp</li>
 <li>Trajectory simplification</li>
+<li>Without MobilityDB a trajectory is stored as JSONB and these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
@@ -405,7 +407,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🛰️ STAC Catalog</h3>
 <ul>
-<li>STAC 1.0.0 compliant API</li>
+<li>Catalog, collection and item routes declaring STAC 1.0.0</li>
 <li>Collection & item discovery</li>
 <li>Spatial + temporal search</li>
 <li>Raster asset management</li>
@@ -415,8 +417,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🌐 Format & CRS</h3>
 <ul>
 <li>GeoJSON, CSV, FlatGeobuf export</li>
-<li>CRS transformation (any EPSG)</li>
-<li>Batch reprojection</li>
+<li>CRS transformation, one geometry per request, through ST_Transform</li>
 <li>CRS search & lookup (spatial_ref_sys)</li>
 </ul>
 </div>

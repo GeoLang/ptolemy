@@ -1,6 +1,10 @@
-# Geodata Version Control in Rust — Architecture Plan
+# Geodata Version Control in Rust: Architecture Plan
 
 A Kart-like distributed VCS for geospatial and tabular data, written in Rust, built on Git's object model.
+
+None of this is built. It is a design for a separate CLI tool, not a description
+of Ptolemy, and every checkbox below is unchecked. Ptolemy's own versioning is a
+changeset DAG in PostGIS, described in its README.
 
 ---
 
@@ -12,7 +16,9 @@ A Kart-like distributed VCS for geospatial and tabular data, written in Rust, bu
 
 **Why Rust over Kart's Python:**
 
-| Aspect | Kart (Python) | geokart (Rust) |
+Nothing in the right column is measured. It is what the design is aiming at.
+
+| Aspect | Kart (Python) | geokart (Rust), intended |
 |--------|--------------|----------------|
 | Startup time | ~500ms (Python interpreter) | ~5ms (native binary) |
 | Large dataset ops | GIL-limited, ~1 thread | Rayon work-stealing, all cores |

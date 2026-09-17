@@ -117,8 +117,12 @@ Ptolemy uses a **changeset DAG** (directed acyclic graph) inspired by git:
 
 Three-way merge using the common ancestor changeset:
 1. Compute diff(ancestor → ours) and diff(ancestor → theirs).
-2. Non-conflicting changes (different features, or same feature different attributes) merge automatically.
-3. Conflicting changes (same feature, same attribute modified differently) are surfaced for manual resolution.
+2. Changes to different features merge automatically. One feature edited on both
+   sides merges only when the two sides wrote different property keys and
+   neither side touched the geometry or the validity times.
+3. Everything else on one feature is a conflict, surfaced for manual
+   resolution: the same property key written on both sides, and any geometry
+   change on either side.
 4. Geometries are compared as raw WKB bytes, so any difference at all, down to
    vertex order or precision, counts as a change. There is no tolerance.
 
@@ -231,7 +235,7 @@ ptolemy --database-url postgres://localhost/ptolemy migrate
 ptolemy --database-url postgres://localhost/ptolemy serve
 
 # API is now available at http://localhost:3000/api/v1
-# Metrics at http://localhost:3000/metrics
+# Metrics at http://localhost:3000/metrics, admin token only
 ```
 
 ## Container image

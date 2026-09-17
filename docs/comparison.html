@@ -41,7 +41,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <header>
 <div class="container">
 <h1>Ptolemy vs Esri Enterprise Geodatabase</h1>
-<p>Feature-by-feature comparison showing how Ptolemy's open-source stack matches Esri's proprietary ArcGIS Enterprise Geodatabase capabilities.</p>
+<p>Capability by capability, what Ptolemy does against what an ArcGIS Enterprise Geodatabase does. Several rows need a PostgreSQL extension that no image here installs.</p>
 <a href="index.html" class="back">← Back to Ptolemy Home</a>
 </div>
 </header>
@@ -49,8 +49,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <div class="summary">
-<div class="card"><div class="num">48</div><div class="label">Rows in the table</div></div>
-<div class="card"><div class="num" style="color:var(--yellow)">no score</div><div class="label">The old 42/48 full-parity count was wrong by at least 12 cells</div></div>
+<div class="card"><div class="num">55</div><div class="label">Rows in the table</div></div>
+<div class="card"><div class="num" style="color:var(--yellow)">no score</div><div class="label">Read the rows. A summed parity count hid which cells need a PostgreSQL extension nobody installed</div></div>
 </div>
 
 <div class="legend">
@@ -64,10 +64,10 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
 <tr><td>Vector feature storage</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS geometry + JSONB properties</span></td></tr>
 <tr><td>Raster/imagery storage</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS Raster tiles with WKB upload</span></td></tr>
-<tr><td>Multi-user concurrent editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Branch isolation + pessimistic locking</span></td></tr>
+<tr><td>Multi-user concurrent editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Branch isolation. There is no feature locking, it was removed</span></td></tr>
 <tr><td>Versioned editing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Git-like branching, temporal feature_versions</span></td></tr>
 <tr><td>Full ACID transactions</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostgreSQL transactional guarantee</span></td></tr>
-<tr><td>Spatial indexing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">GiST R-tree + H3 hexagonal</span></td></tr>
+<tr><td>Spatial indexing</td><td class="yes">✓</td><td class="yes">✓ <span class="note">GiST on every feature version's geometry. H3 indexing is a separate route needing h3-pg</span></td></tr>
 <tr><td>Dataset schema enforcement</td><td class="yes">✓</td><td class="partial">~ <span class="note">Schema is stored and served, not enforced</span></td></tr>
 <tr><td>Geometry type constraints</td><td class="yes">✓</td><td class="no">— <span class="note">Stored and never checked</span></td></tr>
 </table>
@@ -80,7 +80,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Conflict detection on reconcile</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Three-way merge with conflict table</span></td></tr>
 <tr><td>Conflict resolution (manual)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Conflict resolution API (ours/theirs/custom)</span></td></tr>
 <tr><td>Time-travel / historical queries</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Query any changeset or point-in-time</span></td></tr>
-<tr><td>Compress/post versions</td><td class="yes">✓</td><td class="partial">~ <span class="note">Changesets are immutable; branch compaction is a DBA task</span></td></tr>
+<tr><td>Compress/post versions</td><td class="yes">✓</td><td class="partial">~ <span class="note">Changesets are immutable. POST /api/v1/branches/{id}/compact prunes old feature versions, keeping the newest per feature</span></td></tr>
 <tr><td>Diff between versions</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Full diff API between any two changesets</span></td></tr>
 </table>
 
@@ -91,9 +91,9 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Topology validation</td><td class="yes">✓</td><td class="partial">~ <span class="note">PostGIS Topology primitives: faces, edges, nodes, ValidateTopology</span></td></tr>
 <tr><td>Auto-repair invalid geometry</td><td class="yes">✓</td><td class="yes">✓ <span class="note">ST_MakeValid auto-repair</span></td></tr>
 <tr><td>Geometric networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Junction/edge graph + recursive CTE trace</span></td></tr>
-<tr><td>Utility networks</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pgRouting powered (Dijkstra, A*, TSP, isochrones)</span></td></tr>
+<tr><td>Utility networks</td><td class="yes">✓</td><td class="partial">~ <span class="note">Routing over the junction and edge graph: Dijkstra, A*, TSP, isochrones. No asset model, no rules. Needs pgRouting, 501 without it</span></td></tr>
 <tr><td>Linear referencing (routes)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Measured routes, point/linear events, ST_LocateAlong</span></td></tr>
-<tr><td>3D geometry operations</td><td class="yes">✓</td><td class="yes">✓ <span class="note">SFCGAL: extrusion, volume, 3D intersection, visibility</span></td></tr>
+<tr><td>3D geometry operations</td><td class="yes">✓</td><td class="partial">~ <span class="note">SFCGAL: extrusion, volume, 3D intersection, visibility. Needs SFCGAL, 501 without it</span></td></tr>
 </table>
 
 <h2>Domains & Data Integrity</h2>
@@ -103,7 +103,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Range domains</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored and served, enforced nowhere</span></td></tr>
 <tr><td>Subtypes</td><td class="yes">✓</td><td class="partial">~ <span class="note">Stored, enforced nowhere</span></td></tr>
 <tr><td>Attribute rules</td><td class="yes">✓</td><td class="no">— <span class="note">No expression engine</span></td></tr>
-<tr><td>Relationship classes</td><td class="yes">✓</td><td class="yes">✓ <span class="note">1:1, 1:M, M:N with forward/backward navigation</span></td></tr>
+<tr><td>Relationship classes</td><td class="yes">✓</td><td class="partial">~ <span class="note">Records and forward/backward navigation work. Cardinality is a stored column nothing checks a record against</span></td></tr>
 <tr><td>Feature locking</td><td class="yes">✓</td><td class="no">— <span class="note">Branches and the merge conflict flow instead</span></td></tr>
 </table>
 
@@ -113,19 +113,19 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>Representations / symbology rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">JSON symbology rules with scale ranges</span></td></tr>
 <tr><td>Label rules</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Font, placement, priority-based labeling</span></td></tr>
 <tr><td>Scale-dependent rendering</td><td class="yes">✓</td><td class="yes">✓ <span class="note">min_scale / max_scale per rule</span></td></tr>
-<tr><td>Expression-based classification</td><td class="yes">✓</td><td class="yes">✓ <span class="note">SQL/JSON expression filters</span></td></tr>
+<tr><td>Expression-based classification</td><td class="yes">✓</td><td class="no">— <span class="note">A rule's filter expression is stored and served back. Nothing evaluates it</span></td></tr>
 <tr><td>ArcGIS Pro native renderer</td><td class="yes">✓</td><td class="no">— <span class="note">N/A (Ptolemy is server-only; any renderer can consume the API)</span></td></tr>
 </table>
 
 <h2>Interoperability & Standards</h2>
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
-<tr><td>OGC API - Features</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Core conformance class</span></td></tr>
-<tr><td>CQL2 filtering</td><td class="partial">~ <span class="note">Via OGC API only</span></td><td class="yes">✓ <span class="note">Full CQL2-JSON parser → SQL</span></td></tr>
+<tr><td>OGC API - Features</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Part 1 core and Part 2 CRS by reference: CRS84, EPSG:4326, EPSG:3857 and the dataset's own srid</span></td></tr>
+<tr><td>CQL2 filtering</td><td class="partial">~ <span class="note">Via OGC API only</span></td><td class="partial">~ <span class="note">CQL2-JSON to SQL: comparisons, and, or, not, like, between, in, isNull, and s_intersects, s_within, s_contains. No temporal or array operators</span></td></tr>
 <tr><td>Vector tiles (MVT)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OGC TileMatrixSet + per-dataset tiles</span></td></tr>
 <tr><td>STAC catalog API</td><td class="partial">~ <span class="note">Via Image Server</span></td><td class="yes">✓ <span class="note">Native STAC 1.0.0 implementation</span></td></tr>
 <tr><td>GeoJSON export</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Native format</span></td></tr>
-<tr><td>Shapefile export</td><td class="yes">✓</td><td class="partial">~ <span class="note">Via shapefile crate in CLI</span></td></tr>
+<tr><td>Shapefile export</td><td class="yes">✓</td><td class="no">— <span class="note">The CLI reads shapefiles on import. It writes GeoJSON and GeoPackage, never a shapefile</span></td></tr>
 <tr><td>CRS transformation (EPSG)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS ST_Transform, any EPSG code</span></td></tr>
 <tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST, plus signed webhooks and a collaboration WebSocket relay</span></td></tr>
 </table>
@@ -134,18 +134,18 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
 <tr><td>Spatial statistics</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Buffer, union, DBSCAN clustering, anomaly detection</span></td></tr>
-<tr><td>Network analysis (routing)</td><td class="yes">✓ <span class="note">Network Analyst</span></td><td class="yes">✓ <span class="note">pgRouting: Dijkstra, A*, TSP, isochrones</span></td></tr>
-<tr><td>Point cloud / LiDAR</td><td class="yes">✓</td><td class="yes">✓ <span class="note">pointcloud extension (pcpatch) with elevation profiles</span></td></tr>
-<tr><td>Trajectory / moving objects</td><td class="partial">~ <span class="note">Via Tracker</span></td><td class="yes">✓ <span class="note">MobilityDB (tgeompoint, speed, distance)</span></td></tr>
+<tr><td>Network analysis (routing)</td><td class="yes">✓ <span class="note">Network Analyst</span></td><td class="partial">~ <span class="note">pgRouting: Dijkstra, A*, TSP, isochrones. 501 without it</span></td></tr>
+<tr><td>Point cloud / LiDAR</td><td class="yes">✓</td><td class="partial">~ <span class="note">pointcloud extension (pcpatch) with elevation profiles. 501 without it</span></td></tr>
+<tr><td>Trajectory / moving objects</td><td class="partial">~ <span class="note">Via Tracker</span></td><td class="partial">~ <span class="note">MobilityDB (tgeompoint, speed, distance). Without it a trajectory is stored as JSONB and the analytics answer 501</span></td></tr>
 <tr><td>Vector similarity search</td><td class="no">—</td><td class="partial">~ <span class="note">SHA-256 hash spread over 256 floats. Identical text matches. Near-identical does not. 501 without pgvector</span></td></tr>
-<tr><td>Hexagonal spatial indexing</td><td class="no">—</td><td class="yes">✓ <span class="note">Uber H3: multi-resolution hexagonal binning</span></td></tr>
+<tr><td>Hexagonal spatial indexing</td><td class="no">—</td><td class="partial">~ <span class="note">Uber H3: multi-resolution hexagonal binning. Needs h3-pg, 501 without it</span></td></tr>
 <tr><td>Fuzzy text search</td><td class="partial">~ <span class="note">SQL LIKE only</span></td><td class="partial">~ <span class="note">pg_trgm substring search. No similarity ranking, no typo tolerance</span></td></tr>
 </table>
 
 <h2>Operations & Security</h2>
 <table>
 <tr><th>Capability</th><th>Esri Enterprise GDB</th><th>Ptolemy</th></tr>
-<tr><td>Authentication (SSO)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">OIDC (Keycloak, Auth0) + JWT</span></td></tr>
+<tr><td>Authentication (SSO)</td><td class="yes">✓</td><td class="partial">~ <span class="note">JWT, plus OIDC against Keycloak only: the three endpoint URLs are built as {issuer}/protocol/openid-connect/…, with no discovery document read</span></td></tr>
 <tr><td>Role-based access control</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Admin/Editor/Viewer roles</span></td></tr>
 <tr><td>Multi-tenancy</td><td class="yes">✓</td><td class="no">— <span class="note">Dropped in migration 028</span></td></tr>
 <tr><td>Audit logging</td><td class="yes">✓</td><td class="yes">✓ <span class="note">One row per mutation: subject, route, target, time. Reads are not recorded</span></td></tr>
@@ -164,12 +164,12 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><th>Advantage</th><th>Details</th></tr>
 <tr><td><strong>Open Source (AGPL-3.0)</strong></td><td>No per-user licensing fees. Full source access. Community-driven.</td></tr>
 <tr><td><strong>Git-like versioning</strong></td><td>True branch/merge workflows vs Esri's limited parent/child versions.</td></tr>
-<tr><td><strong>PostgreSQL ecosystem</strong></td><td>Leverage 9+ proven extensions (pgRouting, pgvector, MobilityDB, H3, SFCGAL, pointcloud, pg_trgm, PostGIS Topology, pg_partman).</td></tr>
+<tr><td><strong>PostgreSQL ecosystem</strong></td><td>Routes call pgRouting, pgvector, MobilityDB, h3-pg, SFCGAL, pointcloud, pg_trgm and PostGIS Topology. No image here installs any of them, and the routes answer 501 until you do.</td></tr>
 <tr><td><strong>Modern API</strong></td><td>REST, signed webhooks, a collaboration WebSocket relay.</td></tr>
-<tr><td><strong>Standards-first</strong></td><td>Native OGC API Features, CQL2, STAC 1.0, OGC Tiles — not proprietary protocols.</td></tr>
-<tr><td><strong>Cloud-native</strong></td><td>Single Rust binary, Docker-ready, sub-millisecond startup. No Windows/.NET requirement.</td></tr>
+<tr><td><strong>Standards-first</strong></td><td>OGC API Features Part 1 and Part 2, CQL2-JSON, STAC 1.0 and OGC Tiles are served directly, with no proprietary protocol in between.</td></tr>
+<tr><td><strong>Cloud-native</strong></td><td>Single Rust binary, Docker-ready. No Windows/.NET requirement.</td></tr>
 <tr><td><strong>pgvector route</strong></td><td>Exact-string matching expressed as a SHA-256 hash vector. 501 unless you install pgvector yourself.</td></tr>
-<tr><td><strong>Trajectory support</strong></td><td>MobilityDB for moving objects — Esri requires separate Tracker for Location.</td></tr>
+<tr><td><strong>Trajectory support</strong></td><td>MobilityDB for moving objects, where you install it. Esri requires a separate Tracker for Location.</td></tr>
 </table>
 </div>
 </section>
