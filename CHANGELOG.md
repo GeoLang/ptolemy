@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-09-16: **the aarch64 release binary builds again**. `cross build
+  --release -p ptolemy-cli --target aarch64-unknown-linux-gnu` stopped in
+  `openssl-sys` with "Could not find directory of OpenSSL installation", because
+  the stock cross image carries libssl for the host only. A `Cross.toml`
+  pre-build hook now adds the arm64 dpkg architecture and installs
+  `libssl-dev:arm64` into the image before the build. The image already points
+  pkg-config at `/usr/lib/aarch64-linux-gnu/pkgconfig/` and sets
+  `PKG_CONFIG_ALLOW_CROSS=1`, so nothing else changes.
+
 ### Added
 
 - 2026-08-30: **dataset attach and detach close six review findings**. Detaching
