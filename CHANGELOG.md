@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-20: **a bulk GeoJSON or CSV import is no longer cut off at 2 MB**.
+  The two import routes took axum's default body limit, so a request near the
+  documented 50,000-feature cap was refused as too large before it was read.
+  They now take a 64 MiB body.
 - 2026-09-16: **the public docs say what the code does**. `docs/comparison.html`
   claimed pessimistic feature locking, shapefile export, evaluated symbology
   filter expressions, a full CQL2 parser, OIDC against Auth0, sub-millisecond

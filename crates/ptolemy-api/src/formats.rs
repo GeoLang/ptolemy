@@ -7,7 +7,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -18,13 +18,22 @@ use uuid::Uuid;
 
 use crate::{AppState, auth::Actor};
 
+// 50,000 parcel polygons as GeoJSON run to tens of MB, past axum's 2 MB default
+const MAX_IMPORT_BODY: usize = 64 * 1024 * 1024;
+
 pub fn format_routes() -> Router<AppState> {
     Router::new()
         .route("/branches/{id}/export/geojson", get(export_geojson))
         .route("/branches/{id}/export/csv", get(export_csv))
         .route("/branches/{id}/export/flatgeobuf", get(export_flatgeobuf))
-        .route("/branches/{id}/import/geojson", post(import_geojson))
-        .route("/branches/{id}/import/csv", post(import_csv))
+        .route(
+            "/branches/{id}/import/geojson",
+            post(import_geojson).layer(DefaultBodyLimit::max(MAX_IMPORT_BODY)),
+        )
+        .route(
+            "/branches/{id}/import/csv",
+            post(import_csv).layer(DefaultBodyLimit::max(MAX_IMPORT_BODY)),
+        )
         .route("/branches/{id}/transform", post(transform_crs))
         .route("/crs/search", get(search_crs))
         .route("/crs/{srid}", get(get_crs_info))

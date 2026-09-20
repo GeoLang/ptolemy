@@ -1168,7 +1168,9 @@ nothing here pulls from a registered peer on its own.
 Both imports answer `{imported, skipped, changeset_id, errors}`. Rows that
 cannot be parsed are skipped and named in `errors`; the rest land as one
 changeset on the branch, visible to reads like any other commit. A request whose
-rows all fail answers 422 and writes no changeset.
+rows all fail answers 422 and writes no changeset. One request takes at most
+50,000 features and a 64 MiB body, so a larger file goes in as several
+requests, each its own changeset.
 
 ## CLI Commands
 
