@@ -602,14 +602,14 @@ impl AuthConfig {
     /// [`AuthConfig::from_env_strict`] instead so a missing secret refuses to
     /// start rather than silently opening every write endpoint.
     pub fn from_env() -> Self {
-        let secret = std::env::var("PTOLEMY_JWT_SECRET").unwrap_or_default();
+        let secret = std::env::var("PLATFORM_JWT_SECRET").unwrap_or_default();
         let enabled = !secret.is_empty();
         Self { secret, enabled }
     }
 
     /// Fail-closed env read for the serve path.
     pub fn from_env_strict() -> Result<Self, String> {
-        let secret = std::env::var("PTOLEMY_JWT_SECRET").ok();
+        let secret = std::env::var("PLATFORM_JWT_SECRET").ok();
         let disabled = std::env::var("PTOLEMY_AUTH_DISABLED").as_deref() == Ok("true");
         Self::resolve(secret.as_deref(), disabled)
     }
@@ -628,14 +628,14 @@ impl AuthConfig {
         let secret = secret.unwrap_or_default();
         if secret.is_empty() {
             return Err(
-                "PTOLEMY_JWT_SECRET is not set. Set it to 32+ random bytes shared with the other \
+                "PLATFORM_JWT_SECRET is not set. Set it to 32+ random bytes shared with the other \
                  platform services, or set PTOLEMY_AUTH_DISABLED=true to run without auth."
                     .into(),
             );
         }
         if secret.len() < MIN_SECRET_LEN {
             return Err(format!(
-                "PTOLEMY_JWT_SECRET is {} bytes, need at least {MIN_SECRET_LEN}",
+                "PLATFORM_JWT_SECRET is {} bytes, need at least {MIN_SECRET_LEN}",
                 secret.len()
             ));
         }
@@ -975,11 +975,11 @@ pub fn generate_token(secret: &str, sub: &str, role: Role, ttl_secs: u64) -> Str
 }
 
 /// Generate a JWT token using the configured secret (for OIDC callback).
-/// Returns Err if PTOLEMY_JWT_SECRET is not set.
+/// Returns Err if PLATFORM_JWT_SECRET is not set.
 pub fn generate_token_from_env(sub: &str, role: Role) -> Result<String, String> {
     let config = AuthConfig::from_env();
     if !config.enabled {
-        return Err("JWT secret not configured (set PTOLEMY_JWT_SECRET)".into());
+        return Err("JWT secret not configured (set PLATFORM_JWT_SECRET)".into());
     }
     Ok(generate_token(&config.secret, sub, role, 86400))
 }
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn resolve_rejects_missing_secret() {
         let err = AuthConfig::resolve(None, false).unwrap_err();
-        assert!(err.contains("PTOLEMY_JWT_SECRET is not set"));
+        assert!(err.contains("PLATFORM_JWT_SECRET is not set"));
         assert!(AuthConfig::resolve(Some(""), false).is_err());
     }
 

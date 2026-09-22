@@ -25,7 +25,7 @@ services:
       RUST_LOG: info,ptolemy=debug
       # local dev only: a known secret is no better than none in production.
       # 32-byte minimum, or the server refuses to start.
-      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:-local-dev-secret-not-for-production}
+      PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:-local-dev-secret-not-for-production}
     ports:
       - "3000:3000"
     healthcheck:

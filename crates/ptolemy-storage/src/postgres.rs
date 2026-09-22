@@ -23,6 +23,7 @@ use ptolemy_core::schema::{
     DatasetSchema, FieldDef, GeometryRules, QualityReport, QualityStatistics,
 };
 use serde::Serialize;
+use sqlx::migrate::Migrate;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -166,6 +167,9 @@ pub const EXTERNAL_READ_ONLY: &str =
 /// the guarantee holds at the database, not only in this process.
 pub const EXTERNAL_DATABASE_URL: &str = "PTOLEMY_EXTERNAL_DATABASE_URL";
 
+// the last migration file v0.1.0 shipped
+const LAST_UNLEDGERED_MIGRATION_VERSION: i64 = 18;
+
 /// The owner a write has to be allowed on, resolved from whatever id the request
 /// named. See [`PgStore::write_targets_for_id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,12 +232,50 @@ impl PgStore {
 
     /// Run migrations embedded in this crate.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        // sqlx tracks applied migrations in _sqlx_migrations, so this is
-        // idempotent and picks up new migration files automatically
-        sqlx::migrate!("./migrations")
+        let migrator = sqlx::migrate!("./migrations");
+        if self.has_tables_but_no_ledger().await? {
+            self.stamp_unledgered_migrations(&migrator).await?;
+        }
+        migrator
             .run(&self.pool)
             .await
             .map_err(|e| StoreError::Db(sqlx::Error::Migrate(Box::new(e))))?;
+        Ok(())
+    }
+
+    async fn has_tables_but_no_ledger(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query(
+            "SELECT to_regclass('datasets') IS NOT NULL AND to_regclass('_sqlx_migrations') IS NULL AS unledgered",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("unledgered"))
+    }
+
+    // v0.1.0 replayed the migration files on every start and wrote no ledger
+    async fn stamp_unledgered_migrations(
+        &self,
+        migrator: &sqlx::migrate::Migrator,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.pool.acquire().await?;
+        connection
+            .ensure_migrations_table()
+            .await
+            .map_err(|e| StoreError::Db(sqlx::Error::Migrate(Box::new(e))))?;
+        let unledgered = migrator
+            .iter()
+            .filter(|migration| migration.version <= LAST_UNLEDGERED_MIGRATION_VERSION);
+        for migration in unledgered {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+                 VALUES ($1, $2, true, $3, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&mut *connection)
+            .await?;
+        }
         Ok(())
     }
 
@@ -2837,7 +2879,7 @@ impl PgStore {
         migration: &SchemaMigration,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO schema_migrations (id, dataset_id, version, description, migration_type, field_name, old_definition, new_definition, applied_by, rollback_sql)
+            "INSERT INTO dataset_schema_migrations (id, dataset_id, version, description, migration_type, field_name, old_definition, new_definition, applied_by, rollback_sql)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(migration.id)
@@ -2861,7 +2903,7 @@ impl PgStore {
     ) -> Result<Vec<SchemaMigration>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, dataset_id, version, description, migration_type, field_name, old_definition, new_definition, applied_by, applied_at, rollback_sql
-             FROM schema_migrations
+             FROM dataset_schema_migrations
              WHERE dataset_id = $1
              ORDER BY version ASC",
         )
@@ -2889,7 +2931,7 @@ impl PgStore {
 
     pub async fn get_schema_version(&self, dataset_id: Uuid) -> Result<i32, StoreError> {
         let row = sqlx::query(
-            "SELECT COALESCE(MAX(version), 0) as version FROM schema_migrations WHERE dataset_id = $1",
+            "SELECT COALESCE(MAX(version), 0) as version FROM dataset_schema_migrations WHERE dataset_id = $1",
         )
         .bind(dataset_id)
         .fetch_one(&self.pool)

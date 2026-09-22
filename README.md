@@ -247,11 +247,11 @@ Every push to `master` publishes `ghcr.io/geolang/ptolemy`, tagged `master` and
 ```bash
 docker run -p 3000:3000 \
   -e DATABASE_URL=postgres://ptolemy:ptolemy@db/ptolemy \
-  -e PTOLEMY_JWT_SECRET=$(openssl rand -hex 32) \
+  -e PLATFORM_JWT_SECRET=$(openssl rand -hex 32) \
   ghcr.io/geolang/ptolemy:master
 ```
 
-`DATABASE_URL` and `PTOLEMY_JWT_SECRET` are the two it refuses to start without,
+`DATABASE_URL` and `PLATFORM_JWT_SECRET` are the two it refuses to start without,
 the second unless `PTOLEMY_AUTH_DISABLED=true`. Everything else in
 [Configuration](#configuration) has a default.
 
@@ -327,7 +327,7 @@ of them. On the Helm chart the URL carrying them is the one in
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection URL | (required) |
-| `PTOLEMY_JWT_SECRET` | JWT signing secret, 32+ bytes (required to serve) | (required) |
+| `PLATFORM_JWT_SECRET` | JWT signing secret, 32+ bytes (required to serve) | (required) |
 | `PTOLEMY_AUTH_DISABLED` | Set to `true` to serve with auth off | `false` |
 | `PTOLEMY_OIDC_ISSUER_URL` | Keycloak realm URL. The authorize, token and userinfo URLs are built from it as `{issuer}/protocol/openid-connect/…`, with no discovery document read, so a provider that spells those paths differently does not work | (disabled) |
 | `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |

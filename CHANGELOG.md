@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-22: **a database created by v0.1.0 upgrades in place**. v0.1.0
+  replayed the migration files on every start and wrote no `_sqlx_migrations`
+  ledger, so a later image started at migration 1 and failed on
+  `relation "datasets" already exists` before it could serve. `migrate` now
+  stamps migrations 1 to 18 as applied when the tables exist and the ledger
+  does not, then runs the rest. Covered by a storage integration test that
+  applies the v0.1.0 files raw and upgrades.
 - 2026-09-20: **a bulk GeoJSON or CSV import is no longer cut off at 2 MB**.
   The two import routes took axum's default body limit, so a request near the
   documented 50,000-feature cap was refused as too large before it was read.
@@ -124,6 +131,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-09-22: **the JWT secret is `PLATFORM_JWT_SECRET`**, the name agora,
+  sibyl, geodukt and the geolang API already read. `PTOLEMY_JWT_SECRET` is no
+  longer read. The platform compose and the hosted task definition pass the
+  new name.
+- 2026-09-22: **`schema_migrations` is now `dataset_schema_migrations`**
+  (migration 040). The table holds the schema changes applied to one dataset
+  and shared its name with the conventional migration ledger, which is
+  `_sqlx_migrations` here.
 - 2026-08-31: **dataset listings skip the project-role subquery on datasets
   with no project**, halving listing time at 5000 datasets (150 ms to 73 ms
   median). `idx_datasets_project` stays: no listing uses it, but the

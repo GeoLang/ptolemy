@@ -18,7 +18,7 @@ services:
       RUST_LOG: info,ptolemy=debug
       # no default: starting a hosted deployment with a known signing secret
       # is the same as having no auth at all
-      PTOLEMY_JWT_SECRET: ${PTOLEMY_JWT_SECRET:?set PTOLEMY_JWT_SECRET to 32+ random bytes}
+      PLATFORM_JWT_SECRET: ${PLATFORM_JWT_SECRET:?set PLATFORM_JWT_SECRET to 32+ random bytes}
     ports:
       - "3000:3000"
     healthcheck:

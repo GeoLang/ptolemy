@@ -55,7 +55,7 @@ jobs:
           done
           docker run -d --name smoke-api --network smoke -p 3000:3000 \
             -e DATABASE_URL=postgres://ptolemy:ptolemy@smoke-db/ptolemy \
-            -e PTOLEMY_JWT_SECRET=0123456789abcdef0123456789abcdef \
+            -e PLATFORM_JWT_SECRET=0123456789abcdef0123456789abcdef \
             ptolemy:smoke
           # readyz answers only once migrations are applied and the pool
           # connects, so it covers the whole startup path health cannot

@@ -151,7 +151,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🔐 Authentication</h3>
 <ul>
-<li>JWT authentication (PTOLEMY_JWT_SECRET)</li>
+<li>JWT authentication (PLATFORM_JWT_SECRET)</li>
 <li>Workspace and project roles: owner, editor, viewer</li>
 <li>Project access inherited from workspace membership</li>
 <li>Direct project membership for project-only access</li>
@@ -537,7 +537,7 @@ cargo build --release
 # Start with a PostGIS database. serve refuses to start without a signing
 # secret of 32 bytes or more, and applies migrations before it binds.
 export DATABASE_URL="postgres://user:pass@localhost/ptolemy"
-export PTOLEMY_JWT_SECRET="$(openssl rand -hex 32)"
+export PLATFORM_JWT_SECRET="$(openssl rand -hex 32)"
 ./target/release/ptolemy serve --bind 0.0.0.0:3000
 
 # Check health

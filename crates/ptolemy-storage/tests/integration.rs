@@ -2782,3 +2782,63 @@ async fn test_native_geometry_unknown_feature_not_found() {
             .is_err()
     );
 }
+
+const UNLEDGERED_MIGRATIONS: [&str; 18] = [
+    include_str!("../migrations/001_initial.sql"),
+    include_str!("../migrations/002_reviews.sql"),
+    include_str!("../migrations/003_schema_topology.sql"),
+    include_str!("../migrations/004_webhooks.sql"),
+    include_str!("../migrations/005_audit.sql"),
+    include_str!("../migrations/006_locks.sql"),
+    include_str!("../migrations/007_catalog.sql"),
+    include_str!("../migrations/008_tenancy.sql"),
+    include_str!("../migrations/009_networks.sql"),
+    include_str!("../migrations/010_linear_ref.sql"),
+    include_str!("../migrations/011_raster.sql"),
+    include_str!("../migrations/012_domains_rules.sql"),
+    include_str!("../migrations/013_relationships.sql"),
+    include_str!("../migrations/014_cartography.sql"),
+    include_str!("../migrations/015_extensions.sql"),
+    include_str!("../migrations/016_features_view.sql"),
+    include_str!("../migrations/017_temporal_attachments_replication.sql"),
+    include_str!("../migrations/018_rbac_compaction.sql"),
+];
+
+#[tokio::test]
+async fn migrate_carries_a_database_v0_1_0_left_without_a_ledger() {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for sql in UNLEDGERED_MIGRATIONS {
+        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+    }
+    let dataset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO datasets (id, name, created_by) VALUES ($1, 'from v0.1.0', 'upgrade')",
+    )
+    .bind(dataset_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PgStore::new(pool.clone());
+    store.migrate().await.unwrap();
+
+    let latest = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap();
+    let ledger_version: i64 = sqlx::query("SELECT MAX(version) AS version FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("version");
+    assert_eq!(ledger_version, latest);
+    let carried = store.get_dataset(dataset_id).await.unwrap();
+    assert_eq!(carried.name, "from v0.1.0");
+}

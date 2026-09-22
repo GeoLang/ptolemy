@@ -6,7 +6,7 @@ scrape_configs:
     static_configs:
       - targets: ["ptolemy:3000"]
     metrics_path: /metrics
-    # /metrics needs an admin JWT whenever PTOLEMY_JWT_SECRET is set. Mint one
+    # /metrics needs an admin JWT whenever PLATFORM_JWT_SECRET is set. Mint one
     # with the platform secret and point prometheus at it:
     # authorization:
     #   type: Bearer
