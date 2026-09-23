@@ -54,6 +54,7 @@ h3{color:var(--heading);margin-bottom:8px}
 <a onclick="showList()">Reviews</a>
 <a onclick="showCreate()">New Review</a>
 </nav>
+<input id="api-token" type="password" class="btn" style="margin-left:auto" placeholder="Bearer token" autocomplete="off" />
 </header>
 
 <main>
@@ -177,17 +178,25 @@ function showDetail(id) {
 }
 
 // ─── API calls ──────────────────────────────────────────────────────
+const TOKEN_STORAGE_KEY = 'ptolemy_token';
+const tokenInput = document.getElementById('api-token');
+tokenInput.value = sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+tokenInput.addEventListener('change', () => sessionStorage.setItem(TOKEN_STORAGE_KEY, tokenInput.value.trim()));
+
 async function api(path, opts = {}) {
-  const resp = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
-    ...opts,
-  });
+  const headers = { 'Content-Type': 'application/json', ...opts.headers };
+  const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(API + path, { ...opts, headers });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
     throw new Error(err.error || resp.statusText);
   }
-  return resp.status === 200 || resp.status === 201 ? resp.json() : null;
+  const text = await resp.text();
+  return text ? JSON.parse(text) : null;
 }
+
+window.addEventListener('unhandledrejection', event => alert(event.reason.message));
 
 // ─── Datasets & Branches ────────────────────────────────────────────
 async function loadDatasets() {
@@ -317,7 +326,7 @@ async function loadComments(id) {
 
 // ─── Actions ────────────────────────────────────────────────────────
 async function approveReview() {
-  await fetch(API + `/reviews/${currentMR.id}/approve`, { method: 'PUT' });
+  await api(`/reviews/${currentMR.id}/approve`, { method: 'PUT' });
   loadReviewDetail(currentMR.id);
 }
 
@@ -338,7 +347,7 @@ async function mergeReview() {
 
 async function closeReview() {
   if (!confirm('Close this merge request?')) return;
-  await fetch(API + `/reviews/${currentMR.id}/close`, { method: 'PUT' });
+  await api(`/reviews/${currentMR.id}/close`, { method: 'PUT' });
   loadReviewDetail(currentMR.id);
 }
 

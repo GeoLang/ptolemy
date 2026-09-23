@@ -591,8 +591,8 @@ sync, cursors, presence and chat:
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
 | GET | `/auth/oidc/config` | Whether OIDC is enabled, and the issuer URL when it is |
-| GET | `/review` | Merge request UI. Sends no token, and its map panel draws no diff |
-| GET | `/conflicts` | Conflict resolution UI. Sends no token |
+| GET | `/review` | Merge request UI. Sends the token pasted into its header field, and its map panel draws no diff |
+| GET | `/conflicts` | Conflict resolution UI. Sends the token pasted into its header field |
 | GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
 | PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |

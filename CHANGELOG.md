@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **the `/review` and `/conflicts` pages work with auth on**. Each
+  has a token field in its header, kept in `sessionStorage` for the tab, and
+  every request the page makes sends it as `Authorization: Bearer`. The review
+  page's approve and close buttons called `fetch` directly and never reported a
+  failure. They go through the same helper now, and a failed request shows its
+  error.
 - 2026-09-23: **`POST /branches/{id}/repair` reports how many features it
   fixed**. `features_fixed` was 1 whenever any geometry was repaired.
 - 2026-09-23: **`/branches/{id}/analytics/buffer` buffers the feature as it

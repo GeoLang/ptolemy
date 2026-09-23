@@ -68,6 +68,7 @@ main{flex:1;padding:16px;display:grid;grid-template-columns:320px 1fr;grid-templ
   <h1>Ptolemy Conflict Resolution</h1>
   <span class="subtitle" id="merge-info">Select a merge to resolve conflicts</span>
   <div style="flex:1"></div>
+  <input id="api-token" type="password" class="btn" placeholder="Bearer token" autocomplete="off">
   <button class="btn btn-success" id="btn-apply" onclick="applyResolutions()" disabled>Apply Resolutions</button>
 </header>
 
@@ -153,11 +154,16 @@ document.addEventListener('DOMContentLoaded', () => {
   }).addTo(map);
 });
 
+const TOKEN_STORAGE_KEY = 'ptolemy_token';
+const tokenInput = document.getElementById('api-token');
+tokenInput.value = sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+tokenInput.addEventListener('change', () => sessionStorage.setItem(TOKEN_STORAGE_KEY, tokenInput.value.trim()));
+
 async function api(path, opts = {}) {
-  const resp = await fetch(API_BASE + path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts
-  });
+  const headers = { 'Content-Type': 'application/json' };
+  const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const resp = await fetch(API_BASE + path, { ...opts, headers });
   return resp.json();
 }
 
