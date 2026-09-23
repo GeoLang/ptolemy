@@ -113,6 +113,11 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- 2026-09-23: **`POST /api/v1/topologies/{name}/simplify` is gone**
+  (`crates/ptolemy-api/src/topology.rs`, last sha `a613eb6`). It built a
+  TopoGeometry from the first edge of face 1 on a hard-coded layer id 1, ran
+  `topology.ST_Simplify` on it, discarded the result and answered
+  `{"status": "simplified"}`. Nothing in the topology changed.
 - 2026-09-02: **the OpenTelemetry setup helper is gone**. `ptolemy_api::telemetry`
   offered `init_telemetry`, `TelemetryConfig` and `OtlpProtocol`, and nothing
   called any of them: the CLI sets up logging with

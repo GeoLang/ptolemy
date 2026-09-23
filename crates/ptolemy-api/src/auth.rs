@@ -536,10 +536,7 @@ pub fn classify(method: &Method, route: &str) -> Access {
     // owner for the write ladder to check, so these stay admin-only until a
     // topology is bound to a dataset. Name-keyed reads are gated in the GET
     // branch for the same reason.
-    if route.ends_with("/topologies")
-        || route.ends_with("/add-face")
-        || (route.starts_with("/api/v1/topologies/") && route.ends_with("/simplify"))
-    {
+    if route.ends_with("/topologies") || route.ends_with("/add-face") {
         return Access::Admin;
     }
 
@@ -1595,7 +1592,6 @@ mod tests {
         for path in [
             "/api/v1/datasets/{id}/topologies",
             "/api/v1/topologies/{name}/add-face",
-            "/api/v1/topologies/{name}/simplify",
         ] {
             assert_eq!(classify(&Method::POST, path), Access::Admin, "POST {path}");
         }

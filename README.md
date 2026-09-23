@@ -721,7 +721,6 @@ sync, cursors, presence and chat:
 | GET | `/api/v1/topologies/{name}/edges` | List edges |
 | GET | `/api/v1/topologies/{name}/nodes` | List nodes |
 | POST | `/api/v1/topologies/{name}/add-face` | Add face |
-| POST | `/api/v1/topologies/{name}/simplify` | Answers `simplified` and changes nothing |
 | **SFCGAL 3D**, needs SFCGAL | | |
 | POST | `/api/v1/branches/{id}/3d/extrude` | Extrude 2D to 3D |
 | POST | `/api/v1/branches/{id}/3d/volume` | Compute volume |
@@ -896,7 +895,6 @@ and MobilityDB routes.
 | Geometry type constraints | Stored and never checked |
 | Multi-tenancy | None. One instance is one tenant |
 | Parcel split and merge | `POST /api/v1/parcels/split` and `/parcels/merge` answer the input geometry as hex WKB and a message telling the caller to do it elsewhere. The geoprocessing `split` and `merge` routes do compute a geometry |
-| Topology simplify | `POST /api/v1/topologies/{name}/simplify` computes a simplified edge, discards it and answers `simplified` |
 | Pluggable storage backends | `DataStore` in `ptolemy-core` is implemented by `ptolemy-geopackage`, `ptolemy-mongodb` and `ptolemy-elasticsearch`, and no binary uses any of them. The server and CLI use `PgStore`, which does not implement it |
 
 ## CLI

@@ -28,7 +28,6 @@ pub fn topology_routes() -> Router<AppState> {
         .route("/topologies/{name}/edges", get(list_topo_edges))
         .route("/topologies/{name}/nodes", get(list_topo_nodes))
         .route("/topologies/{name}/add-face", post(add_face))
-        .route("/topologies/{name}/simplify", post(simplify_topology))
 }
 
 #[derive(Serialize)]
@@ -246,34 +245,6 @@ const ADD_FACE_REFUSALS: [&str; 4] = [
     "Polygon boundary is not fully defined by existing edges",
     "Invalid null argument",
 ];
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SimplifyRequest {
-    #[serde(default = "default_precision")]
-    tolerance: f64,
-}
-
-async fn simplify_topology(
-    State(store): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<SimplifyRequest>,
-) -> Result<Json<serde_json::Value>, TopoError> {
-    let _rows = sqlx::query(
-        // ST_GetFaceEdges returns (sequence, edge), and a TopoElement is the
-        // two-element array {id, type}, not a record
-        "SELECT topology.ST_Simplify(topology.TopoGeom_addElement(
-            topology.CreateTopoGeom($1, 3, 1), ARRAY[edge, 2]::topology.TopoElement
-        ), $2) FROM (SELECT edge FROM topology.ST_GetFaceEdges($1, 1) LIMIT 1) sub",
-    )
-    .bind(&name)
-    .bind(req.tolerance)
-    .fetch_optional(store.read_pool())
-    .await?;
-    Ok(Json(
-        serde_json::json!({"status": "simplified", "tolerance": req.tolerance}),
-    ))
-}
 
 /// Sanitize topology name to prevent SQL injection.
 fn sanitize_topo_name(name: &str) -> String {

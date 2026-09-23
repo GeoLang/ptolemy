@@ -10888,10 +10888,6 @@ async fn test_topology_ddl_is_admin_only() {
             "/api/v1/topologies/roads_topo/add-face".to_string(),
             json!({"geometry_wkb_hex": "0101000000000000000000f03f000000000000f03f"}),
         ),
-        (
-            "/api/v1/topologies/roads_topo/simplify".to_string(),
-            json!({"tolerance": 0.001}),
-        ),
     ] {
         let (status, response) = request_as(&app, "POST", &uri, Some(&editor), Some(body)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "editor {uri}: {response}");
