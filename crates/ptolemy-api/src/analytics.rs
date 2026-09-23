@@ -11,6 +11,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use ptolemy_storage::branch_features_subquery;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -45,19 +46,20 @@ struct BufferResult {
 
 async fn buffer_analysis(
     State(store): State<AppState>,
-    Path(_branch_id): Path<Uuid>,
+    Path(branch_id): Path<Uuid>,
     Query(q): Query<BufferQuery>,
 ) -> Result<Json<BufferResult>, AnalyticsError> {
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT
             ST_AsGeoJSON(ST_Buffer(geometry::geography, $2)::geometry)::jsonb as geojson,
             ST_Area(ST_Buffer(geometry::geography, $2)) as area
-         FROM feature_versions
-         WHERE feature_id = $1
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(q.feature_id)
+         FROM {} f
+         WHERE f.id = $3 AND f.geometry IS NOT NULL",
+        branch_features_subquery("$1")
+    ))
+    .bind(branch_id)
     .bind(q.distance)
+    .bind(q.feature_id)
     .fetch_optional(store.read_pool())
     .await?
     .ok_or_else(|| AnalyticsError::NotFound("feature not found".into()))?;

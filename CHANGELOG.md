@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **`/branches/{id}/analytics/buffer` buffers the feature as it
+  stands on that branch**. It ignored the branch and took the newest version
+  of the feature from any branch, deleted or not. A feature deleted on the
+  branch, or with no geometry, is now a 404.
 - 2026-09-23: **the Helm chart starts a working pod**. It pulls
   `ghcr.io/geolang/ptolemy:v0.2.1` and reads `DATABASE_URL` and
   `PLATFORM_JWT_SECRET` from Secrets named by `externalDatabase.existingSecret`

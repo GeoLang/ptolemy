@@ -1687,6 +1687,67 @@ async fn test_buffer_analysis() {
     );
 }
 
+#[tokio::test]
+async fn test_buffer_analysis_reads_the_feature_on_the_named_branch() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, ds_id, "main").await;
+    let f1 = Uuid::now_v7();
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    commit_features(&app, main_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
+    ])).await;
+
+    // a newer write on another branch turns the point into a unit square
+    let dev_id = create_fork(&app, ds_id, "dev", main_id).await;
+    let unit_square_hex = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "update", "feature_id": f1.to_string(), "geometry_wkb_hex": unit_square_hex}
+        ]),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{main_id}/analytics/buffer?feature_id={f1}&distance=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "buffer on main: {body}");
+    let main_area = body["area_sq_meters"].as_f64().unwrap();
+    assert!(
+        main_area < 1_000.0,
+        "main still holds the point: {main_area}"
+    );
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{dev_id}/analytics/buffer?feature_id={f1}&distance=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "buffer on dev: {body}");
+    let dev_area = body["area_sq_meters"].as_f64().unwrap();
+    assert!(dev_area > 1.0e10, "dev holds the square: {dev_area}");
+
+    commit_features(
+        &app,
+        dev_id,
+        json!([
+            {"type": "delete", "feature_id": f1.to_string()}
+        ]),
+    )
+    .await;
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{dev_id}/analytics/buffer?feature_id={f1}&distance=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleted on dev: {body}");
+}
+
 /// `ST_Union` and `ST_Collect` have no geography form, so both of these routes
 /// used to be a 500 for every request. The union is taken on geometry and only
 /// the result cast, which is what makes the area come back in square meters.
