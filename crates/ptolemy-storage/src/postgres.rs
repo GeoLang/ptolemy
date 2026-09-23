@@ -2493,7 +2493,7 @@ impl PgStore {
         branch_id: Uuid,
         author: &str,
         writer: &Writer,
-    ) -> Result<Option<Changeset>, StoreError> {
+    ) -> Result<Option<(Changeset, usize)>, StoreError> {
         // Find features with invalid geometries
         let rows = sqlx::query(
             "WITH RECURSIVE chain AS (
@@ -2547,7 +2547,7 @@ impl PgStore {
             )
             .await?;
 
-        Ok(Some(changeset))
+        Ok(Some((changeset, count)))
     }
 
     // ─── Webhooks & Events (CDC) ────────────────────────────────────

@@ -88,10 +88,10 @@ async fn repair_geometries(
         .repair_geometries(branch_id, actor.or_body("system"), &actor.writer())
         .await?;
     match result {
-        Some(cs) => Ok(Json(RepairResponse {
+        Some((changeset, features_fixed)) => Ok(Json(RepairResponse {
             repaired: true,
-            features_fixed: 1, // simplified; in practice would track count
-            changeset_id: Some(cs.id),
+            features_fixed,
+            changeset_id: Some(changeset.id),
         })),
         None => Ok(Json(RepairResponse {
             repaired: false,

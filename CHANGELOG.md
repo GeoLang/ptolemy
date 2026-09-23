@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **`POST /branches/{id}/repair` reports how many features it
+  fixed**. `features_fixed` was 1 whenever any geometry was repaired.
 - 2026-09-23: **`/branches/{id}/analytics/buffer` buffers the feature as it
   stands on that branch**. It ignored the branch and took the newest version
   of the feature from any branch, deleted or not. A feature deleted on the

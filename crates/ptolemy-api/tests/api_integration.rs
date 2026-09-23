@@ -1748,6 +1748,33 @@ async fn test_buffer_analysis_reads_the_feature_on_the_named_branch() {
     assert_eq!(status, StatusCode::NOT_FOUND, "deleted on dev: {body}");
 }
 
+#[tokio::test]
+async fn test_repair_counts_the_features_it_fixed() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+
+    // two self-intersecting bowties and one valid unit square
+    let bowtie_at_origin_hex = "0103000000010000000500000000000000000000000000000000000000000000000000F03F000000000000F03F000000000000F03F00000000000000000000000000000000000000000000F03F00000000000000000000000000000000";
+    let bowtie_at_two_hex = "01030000000100000005000000000000000000004000000000000000000000000000000840000000000000F03F000000000000084000000000000000000000000000000040000000000000F03F00000000000000400000000000000000";
+    let unit_square_hex = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": Uuid::now_v7().to_string(), "geometry_wkb_hex": bowtie_at_origin_hex, "properties": {}},
+        {"type": "insert", "feature_id": Uuid::now_v7().to_string(), "geometry_wkb_hex": bowtie_at_two_hex, "properties": {}},
+        {"type": "insert", "feature_id": Uuid::now_v7().to_string(), "geometry_wkb_hex": unit_square_hex, "properties": {}}
+    ])).await;
+
+    let repair_uri = format!("/api/v1/branches/{branch_id}/repair");
+    let (status, body) = post_json(&app, &repair_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "repair: {body}");
+    assert_eq!(body["repaired"], true, "repair: {body}");
+    assert_eq!(body["features_fixed"], 2, "repair: {body}");
+
+    let (status, body) = post_json(&app, &repair_uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "second repair: {body}");
+    assert_eq!(body["features_fixed"], 0, "second repair: {body}");
+}
+
 /// `ST_Union` and `ST_Collect` have no geography form, so both of these routes
 /// used to be a 500 for every request. The union is taken on geometry and only
 /// the result cast, which is what makes the area come back in square meters.
