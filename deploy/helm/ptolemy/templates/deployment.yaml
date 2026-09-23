@@ -31,24 +31,27 @@ spec:
       {{- end }}
       containers:
         - name: ptolemy
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
               containerPort: 3000
               protocol: TCP
           env:
-            {{- if .Values.externalDatabase.existingSecret }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.externalDatabase.existingSecret }}
-                  key: {{ .Values.externalDatabase.existingSecretKey }}
-            {{- else }}
-            - name: DATABASE_URL
-              value: "postgres://{{ .Values.postgresql.auth.username }}:{{ .Values.postgresql.auth.password }}@{{ .Release.Name }}-postgresql/{{ .Values.postgresql.auth.database }}"
-            {{- end }}
+                  name: {{ required "externalDatabase.existingSecret is required: name a Secret holding the PostGIS DATABASE_URL, the chart brings no database" .Values.externalDatabase.existingSecret | quote }}
+                  key: {{ .Values.externalDatabase.existingSecretKey | quote }}
+            - name: PLATFORM_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.existingSecret is required: name a Secret holding PLATFORM_JWT_SECRET, 32+ random bytes" .Values.auth.existingSecret | quote }}
+                  key: {{ .Values.auth.existingSecretKey | quote }}
             {{- range $key, $value := .Values.env }}
+            {{- if has $key (list "DATABASE_URL" "PLATFORM_JWT_SECRET") }}
+            {{- fail (printf "env.%s is not allowed: it comes from a Secret, set externalDatabase.existingSecret or auth.existingSecret" $key) }}
+            {{- end }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **the Helm chart starts a working pod**. It pulls
+  `ghcr.io/geolang/ptolemy:v0.2.1` and reads `DATABASE_URL` and
+  `PLATFORM_JWT_SECRET` from Secrets named by `externalDatabase.existingSecret`
+  and `auth.existingSecret`, both required. The `postgresql` values that
+  pointed at a database nothing created are gone.
 - 2026-09-22: **a database created by v0.1.0 upgrades in place**. v0.1.0
   replayed the migration files on every start and wrote no `_sqlx_migrations`
   ledger, so a later image started at migration 1 and failed on

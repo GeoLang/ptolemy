@@ -1,40 +1,24 @@
 replicaCount: 1
 
 image:
-  repository: ptolemy
+  repository: ghcr.io/geolang/ptolemy
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # empty means v<appVersion>
+  tag: ""
 
 service:
   type: ClusterIP
   port: 3000
 
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts:
-    - host: ptolemy.local
-      paths:
-        - path: /
-          pathType: Prefix
-  tls: []
-
-# Naming a secret here points DATABASE_URL at a database outside the cluster
-# instead of the in-cluster one below. The secret holds the whole URL, so it
-# carries sslmode and sslrootcert too.
+# required: a Secret holding the whole PostGIS DATABASE_URL, the chart brings no database
 externalDatabase:
   existingSecret: ""
   existingSecretKey: url
 
-postgresql:
-  enabled: true
-  auth:
-    username: ptolemy
-    password: ptolemy
-    database: ptolemy
-  postgis:
-    enabled: true
+# required: a Secret holding PLATFORM_JWT_SECRET, 32+ bytes shared with the other platform services
+auth:
+  existingSecret: ""
+  existingSecretKey: jwt-secret
 
 resources:
   requests:

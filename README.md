@@ -58,31 +58,30 @@ created by v0.1.0 upgrades in place.
 
 ## Helm chart
 
-```bash
-helm install ptolemy deploy/helm/ptolemy \
-  --set image.repository=ghcr.io/geolang/ptolemy \
-  --set image.tag=master \
-  --set env.PLATFORM_JWT_SECRET=$(openssl rand -hex 32)
-```
-
-The chart deploys Ptolemy only. Its default `DATABASE_URL` points at a
-PostgreSQL service named `<release>-postgresql` with the credentials in
-`postgresql.auth`, which you create yourself. The chart's `image.repository`
-default is `ptolemy`, which is not published anywhere, hence the override.
-
-To use a database outside the cluster, put the whole `DATABASE_URL` in a secret
-and name it. The URL can then carry the `sslmode` and `sslrootcert` a managed
-database needs, and the password stays out of `values.yaml`.
+The chart deploys Ptolemy against a PostGIS database you already run. It brings
+no database. It reads the database URL and the JWT secret from two Secrets you
+create first, and `helm install` fails if either is not named.
 
 ```bash
 kubectl create secret generic ptolemy-database \
   --from-literal=url='postgres://user:pass@host/ptolemy?sslmode=verify-full'
 
+kubectl create secret generic ptolemy-auth \
+  --from-literal=jwt-secret="$(openssl rand -hex 32)"
+
 helm install ptolemy deploy/helm/ptolemy \
-  --set externalDatabase.existingSecret=ptolemy-database
+  --set externalDatabase.existingSecret=ptolemy-database \
+  --set auth.existingSecret=ptolemy-auth
 ```
 
-The key defaults to `url`, and `externalDatabase.existingSecretKey` changes it.
+The database URL carries the `sslmode` and `sslrootcert` a managed database
+needs, see [Database TLS](#database-tls). The JWT secret must be the same
+`PLATFORM_JWT_SECRET` the other platform services use. The keys default to
+`url` and `jwt-secret`, and `externalDatabase.existingSecretKey` and
+`auth.existingSecretKey` change them.
+
+The image is `ghcr.io/geolang/ptolemy` at `v<appVersion>` from `Chart.yaml`.
+Set `image.tag` to run another published tag.
 
 ## Database TLS
 
