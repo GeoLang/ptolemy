@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
 };
 use ptolemy_storage::{
     WriteGrant,
@@ -41,7 +41,6 @@ pub fn domain_routes() -> Router<AppState> {
             "/attribute-rules/{id}",
             get(get_rule).put(update_rule).delete(delete_rule),
         )
-        .route("/attribute-rules/{id}/validate", post(validate_rule))
 }
 
 // ─── Domains ────────────────────────────────────────────────────────
@@ -369,25 +368,6 @@ async fn delete_rule(
 ) -> Result<StatusCode, DomainError> {
     store.delete_attribute_rule(&grant).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Validate a rule expression against sample features.
-async fn validate_rule(
-    State(store): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, DomainError> {
-    let r = sqlx::query("SELECT expression, dataset_id FROM attribute_rules WHERE id = $1")
-        .bind(id)
-        .fetch_optional(store.read_pool())
-        .await?
-        .ok_or(DomainError::NotFound)?;
-    let _dataset_id: Uuid = r.get("dataset_id");
-    let expression: String = r.get("expression");
-    // Basic validation: check it's parseable SQL
-    let is_valid = !expression.trim().is_empty();
-    Ok(Json(
-        serde_json::json!({"valid": is_valid, "expression": expression}),
-    ))
 }
 
 // ─── Error ──────────────────────────────────────────────────────────

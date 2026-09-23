@@ -113,6 +113,10 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- 2026-09-23: **`POST /api/v1/attribute-rules/{id}/validate` is gone**
+  (`crates/ptolemy-api/src/domains.rs`, last sha `a613eb6`). It answered
+  `valid: true` for any non-empty expression. The rule types are named only in a
+  schema comment and there is no expression language to check against.
 - 2026-09-23: **`POST /api/v1/topologies/{name}/simplify` is gone**
   (`crates/ptolemy-api/src/topology.rs`, last sha `a613eb6`). It built a
   TopoGeometry from the first edge of face 1 on a hard-coded layer id 1, ran

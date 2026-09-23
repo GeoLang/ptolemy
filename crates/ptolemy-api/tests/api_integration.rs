@@ -11210,7 +11210,7 @@ fn calls(args: &str, name: &str) -> bool {
 /// entry is either a POST that only computes, or grant management, which
 /// rbac.rs gates harder. Adding a route to this list is the only way to opt out,
 /// and it cannot be done from a request.
-const UNGATED_TEMPLATES: [&str; 52] = [
+const UNGATED_TEMPLATES: [&str; 51] = [
     // the FeatureServer's two queries take a POST body only because an object id
     // list is too long for a URL, and extractChanges takes one because the
     // generations it is asked about are JSON. They are the only ungated POSTs on
@@ -11219,7 +11219,6 @@ const UNGATED_TEMPLATES: [&str; 52] = [
     "/arcgis/rest/services/{service}/FeatureServer/extractChanges",
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/query",
     "/arcgis/rest/services/{service}/FeatureServer/{layer}/queryAttachments",
-    "/api/v1/attribute-rules/{id}/validate",
     "/api/v1/branches/{branch_id}/permissions/{user_id}",
     "/api/v1/branches/{id}/3d/extrude",
     "/api/v1/branches/{id}/3d/intersection",

@@ -691,7 +691,6 @@ sync, cursors, presence and chat:
 | GET | `/api/v1/attribute-rules/{id}` | Get rule |
 | PUT | `/api/v1/attribute-rules/{id}` | Update rule |
 | DELETE | `/api/v1/attribute-rules/{id}` | Delete rule |
-| POST | `/api/v1/attribute-rules/{id}/validate` | Answers `valid: true` for any non-empty expression. Nothing parses it |
 | **Relationships** | | |
 | GET | `/api/v1/datasets/{id}/relationships` | List relationship classes |
 | POST | `/api/v1/datasets/{id}/relationships` | Create relationship class |

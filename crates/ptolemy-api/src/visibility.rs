@@ -409,7 +409,6 @@ mod tests {
             "/api/v1/networks/{id}/tsp",
             "/api/v1/pointclouds/{id}/query",
             "/api/v1/pointclouds/{id}/profile",
-            "/api/v1/attribute-rules/{id}/validate",
             "/api/v1/topologies/{name}/validate",
             "/api/v1/branches/{id}/similarity/search",
             "/api/v1/branches/{id}/similarity/cluster",
