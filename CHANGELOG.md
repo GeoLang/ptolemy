@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **the `/review` map panel draws the diff**. The page decodes the
+  WKB the review diff already returns and draws inserts in green and updates in
+  blue, then fits the map to them. Deletes carry no geometry and stay in the
+  text list only.
 - 2026-09-23: **the `/review` and `/conflicts` pages work with auth on**. Each
   has a token field in its header, kept in `sessionStorage` for the tab, and
   every request the page makes sends it as `Authorization: Bearer`. The review

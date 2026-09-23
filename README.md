@@ -591,7 +591,7 @@ sync, cursors, presence and chat:
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
 | GET | `/auth/oidc/config` | Whether OIDC is enabled, and the issuer URL when it is |
-| GET | `/review` | Merge request UI. Sends the token pasted into its header field, and its map panel draws no diff |
+| GET | `/review` | Merge request UI. Sends the token pasted into its header field. The map draws inserted and updated geometries. A delete carries no geometry in the diff, so it is only listed |
 | GET | `/conflicts` | Conflict resolution UI. Sends the token pasted into its header field |
 | GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
 | PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
@@ -897,7 +897,6 @@ and MobilityDB routes.
 | Multi-tenancy | None. One instance is one tenant |
 | Parcel split and merge | `POST /api/v1/parcels/split` and `/parcels/merge` answer the input geometry as hex WKB and a message telling the caller to do it elsewhere. The geoprocessing `split` and `merge` routes do compute a geometry |
 | Topology simplify | `POST /api/v1/topologies/{name}/simplify` computes a simplified edge, discards it and answers `simplified` |
-| Review map diff | The `/review` map panel draws a basemap and no changes |
 | Pluggable storage backends | `DataStore` in `ptolemy-core` is implemented by `ptolemy-geopackage`, `ptolemy-mongodb` and `ptolemy-elasticsearch`, and no binary uses any of them. The server and CLI use `PgStore`, which does not implement it |
 
 ## CLI

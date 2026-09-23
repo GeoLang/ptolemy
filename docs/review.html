@@ -305,10 +305,59 @@ function renderDiffMap(ops) {
     }).addTo(map);
   }
   if (diffLayer) map.removeLayer(diffLayer);
-  diffLayer = L.layerGroup().addTo(map);
-  // We don't have decoded geometries in the diff response (it's WKB), so just show counts
-  const bounds = [];
-  // TODO: decode the WKB and draw the changes
+  diffLayer = L.featureGroup().addTo(map);
+  const rootStyle = getComputedStyle(document.documentElement);
+  for (const op of ops) {
+    const [kind, change] = Object.entries(op)[0];
+    if (!change.geometry_wkb) continue;
+    const color = rootStyle.getPropertyValue(DIFF_COLOR_VARIABLES[kind]).trim();
+    L.geoJSON(wkbToGeoJSON(change.geometry_wkb), {
+      style: { color, weight: 3 },
+      pointToLayer: (feature, latlng) => L.circleMarker(latlng, { radius: 6, color }),
+    }).addTo(diffLayer);
+  }
+  const bounds = diffLayer.getBounds();
+  if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30], maxZoom: MAX_DIFF_FIT_ZOOM });
+}
+
+const DIFF_COLOR_VARIABLES = { Insert: '--green', Update: '--accent' };
+const MAX_DIFF_FIT_ZOOM = 16;
+const WKB_LITTLE_ENDIAN = 1;
+const WKB_DIMENSIONS_BY_THOUSANDS = [2, 3, 3, 4];
+
+function wkbToGeoJSON(bytes) {
+  const view = new DataView(new Uint8Array(bytes).buffer);
+  let offset = 0;
+  function readGeometry() {
+    const littleEndian = view.getUint8(offset) === WKB_LITTLE_ENDIAN;
+    const typeCode = view.getUint32(offset + 1, littleEndian);
+    offset += 5;
+    const dimensions = WKB_DIMENSIONS_BY_THOUSANDS[Math.floor(typeCode / 1000)];
+    const readCount = () => {
+      const count = view.getUint32(offset, littleEndian);
+      offset += 4;
+      return count;
+    };
+    const readPosition = () => {
+      const position = [view.getFloat64(offset, littleEndian), view.getFloat64(offset + 8, littleEndian)];
+      offset += 8 * dimensions;
+      return position;
+    };
+    const repeat = read => Array.from({ length: readCount() }, read);
+    const readRing = () => repeat(readPosition);
+    const readPartCoordinates = () => readGeometry().coordinates;
+    switch (typeCode % 1000) {
+      case 1: return { type: 'Point', coordinates: readPosition() };
+      case 2: return { type: 'LineString', coordinates: readRing() };
+      case 3: return { type: 'Polygon', coordinates: repeat(readRing) };
+      case 4: return { type: 'MultiPoint', coordinates: repeat(readPartCoordinates) };
+      case 5: return { type: 'MultiLineString', coordinates: repeat(readPartCoordinates) };
+      case 6: return { type: 'MultiPolygon', coordinates: repeat(readPartCoordinates) };
+      case 7: return { type: 'GeometryCollection', geometries: repeat(readGeometry) };
+    }
+    throw new Error(`unsupported WKB geometry type ${typeCode}`);
+  }
+  return readGeometry();
 }
 
 async function loadComments(id) {
