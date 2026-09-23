@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ptolemy — Conflict Resolution</title>
+<title>Ptolemy conflict resolution</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -65,7 +65,7 @@ main{flex:1;padding:16px;display:grid;grid-template-columns:320px 1fr;grid-templ
 <body>
 
 <header>
-  <h1>⚡ Ptolemy Conflict Resolution</h1>
+  <h1>Ptolemy Conflict Resolution</h1>
   <span class="subtitle" id="merge-info">Select a merge to resolve conflicts</span>
   <div style="flex:1"></div>
   <button class="btn btn-success" id="btn-apply" onclick="applyResolutions()" disabled>Apply Resolutions</button>
@@ -108,16 +108,16 @@ main{flex:1;padding:16px;display:grid;grid-template-columns:320px 1fr;grid-templ
   </div>
   <div class="resolution-options" id="resolution-options">
     <button class="resolution-btn" data-strategy="ours" onclick="selectStrategy('ours')">
-      ✅ Accept Ours
+      Accept Ours
     </button>
     <button class="resolution-btn" data-strategy="theirs" onclick="selectStrategy('theirs')">
-      ↩️ Accept Theirs
+      Accept Theirs
     </button>
     <button class="resolution-btn" data-strategy="auto_merge" onclick="selectStrategy('auto_merge')">
-      🔀 Auto-Merge
+      Auto-Merge
     </button>
     <button class="resolution-btn" data-strategy="delete" onclick="selectStrategy('delete')">
-      🗑️ Delete
+      Delete
     </button>
   </div>
   <div class="props-diff" id="props-diff"></div>
@@ -335,14 +335,14 @@ async function applyResolutions() {
   });
 
   if (result.success) {
-    alert(`✅ Merge complete! Changeset: ${result.changeset_id}`);
+    alert(`Merge complete. Changeset: ${result.changeset_id}`);
     conflicts = [];
     resolutions = {};
     updateSummary();
     renderConflictList();
     closePanel();
   } else {
-    alert('❌ Error: ' + (result.error || JSON.stringify(result)));
+    alert('Error: ' + (result.error || JSON.stringify(result)));
   }
 }
 </script>

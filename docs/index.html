@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ptolemy — Open-Source Enterprise Geodatabase</title>
+<title>Ptolemy: versioned geodatabase on PostGIS</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
@@ -43,8 +43,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <body>
 <header>
 <div class="container">
-<h1>🗺️ Ptolemy</h1>
-<p class="tagline">Open-source versioned enterprise geodatabase — Git-like collaboration for geospatial features, powered by PostgreSQL/PostGIS.</p>
+<h1>Ptolemy</h1>
+<p class="tagline">A versioned geodatabase on PostgreSQL and PostGIS. Branch, commit, diff and merge geographic datasets, and read them over REST, OGC API - Features and an ArcGIS FeatureServer facade.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
@@ -60,8 +60,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </div>
 <div class="stats">
 <div class="stat"><div class="num">7</div><div class="label">Rust crates</div></div>
-<div class="stat"><div class="num">703</div><div class="label">Rust tests</div></div>
-<div class="stat"><div class="num">10+</div><div class="label">CLI commands</div></div>
+<div class="stat"><div class="num">15</div><div class="label">CLI commands</div></div>
+<div class="stat"><div class="num">OGC</div><div class="label">API - Features and Tiles</div></div>
 <div class="stat"><div class="num">PostGIS</div><div class="label">Feature store</div></div>
 </div>
 </div>
@@ -72,27 +72,27 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Features</h2>
 <div class="grid">
 <div class="card">
-<h3>🔀 Versioned Geodata</h3>
+<h3>Versioned Geodata</h3>
 <ul>
-<li>Git-like branching & merging for features</li>
+<li>Git-like branching and merging for features</li>
 <li>Full changeset history with diffs</li>
 <li>Branch-level isolation for concurrent edits</li>
-<li>Conflict detection & resolution</li>
-<li>Time-travel queries (any revision)</li>
+<li>Three-way merge, conflicts resolved per feature as ours, theirs, custom, delete or auto_merge</li>
+<li>Features as of any instant, and a diff between any two changesets</li>
 </ul>
 </div>
 <div class="card">
-<h3>🗄️ PostGIS Backend</h3>
+<h3>PostGIS Backend</h3>
 <ul>
 <li>PostgreSQL + PostGIS for spatial indexing</li>
 <li>A GIST-indexed geometry column and a JSONB properties column per feature version</li>
-<li>Spatial queries (intersect, within, buffer)</li>
-<li>Full ACID transactions</li>
+<li>A <code>features</code> view any PostgreSQL client can read without Ptolemy running</li>
+<li>Each commit is one PostgreSQL transaction</li>
 <li>Connection pooling (sqlx)</li>
 </ul>
 </div>
 <div class="card">
-<h3>🌐 REST API</h3>
+<h3>REST API</h3>
 <ul>
 <li>Axum 0.8 async HTTP server</li>
 <li>Dataset, branch, and feature CRUD</li>
@@ -104,16 +104,15 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>MVT vector tile endpoint</li>
 <li>Cursor-based pagination</li>
 <li>Batch commit operations</li>
-<li>Health checks & readiness probes</li>
+<li>Liveness and readiness probes</li>
 <li>A body or query string naming a field the route does not declare is refused, 422 or 400, with the key named</li>
 </ul>
 </div>
 <div class="card">
-<h3>🤝 Collaboration</h3>
+<h3>Collaboration</h3>
 <ul>
-<li>Multi-user concurrent editing</li>
-<li>Named branches per team/task</li>
-<li>Review & merge workflows</li>
+<li>Named branches per team or task</li>
+<li>Merge requests with approval, comments and a diff</li>
 <li>Three-way merge with conflict detection</li>
 <li>Authenticated workspaces and nested projects</li>
 <li>Owner, editor, and viewer roles with inherited access</li>
@@ -121,56 +120,57 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Invitations grant editor or viewer and require an authenticated acceptance</li>
 <li>A dataset attached to a project is private to its members, at their project role</li>
 <li>Roles do not reach Agora permissions</li>
-<li>Ephemeral room relay (view sync, cursor sharing, chat)</li>
-<li>Follow mode — sync camera between viewer instances</li>
+<li>A WebSocket room relay that ViewTopia uses for view sync, cursors and chat</li>
+<li>Shared project state and project attachments</li>
 </ul>
 </div>
 <div class="card">
-<h3>📐 Geospatial Types</h3>
+<h3>Geospatial Types</h3>
 <ul>
-<li>Point, LineString, Polygon, Multi-*</li>
+<li>Point, LineString, Polygon, Multi-*, GeometryCollection and mixed geometry datasets</li>
 <li>Arbitrary JSON properties per feature</li>
-<li>Schema-on-read flexibility</li>
+<li>Optional per-feature validity times and pre-reprojection geometry</li>
 <li>UUID v7 for time-ordered IDs</li>
 <li>WKB/GeoJSON interchange</li>
 </ul>
 </div>
 <div class="card">
-<h3>🚀 Deployment</h3>
+<h3>Deployment</h3>
 <ul>
 <li>Single binary CLI (<code>ptolemy serve</code>)</li>
-<li>Docker + docker-compose</li>
-<li>ENV-based configuration</li>
+<li>Container image at <code>ghcr.io/geolang/ptolemy</code>, docker-compose and a Helm chart</li>
+<li>Configured by environment variables</li>
 <li>GeoJSON import/export</li>
-<li>Full CLI: dataset, branch, commit, merge, log, diff</li>
-<li>Prometheus metrics endpoint (<code>/metrics</code>)</li>
+<li>CLI: dataset, branch, commit, merge, log, diff, import, export, backup, restore, api-key</li>
+<li>Prometheus metrics at <code>/metrics</code> for an admin token</li>
 <li>Graceful shutdown (SIGTERM/SIGINT)</li>
 <li>Configurable connection pool</li>
 </ul>
 </div>
 <div class="card">
-<h3>🔐 Authentication</h3>
+<h3>Authentication</h3>
 <ul>
-<li>JWT authentication (PLATFORM_JWT_SECRET)</li>
+<li>HS256 JWTs signed with <code>PLATFORM_JWT_SECRET</code>, roles admin, editor and viewer</li>
 <li>Workspace and project roles: owner, editor, viewer</li>
 <li>Project access inherited from workspace membership</li>
 <li>Direct project membership for project-only access</li>
 <li>A dataset attached to a project is reached by its members: viewer reads, editor writes, owner administers</li>
 <li>OIDC Single Sign-On against Keycloak: the three endpoint URLs are built from the issuer as <code>/protocol/openid-connect/…</code>, so a provider that spells them differently does not work</li>
-<li>Token exchange & user info retrieval</li>
-<li>Per-endpoint permission checks</li>
+<li>The OIDC callback answers a Ptolemy JWT with role editor for every user it signs in</li>
+<li>API keys (<code>ptk_</code>) from <code>ptolemy api-key create</code>, and scoped tool tokens</li>
+<li>Per-dataset and per-branch grants: read, write, admin</li>
 </ul>
 </div>
 <div class="card">
-<h3>📏 Schema & Topology</h3>
+<h3>Schema and Topology</h3>
 <ul>
-<li>Dataset schema definitions (field types). Stored, not enforced</li>
-<li>PostGIS Topology primitives (faces, edges, nodes)</li>
+<li>Dataset schema: field types, required, allowed values, min and max, checked on commit and ArcGIS applyEdits</li>
+<li>Batch commit, imports and sync skip the check, and geometry rules are never checked</li>
 <li>Auto-repair invalid geometries (ST_MakeValid)</li>
 </ul>
 </div>
 <div class="card">
-<h3>📡 Webhooks & CDC</h3>
+<h3>Webhooks and CDC</h3>
 <ul>
 <li>Subscribe a url per dataset, filtered by event type</li>
 <li>commit, merge, branch_created, schema_changed, plus custom events</li>
@@ -180,20 +180,20 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>📊 Spatial Analytics</h3>
+<h3>Spatial Analytics</h3>
 <ul>
-<li>Buffer analysis (per-feature, configurable distance)</li>
-<li>Union analysis (aggregate geometry)</li>
+<li>Buffer one feature by a distance in meters</li>
+<li>Union of a branch's features and its area</li>
 <li>Coverage: the area a branch's features reach when buffered, counted once where they overlap</li>
 <li>DBSCAN spatial clustering</li>
-<li>Anomaly detection (outliers, self-intersections)</li>
-<li>Branch-level spatial statistics</li>
+<li>Anomalies: features over 3 standard deviations from the centroid, and non-simple geometries</li>
+<li>Branch statistics: count, total area and length, extent, centroid</li>
 </ul>
 </div>
 <div class="card">
-<h3>🌍 OGC Compliance</h3>
+<h3>OGC API - Features</h3>
 <ul>
-<li>OGC API - Features 1.0 Core</li>
+<li>Part 1 Core</li>
 <li>GeoJSON feature collections</li>
 <li>Bbox filtering, pagination</li>
 <li>Conformance declaration</li>
@@ -211,6 +211,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Attachments, and <code>extractChanges</code> deltas against a generation the client holds</li>
 <li>A stored Esri drawing document is served back as <code>drawingInfo</code>, or translated to Mapbox GL layers at <code>/api/v1/datasets/{id}/style</code></li>
 <li>A token may arrive in <code>X-Esri-Authorization</code> or a <code>token</code> parameter, read under this prefix and nowhere else</li>
+<li>The dataset schema is checked on <code>applyEdits</code>, as on a commit</li>
 </ul>
 </div>
 <div class="card">
@@ -225,7 +226,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔎 Audit Log</h3>
+<h3>Audit Log</h3>
 <ul>
 <li>One row per mutation: subject, route, target, time</li>
 <li>Reads are not recorded</li>
@@ -233,28 +234,28 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>⏱️ Temporal Queries</h3>
+<h3>Temporal Queries</h3>
 <ul>
-<li>Query features at any point in time</li>
-<li>Time-travel across branch history</li>
-<li>Historical state reconstruction</li>
+<li>A branch's features as of an RFC 3339 instant: <code>/api/v1/branches/{id}/features/at?at=</code></li>
+<li>Per-feature <code>valid_from</code> and <code>valid_to</code>, filtered with <code>valid_at</code></li>
+<li>Branch history and a diff between any two changesets</li>
 </ul>
 </div>
 <div class="card">
-<h3>📂 Data Catalog</h3>
+<h3>Data Catalog</h3>
 <ul>
 <li>Substring search over dataset name and description, case-insensitive</li>
-<li>Tag-based organization & filtering</li>
-<li>Rich metadata (source, license, attribution)</li>
+<li>Tags, and search filtered by them</li>
+<li>Metadata per dataset: source, license, attribution</li>
 <li>No ranking and no typo tolerance: it is ILIKE, not a text index</li>
 </ul>
 </div>
 <div class="card">
 <h3>Access</h3>
 <ul>
-<li>Dataset visibility: public listings vs private 404</li>
-<li>JWT roles Admin / Editor / Viewer</li>
-<li>Multi-tenancy was dropped in migration 028</li>
+<li>Dataset visibility: a private dataset answers 404 and is left out of listings for a caller with no grant</li>
+<li>Webhooks, audit, metrics, replication and PostGIS Topology need an admin token</li>
+<li>No multi-tenancy. One instance is one tenant</li>
 <li>No rate limiting. Put a proxy in front</li>
 </ul>
 </div>
@@ -262,14 +263,14 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>Operations</h3>
 <ul>
 <li>Webhook delivery worker starts with the server</li>
-<li>Conflict resolution API is real</li>
+<li>Planner statistics refreshed after a bulk write, over <code>PTOLEMY_ANALYZE_ROW_THRESHOLD</code> rows</li>
 <li>Console logging through tracing-subscriber, filtered by RUST_LOG</li>
 <li>Prometheus metrics at /metrics for an admin token</li>
 <li>No trace export. There is no OTLP exporter in the binary</li>
 </ul>
 </div>
 <div class="card">
-<h3>🕸️ Geometric Networks</h3>
+<h3>Geometric Networks</h3>
 <ul>
 <li>Graph topology: junctions + edges</li>
 <li>Upstream/downstream/bidirectional trace, walked by a recursive CTE</li>
@@ -278,23 +279,23 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>📏 Linear Referencing</h3>
+<h3>Linear Referencing</h3>
 <ul>
 <li>Route creation with measured geometries</li>
-<li>Point & linear events along routes</li>
-<li>Locate point → measure (ST_LineLocatePoint)</li>
-<li>Measure → sub-line extraction</li>
-<li>ST_LocateAlong / ST_LocateBetween</li>
+<li>Point and linear events along routes</li>
+<li>Point to measure (ST_LineLocatePoint)</li>
+<li>Measure range to sub-line (ST_LineSubstring)</li>
+<li>Event geometry from ST_LocateAlong and ST_LocateBetween</li>
 </ul>
 </div>
 <div class="card">
-<h3>🛰️ Raster & Imagery</h3>
+<h3>Raster and Imagery</h3>
 <ul>
 <li>Raster catalogs per dataset</li>
 <li>Tiles are uploaded as WKB hex, each carrying the zoom level the uploader gives it</li>
 <li>Point value extraction (ST_Value)</li>
 <li>Band statistics over a catalog's tiles</li>
-<li>Configurable pixel type & SRID</li>
+<li>Configurable pixel type and SRID</li>
 <li>Nothing builds an overview pyramid: every level is uploaded</li>
 </ul>
 </div>
@@ -307,86 +308,85 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔗 Relationship Classes</h3>
+<h3>Relationship Classes</h3>
 <ul>
-<li>Simple & composite relationships</li>
+<li>Simple and composite relationships</li>
 <li>Forward/backward label navigation at <code>/api/v1/features/{id}/related</code></li>
 <li>Cross-dataset feature linking</li>
 <li>Cardinality is a stored column. Nothing checks a record against it</li>
 </ul>
 </div>
 <div class="card">
-<h3>🎨 Cartographic Representations</h3>
+<h3>Cartography</h3>
 <ul>
 <li>Symbology rules with scale ranges, listed in priority order</li>
 <li>A rule's filter expression is stored and served back, never evaluated here</li>
-<li>Label rules with font & placement config</li>
+<li>Label rules with font and placement, stored for a client to draw</li>
 <li>JSON-based symbol definitions</li>
 <li>An Esri drawing document stored as a symbol is translated to Mapbox GL layers at <code>/api/v1/datasets/{id}/style</code></li>
 </ul>
 </div>
 <div class="card">
-<h3>🛣️ pgRouting</h3>
+<h3>pgRouting</h3>
 <ul>
-<li>Dijkstra & A* shortest path</li>
-<li>Driving distance / isochrones</li>
+<li>Dijkstra and A* shortest path</li>
+<li>Driving distance and isochrones</li>
 <li>Traveling Salesman (TSP)</li>
 <li>Connected components analysis</li>
 <li>Install pgRouting yourself. No image here does, and without it these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
-<h3>🔺 PostGIS Topology</h3>
+<h3>PostGIS Topology</h3>
 <ul>
-<li>Native topology primitives (faces, edges, nodes)</li>
-<li>Topology validation & simplification</li>
-<li>TopoGeometry support</li>
-<li>Edge/face adjacency queries</li>
+<li>Create a topology, validate it, list its faces, edges and nodes, add a face</li>
+<li>Every route but validate needs an admin token</li>
+<li>Simplify answers <code>simplified</code> and changes nothing</li>
 </ul>
 </div>
 <div class="card">
-<h3>🧊 SFCGAL 3D</h3>
+<h3>SFCGAL 3D</h3>
 <ul>
 <li>3D extrusion, volume computation</li>
-<li>3D intersection & Minkowski sum</li>
+<li>3D intersection and Minkowski sum</li>
 <li>Straight skeleton, tesselation</li>
-<li>Visibility / line-of-sight analysis</li>
+<li>Line of sight from an observer point to a feature's centroid</li>
 <li>Without SFCGAL installed these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
-<h3>⬡ H3 Hexagonal Indexing</h3>
+<h3>H3 Hexagonal Indexing</h3>
 <ul>
 <li>Uber H3 spatial index per feature</li>
 <li>Hex-based spatial aggregation</li>
-<li>K-ring neighbors & compaction</li>
+<li>K-ring neighbors and compaction</li>
 <li>Multi-resolution analysis (0-15)</li>
 <li>Without h3-pg installed these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
-<h3>🔍 pgvector Similarity</h3>
+<h3>pgvector Similarity</h3>
 <ul>
-<li>Feature embedding & similarity search</li>
+<li>Feature embedding and similarity search</li>
 <li>The embedding is a SHA-256 hash spread over 256 floats, so identical text matches and near-identical text does not</li>
 <li>Duplicate detection on that basis</li>
-<li>Bucketing by distance to the mean vector</li>
+<li>Equal-size buckets by distance to the mean vector, not k-means</li>
 <li>IVFFlat index, created when pgvector is installed</li>
 <li>Without pgvector these routes answer 501</li>
 </ul>
 </div>
 <div class="card">
-<h3>☁️ Point Cloud / LiDAR</h3>
+<h3>Point Cloud / LiDAR</h3>
 <ul>
 <li>pointcloud extension (pcpatch)</li>
-<li>Spatial patch queries & elevation profiles</li>
+<li>Spatial patch queries and elevation profiles</li>
 <li>Catalog management</li>
 <li>Points arrive in patches, one row each</li>
-<li>Without the pointcloud extension installed these routes answer 501</li>
+<li>Without the pointcloud extension, adding a patch and a profile answer 501</li>
 </ul>
 </div>
 <div class="card">
-<h3>🚗 MobilityDB Trajectories</h3>
+<h3>MobilityDB Trajectories</h3>
 <ul>
 <li>Temporal geometry (tgeompoint)</li>
 <li>Speed, distance, nearest approach</li>
@@ -396,29 +396,30 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🔎 CQL2 + OGC Tiles</h3>
+<h3>CQL2 + OGC Tiles</h3>
 <ul>
-<li>CQL2-JSON filter expressions</li>
+<li>CQL2-JSON: comparisons, and, or, not, like, between, in, isNull</li>
 <li>Spatial operators: s_intersects, s_within, s_contains</li>
 <li>OGC TileMatrixSet API</li>
 <li>Vector tiles (MVT) per dataset</li>
 </ul>
 </div>
 <div class="card">
-<h3>🛰️ STAC Catalog</h3>
+<h3>STAC Catalog</h3>
 <ul>
 <li>Catalog, collection and item routes declaring STAC 1.0.0</li>
-<li>Collection & item discovery</li>
-<li>Spatial + temporal search</li>
-<li>Raster asset management</li>
+<li>A collection per raster catalog, an item per raster tile</li>
+<li>Spatial and temporal search</li>
+<li>Raster tiles are not covered by dataset visibility</li>
 </ul>
 </div>
 <div class="card">
-<h3>🌐 Format & CRS</h3>
+<h3>Format and CRS</h3>
 <ul>
 <li>GeoJSON, CSV, FlatGeobuf export</li>
+<li>GeoJSON and CSV import, up to 50,000 features and 64 MiB a request, as one changeset</li>
 <li>CRS transformation, one geometry per request, through ST_Transform</li>
-<li>CRS search & lookup (spatial_ref_sys)</li>
+<li>CRS search and lookup (spatial_ref_sys)</li>
 </ul>
 </div>
 </div>
@@ -442,7 +443,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>ptolemy-storage</h3>
 <ul>
 <li>PgStore, the one store the server and CLI use</li>
-<li>SQL migrations, run on every serve</li>
+<li>SQL migrations, run on every serve. A v0.1.0 database upgrades in place</li>
 <li>Reads and writes go through a Reader or Writer that carries the permission decision</li>
 </ul>
 </div>
@@ -451,7 +452,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Each implements the DataStore trait from ptolemy-core</li>
 <li>No binary depends on them: the server and the CLI use PgStore</li>
-<li>The CLI reads shapefiles and writes GeoPackage itself, through shapefile and rusqlite</li>
+<li>The CLI reads shapefiles and GeoPackage and writes GeoPackage itself, through shapefile and rusqlite</li>
 </ul>
 </div>
 <div class="card">
@@ -468,7 +469,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Clap-based CLI</li>
 <li><code>ptolemy serve --bind 0.0.0.0:3000</code></li>
-<li>Dataset, branch, commit, merge, import, export, backup commands</li>
+<li>Dataset, branch, commit, merge, import, export, backup and API key commands</li>
 </ul>
 </div>
 </div>
@@ -478,33 +479,31 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>Real-Time Collaboration Relay</h2>
-<p style="margin-bottom:16px">Ptolemy includes an ephemeral room-based WebSocket relay at <code>/ws/rooms/{room_id}</code>
-for real-time viewer collaboration. Every JSON message sent by one participant is broadcast
-to all others in the same room. No messages are persisted — rooms are created on first
-connection and dropped when the last client disconnects.</p>
+<p style="margin-bottom:16px"><code>/ws/rooms/{room_id}</code> relays every text frame a client sends
+to every other client in the room, never back to the sender. Nothing is stored. A room exists while
+someone is connected. The server does not read the messages. The cards below are what ViewTopia
+sends through it.</p>
 
 <div class="grid">
 <div class="card">
-<h3>📡 View Sync (Follow Mode)</h3>
+<h3>View Sync (Follow Mode)</h3>
 <ul>
-<li>Broadcast camera state (lat, lng, zoom, bearing, pitch)</li>
-<li>Follower's viewer mirrors the leader's view in real-time</li>
+<li>Camera state: latitude, longitude, zoom, bearing, pitch</li>
+<li>A follower's viewer mirrors the leader's view</li>
 <li>The server relays every frame it is given, so throttling is the client's job</li>
 </ul>
 </div>
 <div class="card">
-<h3>🖱️ Cursor Sharing</h3>
+<h3>Cursor Sharing</h3>
 <ul>
-<li>Share mouse position on the map between collaborators</li>
-<li>See other users' cursors as coloured dots</li>
+<li>Each collaborator's mouse position on the map</li>
 </ul>
 </div>
 <div class="card">
-<h3>👥 Presence & Chat</h3>
+<h3>Presence and Chat</h3>
 <ul>
-<li>Track which users are online in a room</li>
-<li>User name and colour assignment</li>
-<li>Real-time text messaging within a room</li>
+<li>Join and Leave messages for who is in the room</li>
+<li>Text chat within a room</li>
 </ul>
 </div>
 </div>
@@ -515,14 +514,13 @@ connection and dropped when the last client disconnects.</p>
 // new WebSocket("ws://localhost:3000/ws/rooms/my-room", ["bearer", jwt])
 ws://localhost:3000/ws/rooms/my-room
 
-// Client → Server (relayed to every other client in the room, never back to the sender)
+// Client to server, relayed to every other client in the room
 { "type": "Join",   "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
 { "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
 { "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
 { "type": "Chat",   "user_id": "u1", "user_name": "Alice", "message": "Look at this area" }
 { "type": "Leave",  "user_id": "u1", "asset_id": "my-room" }</code></pre>
-<p style="margin-top:12px;color:var(--muted);font-size:.9rem">Messages are opaque to the server — it relays any valid text frame to all other
-subscribers. The schema above is the convention used by ViewTopia's collaboration client.</p>
+<p style="margin-top:12px;color:var(--muted);font-size:.9rem">These shapes are ViewTopia's convention. The server relays any text frame.</p>
 </div>
 </section>
 
@@ -535,7 +533,7 @@ cd ptolemy
 cargo build --release
 
 # Start with a PostGIS database. serve refuses to start without a signing
-# secret of 32 bytes or more, and applies migrations before it binds.
+# secret of 32 bytes or more, and applies migrations before it binds
 export DATABASE_URL="postgres://user:pass@localhost/ptolemy"
 export PLATFORM_JWT_SECRET="$(openssl rand -hex 32)"
 ./target/release/ptolemy serve --bind 0.0.0.0:3000
@@ -549,7 +547,7 @@ curl http://localhost:3000/api/v1/readyz</code></pre>
 <footer>
 <div class="container">
 <p>Ptolemy is AGPL-3.0 licensed open source from <a href="https://github.com/GeoLang">GeoLang</a>.</p>
-<p>&copy; 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
+<p>Copyright 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
 </div>
 </footer>
 </body>

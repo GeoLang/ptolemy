@@ -3,163 +3,190 @@
 [![CI](https://github.com/GeoLang/ptolemy/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/ptolemy/actions)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
-**Open-source enterprise geodatabase & collaboration platform.**
+Ptolemy is a versioned geodatabase on PostgreSQL and PostGIS. You branch,
+commit, diff and merge geographic datasets the way you would a git repository,
+and read them over a REST API, OGC API - Features and an ArcGIS FeatureServer
+facade.
 
-Ptolemy provides versioned spatial data management — branch, commit, diff, and merge geographic datasets with git-like workflows. Built on PostGIS, designed for teams.
+## Quick Start
 
-## Why Ptolemy?
+Needs a PostgreSQL server with PostGIS.
 
-Enterprise GIS users are locked into proprietary platforms (Esri, Hexagon) primarily because of versioned geodatabase workflows — multi-user editing with conflict detection, branching, and audit trails. Ptolemy brings these capabilities to the open-source stack.
-
-## Third-Party Integrations
-
-Ptolemy leverages the best battle-tested PostgreSQL extensions and standards:
-
-| Extension | Purpose |
-|-----------|---------|
-| **pgRouting** | Graph routing: Dijkstra, A*, TSP, connected components, reachable-junction sets with costs |
-| **PostGIS Topology** | Native topology primitives (faces, edges, nodes), validation |
-| **SFCGAL** | 3D geometry operations: extrude, volume, Minkowski sum, straight skeleton |
-| **h3-pg** | Uber H3 hexagonal spatial indexing, aggregation, compaction |
-| **pgvector** | Distance-ranked bucketing over hash embeddings, feature deduplication. Without it the `similarity` routes answer `501` |
-| **pg_trgm** | Substring search (`ILIKE '%…%'`) for the data catalog; no similarity ranking, no typo tolerance |
-| **pointcloud** | LiDAR/point cloud storage and spatial queries |
-| **MobilityDB** | Moving object trajectories, speed/distance analysis. Without it a trajectory is stored as JSONB and the analytics routes answer `501` |
-
-The embeddings behind the `similarity` routes are a SHA-256 hash spread over 256
-floats, so identical text matches and near-identical text does not: it is exact
-string matching expressed as vectors, not semantic search.
-
-None of these extensions is installed in any image Ptolemy ships, so the
-pgRouting, SFCGAL, pgvector, pointcloud and MobilityDB routes are exercised by no
-test beyond their `501` branch. Install them yourself before relying on them.
-
-### Standards Implemented
-
-- **STAC 1.0** — SpatioTemporal Asset Catalog for raster discovery
-- **OGC Tiles** — Standard tile matrix sets (WebMercatorQuad, WorldCRS84Quad)
-- **CQL2** — Common Query Language for spatial/attribute filtering
-- **OGC API - Features** — Part 1 (core, GeoJSON, OpenAPI 3.0) and Part 2 (CRS by
-  reference). Every collection offers CRS84, EPSG:4326 and EPSG:3857, plus the
-  dataset's own srid where it is none of those. CRS84 is served longitude first and a
-  geographic EPSG code latitude first, and `bbox-crs` is read the same way.
-- **ArcGIS Geoservices REST** — FeatureServer reads, `applyEdits` writes, attachments and `extractChanges` deltas, so Esri clients connect unchanged
-
-### Key Features (Roadmap)
-
-| Version | Milestone | Status |
-|---------|-----------|--------|
-| **v0.1** | Core types, Store trait, API skeleton, CLI | ✓ Done |
-| **v0.2** | SQL migrations, full CRUD, branching, changesets, commit engine | ✓ Done |
-| **v0.3** | Diff engine, three-way merge, conflict detection, REST API | ✓ Done |
-| **v0.4** | Auth (JWT/RBAC), CLI workflows, GeoJSON I/O | ✓ Done |
-| **v0.5** | Prometheus metrics, OIDC SSO, graceful shutdown, connection pool tuning | ✓ Done |
-| **v0.6** | Spatial query API, MVT tile serving, pagination, batch operations | ✓ Done |
-| **v0.7** | QGIS HTTP endpoints, offline sync protocol, field-to-server workflows | ✓ Done |
-| **v0.8** | Web review UI, pull-request-style geodata review, map diffs | ✓ Done |
-| **v0.9** | Schema validation, data quality reports | ✓ Done |
-| **v1.0** | Webhook subscriptions and signed CDC event delivery | ✓ Done |
-| **v1.1** | Spatial analytics (buffer, union, coverage, clustering, anomaly detection) | ✓ Done |
-| **v1.2** | OGC API - Features compliance, audit log | ✓ Done |
-| **v1.3** | Schema enforcement | ✓ Done |
-| **v1.4** | Temporal queries | ✓ Done |
-| **v1.5** | Data catalog | ✓ Done |
-| **v1.6** | Conflict resolution API | ✓ Done |
-
-Not implemented, whatever the code in the repository suggests:
-
-| Subsystem | State |
-|-----------|-------|
-| Rate limiting | Nothing limits request rate. Put a proxy in front |
-| Feature locking | Removed. Use branches and the merge conflict flow for concurrent editing |
-| Topology rule engine | Removed in migration `039`. PostGIS Topology under `/api/v1/topologies` is a different subsystem and stays |
-| Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
-| Geometry type constraints | Stored and never checked |
-| Multi-tenancy | Dropped from the product in migration `028` |
-| Parcel split and merge | `POST /api/v1/parcels/split` and `/parcels/merge` answer the input geometry as hex WKB and a message telling the caller to do the operation elsewhere. The geoprocessing `split` and `merge` routes do compute a geometry |
-| Pluggable storage backends | `DataStore` in `ptolemy-core` is implemented by `ptolemy-geopackage`, `ptolemy-mongodb` and `ptolemy-elasticsearch`, and no binary depends on any of them. The server and the CLI use `PgStore` only, which does not implement the trait |
-
-## Architecture
-
-```
-┌───────────────────────────────────────────┐
-│  Clients (Web UI, CLI)                    │
-├───────────────────────────────────────────┤
-│  ptolemy-api (Axum REST service)          │
-│  - Dataset CRUD                           │
-│  - Branch/commit/merge operations         │
-│  - Feature read/write scoped to branches  │
-├───────────────────────────────────────────┤
-│  ptolemy-core (domain types & logic)      │
-│  - Changeset DAG                          │
-│  - Three-way merge algorithm              │
-│  - Diff computation (geometry + attrs)    │
-├───────────────────────────────────────────┤
-│  ptolemy-storage (backend abstraction)    │
-│  - PostgreSQL/PostGIS implementation      │
-│  - Temporal tables for version history    │
-│  - Spatial indexes on all versions        │
-├───────────────────────────────────────────┤
-│  PostgreSQL + PostGIS                     │
-└───────────────────────────────────────────┘
+```bash
+createdb ptolemy
+psql ptolemy -c "CREATE EXTENSION postgis"
+cargo build --release
+export DATABASE_URL=postgres://localhost/ptolemy
+export PLATFORM_JWT_SECRET=$(openssl rand -hex 32)
+./target/release/ptolemy serve
 ```
 
-## Data Model
+`serve` applies migrations before it binds `0.0.0.0:3000` (`--bind` changes
+it). The API is at `http://localhost:3000/api/v1`. Reads are anonymous and
+writes need a bearer token. `ptolemy api-key create dev --role admin` prints one.
 
-Ptolemy uses a **changeset DAG** (directed acyclic graph) inspired by git:
+`docker compose up --build` runs the same thing with PostGIS on 5432 and
+Prometheus on 9090, using a fixed development secret. The Prometheus scrape gets
+401 until you give it an admin token, see `deploy/prometheus.yml`.
+`docker compose -f docker-compose.neon.yml --env-file .env.neon up --build`
+runs it against Neon instead, with `.env.neon` copied from `.env.neon.example`.
 
-- **Dataset**: A collection of spatial features with shared schema (≈ feature class).
-- **Branch**: A named pointer to the latest changeset. Default branch is `main`.
-- **Changeset**: An atomic set of feature edits (insert/update/delete). Each changeset points to its parent(s), forming the DAG.
-- **Feature**: A spatial object with UUID, WKB geometry, and JSON properties.
+Tagged releases attach prebuilt `ptolemy` binaries for x86_64 and aarch64 Linux
+and macOS.
 
-### Merge Strategy
+## Container image
 
-Three-way merge using the common ancestor changeset:
-1. Compute diff(ancestor → ours) and diff(ancestor → theirs).
-2. Changes to different features merge automatically. One feature edited on both
-   sides merges only when the two sides wrote different property keys and
-   neither side touched the geometry or the validity times.
-3. Everything else on one feature is a conflict, surfaced for manual
-   resolution: the same property key written on both sides, and any geometry
-   change on either side.
-4. Geometries are compared as raw WKB bytes, so any difference at all, down to
-   vertex order or precision, counts as a change. There is no tolerance.
+Every push to `master` publishes `ghcr.io/geolang/ptolemy`, tagged `master` and
+`sha-<short-sha>`. A `v*` tag publishes that version plus `latest`. Pin to a
+`sha-` tag if you need a fixed API surface.
 
-### Your data is just PostGIS
+```bash
+docker run -p 3000:3000 \
+  -e DATABASE_URL=postgres://ptolemy:ptolemy@db/ptolemy \
+  -e PLATFORM_JWT_SECRET=$(openssl rand -hex 32) \
+  ghcr.io/geolang/ptolemy:master
+```
 
-Ptolemy stores features in plain PostGIS tables, not a proprietary format. Every
-feature version is a row in `feature_versions` with a PostGIS `geometry` column
-(GIST-indexed) and a JSONB `properties` column; the `features` view resolves each
-branch to its current feature set. Anything that speaks PostgreSQL can read it
-directly, with or without any Ptolemy service running:
+It refuses to start without `DATABASE_URL`, or without `PLATFORM_JWT_SECRET`
+unless `PTOLEMY_AUTH_DISABLED=true`. Wait on `/api/v1/readyz`, which answers
+once the database does, rather than `/api/v1/healthz`, which answers as soon as
+the process is up.
+
+Pair it with `postgis/postgis:16-3.4`. The first migration declares a PostGIS
+`geometry` column, so a database without PostGIS fails to migrate. A database
+created by v0.1.0 upgrades in place.
+
+## Helm chart
+
+```bash
+helm install ptolemy deploy/helm/ptolemy \
+  --set image.repository=ghcr.io/geolang/ptolemy \
+  --set image.tag=master \
+  --set env.PLATFORM_JWT_SECRET=$(openssl rand -hex 32)
+```
+
+The chart deploys Ptolemy only. Its default `DATABASE_URL` points at a
+PostgreSQL service named `<release>-postgresql` with the credentials in
+`postgresql.auth`, which you create yourself. The chart's `image.repository`
+default is `ptolemy`, which is not published anywhere, hence the override.
+
+To use a database outside the cluster, put the whole `DATABASE_URL` in a secret
+and name it. The URL can then carry the `sslmode` and `sslrootcert` a managed
+database needs, and the password stays out of `values.yaml`.
+
+```bash
+kubectl create secret generic ptolemy-database \
+  --from-literal=url='postgres://user:pass@host/ptolemy?sslmode=verify-full'
+
+helm install ptolemy deploy/helm/ptolemy \
+  --set externalDatabase.existingSecret=ptolemy-database
+```
+
+The key defaults to `url`, and `externalDatabase.existingSecretKey` changes it.
+
+## Database TLS
+
+The `sslmode` parameter on `DATABASE_URL` decides the protection, and the
+default is `prefer`: TLS if the server offers it, plaintext if not.
+
+For anything not on localhost use `sslmode=verify-full`. `sslmode=require`,
+which most hosting providers tell you to paste, encrypts but accepts any
+certificate, even with `sslrootcert` set. Only `verify-ca` and `verify-full`
+check the certificate, and only `verify-full` checks the hostname.
+
+The Mozilla root bundle is compiled in, so a provider whose certificate chains
+to a public CA, such as Neon, needs only `verify-full`. Amazon RDS signs with
+its own roots, so name the bundle:
+
+```
+DATABASE_URL=postgres://user:pass@host/ptolemy?sslmode=verify-full&sslrootcert=/etc/ssl/rds-global-bundle.pem
+```
+
+The container image ships that bundle at `/etc/ssl/rds-global-bundle.pem`,
+downloaded from `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`
+at build time. Outside the image, download it yourself. `sslrootcert` adds to
+the compiled-in roots rather than replacing them. `PTOLEMY_EXTERNAL_DATABASE_URL`
+needs its own copy of these parameters.
+
+## Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection URL | (required) |
+| `PLATFORM_JWT_SECRET` | HS256 signing secret, 32 bytes or more, shared with the other GeoLang services | (required to serve) |
+| `PTOLEMY_AUTH_DISABLED` | `true` serves with auth off, for development only | `false` |
+| `PTOLEMY_OIDC_ISSUER_URL` | Keycloak realm URL. The authorize, token and userinfo URLs are built as `{issuer}/protocol/openid-connect/...` with no discovery document, so other providers do not work | (OIDC off) |
+| `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | |
+| `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | |
+| `PTOLEMY_OIDC_REDIRECT_URL` | Callback URL for the OIDC flow | |
+| `SMTP_URL` | SMTP relay for invitation email, e.g. `smtp://user:pass@mail.example.com:587?tls=required` | (no email) |
+| `SMTP_FROM` | Sender address on invitation email | (no email) |
+| `PUBLIC_BASE_URL` | Where the viewer is served, used to build the invitation link | (no email) |
+| `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets. Use a read-only role | (primary pool) |
+| `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
+| `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
+| `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger an `ANALYZE`. `0` leaves it to autoanalyze | 1000 |
+| `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept. `0` keeps them forever | 30 |
+| `RUST_LOG` | Log filter | (the image sets `info,ptolemy=debug`) |
+
+The OIDC callback answers `{access_token, user}`, where `access_token` is a
+Ptolemy JWT with role `editor` for every user the provider signs in.
+
+A write that touches at least `PTOLEMY_ANALYZE_ROW_THRESHOLD` rows runs
+`ANALYZE` on `feature_versions`, `changesets` and `branches` after it commits,
+off the request path. Without it, reads straight after a bulk import use a plan
+made for empty tables until autoanalyze runs. If the role cannot `ANALYZE`
+because it does not own the tables, the failure is logged and the write is
+unaffected.
+
+## Data model
+
+- **Dataset**: spatial features sharing a schema, like an Esri feature class.
+- **Branch**: a named pointer to a changeset. The default branch is `main`.
+- **Changeset**: one commit of inserts, updates and deletes. It points to its
+  parent, and a merge changeset also to the source head it brought in.
+- **Feature**: a UUID, a WKB geometry in EPSG:4326 and JSON properties. A
+  version may also carry its pre-reprojection geometry (`/native`) and
+  `valid_from` and `valid_to` times, which `GET .../features?valid_at=` filters on.
+
+### Merge
+
+Three-way merge from the common ancestor:
+
+1. Changes to different features merge automatically.
+2. One feature edited on both sides merges only when the two sides wrote
+   different property keys and neither touched the geometry or the validity
+   times.
+3. Anything else on one feature is a conflict: the same property key on both
+   sides, or a geometry change on either side.
+4. Geometries are compared as raw WKB bytes, so a change in vertex order or
+   precision counts. There is no tolerance.
+
+Conflicts can be resolved through `/api/v1/branches/{target}/merge/{source}/resolve`,
+per feature `ours`, `theirs`, `custom`, `delete` or `auto_merge`.
+
+### Your data is PostGIS
+
+Every feature version is a row in `feature_versions` with a GiST-indexed
+`geometry` column and a JSONB `properties` column. The `features` view resolves
+each branch to its current features, so psql, `ogr2ogr` and QGIS's PostGIS
+connector read it with no Ptolemy service running. Backup is `pg_dump`.
 
 ```sql
--- current features on a branch, plain SQL
 SELECT id, geometry, properties
 FROM features
 WHERE branch_id = '...'
-  AND ST_DWithin(geometry, ST_Point(7.42, 43.73)::geography, 500);
+  AND ST_DWithin(geometry, ST_Point(7.42, 43.73)::geography, 500)
 ```
 
-psql, GDAL/OGR (`ogr2ogr -f GPKG out.gpkg PG:"dbname=ptolemy" -sql "..."`), and
-QGIS's native PostGIS connector all work against the database as-is. Backup and
-restore is standard `pg_dump`/`pg_restore`. If you stop using Ptolemy, your data
-is already in the most widely supported spatial database there is.
+The view walks every branch's changeset chain before your `WHERE` filters it,
+so its cost grows with the whole instance's history. The API does not use it.
+It reads one branch's ancestor chain per query.
 
-One caveat for ad-hoc SQL: the `features` view walks the changeset chain of every
-branch in the database before your `WHERE branch_id = …` filters it, so its cost
-is set by total instance history, not by the branch you asked for. That is fine
-for interactive queries and wrong for a hot path — the API does not use the view,
-it builds the same rows from the one branch's ancestor chain per query. On an
-instance with 89k changesets, reading a 100-feature branch was 115 ms through the
-view and 8.9 ms branch-scoped.
+### External datasets: your existing PostGIS, read-only
 
-#### Browse your existing PostGIS read-only
-
-The reverse also works: point Ptolemy at tables you already have and browse them
-through the normal API and the viewer, without importing or copying anything.
-Register the relation as an *external dataset*:
+Register a table or view you already have and read it through the API and the
+viewer without copying it:
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/datasets \
@@ -173,214 +200,192 @@ curl -X POST http://localhost:3000/api/v1/datasets \
   }'
 ```
 
-Registration checks the relation exists, that the geometry column really is
-PostGIS geometry, and that Ptolemy can select from it, then creates the dataset
-and its `main` branch. From there the ordinary read endpoints work: feature
-listing and paging, bbox, CQL2 filters, OGC API - Features collections and
-items, GeoJSON/CSV export, vector tiles.
+Registration checks the relation exists, that the column is PostGIS geometry
+and that Ptolemy can select from it, then creates the dataset and its `main`
+branch. Feature listing and paging, bbox, CQL2, OGC items, GeoJSON and CSV
+export and vector tiles all work. Commits, merges, imports, QGIS push, branch
+creation and project attach answer 409.
 
-The dataset is read-only. Commits, merges, imports, QGIS push and branch
-creation all return 409. Non-geometry columns become the feature `properties`;
-each row's id is hashed into a stable UUID, and the original key stays in
-`properties`. Geometry not in EPSG:4326 is reprojected on read.
+Non-geometry columns become `properties`. Each row's id is hashed into a stable
+UUID and the original key stays in `properties`. Geometry is served in
+EPSG:4326.
 
-Every non-geometry column is published, and a `public` dataset serves reads to
-anonymous callers. Register a view that selects only the columns you want
-public, not a table with columns you don't. If the relation has columns that
-must stay internal, register it with `"visibility": "private"` as well — an
-external dataset is gated on read exactly like a versioned one (see
-[Access control](#access-control)).
+Every non-geometry column is published, and a `public` dataset is readable
+anonymously. Register a view that selects only the columns you want public, or
+register with `"visibility": "private"`.
 
-**An ordinary GiST index on the geometry column is all you need**, whatever the
-relation's SRID. Ptolemy exposes external geometry in EPSG:4326, so on a projected
-relation the read's own predicate sits on `ST_Transform(geom, 4326)`, which no
-index covers. Spatial reads therefore also push a second, index-served predicate
-onto the relation's own column in its own SRID: the query window is reprojected
-into that SRID and widened slightly, so it can only admit extra candidate rows,
-never drop one — the exact 4326 predicate still decides the result. On a 60k-row
-polygon table in EPSG:3857 that took bbox from 213 ms (sequential scan) to 63 ms
-(index scan), and a z6 tile from 268 ms to 18 ms. Covers bbox, intersects, within,
-vector tiles, OGC items and CQL2 spatial filters.
+An ordinary GiST index on the geometry column is enough in any SRID. Spatial
+reads (bbox, intersects, within, vector tiles, OGC items and CQL2 spatial
+filters) add a predicate on the relation's own column in its own SRID, using a
+slightly widened reprojected window, so the index serves it. That predicate is
+skipped for a window wider than 45 degrees or past 85 degrees latitude, and for
+a CQL2 spatial op under `or` or `not`.
 
-Two things it deliberately does not do. A window wider than 45° or reaching past
-±85° latitude is not reprojected at all (PROJ may reject it), so those near-global
-reads scan as before — they return most of the relation anyway. And a CQL2 spatial
-op under `or` or `not` is not pushed down, because a matching row need not satisfy
-it.
-
-Set `PTOLEMY_EXTERNAL_DATABASE_URL` to read external datasets from a different
-database than Ptolemy's own. Use a role with `SELECT` and nothing else:
-
-```sql
-CREATE ROLE ptolemy_ro LOGIN PASSWORD '...';
-GRANT CONNECT ON DATABASE yourdb TO ptolemy_ro;
-GRANT USAGE ON SCHEMA public TO ptolemy_ro;
-GRANT SELECT ON public.parcels TO ptolemy_ro;
-```
-
-Then the read-only guarantee is enforced by PostgreSQL, not only by Ptolemy.
-
-## Quick Start
+`PTOLEMY_EXTERNAL_DATABASE_URL` reads external datasets from another database.
+Give it a role with `SELECT` and nothing else, so PostgreSQL enforces the
+read-only part:
 
 ```bash
-# Prerequisites: PostgreSQL with PostGIS extension
-createdb ptolemy
-psql ptolemy -c "CREATE EXTENSION postgis;"
-
-# Run migrations. --database-url is a top-level flag, so it goes before the
-# subcommand, or set DATABASE_URL in the environment instead.
-ptolemy --database-url postgres://localhost/ptolemy migrate
-
-# Start the server
-ptolemy --database-url postgres://localhost/ptolemy serve
-
-# API is now available at http://localhost:3000/api/v1
-# Metrics at http://localhost:3000/metrics, admin token only
+psql yourdb -c "CREATE ROLE ptolemy_ro LOGIN PASSWORD '...'"
+psql yourdb -c "GRANT CONNECT ON DATABASE yourdb TO ptolemy_ro"
+psql yourdb -c "GRANT USAGE ON SCHEMA public TO ptolemy_ro"
+psql yourdb -c "GRANT SELECT ON public.parcels TO ptolemy_ro"
 ```
 
-## Container image
+## Access control
 
-Every push to `master` publishes `ghcr.io/geolang/ptolemy`, tagged `master` and
-`sha-<short-sha>`; a `v*` tag publishes that version plus `latest`. Pin to a
-`sha-` tag if you need a fixed API surface.
+With auth on, a request needs:
 
-```bash
-docker run -p 3000:3000 \
-  -e DATABASE_URL=postgres://ptolemy:ptolemy@db/ptolemy \
-  -e PLATFORM_JWT_SECRET=$(openssl rand -hex 32) \
-  ghcr.io/geolang/ptolemy:master
-```
+- no token for `GET`, `HEAD` and `OPTIONS`, and for the query POSTs:
+  `features/intersects`, `features/within`, `features/filter`, the point cloud
+  `query` and `profile`, and the FeatureServer `query`, `queryAttachments` and
+  `extractChanges`
+- any valid token for `/ws/`, `/permissions`, `/api/v1/workspaces`,
+  `/api/v1/projects` and `/api/v1/invitations/accept`
+- role `admin` for webhooks, audit, `/metrics`, the replication feed and peers,
+  a dataset's event history, and every PostGIS Topology route except `validate`
+- role `editor` or `admin` for everything else
 
-`DATABASE_URL` and `PLATFORM_JWT_SECRET` are the two it refuses to start without,
-the second unless `PTOLEMY_AUTH_DISABLED=true`. Everything else in
-[Configuration](#configuration) has a default.
+Per-dataset grants and dataset visibility then decide which data a request may
+touch. `PTOLEMY_AUTH_DISABLED=true` turns off both layers.
 
-`serve` applies migrations before it binds, so no separate `ptolemy migrate` step
-is needed. The image binds `0.0.0.0:3000` and answers `/api/v1/healthz` as soon
-as the process is up and `/api/v1/readyz` once the database is reachable; wait on
-`readyz` rather than `healthz` if you are about to issue requests.
+With auth on, attribution fields (`author`, `created_by`, `granted_by`) come
+from the token subject and the request body value is ignored.
 
-Pair it with `postgis/postgis:16-3.4`. The first migration declares a PostGIS
-`geometry` column, so a database without the extension fails to migrate; H3,
-pgRouting, SFCGAL and the rest are created if installed and skipped if not.
+### Tool tokens and API keys
 
-## Helm chart
+A token with `token_use: "tool"` carries a `scope` array and no `role`.
+`ptolemy:read` passes a read and `ptolemy:write` a write. It is refused on every
+admin-role route, on `/api/v1/workspaces`, `/api/v1/projects`,
+`/api/v1/invitations/accept` and `/api/v1/datasets/{id}/project`, so a delegated
+agent can use its subject's grants but cannot hand a project a grant. A token
+with both `role` and `token_use`, or an unknown `token_use`, is refused. Missing
+scope is `403`.
 
-`deploy/helm/ptolemy` runs the image against an in-cluster postgres, whose URL
-it builds from `postgresql.auth`.
+An API key from `ptolemy api-key create` is sent as
+`Authorization: Bearer ptk_...`. Its subject is `apikey:<row id>` and it runs
+with the role stored on the row.
 
-```bash
-helm install ptolemy deploy/helm/ptolemy
-```
+### Grants
 
-To use a database outside the cluster instead, put the whole `DATABASE_URL` in a
-secret and name it. The URL is then yours to write, so it can carry the
-`sslmode` and `sslrootcert` a managed database wants, and the password stays out
-of `values.yaml`.
+Grants are rows in `dataset_permissions` and `branch_permissions`, one per user
+per scope, with permission `read`, `write` or `admin`. A dataset attached to a
+project also grants by project role: `viewer` reads, `editor` writes, `owner`
+administers. The stronger of the explicit grant and the project role applies.
 
-```bash
-kubectl create secret generic ptolemy-database \
-  --from-literal=url='postgres://user:pass@host/ptolemy?sslmode=verify-full'
+The `/permissions` routes admit an instance `admin`, an `admin` grant on the
+dataset, or the `owner` of the dataset's project, and that covers the dataset's
+branches too. Anyone else gets `403`, or `404` for a private dataset they cannot
+read. A branch-level `admin` grant does not let its holder manage grants.
 
-helm install ptolemy deploy/helm/ptolemy \
-  --set externalDatabase.existingSecret=ptolemy-database
-```
+Revoking a dataset's last `admin` row is refused for everyone, including
+instance admins and a project owner, so grant a replacement first. Revoking the
+last row of any other kind is allowed and leaves the dataset denying writes.
 
-The key defaults to `url`, and `externalDatabase.existingSecretKey` changes it.
-`postgresql.auth` goes unread once the secret is named.
+`/permissions/{user}/check?required=read|write|admin` answers with the same
+rules the write and read checks use.
 
-## Database TLS
+### Writes
 
-Ptolemy is built with rustls, so it can connect to a PostgreSQL server that
-requires TLS. Which protection you get is decided entirely by the `sslmode`
-parameter on `DATABASE_URL`, and the default is `prefer`: try TLS, and drop back
-to a plaintext socket if the server will not do it. That is what makes the local
-PostGIS container and the test database work with no query string at all.
+Commit, batch commit, every merge, imports, QGIS push, WFS transaction, sync
+push, branch creation, repair and compaction check:
 
-For anything not on localhost, put `sslmode=verify-full` on the URL. Beware
-`sslmode=require`, which is what most hosting providers tell you to paste: it
-encrypts the connection but accepts any certificate the server offers, including
-one from an attacker in the middle, and it stays that way even if you also set
-`sslrootcert`. Only `verify-ca` and `verify-full` check the certificate, and only
-`verify-full` checks that the hostname matches it.
+1. An `admin` role token passes.
+2. If the target branch has permission rows, the caller needs `write` or
+   `admin` on that branch. A dataset grant does not reach into it.
+3. Otherwise the caller needs `write` or `admin` on the dataset, as a row or
+   through its project.
 
-The Mozilla root bundle is compiled into the binary, so a provider whose
-certificate chains to a public CA needs nothing more than `verify-full`. Neon is
-one of those. Amazon RDS is not: it signs with Amazon's own RDS roots, which no
-public root store carries. Give it the bundle explicitly.
+Denial is `403`. Creating a dataset with auth on grants its creator `admin`. A
+dataset with no rows and no project is writable by instance admins only.
+Compute-only POSTs, such as geoprocessing, 3D, network analysis and similarity
+search, need the `editor` role and no grant.
 
-```
-DATABASE_URL=postgres://user:pass@host/ptolemy?sslmode=verify-full&sslrootcert=/etc/ssl/rds-global-bundle.pem
-```
+### Dataset visibility
 
-The container image ships that bundle at `/etc/ssl/rds-global-bundle.pem`, pulled
-from `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem` at build
-time. Running the binary outside the image means downloading it yourself and
-pointing `sslrootcert` wherever you put it. `sslrootcert` adds to the compiled-in
-roots rather than replacing them, so the same binary still verifies public CAs.
-`PTOLEMY_EXTERNAL_DATABASE_URL` takes the same parameters and needs its own copy
-of them. On the Helm chart the URL carrying them is the one in
-`externalDatabase.existingSecret`.
+Each dataset is `public` (the default) or `private`. Set it on create or with
+`PATCH /api/v1/datasets/{id}` as an instance admin, a dataset admin or the
+project owner.
 
-## Configuration
+A `private` dataset's content and everything derived from it (features,
+queries, OGC items, exports, tiles, history, diff, H3, similarity, QGIS,
+geoprocessing, analytics, sync pull and the vertical listings) needs an
+instance admin token, any grant on the dataset or one of its branches, or any
+role on its project. Otherwise it answers `404`, so ids cannot be probed.
+External datasets are covered the same way. Listings leave it out: `/api/v1/datasets`,
+`/api/v1/catalog/search`, `/api/v1/ogc/collections`, `/api/v1/stac/collections`
+and `/api/v1/qgis/datasets`.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection URL | (required) |
-| `PLATFORM_JWT_SECRET` | JWT signing secret, 32+ bytes (required to serve) | (required) |
-| `PTOLEMY_AUTH_DISABLED` | Set to `true` to serve with auth off | `false` |
-| `PTOLEMY_OIDC_ISSUER_URL` | Keycloak realm URL. The authorize, token and userinfo URLs are built from it as `{issuer}/protocol/openid-connect/…`, with no discovery document read, so a provider that spells those paths differently does not work | (disabled) |
-| `PTOLEMY_OIDC_CLIENT_ID` | OAuth2 client ID | — |
-| `PTOLEMY_OIDC_CLIENT_SECRET` | OAuth2 client secret | — |
-| `PTOLEMY_OIDC_REDIRECT_URL` | Callback URL for OIDC flow | — |
-| `SMTP_URL` | SMTP relay for invitation email, e.g. `smtp://user:pass@mail.example.com:587?tls=required` | (no email) |
-| `SMTP_FROM` | Sender address on invitation email | (no email) |
-| `PUBLIC_BASE_URL` | Where the viewer is served, used to build the invitation link | (no email) |
-| `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets; use a read-only role | (primary pool) |
-| `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
-| `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
-| `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger a planner-statistics refresh; `0` leaves it to autoanalyze | 1000 |
-| `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept; `0` keeps them forever | 30 |
+Raster tiles are not covered. `GET /api/v1/stac/search` returns tile ids and
+bounds from `raster_tiles` without naming a dataset.
 
-### Planner statistics after a bulk import
+## Workspaces and projects
 
-Every branch read walks the changeset ancestor chain, and postgres picks that
-plan from the statistics it holds for `feature_versions`, `changesets` and
-`branches`. Straight after an import those statistics still describe an empty
-database, so reads get a plan sized for an empty table and cost tens of
-milliseconds each until autoanalyze catches up, minutes later. A write that
-touches at least `PTOLEMY_ANALYZE_ROW_THRESHOLD` rows therefore runs `ANALYZE`
-on those three tables once it has committed, off the request path, and
-concurrent bulk writes share one run. It cannot fail or delay a write: if the
-database refuses the `ANALYZE`, for instance because the connecting role does
-not own the tables, the failure is logged and autoanalyze takes over.
+`/api/v1/workspaces` holds workspaces, `/api/v1/workspaces/{id}/projects` their
+projects, and `/api/v1/projects` lists projects across the caller's
+workspaces. Roles are `owner`, `editor` and `viewer`. Workspace membership is
+inherited by its projects, a direct project membership grants that project
+only, and the higher role wins. Owners manage members and invitations and
+delete. Editors update metadata and create projects. Viewers read.
 
-With auth on, attribution fields (`author`, `created_by`, `granted_by`) are taken
-from the token subject and the value in the request body is ignored. With
-`PTOLEMY_AUTH_DISABLED=true` there is no token, so the body value is recorded
-as-is.
+Invitations are created at `/api/v1/workspaces/{id}/invitations` or
+`/api/v1/projects/{id}/invitations`, grant `editor` or `viewer`, expire, and are
+accepted by an authenticated caller at `POST /api/v1/invitations/accept`. The
+token is returned once at creation and stored as a SHA-256 hash.
+
+With `SMTP_URL`, `SMTP_FROM` and `PUBLIC_BASE_URL` set, the create body takes an
+optional `email` and the reply carries `email: {"status": "sent"}` or
+`{"status": "failed", "error": ...}` beside the token. Sending happens on the
+request. With any of the three unset, `email` is a 400 and
+`GET /api/v1/capabilities` answers `{"email_configured": false}`.
+
+Project roles do not reach Agora documents.
+
+### Project state and attachments
+
+`GET` and `PUT /api/v1/projects/{id}/state/{key}` store one JSON value per key,
+up to 5 MB, last write wins. A read answers `{value, updated_at, updated_by}`.
+ViewTopia keeps its map under `map` and its dashboards under `dashboards`.
+
+`/api/v1/projects/{id}/attachments` holds the files that state refers to, up to
+32 MiB per upload. Viewers read, editors write. `/api/v1/attachments/{id}`
+refuses a project attachment.
+
+### Datasets in projects
+
+`PUT /api/v1/datasets/{id}/project` with `{"project_id": "..."}` attaches a
+dataset to one project, and `DELETE` detaches it. Attaching needs an `admin`
+grant on the dataset and `editor` or `owner` on the destination project, and
+asks nothing of the project it leaves. Detaching needs either one. A project the
+caller is not in answers `404`. `expected_project_id` in the body answers `409`
+if the dataset moved since the caller read it.
+
+Attaching makes the dataset `private` unless it was already in that project.
+Detaching leaves it `private`. Project roles join the dataset scope only, so a
+branch with its own rows still decides its own writes. An external dataset
+cannot be attached. `project_id` is on every dataset read and ignored on create.
+
+## Dataset schema
+
+`PUT /api/v1/datasets/{id}/schema` sets typed fields with `required`,
+`allowed_values`, `min` and `max`. `POST /api/v1/branches/{id}/commit` and
+ArcGIS `applyEdits` refuse properties that break it. Batch commit, imports, sync
+push and the QGIS writes do not check it, and `geometry_rules` are stored and
+never checked.
 
 ## Audit log
 
-Every mutation that answered 2xx writes one row: the token subject, the method
-and matched route, the dataset or branch the write ladder checked it against, the
-request path, and when. Reads are not recorded. `GET /api/v1/audit` reads it
-back, `limit` and `actor`, instance admin only.
-
-The query string is never recorded. On the ArcGIS facade it carries the caller's
-token, and this table is served over HTTP.
-
-The row is written after the response is built, so a database that refuses it
-logs and moves on rather than failing the write that was already made. The
-`ip_address` column is left empty: the only source would be a caller-settable
-header, and a spoofable value in an audit column is worse than none.
+Every mutation that answered 2xx writes one row: token subject, method, matched
+route, the dataset or branch the write check used, request path and time. Reads
+are not recorded, and neither is the query string, which on the ArcGIS routes
+carries a token. `GET /api/v1/audit?limit=&actor=` reads it, admin only. The row
+is written after the response, so a failed insert is logged and the write
+stands. `ip_address` is always empty.
 
 ## Webhooks
 
-`POST /api/v1/datasets/{id}/webhooks` subscribes a url to a dataset's events,
-instance admin only, because a subscription takes dataset content to a url of the
-subscriber's choosing. `events` selects the types to receive and an empty array
-takes all of them:
+`POST /api/v1/datasets/{id}/webhooks` subscribes a URL to a dataset's events,
+admin only. `events` selects types and an empty array takes all:
 
 | Event | Raised by |
 |-------|-----------|
@@ -389,453 +394,135 @@ takes all of them:
 | `branch_created` | a new branch |
 | `schema_changed` | `PUT /api/v1/datasets/{id}/schema` |
 
-`POST /api/v1/datasets/{id}/events` emits a custom type, delivered the same way.
-The four above are refused there with 400: a `commit` on the wire always came
-from a real commit.
+`POST /api/v1/datasets/{id}/events` emits a custom type and refuses those four
+with 400.
 
-An event row is written in the same transaction as the change that raised it,
-together with one queued delivery per matching subscription, so a subscriber is
-told about exactly what committed. The worker starts with the server and drains
-that queue: `POST` with `X-Ptolemy-Event`, `X-Ptolemy-Delivery` and, where the
-subscription has a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact
-body sent. Verify that before trusting a payload. A failed attempt is retried
-with a doubling backoff, five attempts in all, after which the row stays with its
-last error for an admin to read. The secret is never returned by any endpoint.
+The event and one delivery per matching subscription are written in the
+transaction of the change that raised them. A worker started by `serve` posts
+each with `X-Ptolemy-Event`, `X-Ptolemy-Delivery` and, when the subscription has
+a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact body. It retries
+with a doubling backoff, five attempts in all, and then leaves the row with its
+last error. No endpoint returns the secret.
 
-Every commit writes an event row and one delivery row per subscription, so the
-worker also retires what it is finished with, once an hour. A delivery goes
-`PTOLEMY_EVENTS_RETENTION_DAYS` after it was delivered, or after the last attempt
-that gave up on it; an event goes once it is that old and no delivery still needs
-it. A delivery still in the retry ladder is never touched, and neither is the
-event behind it. Each sweep deletes in bounded batches, so it never holds a long
-transaction, and what it does not reach waits for the next hour. Set the variable
-to `0` to keep both tables forever, and prune them yourself.
+Once an hour the worker deletes deliveries settled more than
+`PTOLEMY_EVENTS_RETENTION_DAYS` ago, then events no pending delivery needs, in
+bounded batches.
 
 ## ArcGIS FeatureServer
 
-Point an Esri client at `/arcgis/rest/services` and it sees a FeatureServer.
-Each dataset is one single-layer service, `{service}` is the dataset name or its
-uuid, the layer is always id 0, and everything runs on the dataset's `main`
-branch. Dataset visibility applies exactly as it does to the other read routes.
+Point an Esri client at `/arcgis/rest/services`. Each dataset is a single-layer
+service named by its name or uuid, the layer id is always 0, and every request
+runs on `main`. Visibility applies as on the other read routes. Datasets whose
+`geometry_type` is `geometry` or `geometry_collection` are not served. The
+routes answer permissive CORS.
 
-Query supports `where` (the SQL-92 subset Esri clients send: comparisons, `IN`,
-`LIKE`, `BETWEEN`, `IS NULL`, boolean logic and `DATE` literals), `objectIds`,
-`outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`,
-`orderByFields` over any field with `ASC` or `DESC`,
-`resultOffset`/`resultRecordCount` paging with `exceededTransferLimit`, an
-`esriGeometryEnvelope` + `esriSpatialRelIntersects` filter, `outSR` and `inSR`
-as 4326 or Web Mercator (3857/102100), and `f=json`, `f=pjson` or `f=geojson`.
-`returnDistinctValues` answers the distinct values of the fields `outFields`
-names, and `outStatistics` with `groupByFieldsForStatistics` answers `count`,
-`sum`, `min`, `max`, `avg`, `stddev` and `var`. Both of those answer attributes
-and no geometry, page the way rows do, and take an `orderByFields` over the
-columns they return. `having` (or `havingClause`, the two names Esri's own
-docs and JS API use) filters the grouped answer, in the same grammar as `where`.
-It names aggregates rather than rows: `COUNT(houses) > 1000`,
-`AVG(pop) >= 20 AND MIN(score) >= 5`, over the same seven functions
-`outStatistics` offers. An aggregate it names need not be in `outStatistics`, and
-one that is not is computed to filter the groups and not served back.
-`COUNT(*)` and `COUNT(1)` count rows, `COUNT(field)` counts the values that are
-there. Naming a projected column instead, by its grouped field name or its
-`outStatisticFieldName`, also works as an extension. It needs both
-`outStatistics` and `groupByFieldsForStatistics`, and ordering and paging apply
-after it. Anything else it cannot honor is refused rather than ignored. Refusals
-follow the Geoservices convention: HTTP 200 with an `{"error": {...}}` body.
+### Query
 
-Two divergences worth knowing on the aggregated shapes: `returnDistinctValues`
-needs `outFields` to name its fields, because Esri's answer for `*` is the whole
-table back under a different name, and a distinct or grouped row carries an
-object id only when the client asked for that field, because no one feature is
-behind it.
+- `where` in the SQL-92 subset Esri clients send: comparisons, `IN`, `LIKE`,
+  `BETWEEN`, `IS NULL`, boolean logic and `DATE` literals
+- `objectIds`, `outFields`, `returnGeometry`, `returnCountOnly`, `returnIdsOnly`
+- `orderByFields` over any field, `ASC` or `DESC`
+- `resultOffset` and `resultRecordCount`, with `exceededTransferLimit`
+- `esriGeometryEnvelope` with `esriSpatialRelIntersects`
+- `inSR` and `outSR` as 4326 or Web Mercator (3857 or 102100)
+- `f=json`, `f=pjson` or `f=geojson`
+- `returnDistinctValues`, which needs `outFields` to name its fields
+- `outStatistics` with `groupByFieldsForStatistics`: `count`, `sum`, `min`,
+  `max`, `avg`, `stddev` and `var`
+- `having` or `havingClause`, which needs both of the above and names
+  aggregates, e.g. `COUNT(houses) > 1000 AND AVG(pop) >= 20`. An aggregate
+  need not be in `outStatistics`. `COUNT(*)` counts rows, `COUNT(field)` non-null
+  values. A grouped field name or an `outStatisticFieldName` also works.
+  Ordering and paging apply after it.
 
-`applyEdits` writes: the whole batch becomes one commit on `main` and any
-failure refuses all of it. Layers need a real integer `objectid` field to be
-editable.
+Distinct and grouped answers carry attributes and no geometry, page like rows,
+take `orderByFields` over their own columns, and carry an object id only when
+`outFields` names it. A parameter the facade cannot honor is refused, as HTTP
+200 with an `{"error": {...}}` body.
 
-Credentials on these routes: `Authorization: Bearer <jwt>` as everywhere else,
-then `X-Esri-Authorization: Bearer <jwt>`, which is where an Esri-ecosystem
-client such as verne puts its token, then a `token` request parameter, for a
-browser-hosted client that can send no header at all. The first one present wins.
-Both of the extra forms are read under `/arcgis/rest/services` and nowhere else,
-and neither grants anything the standard header would not: the token still needs
-the role and the grant for what it is asking.
+### Edits and attachments
 
-Attachments are served and edited through the Esri routes (per-feature list and
-download, `queryAttachments`, multipart `addAttachment`/`updateAttachment`/
-`deleteAttachments`), with the writes gated like `applyEdits`.
+`applyEdits` makes the batch one commit on `main`, and any failure refuses all
+of it. Only a layer with a real integer `objectid` field takes edits.
 
-`extractChanges` answers what changed on `main` since a generation the client
-already holds. A layer's generation is a point on its own event clock: the epoch
-milliseconds of the latest thing that happened on `main`, which is the newest of
-the head changeset's time and the times attachments on the branch were created and
-deleted at, and 0 for a branch nothing has happened to. The service root states
-`ChangeTracking` among its capabilities and publishes
-`changeTrackingInfo.layerServerGens`, and a client sends that number back.
+Attachments: per-feature list and download, `queryAttachments`, and multipart
+`addAttachment`, `updateAttachment` and `deleteAttachments` up to 32 MiB, the
+writes gated like `applyEdits`. A delete sets `deleted_at` and keeps the bytes,
+and every read, here and under `/api/v1`, skips deleted rows.
 
-A clock rather than a count of commits, because uploading an attachment commits no
-changeset. A count left every attachment invisible to the cursor: a client that
-loaded features in one commit and then uploaded the attachments recorded a
-generation whose changeset predated all of them, so the next delta reported them
-all as adds and duplicated them, while one deleted later was created and deleted
-inside that same window and was reported in neither list, staying forever.
+A layer with an `objectid` also publishes a virtual `globalid` field
+(`esriFieldTypeGlobalID`, named by `globalIdField`): the feature uuid in upper
+case in braces. `outFields` and `where` (`=` and `IN`, braces and case optional)
+accept it. `applyEdits` drops a client-supplied `globalid`.
 
-The job is stateless: `POST extractChanges` with `layers=0` and
-`layerServerGens=[{"id": 0, "serverGen": <n>}]` answers a `statusUrl`, the status
-answers `Completed` with a `resultUrl` on the first ask, and the change file holds
-the object ids of the rows added, updated and deleted in the window. A window is
-half open, `(<n>, the clock at the submit]`: the features in it are the diff from
-the deepest changeset at or before `<n>`, which is the newest state the client
-already held, to the head the submit pinned. Both ends are fixed at the submit, so
-anything landing between the submit and the fetch belongs to the next window, and
-the generation the change file reports is where that next one opens. A job id is
-opaque and carries the whole request, so nothing is stored server side, and one
-this service did not issue is refused rather than answered.
+### Credentials
 
-A generation below the layer's first commit is refused naming the floor, and so is
-one ahead of its clock. Both are cursors this service's clock could not have
-issued: in particular a cursor recorded when generations counted commits is a small
-number, which as a clock reading is 1970 and would open a window before the layer
-existed and report everything in it as an add. The refusal says to extract the
-layer in full and record the generation that answer carries. Generation 0 is not
-one of those, being the clock an untouched branch publishes and a full extraction.
+`Authorization: Bearer <jwt>` first, then `X-Esri-Authorization: Bearer <jwt>`,
+which verne sends, then a `token` query parameter for a browser client that can
+send no header. The last two are read under `/arcgis/rest/services` only and
+carry the same grants. The request log redacts `token`.
 
-Only a layer with a real integer `objectid` publishes any of that, for the same
-reason only such a layer takes edits, and neither does a dataset whose rows come
-from a table ptolemy does not own, whose rows change outside ptolemy's history.
-Features in a change file carry the object id and no geometry, because a client
-fetches the rows themselves through `/query`. `dataFormat=sqlite`, the positional
-`serverGens` form and a `returnInserts`/`returnUpdates`/`returnDeletes` of
-`false` are refused by name.
+### extractChanges
 
-A change file reports attachment changes over that same window. An attachment
-created inside it and still there when it closed is an add carrying `attachmentId`,
-`globalId`, `parentGlobalId`, `contentType`, `name`, `size` and an absolute `url`
-to fetch the bytes from; one already there when it opened that went inside it is an
-attachment global id in `deleteIds`; one created and deleted inside it is in
-neither, because the client never held it. `updates` is always empty, since
-replacing an attachment here is a delete and an upload.
+A layer's generation is the epoch milliseconds of the newest of the head
+changeset's time and the times attachments on `main` were created or deleted, or
+0 for an empty branch. An attachment upload commits no changeset, which is why
+the generation is a time and not a commit count. The service root lists
+`ChangeTracking` and publishes `changeTrackingInfo.layerServerGens`.
 
-Every comparison is on the one clock, so the boundary is exact: a changeset's time
-and an attachment's both come from the database, and an instant is always the same
-generation, being truncated to the millisecond rather than rounded.
+`POST extractChanges` with `layers=0` and
+`layerServerGens=[{"id": 0, "serverGen": <n>}]` answers a `statusUrl`, whose
+first answer is `Completed` with a `resultUrl`. The change file lists the object
+ids added, updated and deleted in the window `(<n>, generation at submit]`,
+which is the diff from the newest changeset at or before `<n>` to the head at
+submit. Its generation opens the next window. The job id encodes the request,
+nothing is stored, and a job id this service did not issue is refused.
 
-Deleting an attachment is a soft delete: the row keeps its bytes and gains a
-`deleted_at`, which is what a change file diffs. Every read filters tombstones
-out, on the Esri routes and on `/api/v1` alike, so a deleted attachment is gone
-from every listing, download and metadata read and a second delete is refused as
-not found.
+A generation below the layer's first commit or ahead of its current one is refused
+with a message to extract the layer in full. Change files carry object ids and
+no geometry, so fetch rows through `/query`. Refused by name: `dataFormat=sqlite`,
+the positional `serverGens` form, and `returnInserts`, `returnUpdates` or
+`returnDeletes` set to `false`. A layer without a real `objectid`, and an
+external dataset, publish no change tracking.
 
-A layer with a real `objectid` also publishes a virtual `globalid` field, declared
-as `esriFieldTypeGlobalID` and named by `globalIdField`. Its value is the feature's
-own uuid as a guid in braces and upper case, which is the shape Esri clients and
-verne expect. `/query` serves it, `outFields` may name it, and `where` filters by
-it: `globalid = '{...}'` and `globalid IN ('{...}', ...)` both work, with or
-without the braces and in any case, which is how a consumer resolves the parent
-feature of an attachment that did not itself change. It is not a property and
-`applyEdits` never writes one: a client-supplied `globalid` attribute is dropped,
-as a client-supplied object id on an add is. A row-number layer publishes no
-`globalIdField`, for the same reason it takes no edits.
+Attachment changes use the same window. One created inside it and still present
+is an add with `attachmentId`, `globalId`, `parentGlobalId`, `contentType`,
+`name`, `size` and an absolute `url`. One present at the start and deleted
+inside it is a global id in `deleteIds`. One created and deleted inside it is in
+neither. `updates` is always empty, since replacing an attachment is a delete
+and an upload.
+
+### Symbology
 
 Layer metadata carries `drawingInfo` when the dataset has a symbology rule whose
-symbol is tagged `{"format": "esri-drawing-info"}`, which is what verne writes
-when it migrates a hosted feature layer. The stored document is served back
-verbatim, so an Esri client draws migrated data the way the original service did.
-A dataset with no such rule has no `drawingInfo` key at all.
-`GET /api/v1/datasets/{id}/style` translates that same document into Mapbox GL
-layers for non-Esri clients, with `source` and `sourceLayer` overridable by query
-parameter and everything the translation could not carry over listed under
-`losses`. `images` carries the bitmaps a picture marker or fill inlines, keyed by
-the name the layers reference them under and each holding a `data_uri`, a `width`
-and a `height` in CSS pixels: the consumer registers them before the layers draw.
-The key is always present, empty for a style with no pictures in it.
+symbol is tagged `{"format": "esri-drawing-info"}`, which verne writes when it
+migrates a hosted feature layer. It is served back verbatim.
 
-Not served: datasets whose `geometry_type` is `geometry` or
-`geometry_collection`, which have no single Esri layer type.
-
-## Access control
-
-Two layers. The token's `role` claim decides what kind of request you may make
-at all: `viewer` reads, `editor` writes, `admin` also reaches config, ACL,
-membership, audit and `/metrics`. Per-dataset grants then decide *which* data
-you may touch. Both are off entirely with `PTOLEMY_AUTH_DISABLED=true`, which is
-why that mode is for development only.
-
-Grants are rows in `dataset_permissions` and `branch_permissions`, one per user
-per scope, with permission `read`, `write` or `admin` (admin > write > read).
-
-A dataset attached to a project has a second source of grants: the caller's
-effective role on that project, mapped `viewer` to `read`, `editor` to `write`,
-`owner` to `admin`. See [project grants](#project-grants). A dataset attached to
-no project decides on its rows alone.
-
-### Tool tokens
-
-A token with `token_use: "tool"` carries no `role` claim and a `scope` array
-instead. `ptolemy:read` passes a read and `ptolemy:write` passes a write, and a
-route that needs the instance `admin` role is refused whatever the scopes say,
-as are `/api/v1/workspaces`, `/api/v1/projects`,
-`/api/v1/invitations/accept` and `/api/v1/datasets/{id}/project`. That is what a
-delegated agent holds: it can read and write the datasets its subject has grants
-on, and it cannot hand a project's whole membership a grant. A token carrying
-both `role` and `token_use`, or a `token_use` this service does not know, is
-refused. Missing scope is `403`.
-
-An API key from `ptolemy api-key create` is the other non-JWT bearer. It is sent
-as `Authorization: Bearer ptk_...`, its subject is `apikey:<row id>`, and it
-runs with the role stored on the row.
-
-### Who manages grants
-
-The `/permissions` endpoints need a valid token but not the `admin` role, because
-delegation is per dataset. A caller gets in if it holds the instance `admin` role,
-an `admin` grant on the dataset in question, or the `owner` role on the project
-the dataset is attached to — any of which also covers grants on that dataset's
-branches. Anything else is `403` (or `404` if the dataset is private and the
-caller cannot read it, so ids are not confirmed).
-
-A branch-level `admin` grant does **not** carry delegation: it would let a branch
-grantee widen their own scope.
-
-A dataset with no rows and no project has no dataset admin, so only an instance
-admin can make the first grant. Normally the creator auto-grant supplies one.
-
-Revoking the dataset's last `admin` row is refused, for everyone including
-instance admins, because it would leave nobody able to manage its grants. Grant
-a replacement first, then revoke. Stepping down as owner is grant-then-revoke,
-in that order.
-
-Revoking the last row of any other kind is allowed: it leaves the dataset with
-no rows, which denies every write rather than opening one. Branch rows have no
-rule of their own either, removing them all falls back to the dataset scope.
-
-The last-admin rule counts rows only. A project owner who administers the dataset
-through its project does not satisfy it, so revoking the last `admin` row is
-refused even then.
-
-### Writes
-
-On commit, batch commit, merge (plain, review and conflict-resolving),
-GeoJSON/CSV import, QGIS push, WFS transaction, sync push, branch creation,
-repair and compaction:
-
-1. An `admin` role token bypasses per-dataset grants.
-2. Otherwise, if the target **branch** has any permission rows, the caller needs
-   `write` or `admin` **on that branch**. A dataset-level grant does not reach
-   into a branch that has its own rows.
-3. Otherwise the caller needs `write` or `admin` on the **dataset**, either as a
-   row or as what their role on the dataset's project carries.
-
-Denial is `403`. A write needs a grant: a dataset with no rows and no project
-denies everyone except an `admin` role token, which is who makes its first grant.
-Creating a dataset with auth on inserts an `admin` row for the creator, so a new
-dataset is owned from the moment it exists.
-
-Datasets created before that auto-grant, or with auth off, have no rows. The
-`027` migration gives each of them an admin grant for its `created_by`. It skips
-a `created_by` that is blank or a machine label (`unknown`, `system`, `cli`, a
-connector name), because those are not identities anyone holds a token for:
-those datasets are writable by instance admins only until one of them grants.
-
-A grant lets you write, whether it is an explicit row or the one a project role
-carries, and the `/permissions/{user}/check` endpoints answer with the same
-ladder: a `write` or `admin` check on a branch that has rows of its own ignores
-dataset grants, exactly as the write does. A
-`read` check is the visibility question instead, which a grant on the dataset
-answers whatever the branch holds. `required` takes `read`, `write` or `admin`
-and nothing else. The unused org layer (`organizations`, `org_members`,
-`datasets.org_id`) was dropped in migration `028`.
-
-### Reads: dataset visibility
-
-Each dataset has `visibility`, `public` (the default) or `private`. Set it on
-create, or later with `PATCH /api/v1/datasets/{id}` (instance admin, an `admin`
-grant on that dataset, or `owner` on its project).
-
-`public` keeps today's behavior: reads are anonymous, no token needed.
-
-For `private`, every read that serves the dataset's content needs an instance
-admin token, a caller holding *any* grant (`read`, `write` or `admin`) on the
-dataset or on one of its branches, or any role on the project the dataset is
-attached to. That covers feature listing and get, spatial and CQL2 queries, OGC
-items, GeoJSON/CSV export, MVT tiles, history, diff, temporal queries, H3,
-similarity search, QGIS pull and layer definition, geoprocessing and analytics
-reads, sync pull, and the vertical listings — the check runs before the handler,
-keyed on every id the request names. External datasets are covered the same way.
-
-Unauthorized private reads answer `404`, not `403`, so a dataset id cannot be
-confirmed by probing.
-
-Enumeration is gated by the same rule, so a private dataset is simply absent
-from `GET /api/v1/datasets`, `/api/v1/catalog/search`, `/api/v1/ogc/collections`,
-`/api/v1/stac/collections` and `/api/v1/qgis/datasets` for a caller with neither
-a grant nor a role on its project. The filter is a SQL predicate applied inside
-each query, so a paged search's `limit` counts only rows the caller may see.
-
-Raster tiles are not covered: `GET /api/v1/stac/search` returns tile ids and
-bounds from `raster_tiles` without naming a dataset, and raster catalogs have no
-visibility of their own yet.
-
-Two more reads are open to anyone, for the same reason: the check is keyed on the
-ids a request names, and neither request names a dataset. The PostGIS Topology
-reads under `/api/v1/topologies/{name}` are keyed by topology name, and
-`GET /api/v1/replication/peers` names nothing at all.
-
-## Workspaces and projects
-
-The server-backed collaboration API is authenticated. Workspaces are available
-at `/api/v1/workspaces`, and their projects are nested at
-`/api/v1/workspaces/{workspace_id}/projects`. The flat
-`/api/v1/projects` routes list and address projects across the caller's
-workspaces. Workspace and project metadata use `GET`, `POST`, `PUT`, and
-`DELETE` routes as applicable.
-
-Workspace and project members use `/members` routes. Workspace access is
-inherited by its projects. A direct project membership can grant project-only
-access. If both memberships apply, the highest role wins. The roles are
-`owner`, `editor`, and `viewer`.
-
-Owners manage members and invitations and can delete the workspace or project.
-Editors update workspace or project metadata and create projects. Viewers have
-read-only access. Member changes use `PUT` and `DELETE` on
-`/api/v1/workspaces/{workspace_id}/members/{user_id}` or
-`/api/v1/projects/{project_id}/members/{user_id}`.
-
-Workspace invitations use `GET` and `POST` at
-`/api/v1/workspaces/{workspace_id}/invitations`. Project invitations use the
-same methods at `/api/v1/projects/{project_id}/invitations`. Owners revoke
-invitations with `DELETE` on the invitation route. Each invitation token uses
-32 random bytes. The server stores only its SHA-256 hash. Invitations expire
-and can grant `editor` or `viewer`, not `owner`. An authenticated caller accepts
-one with `POST /api/v1/invitations/accept`. The API returns the token when the
-invitation is created, and has no user directory.
-
-Set `SMTP_URL`, `SMTP_FROM` and `PUBLIC_BASE_URL` and the create-invitation body
-takes an optional `email`, which is where the link is mailed. The reply then
-carries `email: {"status": "sent"}` or
-`email: {"status": "failed", "error": ...}` beside the token, so a relay that
-refused the message still leaves a link to copy. Sending happens on the request
-path, not in a worker. With any of the three unset, an `email` in the body is a
-400 rather than a silent drop, and `GET /api/v1/capabilities` answers
-`{"email_configured": false}` so a client knows not to offer the field.
-
-Project roles are not propagated to Agora documents.
-
-### Project state and attachments
-
-A project holds the state its members share, one JSON value per key, at
-`GET` and `PUT /api/v1/projects/{id}/state/{key}`. A viewer reads and an editor
-writes. An unset key answers 404, a value over 5 MB answers 413, and a read
-answers `{value, updated_at, updated_by}` so a client can tell whose write it is
-looking at. Last write wins, and the value is opaque to the server: ViewTopia
-keeps its map snapshot under `map` and its dashboards under `dashboards`.
-
-The binary files that state refers to are project attachments, at
-`GET`/`POST /api/v1/projects/{id}/attachments` and
-`GET`/`DELETE /api/v1/projects/{id}/attachments/{attachment_id}`, again editor
-for the writes and viewer for the reads. A project attachment belongs to no
-dataset, so the per-dataset visibility layer and the write ladder have nothing
-to weigh it against: `/api/v1/attachments/{id}` refuses one, and these routes
-with their project role check are the only way to it.
-
-### Project grants
-
-A dataset can belong to one project, and every member of that project then
-reaches it without a grant of their own: `viewer` reads, `editor` writes, `owner`
-administers. Where a caller also holds an explicit grant, the stronger of the two
-stands, in both directions: an explicit `write` lets a project viewer commit, and
-an explicit `read` does not stop a project owner from managing grants.
-
-The effective project role is the higher of the caller's project membership and
-the workspace membership they inherit, the same rule the metadata routes use.
-
-`PUT /api/v1/datasets/{id}/project` with `{"project_id": "..."}` attaches, and
-`DELETE` on the same route detaches. Attaching needs an `admin` grant on the
-dataset *and* `editor` or `owner` on the project, so neither half of the change
-can be made alone. A project the caller is not a member of answers `404`.
-Detaching needs either half: the dataset's own admin undoes an attach without
-joining the project, and an editor on the project drops a dataset without a
-grant on it.
-
-Moving a dataset from one project to another asks nothing of the project it
-leaves. An `admin` grant on the dataset and `editor` on the destination is the
-whole bar, and the losing project is told by the dataset's `project_id`
-changing.
-
-The attach body takes an optional `expected_project_id`: the project the caller
-believes the dataset is in right now. Naming it refuses the attach with `409`
-when the dataset moved in between, so two callers racing to place the same
-dataset cannot silently overwrite each other. Leaving it out attaches whatever
-the dataset currently belongs to.
-
-Both methods refuse a tool token, the same refusal every `/api/v1/projects`
-route gives one: handing a project's whole membership a grant is not a
-delegated-agent operation.
-
-A dataset carries `project_id`, `null` when it belongs to no project, and
-`GET /api/v1/datasets/{id}` and `GET /api/v1/datasets` both report it to anyone
-who may read the dataset. It is read-only: `POST /api/v1/datasets` ignores it, so
-attaching always goes through the route above and its project-role check.
-
-Attaching sets the dataset's `visibility` to `private` in the same transaction:
-a project's data readable by anyone who asks is not what attaching it meant.
-Attaching a dataset to the project it is already in leaves the visibility alone,
-so a project dataset an admin deliberately published is not re-hidden by a
-repeated attach. Detaching leaves it `private`, so losing a project cannot
-publish its data. A dataset admin flips it back with
-`PATCH /api/v1/datasets/{id}`.
-
-Branch grants are unaffected. A project role joins the dataset scope, never the
-branch scope, so a branch that has rows of its own still decides its own writes,
-and a project owner is not among them unless a row says so.
-
-An external read-only dataset cannot be attached: there is no visibility to flip
-and no rows for a project role to administer. The store refuses it, not the role
-checks, so the rule holds with `PTOLEMY_AUTH_DISABLED=true` as well. The answer
-is `409`, the same one every other write aimed at an external dataset gets.
-
-The focused multi-user PostGIS integration test, strict Clippy, and formatting
-passed on 2026-08-23.
+`GET /api/v1/datasets/{id}/style` translates that document into Mapbox GL
+layers. `source` and `sourceLayer` are query parameters, `losses` lists what
+did not translate, and `images` holds the bitmaps picture symbols use, keyed by
+name, each with a `data_uri`, `width` and `height` in CSS pixels, to register
+before the layers draw.
 
 ## API Endpoints
 
-A key a route does not declare is refused, not dropped. A JSON body carrying one
-answers `422` and a query string carrying one answers `400`, both naming the key.
-A misspelled field used to leave the request looking successful while the value
-went nowhere.
+A key a route does not declare is refused: `422` in a JSON body, `400` in a
+query string, naming the key. Exempt are the OIDC callback,
+`/api/v1/ogc/collections/{id}/items`, `/api/v1/stac/search` and the replication
+routes, whose callers are outside this codebase.
 
-Four surfaces are exempt because their callers are not ours: the OIDC callback,
-whose parameters the identity provider chooses, `/api/v1/ogc/collections/{id}/items`
-and `/api/v1/stac/search`, which any conforming OGC or STAC client may call with
-spec parameters Ptolemy does not implement, and the replication endpoints, whose
-caller is a peer running another version.
+### Collaboration relay
 
-### Real-Time Collaboration Relay
+`/ws/rooms/{room_id}` relays every text frame a client sends to every other
+client in the room, never back to the sender. Nothing is stored. A room exists
+while someone is connected. The handshake needs a token, which a browser sends
+as `new WebSocket(url, ["bearer", jwt])`, and the server echoes only `bearer`.
+The subprotocol is read as a credential on `/ws/` paths only.
 
-Ptolemy includes an ephemeral room-based WebSocket relay at `/ws/rooms/{room_id}` for
-real-time viewer collaboration.  Every JSON message sent by one participant is broadcast
-to every other participant in the room. The sender does not get its own message back.
-No messages are persisted — rooms are created on first connection and dropped when the
-last client disconnects.
-
-The handshake needs a token, like every other route. A browser cannot set the
-`Authorization` header on a WebSocket, so the socket may carry it as
-`Sec-WebSocket-Protocol: bearer, <jwt>`, which is what
-`new WebSocket(url, ["bearer", jwt])` sends. The server echoes the `bearer` marker
-and never the token. That form is read on `/ws/` paths and nowhere else.
-
-**Intended use cases:**
-
-| Feature | Description |
-|---------|-------------|
-| **View sync** | Broadcast camera state (lat, lng, zoom, bearing, pitch) so a follower's viewer mirrors the leader's view |
-| **Cursor sharing** | Share mouse position on the map between collaborators |
-| **Presence** | Track which users are online in a room |
-| **Chat** | Real-time text messaging within a room |
-
-**Protocol (JSON over WebSocket):**
+The server does not read the messages. ViewTopia uses these shapes for view
+sync, cursors, presence and chat:
 
 ```jsonc
-// Client → Server (broadcast to every other client in the room)
 { "type": "Join", "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
 { "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
 { "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
@@ -843,21 +530,19 @@ and never the token. That form is read on `/ws/` paths and nowhere else.
 { "type": "Leave", "user_id": "u1", "asset_id": "my-room" }
 ```
 
-Messages are opaque to the server — it simply relays any valid text frame to every
-other subscriber on the room's channel.  The message schema above is a convention used by
-ViewTopia's collaboration client but any JSON structure will work.
+### Routes
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/health` | Health check |
 | GET | `/api/v1/healthz` | Liveness, 200 as soon as the process is up |
 | GET | `/api/v1/readyz` | Readiness, 200 once the database answers |
-| GET POST | `/api/v1/workspaces` | List or create authenticated workspaces |
+| GET | `/api/v1/capabilities` | What this deployment can do, currently `email_configured` |
+| GET POST | `/api/v1/workspaces` | List or create workspaces |
 | GET PUT DELETE | `/api/v1/workspaces/{id}` | Read, update, or delete a workspace |
 | GET | `/api/v1/workspaces/{id}/members` | List workspace members, owner only |
 | PUT DELETE | `/api/v1/workspaces/{workspace_id}/members/{user_id}` | Set or remove a workspace member |
 | GET POST | `/api/v1/workspaces/{id}/projects` | List or create projects in a workspace |
-| GET | `/api/v1/capabilities` | What this deployment can do, currently `email_configured` |
 | GET POST | `/api/v1/workspaces/{id}/invitations` | List or create workspace invitations |
 | DELETE | `/api/v1/workspaces/{workspace_id}/invitations/{invitation_id}` | Revoke a workspace invitation |
 | GET | `/api/v1/projects` | List accessible projects |
@@ -875,19 +560,20 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/datasets/{id}` | Get dataset |
 | PATCH | `/api/v1/datasets/{id}` | Set dataset visibility (dataset admin) |
 | GET | `/api/v1/datasets/{id}/branches` | List branches |
-| POST | `/api/v1/datasets/{id}/branches` | Create branch |
+| POST | `/api/v1/datasets/{id}/branches` | Create branch, optionally from `fork_from_branch` |
 | GET | `/api/v1/branches/{id}` | Get branch |
-| GET | `/api/v1/branches/{id}/history` | Commit log |
-| GET | `/api/v1/branches/{id}/features` | List features (paginated) |
+| GET | `/api/v1/branches/{id}/history` | Last 100 changesets |
+| GET | `/api/v1/branches/{id}/features` | List features, `cursor`, `limit` up to 10000, `valid_at` |
 | GET | `/api/v1/branches/{id}/features/{feature_id}` | One live feature, geometry as hex WKB with its properties |
 | GET | `/api/v1/branches/{id}/features/{feature_id}/native` | Pre-reprojection original geometry, exact |
 | GET | `/api/v1/branches/{id}/features/bbox` | Spatial bbox filter |
 | POST | `/api/v1/branches/{id}/features/intersects` | Spatial intersects filter |
 | POST | `/api/v1/branches/{id}/features/within` | Spatial within filter |
 | GET | `/api/v1/branches/{id}/features/count` | Feature count |
+| GET | `/api/v1/branches/{id}/features/at?at=` | Features as of an RFC 3339 instant |
 | GET | `/api/v1/branches/{id}/tiles/{z}/{x}/{y}` | MVT vector tiles |
-| POST | `/api/v1/branches/{id}/commit` | Commit changes |
-| POST | `/api/v1/branches/{id}/batch` | Batch commit (bulk ops) |
+| POST | `/api/v1/branches/{id}/commit` | Commit changes, checked against the dataset schema |
+| POST | `/api/v1/branches/{id}/batch` | Batch commit, not checked against the schema |
 | POST | `/api/v1/branches/{target}/merge/{source}` | Merge branches |
 | GET | `/api/v1/diff/{from}/{to}` | Diff changesets |
 | GET | `/api/v1/sync/pull` | Pull branch snapshot (full or incremental) |
@@ -902,27 +588,27 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/reviews/{id}/diff` | Review diff |
 | GET | `/api/v1/reviews/{id}/comments` | List comments |
 | POST | `/api/v1/reviews/{id}/comments` | Add comment |
-| GET | `/metrics` | Prometheus metrics (admin token) |
+| GET | `/metrics` | Prometheus metrics (admin) |
 | GET | `/auth/oidc/login` | OIDC SSO login |
 | GET | `/auth/oidc/callback` | OIDC callback |
 | GET | `/auth/oidc/config` | Whether OIDC is enabled, and the issuer URL when it is |
-| GET | `/review` | Web review UI |
-| GET | `/conflicts` | Web conflict resolution UI |
+| GET | `/review` | Merge request UI. Sends no token, and its map panel draws no diff |
+| GET | `/conflicts` | Conflict resolution UI. Sends no token |
 | GET | `/api/v1/datasets/{id}/schema` | Get dataset schema |
 | PUT | `/api/v1/datasets/{id}/schema` | Set dataset schema |
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
-| POST | `/api/v1/branches/{id}/repair` | Auto-repair invalid geometries |
-| GET | `/api/v1/datasets/{id}/webhooks` | List webhook subscriptions (instance admin) |
-| POST | `/api/v1/datasets/{id}/webhooks` | Subscribe, `url` must be http or https (instance admin) |
-| DELETE | `/api/v1/webhooks/{id}` | Delete subscription (instance admin) |
-| GET | `/api/v1/datasets/{id}/events` | List events, `limit` only |
+| POST | `/api/v1/branches/{id}/repair` | Repair invalid geometries with `ST_MakeValid`, as one commit |
+| GET | `/api/v1/datasets/{id}/webhooks` | List webhook subscriptions (admin) |
+| POST | `/api/v1/datasets/{id}/webhooks` | Subscribe, `url` must be http or https (admin) |
+| DELETE | `/api/v1/webhooks/{id}` | Delete subscription (admin) |
+| GET | `/api/v1/datasets/{id}/events` | List events, `limit` only (admin) |
 | POST | `/api/v1/datasets/{id}/events` | Emit a custom event, delivered like the built-in ones |
-| GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer analysis |
-| GET | `/api/v1/branches/{id}/analytics/union` | Union analysis |
+| GET | `/api/v1/branches/{id}/analytics/buffer` | Buffer one `feature_id` by `distance` meters |
+| GET | `/api/v1/branches/{id}/analytics/union` | Union of all features and its area |
 | GET | `/api/v1/branches/{id}/analytics/coverage` | Area covered by the live features buffered by `distance` meters, required, over 0 and at most 100000 |
-| GET | `/api/v1/branches/{id}/analytics/clusters` | DBSCAN clustering |
-| GET | `/api/v1/branches/{id}/analytics/anomalies` | Spatial anomaly detection |
-| GET | `/api/v1/branches/{id}/analytics/stats` | Spatial statistics |
+| GET | `/api/v1/branches/{id}/analytics/clusters` | `ST_ClusterDBSCAN` clusters |
+| GET | `/api/v1/branches/{id}/analytics/anomalies` | Features over 3 standard deviations from the centroid, and non-simple geometries |
+| GET | `/api/v1/branches/{id}/analytics/stats` | Count, total area and length, extent, centroid |
 | GET | `/api/v1/ogc` | OGC landing page |
 | GET | `/api/v1/ogc/conformance` | OGC conformance |
 | GET | `/api/v1/ogc/collections` | OGC collections |
@@ -941,8 +627,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/arcgis/rest/services/{service}/FeatureServer/extractChanges` | ArcGIS change extraction |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/jobs/{jobId}` | ArcGIS extract job status |
 | GET | `/arcgis/rest/services/{service}/FeatureServer/changefiles/{jobId}` | ArcGIS change file |
-| GET | `/api/v1/audit` | Audit log, `limit` and `actor` (instance admin) |
-| GET | `/api/v1/branches/{id}/features/at?at=` | Temporal query (features at time) |
+| GET | `/api/v1/audit` | Audit log, `limit` and `actor` (admin) |
 | GET | `/api/v1/catalog/search` | Search datasets (text + tags) |
 | GET | `/api/v1/datasets/{id}/tags` | List dataset tags |
 | POST | `/api/v1/datasets/{id}/tags` | Add tag |
@@ -954,15 +639,15 @@ ViewTopia's collaboration client but any JSON structure will work.
 | DELETE | `/api/v1/datasets/{id}/permissions/{user}` | Revoke on a dataset (dataset admin) |
 | GET | `/api/v1/datasets/{id}/permissions/{user}/check` | Whether that user holds `required` on the dataset |
 | PUT | `/api/v1/datasets/{id}/project` | Attach to a project and make it private (dataset admin, project editor) |
-| DELETE | `/api/v1/datasets/{id}/project` | Detach, leaving it private (dataset admin, project editor) |
+| DELETE | `/api/v1/datasets/{id}/project` | Detach, leaving it private (dataset admin or project editor) |
 | GET | `/api/v1/branches/{id}/permissions` | List branch grants (dataset admin) |
 | POST | `/api/v1/branches/{id}/permissions` | Grant on a branch (dataset admin) |
 | DELETE | `/api/v1/branches/{id}/permissions/{user}` | Revoke on a branch (dataset admin) |
 | GET | `/api/v1/branches/{id}/permissions/{user}/check` | Whether that user holds `required` on the branch |
-| GET | `/api/v1/conflicts/{id}` | List merge conflicts |
+| GET | `/api/v1/conflicts/{branch_id}` | Conflicts between that branch and its dataset's `main` |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
-| WS | `/ws/rooms/{room_id}` | Ephemeral collaboration relay (presence, view sync, chat) |
+| WS | `/ws/rooms/{room_id}` | Collaboration relay |
 | **Networks** | | |
 | GET | `/api/v1/datasets/{id}/networks` | List geometric networks |
 | POST | `/api/v1/datasets/{id}/networks` | Create network |
@@ -971,7 +656,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/api/v1/networks/{id}/junctions` | Add junction |
 | GET | `/api/v1/networks/{id}/edges` | List edges |
 | POST | `/api/v1/networks/{id}/edges` | Add edge |
-| POST | `/api/v1/networks/{id}/trace` | Network trace (upstream/downstream) |
+| POST | `/api/v1/networks/{id}/trace` | Upstream or downstream trace, a recursive CTE |
 | POST | `/api/v1/networks/{id}/shortest-path` | Dijkstra shortest path, needs pgRouting |
 | POST | `/api/v1/networks/{id}/astar` | A* shortest path, needs pgRouting |
 | POST | `/api/v1/networks/{id}/isochrone` | Driving distance from a junction, needs pgRouting |
@@ -1007,7 +692,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/attribute-rules/{id}` | Get rule |
 | PUT | `/api/v1/attribute-rules/{id}` | Update rule |
 | DELETE | `/api/v1/attribute-rules/{id}` | Delete rule |
-| POST | `/api/v1/attribute-rules/{id}/validate` | Validate rule expression |
+| POST | `/api/v1/attribute-rules/{id}/validate` | Answers `valid: true` for any non-empty expression. Nothing parses it |
 | **Relationships** | | |
 | GET | `/api/v1/datasets/{id}/relationships` | List relationship classes |
 | POST | `/api/v1/datasets/{id}/relationships` | Create relationship class |
@@ -1029,7 +714,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/labels/{id}` | Get label rule |
 | PUT | `/api/v1/labels/{id}` | Update label |
 | DELETE | `/api/v1/labels/{id}` | Delete label |
-| **PostGIS Topology** | | |
+| **PostGIS Topology**, admin except `validate` | | |
 | GET | `/api/v1/datasets/{id}/topologies` | List topologies |
 | POST | `/api/v1/datasets/{id}/topologies` | Create topology |
 | POST | `/api/v1/topologies/{name}/validate` | Validate topology |
@@ -1037,37 +722,37 @@ ViewTopia's collaboration client but any JSON structure will work.
 | GET | `/api/v1/topologies/{name}/edges` | List edges |
 | GET | `/api/v1/topologies/{name}/nodes` | List nodes |
 | POST | `/api/v1/topologies/{name}/add-face` | Add face |
-| POST | `/api/v1/topologies/{name}/simplify` | Simplify topology |
-| **SFCGAL 3D** | | |
-| POST | `/api/v1/branches/{id}/3d/extrude` | Extrude 2D → 3D |
+| POST | `/api/v1/topologies/{name}/simplify` | Answers `simplified` and changes nothing |
+| **SFCGAL 3D**, needs SFCGAL | | |
+| POST | `/api/v1/branches/{id}/3d/extrude` | Extrude 2D to 3D |
 | POST | `/api/v1/branches/{id}/3d/volume` | Compute volume |
 | POST | `/api/v1/branches/{id}/3d/intersection` | 3D intersection |
 | POST | `/api/v1/branches/{id}/3d/straight-skeleton` | Straight skeleton |
 | POST | `/api/v1/branches/{id}/3d/minkowski-sum` | Minkowski sum |
 | POST | `/api/v1/branches/{id}/3d/tesselate` | Tesselation |
-| POST | `/api/v1/branches/{id}/3d/visibility` | Visibility/line-of-sight |
-| **H3 Indexing** | | |
+| POST | `/api/v1/branches/{id}/3d/visibility` | 3D distance from an observer point to a feature, and whether the line to its centroid meets it |
+| **H3 Indexing**, needs h3-pg | | |
 | POST | `/api/v1/branches/{id}/h3/index` | Index features with H3 |
 | GET | `/api/v1/branches/{id}/h3/hexagons` | Get covering hexagons |
 | GET | `/api/v1/branches/{id}/h3/aggregate` | Aggregate by hex cell |
 | GET | `/api/v1/branches/{id}/h3/neighbors` | K-ring neighbors |
 | POST | `/api/v1/branches/{id}/h3/compact` | Compact hex set |
-| GET | `/api/v1/h3/cell?lng=&lat=` | Point → H3 cell |
-| GET | `/api/v1/h3/boundary?cell=` | Cell → boundary polygon |
-| **Vector Similarity** | | |
-| POST | `/api/v1/branches/{id}/similarity/search` | Similarity search, needs pgvector |
-| GET | `/api/v1/branches/{id}/similarity/duplicates` | Find duplicates, needs pgvector |
-| POST | `/api/v1/branches/{id}/similarity/embed` | Generate embeddings, needs pgvector |
-| POST | `/api/v1/branches/{id}/similarity/cluster` | K-means clustering, needs pgvector |
+| GET | `/api/v1/h3/cell?lng=&lat=` | Point to H3 cell |
+| GET | `/api/v1/h3/boundary?cell=` | Cell to boundary polygon |
+| **Vector Similarity**, needs pgvector | | |
+| POST | `/api/v1/branches/{id}/similarity/search` | Similarity search |
+| GET | `/api/v1/branches/{id}/similarity/duplicates` | Find duplicates |
+| POST | `/api/v1/branches/{id}/similarity/embed` | Generate embeddings |
+| POST | `/api/v1/branches/{id}/similarity/cluster` | Equal-size buckets by distance to the mean embedding |
 | **Point Cloud** | | |
 | GET | `/api/v1/datasets/{id}/pointclouds` | List point cloud catalogs |
 | POST | `/api/v1/datasets/{id}/pointclouds` | Create catalog |
 | GET | `/api/v1/pointclouds/{id}` | Get catalog |
 | GET | `/api/v1/pointclouds/{id}/patches` | List patches |
-| POST | `/api/v1/pointclouds/{id}/patches` | Add patch |
+| POST | `/api/v1/pointclouds/{id}/patches` | Add patch, needs pointcloud |
 | POST | `/api/v1/pointclouds/{id}/query` | Spatial query |
 | GET | `/api/v1/pointclouds/{id}/stats` | Catalog stats |
-| POST | `/api/v1/pointclouds/{id}/profile` | Elevation profile |
+| POST | `/api/v1/pointclouds/{id}/profile` | Elevation profile, needs pointcloud |
 | **Trajectories** | | |
 | GET | `/api/v1/datasets/{id}/trajectories` | List trajectories |
 | POST | `/api/v1/datasets/{id}/trajectories` | Create trajectory |
@@ -1109,7 +794,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/api/v1/branches/{id}/geoprocessing/centroid` | Centroids |
 | POST | `/api/v1/branches/{id}/geoprocessing/nearest-neighbor` | Nearest neighbours |
 | POST | `/api/v1/branches/{id}/geoprocessing/distance-matrix` | Pairwise distances |
-| POST | `/api/v1/branches/{id}/geoprocessing/contour` | Contour lines from point values |
+| POST | `/api/v1/branches/{id}/geoprocessing/contour` | Contour lines from point values, needs `ST_ContourLines` |
 | POST | `/api/v1/branches/{id}/geoprocessing/merge` | Union named features into one geometry |
 | POST | `/api/v1/branches/{id}/geoprocessing/split` | Split one feature by a GeoJSON line |
 | POST | `/api/v1/branches/{id}/geoprocessing/simplify` | Simplify geometries |
@@ -1133,7 +818,7 @@ ViewTopia's collaboration client but any JSON structure will work.
 | **Compaction** | | |
 | POST | `/api/v1/branches/{id}/compact` | Prune old feature versions, keeping the most recent per feature |
 | GET | `/api/v1/datasets/{id}/compaction-history` | What past compactions removed |
-| **Replication** | | |
+| **Replication**, admin | | |
 | GET | `/api/v1/replication/feed/{branch_id}` | Ordered change feed a replica consumes |
 | GET POST | `/api/v1/replication/peers` | List or register peers |
 | POST | `/api/v1/replication/peers/{id}/sync` | Record how far a peer has consumed |
@@ -1154,144 +839,164 @@ ViewTopia's collaboration client but any JSON structure will work.
 | POST | `/api/v1/parcels/split` | Answers the parcel geometry, does not split it |
 | POST | `/api/v1/parcels/merge` | Answers the parcels' geometries, does not merge them |
 
-The geoprocessing routes compute and answer GeoJSON. None of them writes a
-changeset, so keeping a result means committing it yourself. The vertical routes
-are conventions over feature `properties` on a branch rather than tables of their
-own: `/api/v1/sensors` is a feature list filtered on a `sensor_type` property, and
-the rest read `mean_elevation`, `ndvi_mean` and the like off whatever a client
-wrote there. `POST /api/v1/incidents` is the one of them that commits.
+A route that needs an extension answers `501` without it.
 
-Replication is the change feed plus a peer table, and the caller drives it. The
-only background worker the server starts is the webhook delivery worker, so
-nothing here pulls from a registered peer on its own.
+The geoprocessing routes answer GeoJSON and write no changeset, so commit a
+result yourself to keep it. The vertical routes read conventions over feature
+`properties` on a branch, such as a `sensor_type`, `mean_elevation` or
+`ndvi_mean` property. `POST /api/v1/incidents` is the only one that commits.
 
-Both imports answer `{imported, skipped, changeset_id, errors}`. Rows that
-cannot be parsed are skipped and named in `errors`; the rest land as one
-changeset on the branch, visible to reads like any other commit. A request whose
-rows all fail answers 422 and writes no changeset. One request takes at most
-50,000 features and a 64 MiB body, so a larger file goes in as several
-requests, each its own changeset.
+Replication is the change feed plus a peer table, and the caller drives it.
+Nothing pulls from a registered peer on its own.
 
-## CLI Commands
+Both imports answer `{imported, skipped, changeset_id, errors}`. Rows that fail
+to parse are skipped and named in `errors`, and the rest land as one changeset.
+A request whose rows all fail answers 422 and writes nothing. One request takes
+at most 50,000 features and a 64 MiB body.
+
+Feature and dataset attachment uploads take axum's default 2 MB body.
+
+## Optional PostgreSQL extensions
+
+Migrations create each of these when the server has it and skip it when not.
+Ptolemy ships no database image, so install the ones you need yourself. Tests
+exercise only the `501` branch of the pgRouting, SFCGAL, pgvector, pointcloud
+and MobilityDB routes.
+
+| Extension | Used for |
+|-----------|----------|
+| PostGIS Topology | `/api/v1/topologies` |
+| pg_trgm | Index for the catalog's case-insensitive substring search. No ranking, no typo tolerance |
+| pgRouting | Dijkstra, A*, TSP, connected components, isochrones |
+| SFCGAL | 3D routes |
+| h3-pg | H3 routes |
+| pgvector | Similarity routes. The embedding is a SHA-256 hash spread over 256 floats, so identical text matches and near-identical text does not |
+| pointcloud | Point cloud patches and profiles |
+| MobilityDB | Trajectory analytics. Without it a trajectory is stored as JSONB |
+
+## Standards
+
+- **OGC API - Features** Part 1 (core, GeoJSON, OpenAPI 3.0) and Part 2 (CRS by
+  reference). Every collection offers CRS84, EPSG:4326 and EPSG:3857, plus the
+  dataset's own srid. CRS84 is longitude first and a geographic EPSG code
+  latitude first, and `bbox-crs` is read the same way.
+- **CQL2-JSON**: comparisons, `and`, `or`, `not`, `like`, `between`, `in`,
+  `isNull`, `s_intersects`, `s_within`, `s_contains`
+- **OGC Tiles**: WebMercatorQuad and WorldCRS84Quad
+- **STAC 1.0** over raster catalogs
+- **ArcGIS Geoservices REST** FeatureServer, see above
+
+## Not built
+
+| Subsystem | State |
+|-----------|-------|
+| Rate limiting | None. Put a proxy in front |
+| Feature locking | None. Use branches and the merge conflict flow |
+| Topology rule engine | None. PostGIS Topology under `/api/v1/topologies` is a separate subsystem |
+| Domains, subtypes, attribute rules | Stored and served, enforced nowhere. There is no expression engine |
+| Geometry type constraints | Stored and never checked |
+| Multi-tenancy | None. One instance is one tenant |
+| Parcel split and merge | `POST /api/v1/parcels/split` and `/parcels/merge` answer the input geometry as hex WKB and a message telling the caller to do it elsewhere. The geoprocessing `split` and `merge` routes do compute a geometry |
+| Topology simplify | `POST /api/v1/topologies/{name}/simplify` computes a simplified edge, discards it and answers `simplified` |
+| Review map diff | The `/review` map panel draws a basemap and no changes |
+| Pluggable storage backends | `DataStore` in `ptolemy-core` is implemented by `ptolemy-geopackage`, `ptolemy-mongodb` and `ptolemy-elasticsearch`, and no binary uses any of them. The server and CLI use `PgStore`, which does not implement it |
+
+## CLI
 
 `serve`, `migrate`, `dataset` (`create`, `list`, `show`), `branch` (`create`,
-`list`, `show`), `commit`, `merge`, `log`, `features`, `diff`, `import`, `export`,
-`gpkg-export`, `backup`, `restore` and `api-key` (`create`, `list`, `revoke`).
-`--database-url`, `--db-max-connections` and `--db-min-connections` are
-top-level flags, so they go before the subcommand, and each reads its
-environment variable from [Configuration](#configuration) when left out.
+`list`, `show`), `commit`, `merge`, `log`, `features`, `diff`, `import`,
+`export`, `gpkg-export`, `backup`, `restore` and `api-key` (`create`, `list`,
+`revoke`). `--database-url`, `--db-max-connections` and `--db-min-connections`
+go before the subcommand and default to their environment variables.
 
-`export` writes a GeoJSON FeatureCollection to `--output` or to stdout.
-`gpkg-export --branch <uuid> --output out.gpkg` writes a GeoPackage for offline
-editing, with the layer named by `--layer` (`features` by default).
+`export` writes a GeoJSON FeatureCollection to `--output` or stdout.
+`gpkg-export --branch <uuid> --output out.gpkg` writes a GeoPackage, with the
+layer named by `--layer` (`features` by default).
 
-### Data Import
+### Import
 
-Import geospatial data from multiple formats, picked by file extension. The file
-path is positional and the branch is named by uuid, not by branch name.
-Everything lands as one commit, so `--author` is required and `--message`
-defaults to `Import features`.
+The format is picked by extension: `.shp` (with its `.dbf`), `.gpkg`, and
+anything else as GeoJSON. The file is positional, the branch is a uuid, and it
+lands as one commit.
 
 ```bash
-# Import GeoJSON
 ptolemy import --branch <branch-uuid> --author you data.geojson
-
-# Import Shapefile (reads .shp + .dbf)
 ptolemy import --branch <branch-uuid> --author you parcels.shp
-
-# Import GeoPackage
 ptolemy import --branch <branch-uuid> --author you terrain.gpkg
 ```
 
-Any other extension is read as GeoJSON.
+`--message` defaults to `Import features`.
 
-### API Keys
-
-Manage programmatic access keys, SHA-256 hashed and never stored in plaintext.
+### API keys
 
 ```bash
-# Create a new key, printed once and never again
 ptolemy api-key create "CI Pipeline" --role editor --expires-days 365
-
-# List active keys (shows prefix only)
 ptolemy api-key list
-
-# Revoke by prefix or full key
 ptolemy api-key revoke ptk_abc123
 ```
 
-`--role` takes `admin`, `editor` or `viewer` and anything else is read as
-`viewer`. `--expires-days` defaults to 365, and `0` means never. A key is sent
-the way a JWT is, `Authorization: Bearer ptk_...`, and the role on the row is
-the role the request runs with.
+The key is printed once and stored as a SHA-256 hash. `list` shows prefixes.
+`revoke` takes a prefix or the full key. `--role` takes `admin`, `editor` or
+`viewer`, and anything else becomes `viewer`. `--expires-days` defaults to 365,
+and `0` means never.
 
-### Backup & Restore
-
-Both paths are positional. `backup` runs `pg_dump`, plain SQL by default and
-`pg_dump -Fc` with `--custom`. `restore` tries `pg_restore` and falls back to
-running the file as plain SQL, so it takes either format. `--clean` drops the
-existing objects first.
+### Backup and restore
 
 ```bash
-# Backup to a custom-format dump
 ptolemy backup --custom ptolemy_backup.dump
-
-# Restore from dump
 ptolemy restore ptolemy_backup.dump
 ```
 
-## Building
-
-```bash
-cargo build --release
-```
+`backup` runs `pg_dump`, plain SQL unless `--custom`. `restore` tries
+`pg_restore` and falls back to plain SQL, so it takes either. `--clean` drops
+existing objects first.
 
 ## Tests
 
-The suite needs a migrated PostGIS database:
+The suite needs a PostGIS database:
 
 ```bash
 DATABASE_URL=postgres://postgres:postgres@localhost/ptolemy_test cargo test --all -- --test-threads=1
 ```
 
-`crates/ptolemy-api/tests/route_sweep.rs` is one test that calls every route
-mounted on the router, reading the route list off the router itself so a new
-route is covered without being added anywhere. It fails on SQLSTATE 42703
-(undefined column) and 42P01 (undefined table), which is what a handler naming a
-column the migrations do not create looks like, and every query here is a runtime
-`sqlx::query` that nothing else checks against the schema. It prints what it
-covered and every 500 it saw. Routes it deliberately skips are listed in the
-test with a reason each.
+`crates/ptolemy-api/tests/route_sweep.rs` calls every route on the router,
+reading the list off the router itself, and fails on SQLSTATE 42703 (undefined
+column) and 42P01 (undefined table). Every query is a runtime `sqlx::query`, so
+this is the only check of handler SQL against the migrated schema. It prints
+what it covered and every 500. Skipped routes are listed in the test with a
+reason each.
+
+The MongoDB and Elasticsearch tests are ignored by default. Run them with
+`cargo test -p ptolemy-mongodb -- --ignored` against `PTOLEMY_MONGO_URI`
+(default `mongodb://localhost:27019`) and `cargo test -p ptolemy-elasticsearch
+-- --ignored` against `PTOLEMY_ES_URL` (default `http://localhost:9209`).
 
 ## Project Structure
 
 ```
 crates/
-├── ptolemy-core/          # Domain types, merge logic, diff algorithms
-├── ptolemy-storage/       # PostGIS storage backend
-├── ptolemy-geopackage/    # GeoPackage DataStore, unused by the binaries
-├── ptolemy-mongodb/       # MongoDB DataStore, unused by the binaries
-├── ptolemy-elasticsearch/ # Elasticsearch DataStore, unused by the binaries
-├── ptolemy-api/           # Axum REST API server
-└── ptolemy-cli/           # CLI binary (server + admin commands)
+├── ptolemy-core/          # Domain types, diff, the DataStore trait
+├── ptolemy-storage/       # PgStore: migrations, commits, merges, queries
+├── ptolemy-api/           # Axum router
+├── ptolemy-cli/           # the ptolemy binary
+├── ptolemy-geopackage/    # GeoPackage DataStore, unused by the binary
+├── ptolemy-mongodb/       # MongoDB DataStore, unused by the binary
+└── ptolemy-elasticsearch/ # Elasticsearch DataStore, unused by the binary
 ```
 
-`ptolemy-cli` reads and writes GeoPackage through `rusqlite` and shapefiles
-through the `shapefile` crate, so `import` and `gpkg-export` do not go through
-`ptolemy-geopackage`.
+The CLI reads shapefiles through the `shapefile` crate and GeoPackage through
+`rusqlite`, not through `ptolemy-geopackage`.
+
+## Prior art
+
+| Project | Status | Difference |
+|---------|--------|-----------|
+| [GeoGig](https://geogig.org/) | Abandoned | Java |
+| [Kart](https://kartproject.org/) | Active | Git-backed CLI with local working copies, no multi-user server |
+| [pg_version](https://github.com/CartoDB/cartodb-postgresql) | Limited | Single-table temporal, no branching |
 
 ## License
 
 AGPL-3.0-or-later, see [LICENSE](LICENSE).
 
 Copyright (C) 2026 Grok Image Compression Inc.
-
-## Prior Art & Differentiation
-
-| Project | Status | Limitation |
-|---------|--------|-----------|
-| [GeoGig](https://geogig.org/) | Abandoned | Java, heavy, poor DX |
-| [Kart](https://kartproject.org/) | Active | GeoPackage-only, no multi-user server |
-| [pg_version](https://github.com/CartoDB/cartodb-postgresql) | Limited | Single-table temporal, no branching |
-
-Ptolemy aims to be: **fast (Rust), server-native (PostGIS), with git-quality branching/merging UX**.
