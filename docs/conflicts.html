@@ -159,6 +159,11 @@ const tokenInput = document.getElementById('api-token');
 tokenInput.value = sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
 tokenInput.addEventListener('change', () => sessionStorage.setItem(TOKEN_STORAGE_KEY, tokenInput.value.trim()));
 
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => HTML_ESCAPES[character]);
+}
+
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json' };
   const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
@@ -230,8 +235,8 @@ function renderConflictList() {
       : c.conflict_type === 'delete_modify' ? 'type-delete' : 'type-full';
     return `
       <div class="conflict-item ${currentConflict === i ? 'active' : ''}" onclick="selectConflict(${i})">
-        <div class="fid">${c.feature_id.slice(0, 8)}…${resolved}</div>
-        <span class="type ${typeClass}">${c.conflict_type.replace('_', ' ')}</span>
+        <div class="fid">${escapeHtml(c.feature_id.slice(0, 8))}…${resolved}</div>
+        <span class="type ${typeClass}">${escapeHtml(c.conflict_type.replace('_', ' '))}</span>
       </div>`;
   }).join('');
 }
@@ -280,14 +285,15 @@ function renderPropsDiff(c) {
   const allKeys = [...new Set([...Object.keys(ours), ...Object.keys(theirs)])];
 
   let html = '<strong>Property Differences:</strong>\n';
-  allKeys.forEach(k => {
-    const ov = JSON.stringify(ours[k]);
-    const tv = JSON.stringify(theirs[k]);
+  allKeys.forEach(rawKey => {
+    const k = escapeHtml(rawKey);
+    const ov = escapeHtml(JSON.stringify(ours[rawKey]));
+    const tv = escapeHtml(JSON.stringify(theirs[rawKey]));
     if (ov === tv) {
       html += `  ${k}: ${ov}\n`;
-    } else if (!ours[k]) {
+    } else if (!ours[rawKey]) {
       html += `<span class="prop-added">+ ${k}: ${tv}</span>\n`;
-    } else if (!theirs[k]) {
+    } else if (!theirs[rawKey]) {
       html += `<span class="prop-removed">- ${k}: ${ov}</span>\n`;
     } else {
       html += `<span class="prop-changed">~ ${k}: ${ov} → ${tv}</span>\n`;

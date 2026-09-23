@@ -203,13 +203,13 @@ async function loadDatasets() {
   const datasets = await api('/datasets');
   const sel = document.getElementById('filter-dataset');
   sel.innerHTML = '<option value="">Select dataset...</option>' +
-    datasets.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+    datasets.map(d => `<option value="${escapeHtml(d.id)}">${escapeHtml(d.name)}</option>`).join('');
 }
 
 async function loadDatasetsForCreate() {
   const datasets = await api('/datasets');
   const sel = document.getElementById('create-dataset');
-  sel.innerHTML = datasets.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+  sel.innerHTML = datasets.map(d => `<option value="${escapeHtml(d.id)}">${escapeHtml(d.name)}</option>`).join('');
   if (datasets.length) loadBranches();
 }
 
@@ -217,7 +217,7 @@ async function loadBranches() {
   const dsId = document.getElementById('create-dataset').value;
   if (!dsId) return;
   const branches = await api(`/datasets/${dsId}/branches`);
-  const opts = branches.map(b => `<option value="${b.id}">${b.name}</option>`).join('');
+  const opts = branches.map(b => `<option value="${escapeHtml(b.id)}">${escapeHtml(b.name)}</option>`).join('');
   document.getElementById('create-source').innerHTML = opts;
   document.getElementById('create-target').innerHTML = opts;
 }
@@ -233,11 +233,11 @@ async function loadReviews() {
   document.getElementById('review-list').innerHTML = reviews.length === 0
     ? '<p class="meta">No merge requests found.</p>'
     : reviews.map(mr => `
-      <div class="card mr-list-item" onclick="showDetail('${mr.id}')">
+      <div class="card mr-list-item" data-review-id="${escapeHtml(mr.id)}" onclick="showDetail(this.dataset.reviewId)">
         <div>
-          <strong>${escHtml(mr.title)}</strong>
-          <span class="badge badge-${mr.status}">${mr.status}</span>
-          <div class="meta">${escHtml(mr.author)} · ${new Date(mr.created_at).toLocaleDateString()}</div>
+          <strong>${escapeHtml(mr.title)}</strong>
+          <span class="badge badge-${escapeHtml(mr.status)}">${escapeHtml(mr.status)}</span>
+          <div class="meta">${escapeHtml(mr.author)} · ${new Date(mr.created_at).toLocaleDateString()}</div>
         </div>
       </div>
     `).join('');
@@ -265,7 +265,7 @@ async function loadReviewDetail(id) {
   document.getElementById('detail-meta').textContent =
     `By ${currentMR.author} · Created ${new Date(currentMR.created_at).toLocaleString()}`;
   document.getElementById('detail-badge').innerHTML =
-    `<span class="badge badge-${currentMR.status}">${currentMR.status}</span>`;
+    `<span class="badge badge-${escapeHtml(currentMR.status)}">${escapeHtml(currentMR.status)}</span>`;
 
   const isOpen = currentMR.status === 'open';
   const isApproved = currentMR.status === 'approved';
@@ -283,15 +283,15 @@ async function loadDiff(id) {
     renderDiffOps(diff.operations);
     renderDiffMap(diff.operations);
   } catch (e) {
-    document.getElementById('diff-ops').innerHTML = `<p class="meta">Could not load diff: ${escHtml(e.message)}</p>`;
+    document.getElementById('diff-ops').innerHTML = `<p class="meta">Could not load diff: ${escapeHtml(e.message)}</p>`;
   }
 }
 
 function renderDiffOps(ops) {
   const html = ops.map(op => {
-    if (op.Insert) return `<div class="diff-insert">+ INSERT feature ${op.Insert.feature_id}</div>`;
-    if (op.Update) return `<div class="diff-update">~ UPDATE feature ${op.Update.feature_id}</div>`;
-    if (op.Delete) return `<div class="diff-delete">- DELETE feature ${op.Delete.feature_id}</div>`;
+    if (op.Insert) return `<div class="diff-insert">+ INSERT feature ${escapeHtml(op.Insert.feature_id)}</div>`;
+    if (op.Update) return `<div class="diff-update">~ UPDATE feature ${escapeHtml(op.Update.feature_id)}</div>`;
+    if (op.Delete) return `<div class="diff-delete">- DELETE feature ${escapeHtml(op.Delete.feature_id)}</div>`;
     return '';
   }).join('');
   document.getElementById('diff-ops').innerHTML = html || '<p class="meta">No changes</p>';
@@ -366,9 +366,9 @@ async function loadComments(id) {
     ? '<p class="meta">No comments yet.</p>'
     : comments.map(c => `
       <div class="comment">
-        <div class="author">${escHtml(c.author)} <span class="meta">${new Date(c.created_at).toLocaleString()}</span></div>
-        <div class="body">${escHtml(c.body)}</div>
-        ${c.feature_id ? `<div class="meta">Re: feature ${c.feature_id}</div>` : ''}
+        <div class="author">${escapeHtml(c.author)} <span class="meta">${new Date(c.created_at).toLocaleString()}</span></div>
+        <div class="body">${escapeHtml(c.body)}</div>
+        ${c.feature_id ? `<div class="meta">Re: feature ${escapeHtml(c.feature_id)}</div>` : ''}
       </div>
     `).join('');
 }
@@ -413,10 +413,9 @@ async function submitComment() {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
-function escHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s || '';
-  return d.innerHTML;
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => HTML_ESCAPES[character]);
 }
 
 // Boot

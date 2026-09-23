@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-23: **the `/review` and `/conflicts` pages show API strings as
+  text**. Dataset and branch names, feature property keys and values, and the
+  other API fields they put into `innerHTML` went in unescaped, so a value like
+  `<img src=x onerror=alert(1)>` ran script on a page holding the bearer token.
+  Each page escapes them through one `escapeHtml` helper, and the review list
+  passes its id through a `data-review-id` attribute instead of inline script.
 - 2026-09-23: **the `/review` map panel draws the diff**. The page decodes the
   WKB the review diff already returns and draws inserts in green and updates in
   blue, then fits the map to them. Deletes carry no geometry and stay in the
