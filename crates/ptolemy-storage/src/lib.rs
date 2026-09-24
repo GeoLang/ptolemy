@@ -20,7 +20,7 @@ pub use postgres::{
     ApiKeyIdentity, Attachment, AttachmentMeta, AuditEntry, BranchPermission, ChangeFeedEntry,
     CompactionResult, CompactionRun, ConflictInfo, DatasetPermission, MergeChoice, MergeResult,
     PgStore, ReplicationPeer, SchemaMigration, StoreError, VersionContent, WriteTarget,
-    branch_features_subquery, merge_choice,
+    branch_features_subquery, merge_choice, with_statement_timeout,
 };
 pub use postgres::{LATEST_COLUMNS, MVT_TILE_EXTENT, mvt_simplify_tolerance};
 pub use quota::UserQuotas;

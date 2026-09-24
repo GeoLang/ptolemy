@@ -25,6 +25,7 @@ use ptolemy_core::schema::{
 };
 use serde::Serialize;
 use sqlx::migrate::Migrate;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -168,6 +169,10 @@ pub const EXTERNAL_READ_ONLY: &str =
 /// the guarantee holds at the database, not only in this process.
 pub const EXTERNAL_DATABASE_URL: &str = "PTOLEMY_EXTERNAL_DATABASE_URL";
 
+pub fn with_statement_timeout(options: PgConnectOptions, seconds: u64) -> PgConnectOptions {
+    options.options([("statement_timeout", format!("{seconds}s"))])
+}
+
 // the last migration file v0.1.0 shipped
 const LAST_UNLEDGERED_MIGRATION_VERSION: i64 = 18;
 
@@ -187,6 +192,7 @@ pub struct PgStore {
     /// Built on first external read, so an unset env var costs nothing and a
     /// bad URL fails the request rather than startup.
     external_pool: tokio::sync::OnceCell<PgPool>,
+    external_statement_timeout_seconds: Option<u64>,
     analyzer: Analyzer,
     pub(crate) quotas: UserQuotas,
 }
@@ -203,12 +209,20 @@ impl PgStore {
             analyzer: Analyzer::new(pool.clone(), rows),
             pool,
             external_pool: tokio::sync::OnceCell::new(),
+            external_statement_timeout_seconds: None,
             quotas: UserQuotas::default(),
         }
     }
 
     pub fn with_user_quotas(self, quotas: UserQuotas) -> Self {
         Self { quotas, ..self }
+    }
+
+    pub fn with_external_statement_timeout(self, seconds: u64) -> Self {
+        Self {
+            external_statement_timeout_seconds: Some(seconds),
+            ..self
+        }
     }
 
     /// The pool a caller runs reads on. Every `SELECT` in `ptolemy-api` uses
@@ -628,9 +642,19 @@ impl PgStore {
             return Ok(&self.pool);
         }
         self.external_pool
-            .get_or_try_init(|| async { PgPool::connect(&url).await })
+            .get_or_try_init(|| async {
+                PgPool::connect_with(self.external_connect_options(&url)?).await
+            })
             .await
             .map_err(StoreError::Db)
+    }
+
+    fn external_connect_options(&self, url: &str) -> Result<PgConnectOptions, sqlx::Error> {
+        let options: PgConnectOptions = url.parse()?;
+        Ok(match self.external_statement_timeout_seconds {
+            Some(seconds) => with_statement_timeout(options, seconds),
+            None => options,
+        })
     }
 
     /// The pool a read should use, given whether it targets an external dataset.
@@ -4221,6 +4245,36 @@ mod merge_attribute_tests {
         let ours = upd(json!({"name": "A"}));
         let theirs = upd(json!({"name": "B"}));
         assert!(merge_disjoint_updates(&ours, &theirs, Some(&base)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod external_pool_tests {
+    use super::*;
+
+    const EXTERNAL_URL: &str = "postgres://reader@external.invalid/datasets";
+
+    fn store() -> PgStore {
+        let unconnected = PgPool::connect_lazy("postgres://localhost/primary").unwrap();
+        PgStore::with_analyze_threshold(unconnected, 0)
+    }
+
+    #[tokio::test]
+    async fn the_external_pool_carries_the_statement_timeout_it_was_given() {
+        let options = store()
+            .with_external_statement_timeout(30)
+            .external_connect_options(EXTERNAL_URL)
+            .unwrap();
+        let startup_options = options.get_options().unwrap_or_default();
+        assert!(startup_options.contains("-c statement_timeout=30s"));
+        assert_eq!(options.get_host(), "external.invalid");
+    }
+
+    #[tokio::test]
+    async fn the_external_pool_has_no_statement_timeout_unless_given_one() {
+        let options = store().external_connect_options(EXTERNAL_URL).unwrap();
+        let startup_options = options.get_options().unwrap_or_default();
+        assert!(!startup_options.contains("statement_timeout"));
     }
 }
 

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
-use ptolemy_storage::{PgStore, UserQuotas};
+use ptolemy_storage::{PgStore, UserQuotas, with_statement_timeout};
 use serde_json::json;
 use sqlx::postgres::PgConnectOptions;
 use std::sync::Arc;
@@ -262,12 +262,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let connect_options: PgConnectOptions = cli.database_url.parse()?;
-    let pool_connect_options = match cli.command {
-        Commands::Serve { .. } => connect_options.clone().options([(
-            "statement_timeout",
-            format!("{}s", cli.statement_timeout_seconds),
-        )]),
-        _ => connect_options.clone(),
+    let serving = matches!(cli.command, Commands::Serve { .. });
+    let pool_connect_options = match serving {
+        true => with_statement_timeout(connect_options.clone(), cli.statement_timeout_seconds),
+        false => connect_options.clone(),
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(cli.db_max_connections)
@@ -275,7 +273,11 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(pool_connect_options)
         .await?;
     let quotas = UserQuotas::from_env().map_err(anyhow::Error::msg)?;
-    let store = Arc::new(PgStore::new(pool).with_user_quotas(quotas));
+    let store = PgStore::new(pool).with_user_quotas(quotas);
+    let store = Arc::new(match serving {
+        true => store.with_external_statement_timeout(cli.statement_timeout_seconds),
+        false => store,
+    });
 
     match cli.command {
         Commands::Serve { bind } => {

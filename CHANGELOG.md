@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-24: **`serve` applies `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` to the
+  `PTOLEMY_EXTERNAL_DATABASE_URL` pool too**, so an external dataset export
+  cannot hold that connection past it either.
 - 2026-09-24: **exports and OGC items return at most 10,000 features, and
   `serve` cancels a statement after 30 s**. The GeoJSON, CSV and FlatGeobuf
   exports and `/ogc/collections/{id}/items` took any `limit` and loaded every
