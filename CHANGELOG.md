@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-24: **geoprocessing routes bind request values instead of splicing
+  them into SQL**. A voronoi `envelope` holding a single quote ended the SQL
+  literal it was pasted into. Voronoi, dissolve, contour and convex hull now
+  pass their request values as parameters, and a convex hull with an empty
+  `feature_ids` answers a null geometry instead of a 500.
 - 2026-09-24: **`serve` applies `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` to the
   `PTOLEMY_EXTERNAL_DATABASE_URL` pool too**, so an external dataset export
   cannot hold that connection past it either.

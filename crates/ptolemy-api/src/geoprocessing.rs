@@ -269,16 +269,16 @@ async fn dissolve(
     let rows = sqlx::query(&format!(
         "{LIVE_FEATURES_CTE}
          SELECT
-             properties->>'{key}' as group_key,
+             properties->>$2 as group_key,
              COUNT(*) as cnt,
              ST_AsGeoJSON(ST_Union(geometry))::jsonb as geojson,
              COALESCE(ST_Area(ST_Union(geometry)::geography), 0) as area
          FROM live
-         WHERE properties->>'{key}' IS NOT NULL
-         GROUP BY properties->>'{key}'",
-        key = req.group_by
+         WHERE properties->>$2 IS NOT NULL
+         GROUP BY properties->>$2"
     ))
     .bind(branch_id)
+    .bind(&req.group_by)
     .fetch_all(store.read_pool())
     .await?;
 
@@ -400,16 +400,14 @@ async fn voronoi(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<VoronoiRequest>,
 ) -> Result<Json<GeoJsonCollection>, GeoprocessingError> {
-    let envelope_clause = if let Some(env) = &req.envelope {
-        let env_json = serde_json::to_string(env)
-            .map_err(|_| GeoprocessingError::BadRequest("invalid envelope".into()))?;
-        format!("ST_GeomFromGeoJSON('{env_json}')")
-    } else {
-        // the outer select reads from points, which carries the collected
-        // centroids as geom and no geometry column of its own
-        "ST_Envelope(geom)".to_string()
-    };
+    let envelope = req
+        .envelope
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| GeoprocessingError::BadRequest("invalid envelope".into()))?;
 
+    // points has no geometry column, only the collected centroids as geom
     let rows = sqlx::query(&format!(
         "{LIVE_FEATURES_CTE},
          points AS (
@@ -417,12 +415,15 @@ async fn voronoi(
          )
          SELECT
              ST_AsGeoJSON(
-                 (ST_Dump(ST_VoronoiPolygons(geom, $2, {envelope_clause}))).geom
+                 (ST_Dump(ST_VoronoiPolygons(
+                     geom, $2, COALESCE(ST_GeomFromGeoJSON($3), ST_Envelope(geom))
+                 ))).geom
              )::jsonb as geojson
          FROM points"
     ))
     .bind(branch_id)
     .bind(req.tolerance)
+    .bind(&envelope)
     .fetch_all(store.read_pool())
     .await?;
 
@@ -465,22 +466,16 @@ async fn convex_hull(
     Path(branch_id): Path<Uuid>,
     Json(req): Json<ConvexHullRequest>,
 ) -> Result<Json<SingleGeometryResult>, GeoprocessingError> {
-    let filter = if let Some(ids) = &req.feature_ids {
-        let id_list: Vec<String> = ids.iter().map(|id| format!("'{id}'")).collect();
-        format!("AND feature_id IN ({})", id_list.join(","))
-    } else {
-        String::new()
-    };
-
     let row = sqlx::query(&format!(
         "{LIVE_FEATURES_CTE}
          SELECT
              ST_AsGeoJSON(ST_ConvexHull(ST_Collect(geometry)))::jsonb as geojson,
              COALESCE(ST_Area(ST_ConvexHull(ST_Collect(geometry))::geography), 0) as area
          FROM live
-         WHERE TRUE {filter}"
+         WHERE $2::uuid[] IS NULL OR feature_id = ANY($2::uuid[])"
     ))
     .bind(branch_id)
+    .bind(&req.feature_ids)
     .fetch_one(store.read_pool())
     .await?;
 
@@ -689,9 +684,9 @@ async fn contour(
          pts AS (
              SELECT
                  ST_Centroid(geometry) as geom,
-                 (properties->>'{prop}')::double precision as val
+                 (properties->>$3)::double precision as val
              FROM live
-             WHERE properties->>'{prop}' IS NOT NULL
+             WHERE properties->>$3 IS NOT NULL
          ),
          tin AS (
              SELECT ST_DelaunayTriangles(ST_Collect(geom)) as geom FROM pts
@@ -702,11 +697,11 @@ async fn contour(
              )::jsonb as geojson,
              $2 * generate_series(1, 100) as level
          FROM tin
-         LIMIT 1000",
-        prop = req.value_property
+         LIMIT 1000"
     ))
     .bind(branch_id)
     .bind(req.interval)
+    .bind(&req.value_property)
     .fetch_all(store.read_pool())
     .await
     .map_err(no_contour_lines_or_internal)?;

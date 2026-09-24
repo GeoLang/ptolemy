@@ -1689,6 +1689,75 @@ async fn test_geoprocessing_merge_of_no_features_is_a_null_geometry() {
     assert_eq!(body["area_sq_meters"], 0.0, "merge of nothing: {body}");
 }
 
+#[tokio::test]
+async fn test_voronoi_envelope_with_a_quote_is_data() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let point_count = 3;
+    seed_points(&app, branch_id, point_count).await;
+    let envelope_half_width = 50.0;
+    let (low, high) = (-envelope_half_width, envelope_half_width);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/geoprocessing/voronoi"),
+        json!({
+            "envelope": {
+                "type": "Polygon",
+                "coordinates": [[[low, low], [high, low], [high, high], [low, high], [low, low]]],
+                "note": "x'); DROP TABLE datasets; --"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "voronoi: {body}");
+    let cells = body["features"].as_array().expect("a feature array");
+    assert_eq!(cells.len(), point_count, "voronoi: {body}");
+    let widest = cells
+        .iter()
+        .flat_map(|cell| cell["geometry"]["coordinates"][0].as_array().unwrap())
+        .flat_map(|vertex| vertex.as_array().unwrap())
+        .map(|coordinate| coordinate.as_f64().unwrap().abs())
+        .fold(0.0, f64::max);
+    assert_eq!(
+        widest, envelope_half_width,
+        "cells reach the envelope: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_convex_hull_of_no_listed_features_is_a_null_geometry() {
+    let (app, _) = setup_app().await;
+    let ds_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, ds_id, "main").await;
+    let (f1, f2) = (Uuid::now_v7(), Uuid::now_v7());
+
+    let sq1 = "0103000000010000000500000000000000000000000000000000000000000000000000F03F0000000000000000000000000000F03F000000000000F03F0000000000000000000000000000F03F00000000000000000000000000000000";
+    let sq2 = "01030000000100000005000000000000000000F03F0000000000000000000000000000004000000000000000000000000000000040000000000000F03F000000000000F03F000000000000F03F000000000000F03F0000000000000000";
+    commit_features(&app, branch_id, json!([
+        {"type": "insert", "feature_id": f1.to_string(), "geometry_wkb_hex": sq1, "properties": {}},
+        {"type": "insert", "feature_id": f2.to_string(), "geometry_wkb_hex": sq2, "properties": {}}
+    ])).await;
+    let uri = format!("/api/v1/branches/{branch_id}/geoprocessing/convex-hull");
+
+    let (status, body) = post_json(&app, &uri, json!({"feature_ids": []})).await;
+    assert_eq!(status, StatusCode::OK, "hull of nothing: {body}");
+    assert!(body["geometry"].is_null(), "hull of nothing: {body}");
+    assert_eq!(body["area_sq_meters"], 0.0, "hull of nothing: {body}");
+
+    let (status, one) = post_json(&app, &uri, json!({"feature_ids": [f1.to_string()]})).await;
+    assert_eq!(status, StatusCode::OK, "hull of one: {one}");
+    let (status, both) = post_json(&app, &uri, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "hull of both: {both}");
+    let one_area = one["area_sq_meters"].as_f64().unwrap();
+    let both_area = both["area_sq_meters"].as_f64().unwrap();
+    assert!(
+        one_area > 0.0 && one_area < both_area * 0.6,
+        "one square {one_area} against two {both_area}"
+    );
+}
+
 /// `ST_Simplify` drops a geometry it cannot keep at the given tolerance, and
 /// returns NULL where it did, so a tolerance wider than the feature answers a
 /// feature with no geometry rather than failing the whole request.
