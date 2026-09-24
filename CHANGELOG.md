@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-24: **the `/ws/rooms` relay refuses a message over 64 KiB**. It
+  took messages up to tungstenite's 64 MiB default and relayed each one to
+  every peer in the room. A larger message now reaches nobody and closes the
+  sender's socket.
+- 2026-09-24: **a project attachment upload checks the project role before it
+  reads the body**. A caller who was not a project editor had the JSON body,
+  up to 32 MiB, parsed before the refusal. The refusal, `404` for a
+  non-member and `403` for a viewer, now comes first.
 - 2026-09-24: **a percent-encoded id no longer skips the private dataset
   check**. The read and write gates looked for ids in the raw path and query,
   while the handlers decode them, so writing a private branch or dataset id as

@@ -9856,6 +9856,78 @@ async fn test_ws_handshake_with_authorization_header_upgrades() {
     }
 }
 
+type RoomSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_room_socket(base: &str, token: &str) -> RoomSocket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut req = format!("{base}/ws/rooms/size-limit")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+async fn next_room_text(socket: &mut RoomSocket) -> Option<String> {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let wait = std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(wait, socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => return Some(text.to_string()),
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(_) => return None,
+            Err(_) => panic!("no frame and no close within {wait:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_room_relay_refuses_a_message_over_the_size_limit() {
+    use futures::{SinkExt, StreamExt};
+    use ptolemy_api::room_relay::MAX_ROOM_MESSAGE_BYTES;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const READY: &str = "ready";
+    const MARKER: &str = "sent after the oversized message";
+
+    let base = spawn_ws_app(setup_app_authed().await).await;
+    let token = token_for(Role::Viewer);
+    let mut sender = open_room_socket(&base, &token).await;
+    let mut peer = open_room_socket(&base, &token).await;
+
+    // a relayed frame proves both sockets have joined the room
+    loop {
+        peer.send(Message::text(READY)).await.unwrap();
+        let poll = std::time::Duration::from_millis(100);
+        if let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(poll, sender.next()).await
+            && text.as_str() == READY
+        {
+            break;
+        }
+    }
+
+    let at_the_limit = "a".repeat(MAX_ROOM_MESSAGE_BYTES);
+    sender
+        .send(Message::text(at_the_limit.clone()))
+        .await
+        .unwrap();
+    assert_eq!(next_room_text(&mut peer).await, Some(at_the_limit));
+
+    let over_the_limit = "b".repeat(MAX_ROOM_MESSAGE_BYTES + 1);
+    let _ = sender.send(Message::text(over_the_limit)).await;
+    while let Some(text) = next_room_text(&mut sender).await {
+        assert_eq!(text, READY, "only the peer's ready frames reach the sender");
+    }
+
+    let mut third = open_room_socket(&base, &token).await;
+    third.send(Message::text(MARKER)).await.unwrap();
+    assert_eq!(next_room_text(&mut peer).await.as_deref(), Some(MARKER));
+}
+
 /// The subprotocol must not act as a credential anywhere but the socket paths,
 /// or any route could be entered with a header script sets without a preflight.
 #[tokio::test]
@@ -17606,6 +17678,49 @@ async fn test_project_attachment_round_trip() {
 
     let (status, _) = get_bytes_as(&app, &attachment_path, &viewer).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+async fn post_raw_json_as(app: &axum::Router, uri: &str, token: &str, body: Vec<u8>) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn test_project_attachment_upload_refuses_a_stranger_before_reading_the_body() {
+    let app = setup_app_authed().await;
+    let carol = token_for_user("carol", Role::Editor);
+    let project_id = seed_project_with_members(&app, &carol).await;
+    let uri = format!("/api/v1/projects/{project_id}/attachments");
+    let stranger = token_for_user("stranger", Role::Editor);
+    let editor = token_for_user("project-editor", Role::Editor);
+
+    let malformed = b"{not json".to_vec();
+    let over_the_upload_limit = vec![b' '; 33 * 1024 * 1024];
+
+    assert_eq!(
+        post_raw_json_as(&app, &uri, &stranger, malformed.clone()).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post_raw_json_as(&app, &uri, &stranger, over_the_upload_limit.clone()).await,
+        StatusCode::NOT_FOUND
+    );
+
+    // the same bodies from a member are read, so the stranger's 404 came first
+    assert_eq!(
+        post_raw_json_as(&app, &uri, &editor, malformed).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post_raw_json_as(&app, &uri, &editor, over_the_upload_limit).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
 }
 
 #[tokio::test]

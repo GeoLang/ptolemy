@@ -531,7 +531,8 @@ routes, whose callers are outside this codebase.
 
 `/ws/rooms/{room_id}` relays every text frame a client sends to every other
 client in the room, never back to the sender. Nothing is stored. A room exists
-while someone is connected. The handshake needs a token, which a browser sends
+while someone is connected. A message over 64 KiB is dropped and closes the
+sender's socket. The handshake needs a token, which a browser sends
 as `new WebSocket(url, ["bearer", jwt])`, and the server echoes only `bearer`.
 The subprotocol is read as a credential on `/ws/` paths only.
 

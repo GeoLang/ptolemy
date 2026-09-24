@@ -40,6 +40,8 @@ fn text_for_connection(msg: &RoomMessage, conn_id: u64) -> Option<&str> {
 /// Capacity of the per-room broadcast channel.
 const ROOM_CAPACITY: usize = 256;
 
+pub const MAX_ROOM_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// Shared state holding all active rooms.
 #[derive(Clone, Default)]
 pub struct RoomRelay {
@@ -99,6 +101,8 @@ async fn ws_room_handler(
     // marker is required for a browser to accept the 101, and the token itself
     // is never echoed
     ws.protocols([crate::auth::BEARER_SUBPROTOCOL])
+        .max_message_size(MAX_ROOM_MESSAGE_BYTES)
+        .max_frame_size(MAX_ROOM_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_room_socket(socket, room_id, relay))
 }
 

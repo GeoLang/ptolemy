@@ -19,7 +19,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get},
@@ -191,10 +191,12 @@ async fn upload_project_attachment(
     State(store): State<AppState>,
     Path(project_id): Path<Uuid>,
     actor: Actor,
-    Json(req): Json<UploadAttachmentRequest>,
+    request: Request,
 ) -> Result<(StatusCode, Json<AttachmentMeta>), AttachmentError> {
     let user_id = authenticated_subject(&actor)?.to_string();
     require_project_role(&store, project_id, &user_id, CollaborationRole::Editor).await?;
+    // read only once the role check passed
+    let Json(req) = Json::<UploadAttachmentRequest>::from_request(request, &store).await?;
     let data = base64_decode(&req.data)?;
     let size = data.len() as i64;
     let now = OffsetDateTime::now_utc();
@@ -366,11 +368,18 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, AttachmentError> {
 enum AttachmentError {
     Store(ptolemy_storage::StoreError),
     BadRequest(String),
+    Body(JsonRejection),
 }
 
 impl From<ptolemy_storage::StoreError> for AttachmentError {
     fn from(e: ptolemy_storage::StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl From<JsonRejection> for AttachmentError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::Body(rejection)
     }
 }
 
@@ -382,6 +391,7 @@ impl IntoResponse for AttachmentError {
                 (status, message).into_response()
             }
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Self::Body(rejection) => rejection.into_response(),
         }
     }
 }
