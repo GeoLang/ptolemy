@@ -126,10 +126,27 @@ needs its own copy of these parameters.
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
 | `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger an `ANALYZE`. `0` leaves it to autoanalyze | 1000 |
 | `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept. `0` keeps them forever | 30 |
+| `PTOLEMY_MAX_ATTACHMENT_MEGABYTES_PER_USER` | Attachment storage one user may upload, deleted attachments included | (no limit) |
+| `PTOLEMY_MAX_ATTACHMENTS_PER_USER` | Attachments one user may upload, deleted attachments included | (no limit) |
+| `PTOLEMY_MAX_WORKSPACES_PER_USER` | Workspaces one user may create | (no limit) |
+| `PTOLEMY_MAX_PROJECTS_PER_USER` | Projects one user may create, across every workspace | (no limit) |
+| `PTOLEMY_MAX_INVITATIONS_PER_USER` | Invitations one user may create, revoked and accepted ones included | (no limit) |
+| `PTOLEMY_MAX_MEMBERS_PER_WORKSPACE` | Members one workspace may hold | (no limit) |
+| `PTOLEMY_MAX_MEMBERS_PER_PROJECT` | Direct members one project may hold | (no limit) |
+| `PTOLEMY_MAX_STATE_KEYS_PER_PROJECT` | Project state keys one project may hold | (no limit) |
 | `RUST_LOG` | Log filter | (the image sets `info,ptolemy=debug`) |
 
 The OIDC callback answers `{access_token, user}`, where `access_token` is a
 Ptolemy JWT with role `editor` for every user the provider signs in.
+
+The `PTOLEMY_MAX_*` quotas are checked in the same transaction as the insert
+they limit, under a lock per user, so parallel requests cannot pass one
+together. A refusal is a `403` whose body names the limit, for example
+`quota reached: the limit on workspaces per user is 3`. A user is the token
+subject that created the row. A deleted attachment keeps its bytes as a
+tombstone, which is why it still counts. Changing a member's role or rewriting
+an existing state key never counts as a new row. A value that is not a whole
+number refuses startup.
 
 A write that touches at least `PTOLEMY_ANALYZE_ROW_THRESHOLD` rows runs
 `ANALYZE` on `feature_versions`, `changesets` and `branches` after it commits,

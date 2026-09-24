@@ -27,6 +27,10 @@ async fn fresh_state() -> AppState {
 /// Same, with the bulk-write ANALYZE threshold pinned so a test does not depend
 /// on the ambient environment.
 async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
+    Arc::new(fresh_store(rows).await)
+}
+
+async fn fresh_store(rows: usize) -> PgStore {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/ptolemy_test".to_string());
     let pool = PgPool::connect(&url).await.expect("DB connect failed");
@@ -85,8 +89,7 @@ async fn fresh_state_with_analyze_threshold(rows: usize) -> AppState {
 
     let store = PgStore::with_analyze_threshold(pool, rows);
     store.migrate().await.unwrap();
-
-    Arc::new(store)
+    store
 }
 
 /// Helper: create the test app from a fresh database, with auth off. The bulk
@@ -18907,4 +18910,76 @@ async fn unknown_key_refused_on_verticals() {
     assert!(status.is_success(), "{status}: {text}");
 
     assert_body_key_refused(&app, "POST", "/api/v1/incidents", NO_AUTH, valid).await;
+}
+
+// ─── User quotas ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_viewer_past_a_user_quota_gets_a_403_naming_the_limit() {
+    use base64::Engine;
+
+    let store = fresh_store(ptolemy_storage::DEFAULT_ANALYZE_ROW_THRESHOLD)
+        .await
+        .with_user_quotas(ptolemy_storage::UserQuotas {
+            workspaces_per_user: Some(1),
+            attachment_bytes_per_user: Some(4),
+            ..Default::default()
+        });
+    let app = app_with_auth(Arc::new(store), AuthConfig::enabled(TEST_SECRET));
+    let viewer = token_for_subject("quota-viewer");
+
+    let (status, workspace) = request_as(
+        &app,
+        "POST",
+        "/api/v1/workspaces",
+        Some(&viewer),
+        Some(json!({"name": "first"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{workspace}");
+    let (status, refusal) = send_text(
+        &app,
+        "POST",
+        "/api/v1/workspaces",
+        &viewer,
+        Some(json!({"name": "second"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert!(
+        refusal.contains("the limit on workspaces per user is 1"),
+        "{refusal}"
+    );
+
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let (status, project) = request_as(
+        &app,
+        "POST",
+        &format!("/api/v1/workspaces/{workspace_id}/projects"),
+        Some(&viewer),
+        Some(json!({"name": "p"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{project}");
+    let attachments = format!(
+        "/api/v1/projects/{}/attachments",
+        project["id"].as_str().unwrap()
+    );
+    let upload = |bytes: &[u8]| {
+        json!({
+            "name": "overlay.png",
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "created_by": "ignored",
+        })
+    };
+
+    let (status, body) = send_text(&app, "POST", &attachments, &viewer, Some(upload(b"abc"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, refusal) =
+        send_text(&app, "POST", &attachments, &viewer, Some(upload(b"de"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert!(
+        refusal.contains("the limit on attachment bytes per user is 4"),
+        "{refusal}"
+    );
 }

@@ -2183,8 +2183,8 @@ async fn max_oid(store: &AppState, layer: &Layer) -> Result<i64, EsriError> {
 }
 
 /// The advisory lock space the object id lock is taken in, so a lock taken
-/// anywhere else against this database cannot collide with it. Arbitrary, fixed,
-/// and the only advisory lock this service takes.
+/// anywhere else against this database cannot collide with it. Arbitrary and
+/// fixed, apart from the user quota lock space in ptolemy-storage.
 const OID_LOCK_SPACE: i32 = 0x0A_C6_15_ED;
 
 /// How long a batch waits for the layer's object id lock before it is refused as

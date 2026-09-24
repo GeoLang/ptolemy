@@ -10,6 +10,7 @@ use crate::permission::{
     Check, Reader, Scope, Writer, permission_level, stronger_permission, visible_datasets_sql,
     write_allowed,
 };
+use crate::quota::{UserQuotas, lock_user_quota, quota_refusal};
 use crate::workspace::{effective_project_role_sql, parse_effective_role};
 use ptolemy_core::Feature;
 use ptolemy_core::branch::Branch;
@@ -187,6 +188,7 @@ pub struct PgStore {
     /// bad URL fails the request rather than startup.
     external_pool: tokio::sync::OnceCell<PgPool>,
     analyzer: Analyzer,
+    pub(crate) quotas: UserQuotas,
 }
 
 impl PgStore {
@@ -201,7 +203,12 @@ impl PgStore {
             analyzer: Analyzer::new(pool.clone(), rows),
             pool,
             external_pool: tokio::sync::OnceCell::new(),
+            quotas: UserQuotas::default(),
         }
+    }
+
+    pub fn with_user_quotas(self, quotas: UserQuotas) -> Self {
+        Self { quotas, ..self }
     }
 
     /// The pool a caller runs reads on. Every `SELECT` in `ptolemy-api` uses
@@ -2715,6 +2722,9 @@ impl PgStore {
     // must not change because the row was deleted.
 
     pub async fn create_attachment(&self, attachment: &Attachment) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.ensure_attachment_quota(&mut tx, &attachment.created_by, attachment.size_bytes)
+            .await?;
         sqlx::query(
             "INSERT INTO attachments (id, feature_id, branch_id, dataset_id, project_id, name, content_type, size_bytes, data, thumbnail, metadata, created_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -2731,8 +2741,57 @@ impl PgStore {
         .bind(&attachment.thumbnail)
         .bind(&attachment.metadata)
         .bind(&attachment.created_by)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // counts tombstones too: a soft delete keeps the bytes
+    async fn ensure_attachment_quota(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        created_by: &str,
+        size_bytes: i64,
+    ) -> Result<(), StoreError> {
+        let UserQuotas {
+            attachment_bytes_per_user,
+            attachments_per_user,
+            ..
+        } = self.quotas;
+        if attachment_bytes_per_user.is_none() && attachments_per_user.is_none() {
+            return Ok(());
+        }
+        lock_user_quota(tx, created_by).await?;
+        let row = sqlx::query(
+            "SELECT count(*) AS attachments, COALESCE(sum(size_bytes), 0)::bigint AS bytes
+               FROM attachments WHERE created_by = $1",
+        )
+        .bind(created_by)
+        .fetch_one(&mut **tx)
+        .await?;
+        let attachments: i64 = row.get("attachments");
+        let bytes: i64 = row.get("bytes");
+        if let Some(limit) = attachments_per_user
+            && attachments >= limit
+        {
+            return Err(quota_refusal(
+                limit,
+                "attachments per user",
+                ", deleted attachments count",
+            ));
+        }
+        if let Some(limit) = attachment_bytes_per_user
+            && bytes.saturating_add(size_bytes) > limit
+        {
+            return Err(quota_refusal(
+                limit,
+                "attachment bytes per user",
+                &format!(
+                    ", deleted attachments count, {bytes} are used and this upload is {size_bytes}"
+                ),
+            ));
+        }
         Ok(())
     }
 

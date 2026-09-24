@@ -6,6 +6,7 @@ pub mod analyze;
 pub mod grant;
 pub mod permission;
 pub mod postgres;
+pub mod quota;
 pub mod workspace;
 pub mod writes;
 
@@ -22,6 +23,7 @@ pub use postgres::{
     branch_features_subquery, merge_choice,
 };
 pub use postgres::{LATEST_COLUMNS, MVT_TILE_EXTENT, mvt_simplify_tolerance};
+pub use quota::UserQuotas;
 pub use workspace::{
     CollaborationRole, CreatedInvitation, InvitationTarget, Project, ProjectInvitation,
     ProjectMember, ProjectStateEntry, ProjectWithRole, Workspace, WorkspaceInvitation,

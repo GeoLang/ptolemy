@@ -2842,3 +2842,326 @@ async fn migrate_carries_a_database_v0_1_0_left_without_a_ledger() {
     let carried = store.get_dataset(dataset_id).await.unwrap();
     assert_eq!(carried.name, "from v0.1.0");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// User Quotas
+// ═══════════════════════════════════════════════════════════════════════
+
+async fn setup_with_quotas(quotas: ptolemy_storage::UserQuotas) -> PgStore {
+    setup().await.with_user_quotas(quotas)
+}
+
+fn assert_quota_refusal(
+    result: Result<impl std::fmt::Debug, ptolemy_storage::StoreError>,
+    limit_text: &str,
+) {
+    match result {
+        Err(ptolemy_storage::StoreError::Forbidden(message)) => {
+            assert!(message.contains(limit_text), "{message}")
+        }
+        other => panic!("expected a quota refusal naming {limit_text:?}, got {other:?}"),
+    }
+}
+
+fn project_attachment_of(
+    project_id: Uuid,
+    created_by: &str,
+    size: usize,
+) -> ptolemy_storage::Attachment {
+    ptolemy_storage::Attachment {
+        id: Uuid::now_v7(),
+        feature_id: None,
+        branch_id: None,
+        dataset_id: None,
+        project_id: Some(project_id),
+        name: "overlay.png".to_string(),
+        content_type: "image/png".to_string(),
+        size_bytes: size as i64,
+        data: vec![0u8; size],
+        thumbnail: None,
+        metadata: json!({}),
+        created_by: created_by.to_string(),
+        created_at: OffsetDateTime::now_utc(),
+    }
+}
+
+async fn project_owned_by(store: &PgStore, user_id: &str) -> Uuid {
+    let workspace = store.create_workspace("w", None, user_id).await.unwrap();
+    store
+        .create_project(workspace.workspace.id, user_id, "p", None)
+        .await
+        .unwrap()
+        .project
+        .id
+}
+
+#[tokio::test]
+async fn workspace_and_project_quotas_count_each_creator_on_their_own() {
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        workspaces_per_user: Some(2),
+        projects_per_user: Some(1),
+        ..Default::default()
+    })
+    .await;
+
+    let first = store.create_workspace("a1", None, "alice").await.unwrap();
+    store.create_workspace("a2", None, "alice").await.unwrap();
+    assert_quota_refusal(
+        store.create_workspace("a3", None, "alice").await,
+        "the limit on workspaces per user is 2",
+    );
+    store.create_workspace("b1", None, "bob").await.unwrap();
+
+    // a deleted workspace frees its place
+    store
+        .delete_workspace(first.workspace.id, "alice")
+        .await
+        .unwrap();
+    let again = store.create_workspace("a3", None, "alice").await.unwrap();
+
+    let workspace_id = again.workspace.id;
+    store
+        .create_project(workspace_id, "alice", "p1", None)
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .create_project(workspace_id, "alice", "p2", None)
+            .await,
+        "the limit on projects per user is 1",
+    );
+}
+
+#[tokio::test]
+async fn concurrent_creates_cannot_pass_the_count_together() {
+    const ATTEMPTS: usize = 8;
+    let store = std::sync::Arc::new(
+        setup_with_quotas(ptolemy_storage::UserQuotas {
+            workspaces_per_user: Some(1),
+            ..Default::default()
+        })
+        .await,
+    );
+
+    let mut attempts = tokio::task::JoinSet::new();
+    for attempt in 0..ATTEMPTS {
+        let store = std::sync::Arc::clone(&store);
+        attempts.spawn(async move {
+            store
+                .create_workspace(&format!("race {attempt}"), None, "racer")
+                .await
+                .is_ok()
+        });
+    }
+    let created = attempts
+        .join_all()
+        .await
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(created, 1);
+}
+
+#[tokio::test]
+async fn attachment_quotas_count_bytes_and_files_deleted_ones_included() {
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        attachment_bytes_per_user: Some(100),
+        attachments_per_user: Some(3),
+        ..Default::default()
+    })
+    .await;
+    let project_id = project_owned_by(&store, "alice").await;
+
+    let first = project_attachment_of(project_id, "alice", 60);
+    store.create_attachment(&first).await.unwrap();
+    assert_quota_refusal(
+        store
+            .create_attachment(&project_attachment_of(project_id, "alice", 41))
+            .await,
+        "the limit on attachment bytes per user is 100",
+    );
+    // exactly at the limit is allowed
+    store
+        .create_attachment(&project_attachment_of(project_id, "alice", 40))
+        .await
+        .unwrap();
+
+    // the tombstone keeps its bytes
+    store
+        .delete_project_attachment(project_id, first.id)
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .create_attachment(&project_attachment_of(project_id, "alice", 1))
+            .await,
+        "the limit on attachment bytes per user is 100",
+    );
+
+    store
+        .create_attachment(&project_attachment_of(project_id, "bob", 0))
+        .await
+        .unwrap();
+    store
+        .create_attachment(&project_attachment_of(project_id, "bob", 0))
+        .await
+        .unwrap();
+    store
+        .create_attachment(&project_attachment_of(project_id, "bob", 0))
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .create_attachment(&project_attachment_of(project_id, "bob", 0))
+            .await,
+        "the limit on attachments per user is 3",
+    );
+}
+
+#[tokio::test]
+async fn state_key_quota_refuses_a_new_key_but_not_a_rewrite() {
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        state_keys_per_project: Some(2),
+        ..Default::default()
+    })
+    .await;
+    let project_id = project_owned_by(&store, "alice").await;
+
+    store
+        .set_project_state(project_id, "map", &json!({}), "alice")
+        .await
+        .unwrap();
+    store
+        .set_project_state(project_id, "dashboards", &json!([]), "alice")
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .set_project_state(project_id, "third", &json!(1), "alice")
+            .await,
+        "the limit on state keys per project is 2",
+    );
+    let rewritten = store
+        .set_project_state(project_id, "map", &json!({"zoom": 3}), "alice")
+        .await
+        .unwrap();
+    assert_eq!(rewritten.value, json!({"zoom": 3}));
+}
+
+#[tokio::test]
+async fn member_quota_refuses_a_new_member_but_not_a_role_change() {
+    use ptolemy_storage::CollaborationRole::{Editor, Viewer};
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        members_per_workspace: Some(2),
+        members_per_project: Some(2),
+        ..Default::default()
+    })
+    .await;
+    let workspace = store.create_workspace("w", None, "alice").await.unwrap();
+    let workspace_id = workspace.workspace.id;
+
+    store
+        .set_workspace_member(workspace_id, "alice", "bob", Viewer)
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .set_workspace_member(workspace_id, "alice", "carol", Viewer)
+            .await,
+        "the limit on members per workspace is 2",
+    );
+    store
+        .set_workspace_member(workspace_id, "alice", "bob", Editor)
+        .await
+        .unwrap();
+
+    let project_id = store
+        .create_project(workspace_id, "alice", "p", None)
+        .await
+        .unwrap()
+        .project
+        .id;
+    store
+        .set_project_member(project_id, "alice", "dave", Viewer)
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .set_project_member(project_id, "alice", "erin", Viewer)
+            .await,
+        "the limit on members per project is 2",
+    );
+}
+
+#[tokio::test]
+async fn member_quota_holds_when_an_invitation_is_accepted() {
+    use ptolemy_storage::CollaborationRole::Viewer;
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        members_per_workspace: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let workspace = store.create_workspace("w", None, "alice").await.unwrap();
+    let token_hash = [7u8; 32];
+    let expires_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    store
+        .create_workspace_invitation(
+            workspace.workspace.id,
+            "alice",
+            Viewer,
+            expires_at,
+            &token_hash,
+            "token".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store.accept_invitation(&token_hash, "bob").await,
+        "the limit on members per workspace is 1",
+    );
+}
+
+#[tokio::test]
+async fn invitation_quota_counts_revoked_invitations() {
+    use ptolemy_storage::CollaborationRole::Viewer;
+    let store = setup_with_quotas(ptolemy_storage::UserQuotas {
+        invitations_per_user: Some(1),
+        ..Default::default()
+    })
+    .await;
+    let workspace_id = store
+        .create_workspace("w", None, "alice")
+        .await
+        .unwrap()
+        .workspace
+        .id;
+    let expires_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+    let invitation = store
+        .create_workspace_invitation(
+            workspace_id,
+            "alice",
+            Viewer,
+            expires_at,
+            &[1u8; 32],
+            "first".to_string(),
+        )
+        .await
+        .unwrap();
+    store
+        .revoke_workspace_invitation(workspace_id, invitation.id, "alice")
+        .await
+        .unwrap();
+    assert_quota_refusal(
+        store
+            .create_workspace_invitation(
+                workspace_id,
+                "alice",
+                Viewer,
+                expires_at,
+                &[2u8; 32],
+                "second".to_string(),
+            )
+            .await,
+        "the limit on invitations ever created per user is 1",
+    );
+}

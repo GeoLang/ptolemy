@@ -1,3 +1,4 @@
+use crate::quota::{ensure_room_for_row, ensure_user_row_quota};
 use crate::{PgStore, StoreError};
 use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
@@ -210,6 +211,14 @@ impl PgStore {
         creator: &str,
     ) -> Result<WorkspaceWithRole, StoreError> {
         let mut tx = self.pool.begin().await?;
+        ensure_user_row_quota(
+            &mut tx,
+            self.quotas.workspaces_per_user,
+            "SELECT count(*) FROM workspaces WHERE created_by = $1",
+            creator,
+            "workspaces per user",
+        )
+        .await?;
         let id = Uuid::now_v7();
         let row = sqlx::query(
             "INSERT INTO workspaces (id, name, description, created_by)
@@ -338,6 +347,8 @@ impl PgStore {
         let mut tx = self.pool.begin().await?;
         lock_workspace(&mut tx, workspace_id).await?;
         require_workspace_role(&mut tx, workspace_id, actor, CollaborationRole::Owner).await?;
+        self.ensure_workspace_member_room(&mut tx, workspace_id, user_id)
+            .await?;
         let row = sqlx::query(
             "INSERT INTO workspace_members (workspace_id, user_id, role)
              VALUES ($1, $2, $3)
@@ -386,6 +397,14 @@ impl PgStore {
         description: Option<&str>,
     ) -> Result<ProjectWithRole, StoreError> {
         let mut tx = self.pool.begin().await?;
+        ensure_user_row_quota(
+            &mut tx,
+            self.quotas.projects_per_user,
+            "SELECT count(*) FROM projects WHERE created_by = $1",
+            actor,
+            "projects per user",
+        )
+        .await?;
         lock_workspace(&mut tx, workspace_id).await?;
         require_workspace_role(&mut tx, workspace_id, actor, CollaborationRole::Editor).await?;
         let id = Uuid::now_v7();
@@ -543,6 +562,19 @@ impl PgStore {
         value: &serde_json::Value,
         updated_by: &str,
     ) -> Result<ProjectStateEntry, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        if self.quotas.state_keys_per_project.is_some() {
+            lock_project_and_workspace(&mut tx, project_id).await?;
+        }
+        ensure_room_for_row(
+            &mut tx,
+            self.quotas.state_keys_per_project,
+            "SELECT count(*) FROM project_state WHERE project_id = $1 AND key <> $2",
+            project_id,
+            key,
+            "state keys per project",
+        )
+        .await?;
         let row = sqlx::query(
             "INSERT INTO project_state (project_id, key, value, updated_by)
              VALUES ($1, $2, $3, $4)
@@ -556,8 +588,9 @@ impl PgStore {
         .bind(key)
         .bind(value)
         .bind(updated_by)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(project_state_from_row(&row))
     }
 
@@ -639,6 +672,8 @@ impl PgStore {
             CollaborationRole::Owner,
         )
         .await?;
+        self.ensure_project_member_room(&mut tx, project_id, user_id)
+            .await?;
         let row = sqlx::query(
             "INSERT INTO project_members (project_id, user_id, role)
              VALUES ($1, $2, $3)
@@ -697,6 +732,7 @@ impl PgStore {
     ) -> Result<CreatedInvitation, StoreError> {
         ensure_invitation_role(role)?;
         let mut tx = self.pool.begin().await?;
+        self.ensure_invitation_quota(&mut tx, actor).await?;
         lock_workspace(&mut tx, workspace_id).await?;
         require_workspace_role(&mut tx, workspace_id, actor, CollaborationRole::Owner).await?;
         let id = insert_invitation(
@@ -723,6 +759,7 @@ impl PgStore {
     ) -> Result<CreatedInvitation, StoreError> {
         ensure_invitation_role(role)?;
         let mut tx = self.pool.begin().await?;
+        self.ensure_invitation_quota(&mut tx, actor).await?;
         let workspace_id = lock_project_and_workspace(&mut tx, project_id).await?;
         require_project_role(
             &mut tx,
@@ -859,10 +896,14 @@ impl PgStore {
         match target {
             InvitationTarget::Workspace(workspace_id) => {
                 lock_workspace(&mut tx, workspace_id).await?;
+                self.ensure_workspace_member_room(&mut tx, workspace_id, user_id)
+                    .await?;
                 upsert_workspace_member(&mut tx, workspace_id, user_id, role).await?;
             }
             InvitationTarget::Project(project_id) => {
                 lock_project_and_workspace(&mut tx, project_id).await?;
+                self.ensure_project_member_room(&mut tx, project_id, user_id)
+                    .await?;
                 upsert_project_member(&mut tx, project_id, user_id, role).await?;
             }
         }
@@ -877,6 +918,56 @@ impl PgStore {
         .await?;
         tx.commit().await?;
         Ok(target)
+    }
+
+    // revoked and accepted invitations still take a row
+    async fn ensure_invitation_quota(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        ensure_user_row_quota(
+            tx,
+            self.quotas.invitations_per_user,
+            "SELECT count(*) FROM project_invitations WHERE created_by = $1",
+            actor,
+            "invitations ever created per user",
+        )
+        .await
+    }
+
+    async fn ensure_workspace_member_room(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        workspace_id: Uuid,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        ensure_room_for_row(
+            tx,
+            self.quotas.members_per_workspace,
+            "SELECT count(*) FROM workspace_members WHERE workspace_id = $1 AND user_id <> $2",
+            workspace_id,
+            user_id,
+            "members per workspace",
+        )
+        .await
+    }
+
+    async fn ensure_project_member_room(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        project_id: Uuid,
+        user_id: &str,
+    ) -> Result<(), StoreError> {
+        ensure_room_for_row(
+            tx,
+            self.quotas.members_per_project,
+            "SELECT count(*) FROM project_members WHERE project_id = $1 AND user_id <> $2",
+            project_id,
+            user_id,
+            "members per project",
+        )
+        .await
     }
 }
 

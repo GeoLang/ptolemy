@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use ptolemy_core::branch::Branch;
 use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
-use ptolemy_storage::PgStore;
+use ptolemy_storage::{PgStore, UserQuotas};
 use serde_json::json;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -257,7 +257,8 @@ async fn main() -> anyhow::Result<()> {
         .min_connections(cli.db_min_connections)
         .connect(&cli.database_url)
         .await?;
-    let store = Arc::new(PgStore::new(pool));
+    let quotas = UserQuotas::from_env().map_err(anyhow::Error::msg)?;
+    let store = Arc::new(PgStore::new(pool).with_user_quotas(quotas));
 
     match cli.command {
         Commands::Serve { bind } => {

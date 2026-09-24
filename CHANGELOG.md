@@ -72,6 +72,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- 2026-09-23: **per-user quotas, each off when unset**. Attachment megabytes
+  and attachment count per user, workspaces and projects per user,
+  invitations per user, members per workspace and per project, and state keys
+  per project, through the `PTOLEMY_MAX_*` variables in the README. Before
+  this a signed-in viewer could create workspaces and projects without end and
+  upload 32 MiB project attachments without end. Each check runs in the insert's
+  own transaction under a per-user advisory lock, and a refusal is a `403`
+  naming the limit. Migration 041 indexes the creator columns the checks count
+  on.
 - 2026-08-30: **dataset attach and detach close six review findings**. Detaching
   now takes either half of what attaching took, an `admin` grant on the dataset
   or `editor` on the project it is leaving, so a dataset admin outside the
