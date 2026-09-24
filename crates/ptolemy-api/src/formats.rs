@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{AppState, auth::Actor};
+use crate::{AppState, auth::Actor, routes::MAX_FEATURE_PAGE};
 
 // 50,000 parcel polygons as GeoJSON run to tens of MB, past axum's 2 MB default
 const MAX_IMPORT_BODY: usize = 64 * 1024 * 1024;
@@ -55,7 +55,10 @@ async fn export_geojson(
     Query(q): Query<ExportQuery>,
 ) -> Result<axum::response::Response, FormatError> {
     let target_srid = q.srid.unwrap_or(4326);
-    let limit = q.limit.unwrap_or(10000);
+    let limit = q
+        .limit
+        .unwrap_or(MAX_FEATURE_PAGE)
+        .clamp(1, MAX_FEATURE_PAGE);
     let offset = q.offset.unwrap_or(0);
 
     let (external, source) = store.features_source(branch_id).await?;
@@ -114,7 +117,10 @@ async fn export_csv(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<axum::response::Response, FormatError> {
-    let limit = q.limit.unwrap_or(10000);
+    let limit = q
+        .limit
+        .unwrap_or(MAX_FEATURE_PAGE)
+        .clamp(1, MAX_FEATURE_PAGE);
     let offset = q.offset.unwrap_or(0);
 
     let (external, source) = store.features_source(branch_id).await?;
@@ -194,7 +200,10 @@ async fn export_flatgeobuf(
     Path(branch_id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<axum::response::Response, FormatError> {
-    let limit = q.limit.unwrap_or(10000);
+    let limit = q
+        .limit
+        .unwrap_or(MAX_FEATURE_PAGE)
+        .clamp(1, MAX_FEATURE_PAGE);
     let (external, source) = store.features_source(branch_id).await?;
     let rows = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(geometry)::text as geojson_geom,

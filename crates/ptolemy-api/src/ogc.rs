@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{AppState, auth::Actor};
+use crate::{AppState, auth::Actor, routes::MAX_FEATURE_PAGE};
 
 pub fn ogc_routes() -> Router<AppState> {
     Router::new()
@@ -340,6 +340,7 @@ async fn items(
     Path(dataset_id): Path<Uuid>,
     Query(q): Query<ItemsQuery>,
 ) -> Result<impl IntoResponse, OgcError> {
+    let limit = q.limit.clamp(1, MAX_FEATURE_PAGE);
     let branch_id = collection_branch(&store, dataset_id, q.branch).await?;
     let dataset_srid = match q.crs.is_some() || q.bbox_crs.is_some() {
         true => dataset_srid(&store, dataset_id).await?,
@@ -398,7 +399,7 @@ async fn items(
         .bind(parts[1])
         .bind(parts[2])
         .bind(parts[3])
-        .bind(q.limit)
+        .bind(limit)
         .bind(q.offset)
         .fetch_all(pool)
         .await?
@@ -411,7 +412,7 @@ async fn items(
             LIMIT $2 OFFSET $3"
         ))
         .bind(branch_id)
-        .bind(q.limit)
+        .bind(limit)
         .bind(q.offset)
         .fetch_all(pool)
         .await?

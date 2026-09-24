@@ -124,6 +124,7 @@ needs its own copy of these parameters.
 | `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets. Use a read-only role | (primary pool) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
+| `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` | Seconds one SQL statement may run under `serve` before Postgres cancels it. `0` turns it off. Startup migrations and the other CLI commands run without it | 30 |
 | `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger an `ANALYZE`. `0` leaves it to autoanalyze | 1000 |
 | `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept. `0` keeps them forever | 30 |
 | `PTOLEMY_MAX_ATTACHMENT_MEGABYTES_PER_USER` | Attachment storage one user may upload, deleted attachments included | (no limit) |
@@ -630,7 +631,7 @@ sync, cursors, presence and chat:
 | GET | `/api/v1/ogc/conformance` | OGC conformance |
 | GET | `/api/v1/ogc/collections` | OGC collections |
 | GET | `/api/v1/ogc/collections/{id}` | One OGC collection |
-| GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items |
+| GET | `/api/v1/ogc/collections/{id}/items` | OGC feature items, `limit` up to 10000 |
 | GET | `/api/v1/ogc/collections/{id}/items/{fid}` | OGC single feature |
 | GET | `/arcgis/rest/services` | ArcGIS service catalog |
 | GET | `/arcgis/rest/services/{service}/FeatureServer` | ArcGIS service root |
@@ -790,9 +791,9 @@ sync, cursors, presence and chat:
 | GET | `/api/v1/stac/collections/{id}/items/{item_id}` | STAC item |
 | GET | `/api/v1/stac/search` | STAC search |
 | **Format & CRS** | | |
-| GET | `/api/v1/branches/{id}/export/geojson` | Export GeoJSON |
-| GET | `/api/v1/branches/{id}/export/csv` | Export CSV |
-| GET | `/api/v1/branches/{id}/export/flatgeobuf` | Export FlatGeobuf |
+| GET | `/api/v1/branches/{id}/export/geojson` | Export GeoJSON, `limit` up to 10000, `offset` |
+| GET | `/api/v1/branches/{id}/export/csv` | Export CSV, `limit` up to 10000, `offset` |
+| GET | `/api/v1/branches/{id}/export/flatgeobuf` | Export FlatGeobuf, `limit` up to 10000 |
 | POST | `/api/v1/branches/{id}/transform` | Transform single geometry CRS |
 | POST | `/api/v1/branches/{id}/import/geojson` | Import a FeatureCollection |
 | POST | `/api/v1/branches/{id}/import/csv` | Import point rows from CSV |

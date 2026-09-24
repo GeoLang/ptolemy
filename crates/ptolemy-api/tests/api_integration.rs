@@ -965,6 +965,64 @@ async fn test_export_csv() {
     );
 }
 
+#[tokio::test]
+async fn test_exports_and_ogc_items_clamp_the_limit() {
+    use ptolemy_api::routes::MAX_FEATURE_PAGE;
+
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let branch_id = create_branch(&app, dataset_id, "main").await;
+    let past_the_clamp = MAX_FEATURE_PAGE as usize + 1;
+    for _ in 0..2 {
+        seed_points(&app, branch_id, past_the_clamp / 2 + 1).await;
+    }
+    let clamp = MAX_FEATURE_PAGE as usize;
+    let limit = MAX_FEATURE_PAGE * 10;
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/export/geojson?limit={limit}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["features"].as_array().unwrap().len(), clamp);
+
+    let (status, bytes) = get_bytes(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/export/csv?limit={limit}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let header_line = 1;
+    assert_eq!(
+        String::from_utf8_lossy(&bytes).lines().count() - header_line,
+        clamp
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/branches/{branch_id}/export/flatgeobuf?limit={limit}"
+        ))
+        .header("authorization", "Bearer test-skip")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["x-feature-count"],
+        clamp.to_string().as_str()
+    );
+
+    let (status, body) = get_json(
+        &app,
+        &format!("/api/v1/ogc/collections/{dataset_id}/items?limit={limit}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["numberReturned"], clamp, "{body}");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // CRS Transformation Tests
 // ═══════════════════════════════════════════════════════════════════════

@@ -8,6 +8,7 @@ use ptolemy_core::dataset::{Dataset, GeometryType};
 use ptolemy_core::diff::DiffOp;
 use ptolemy_storage::{PgStore, UserQuotas};
 use serde_json::json;
+use sqlx::postgres::PgConnectOptions;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -29,6 +30,14 @@ struct Cli {
     /// Minimum database connections in the pool
     #[arg(long, env = "PTOLEMY_DB_MIN_CONNECTIONS", default_value = "2")]
     db_min_connections: u32,
+
+    #[arg(
+        long,
+        env = "PTOLEMY_STATEMENT_TIMEOUT_SECONDS",
+        default_value = "30",
+        help = "Seconds one SQL statement may run under `serve` before postgres cancels it, 0 for no limit"
+    )]
+    statement_timeout_seconds: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -252,10 +261,18 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
+    let connect_options: PgConnectOptions = cli.database_url.parse()?;
+    let pool_connect_options = match cli.command {
+        Commands::Serve { .. } => connect_options.clone().options([(
+            "statement_timeout",
+            format!("{}s", cli.statement_timeout_seconds),
+        )]),
+        _ => connect_options.clone(),
+    };
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(cli.db_max_connections)
         .min_connections(cli.db_min_connections)
-        .connect(&cli.database_url)
+        .connect_with(pool_connect_options)
         .await?;
     let quotas = UserQuotas::from_env().map_err(anyhow::Error::msg)?;
     let store = Arc::new(PgStore::new(pool).with_user_quotas(quotas));
@@ -265,9 +282,12 @@ async fn main() -> anyhow::Result<()> {
             // resolved before anything else: serving with no JWT secret would
             // leave every write endpoint open, so refuse to start instead
             let auth = ptolemy_api::AuthConfig::from_env_strict().map_err(anyhow::Error::msg)?;
+            // a migration can outlast the statement timeout the serving pool has
+            let migration_pool = sqlx::PgPool::connect_with(connect_options).await?;
             // migrations are idempotent; running them here means the server
             // can never come up against an unmigrated database
-            store.migrate().await?;
+            PgStore::new(migration_pool.clone()).migrate().await?;
+            migration_pool.close().await;
             let app = ptolemy_api::app_with_auth(store.clone(), auth);
             // drains webhook_deliveries; the queue is in the database, so a
             // restart picks up whatever the last run did not send

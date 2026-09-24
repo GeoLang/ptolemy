@@ -322,12 +322,14 @@ fn default_limit() -> i64 {
     100
 }
 
+pub const MAX_FEATURE_PAGE: i64 = 10_000;
+
 async fn list_features(
     State(store): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<FeatureListParams>,
 ) -> Result<Json<FeaturePage>, AppError> {
-    let limit = params.limit.clamp(1, 10000);
+    let limit = params.limit.clamp(1, MAX_FEATURE_PAGE);
     let valid_at = params
         .valid_at
         .as_deref()
@@ -421,7 +423,7 @@ async fn features_bbox(
     Path(branch_id): Path<Uuid>,
     Query(params): Query<BboxParams>,
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
-    let limit = params.limit.clamp(1, 10000);
+    let limit = params.limit.clamp(1, MAX_FEATURE_PAGE);
     let features = store
         .features_in_bbox(
             branch_id,
@@ -451,7 +453,7 @@ async fn features_intersects(
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
     let geojson_str = serde_json::to_string(&req.geometry)
         .map_err(|e| AppError::BadRequest(format!("invalid geometry: {e}")))?;
-    let limit = req.limit.clamp(1, 10000);
+    let limit = req.limit.clamp(1, MAX_FEATURE_PAGE);
     let features = store
         .features_intersecting(branch_id, &geojson_str, limit)
         .await?;
@@ -465,7 +467,7 @@ async fn features_within(
 ) -> Result<Json<Vec<ptolemy_core::Feature>>, AppError> {
     let geojson_str = serde_json::to_string(&req.geometry)
         .map_err(|e| AppError::BadRequest(format!("invalid geometry: {e}")))?;
-    let limit = req.limit.clamp(1, 10000);
+    let limit = req.limit.clamp(1, MAX_FEATURE_PAGE);
     let features = store
         .features_within(branch_id, &geojson_str, limit)
         .await?;
@@ -502,7 +504,7 @@ async fn features_at_time(
         time::OffsetDateTime::parse(&params.at, &time::format_description::well_known::Rfc3339)
             .map_err(|e| AppError::BadRequest(format!("invalid timestamp (use RFC 3339): {e}")))?;
 
-    let limit = params.limit.clamp(1, 10000);
+    let limit = params.limit.clamp(1, MAX_FEATURE_PAGE);
     let features = store
         .features_at_time(branch_id, at, limit, params.offset)
         .await?;

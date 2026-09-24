@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-24: **exports and OGC items return at most 10,000 features, and
+  `serve` cancels a statement after 30 s**. The GeoJSON, CSV and FlatGeobuf
+  exports and `/ogc/collections/{id}/items` took any `limit` and loaded every
+  row into memory, and nothing bounded how long a query held one of the ten
+  pool connections. The four routes clamp `limit` to 1 to 10,000 like
+  `/branches/{id}/features`. `serve` sets `statement_timeout` on its pool
+  connections from `PTOLEMY_STATEMENT_TIMEOUT_SECONDS`, default 30, `0` for
+  none. Startup migrations and the other CLI commands run without it.
 - 2026-09-24: **the `/ws/rooms` relay refuses a message over 64 KiB**. It
   took messages up to tungstenite's 64 MiB default and relayed each one to
   every peer in the room. A larger message now reaches nobody and closes the
