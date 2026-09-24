@@ -2850,6 +2850,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "openidconnect",
+ "percent-encoding",
  "ptolemy-core",
  "ptolemy-storage",
  "reqwest",

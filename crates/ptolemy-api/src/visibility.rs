@@ -39,7 +39,7 @@
 //! goes wrong otherwise.
 
 use axum::{
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -54,21 +54,28 @@ use crate::{
 };
 
 /// Every uuid the request names, in the path or in a query value.
-fn referenced_ids(uri: &axum::http::Uri) -> Vec<Uuid> {
+fn referenced_ids(uri: &axum::http::Uri) -> Option<Vec<Uuid>> {
+    let Query(query) = Query::<Vec<(String, String)>>::try_from_uri(uri).ok()?;
     let path_ids = uri
         .path()
         .split('/')
-        .filter_map(|s| Uuid::parse_str(s).ok());
-    let query_ids = uri
-        .query()
-        .unwrap_or_default()
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
+        .filter_map(decoded_segment)
+        .filter_map(|segment| Uuid::parse_str(&segment).ok());
+    let query_ids = query
+        .iter()
         .filter_map(|(_, value)| Uuid::parse_str(value).ok());
     let mut ids: Vec<Uuid> = path_ids.chain(query_ids).collect();
     ids.sort_unstable();
     ids.dedup();
-    ids
+    Some(ids)
+}
+
+// the decoding axum's Path extractor applies to each raw segment
+fn decoded_segment(raw: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
 }
 
 fn not_found() -> Response {
@@ -114,7 +121,13 @@ pub async fn visibility_middleware(
         return next.run(request).await;
     }
 
-    let ids = referenced_ids(request.uri());
+    let Some(ids) = referenced_ids(request.uri()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "malformed query string"})),
+        )
+            .into_response();
+    };
     match allowed(&store, request.extensions().get::<Claims>(), &ids).await {
         Ok(true) => next.run(request).await,
         Ok(false) => not_found(),
@@ -165,7 +178,7 @@ pub(crate) fn write_target_id(template: &str, path: &str) -> Option<Uuid> {
     let at = template
         .split('/')
         .position(|segment| segment.starts_with('{'))?;
-    Uuid::parse_str(path.split('/').nth(at)?).ok()
+    Uuid::parse_str(&decoded_segment(path.split('/').nth(at)?)?).ok()
 }
 
 /// Refuse any mutation the caller is not allowed to make against the dataset or
@@ -255,7 +268,7 @@ mod tests {
     use axum::http::Method;
 
     fn ids_of(uri: &str) -> Vec<Uuid> {
-        referenced_ids(&uri.parse().unwrap())
+        referenced_ids(&uri.parse().unwrap()).unwrap()
     }
 
     #[test]
@@ -289,6 +302,45 @@ mod tests {
     fn dedups_repeated_ids() {
         let a = Uuid::now_v7();
         assert_eq!(ids_of(&format!("/api/v1/diff/{a}/{a}")), vec![a]);
+    }
+
+    fn percent_encoded(id: Uuid) -> String {
+        id.to_string()
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect()
+    }
+
+    #[test]
+    fn finds_percent_encoded_path_and_query_ids() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let encoded_a = percent_encoded(a);
+        let encoded_b = percent_encoded(b);
+        assert_eq!(
+            ids_of(&format!("/api/v1/branches/{encoded_a}/features")),
+            vec![a]
+        );
+        assert_eq!(
+            ids_of(&format!("/api/v1/sync/pull?branch_id={encoded_b}")),
+            vec![b]
+        );
+        assert_eq!(
+            ids_of(&format!("/api/v1/sync/pull?branch%5Fid={encoded_b}")),
+            vec![b]
+        );
+    }
+
+    #[test]
+    fn write_target_decodes_the_segment() {
+        let target = Uuid::now_v7();
+        assert_eq!(
+            write_target_id(
+                "/api/v1/branches/{id}/commit",
+                &format!("/api/v1/branches/{}/commit", percent_encoded(target)),
+            ),
+            Some(target)
+        );
     }
 
     /// The convention the write gate rests on, stated as a test: the resource

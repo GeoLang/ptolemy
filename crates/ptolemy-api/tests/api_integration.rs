@@ -6263,6 +6263,59 @@ async fn test_private_dataset_content_is_404_for_outsiders() {
     }
 }
 
+fn percent_encoded(id: Uuid) -> String {
+    id.to_string()
+        .bytes()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_percent_encoded_private_ids_are_404_for_outsiders() {
+    let app = setup_app_authed().await;
+    let (dataset_id, branch_id, carol) = seed_private_dataset(&app).await;
+    let eve = token_for_user("eve", Role::Editor);
+    let encoded_dataset = percent_encoded(dataset_id);
+    let encoded_branch = percent_encoded(branch_id);
+
+    let pairs = [
+        (
+            format!("/api/v1/datasets/{dataset_id}"),
+            format!("/api/v1/datasets/{encoded_dataset}"),
+        ),
+        (
+            format!("/api/v1/ogc/collections/{dataset_id}/items"),
+            format!("/api/v1/ogc/collections/{encoded_dataset}/items"),
+        ),
+        (
+            format!("/api/v1/branches/{branch_id}/features"),
+            format!("/api/v1/branches/{encoded_branch}/features"),
+        ),
+        (
+            format!("/api/v1/sync/pull?branch_id={branch_id}"),
+            format!("/api/v1/sync/pull?branch_id={encoded_branch}"),
+        ),
+    ];
+
+    for (plain, encoded) in pairs {
+        for uri in [&plain, &encoded] {
+            let (status, body) = request_as(&app, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {uri}: {body}");
+
+            let (status, body) = request_as(&app, "GET", uri, Some(&eve), None).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "non-granted editor GET {uri}: {body}"
+            );
+        }
+
+        // the encoded form reaches the same resource, so the refusal above is the gate
+        let (status, body) = request_as(&app, "GET", &encoded, Some(&carol), None).await;
+        assert_eq!(status, StatusCode::OK, "owner GET {encoded}: {body}");
+    }
+}
+
 /// A query-shaped POST is a read, and it is covered too.
 #[tokio::test]
 async fn test_private_dataset_query_posts_are_404_for_outsiders() {

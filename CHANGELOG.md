@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-09-24: **a percent-encoded id no longer skips the private dataset
+  check**. The read and write gates looked for ids in the raw path and query,
+  while the handlers decode them, so writing a private branch or dataset id as
+  `%30%31...` served its content to anyone. Both gates now decode path segments
+  and query values the same way axum's `Path` and `Query` extractors do.
 - 2026-09-23: **the `/review` and `/conflicts` pages show API strings as
   text**. Dataset and branch names, feature property keys and values, and the
   other API fields they put into `innerHTML` went in unescaped, so a value like
