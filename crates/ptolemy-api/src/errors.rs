@@ -53,7 +53,9 @@ pub fn log_db_error(context: &str, e: &sqlx::Error) {
 pub fn store_error_status(e: &StoreError) -> (StatusCode, String) {
     match e {
         StoreError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-        StoreError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+        StoreError::Conflict(msg) | StoreError::AlreadyExists(msg) => {
+            (StatusCode::CONFLICT, msg.clone())
+        }
         StoreError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
         StoreError::Db(e) => {
             log_db_error("store", e);

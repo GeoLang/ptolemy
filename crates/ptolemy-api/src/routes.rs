@@ -186,8 +186,7 @@ async fn create_dataset(
     // registering probes the relation and creates the main branch, so the
     // dataset is browsable the moment the call returns
     let ds = if ds.external.is_some() {
-        // at registration every rejection is about the request, so report 400
-        // rather than the 409 the read-only guard uses
+        // a failed probe is a bad request, not the 409 the read-only guard uses
         store
             .register_external_dataset(&ds, creator)
             .await

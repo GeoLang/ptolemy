@@ -38,6 +38,8 @@ pub enum StoreError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
     #[error("forbidden: {0}")]
     Forbidden(String),
 }
@@ -334,7 +336,8 @@ impl PgStore {
         .bind(ds.external.as_ref().map(|e| e.geometry_column()))
         .bind(ds.visibility.as_str())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| dataset_insert_error(error, &ds.name))?;
         if let Some(creator) = grant_admin_to {
             insert_creator_admin_grant(&mut tx, ds.id, creator).await?;
         }
@@ -379,7 +382,8 @@ impl PgStore {
         .bind(table.geometry_column())
         .bind(ds.visibility.as_str())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| dataset_insert_error(error, &ds.name))?;
 
         // no branch_created event: the dataset is being created here, so it has
         // no subscriptions yet and nobody could be told
@@ -3804,6 +3808,20 @@ pub(crate) async fn queue_named_event(
     .execute(&mut **tx)
     .await?;
     Ok(event_id)
+}
+
+const DATASET_NAME_UNIQUE_CONSTRAINT: &str = "datasets_name_key";
+
+fn dataset_insert_error(error: sqlx::Error, name: &str) -> StoreError {
+    let name_taken = matches!(
+        &error,
+        sqlx::Error::Database(database_error)
+            if database_error.constraint() == Some(DATASET_NAME_UNIQUE_CONSTRAINT)
+    );
+    if name_taken {
+        return StoreError::AlreadyExists(format!("dataset name {name:?} is taken"));
+    }
+    StoreError::Db(error)
 }
 
 /// Give the creator an admin row so a dataset created with auth on always has an

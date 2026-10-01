@@ -786,7 +786,10 @@ impl From<sqlx::Error> for QgisError {
 impl IntoResponse for QgisError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
-            QgisError::Store(ptolemy_storage::StoreError::Conflict(m)) => (StatusCode::CONFLICT, m),
+            QgisError::Store(
+                ptolemy_storage::StoreError::Conflict(m)
+                | ptolemy_storage::StoreError::AlreadyExists(m),
+            ) => (StatusCode::CONFLICT, m),
             QgisError::Store(ptolemy_storage::StoreError::NotFound(m)) => {
                 (StatusCode::NOT_FOUND, m)
             }

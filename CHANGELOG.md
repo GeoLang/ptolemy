@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-10-01: **creating a dataset under a taken name answers `409`, and
+  review timestamps are RFC 3339 strings**. A duplicate name answered `500`
+  from `POST /api/v1/datasets`, ordinary or external, and failed the CLI with
+  a raw database error. It is now `409` with the name in the message. Merge
+  requests and review comments serialized `created_at` and `updated_at` as
+  number arrays, so the `/review` page showed "Created Invalid Date".
 - 2026-09-24: **geoprocessing routes bind request values instead of splicing
   them into SQL**. A voronoi `envelope` holding a single quote ended the SQL
   literal it was pasted into. Voronoi, dissolve, contour and convex hull now

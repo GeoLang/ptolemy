@@ -243,6 +243,27 @@ async fn test_dataset_crud() {
     assert!(!body.as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn test_duplicate_dataset_name_is_a_conflict() {
+    let (app, _) = setup_app().await;
+    let request = json!({
+        "name": "parcels",
+        "geometry_type": "point",
+        "srid": 4326,
+        "created_by": "test"
+    });
+
+    let (status, body) = post_json(&app, "/api/v1/datasets", request.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = post_json(&app, "/api/v1/datasets", request).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("parcels"),
+        "{body}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Branch CRUD Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -685,6 +706,66 @@ async fn test_diff_across_a_merge_sees_both_parents() {
         json!(f3.to_string()),
         "{body}"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Review Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+fn assert_rfc3339(value: &Value, context: &str) {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{context} is not a string: {value}"));
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|error| panic!("{context} {text} is not RFC 3339: {error}"));
+}
+
+#[tokio::test]
+async fn test_review_timestamps_are_rfc3339() {
+    let (app, _) = setup_app().await;
+    let dataset_id = create_dataset(&app).await;
+    let main_id = create_branch(&app, dataset_id, "main").await;
+    let dev_id = create_fork(&app, dataset_id, "dev", main_id).await;
+
+    let (status, review) = post_json(
+        &app,
+        "/api/v1/reviews",
+        json!({
+            "dataset_id": dataset_id,
+            "source_branch_id": dev_id,
+            "target_branch_id": main_id,
+            "title": "add parcels",
+            "author": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{review}");
+    assert_rfc3339(&review["created_at"], "created review created_at");
+    assert_rfc3339(&review["updated_at"], "created review updated_at");
+    let review_id = review["id"].as_str().unwrap();
+
+    let (status, fetched) = get_json(&app, &format!("/api/v1/reviews/{review_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_rfc3339(&fetched["created_at"], "fetched review created_at");
+    assert_rfc3339(&fetched["updated_at"], "fetched review updated_at");
+
+    let (status, listed) =
+        get_json(&app, &format!("/api/v1/reviews?dataset_id={dataset_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_rfc3339(&listed[0]["created_at"], "listed review created_at");
+
+    let (status, comment) = post_json(
+        &app,
+        &format!("/api/v1/reviews/{review_id}/comments"),
+        json!({"author": "test", "body": "looks fine"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{comment}");
+    assert_rfc3339(&comment["created_at"], "created comment created_at");
+
+    let (status, comments) = get_json(&app, &format!("/api/v1/reviews/{review_id}/comments")).await;
+    assert_eq!(status, StatusCode::OK, "{comments}");
+    assert_rfc3339(&comments[0]["created_at"], "listed comment created_at");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1811,9 +1892,25 @@ async fn test_buffer_analysis() {
         &format!("/api/v1/branches/{branch_id}/analytics/buffer?feature_id={f1}&distance=0.01"),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "buffer: {body}");
+    assert_eq!(body["feature_id"], f1.to_string(), "buffer: {body}");
+    let geometry = &body["buffer_geojson"];
+    assert_eq!(geometry["type"], "Polygon", "buffer: {body}");
+    let ring = geometry["coordinates"][0].as_array().unwrap();
+    assert!(ring.len() > 4, "buffer ring is a circle, not a box: {body}");
+    // the point sits at (1, 2)
+    for vertex in ring {
+        let x = vertex[0].as_f64().unwrap();
+        let y = vertex[1].as_f64().unwrap();
+        assert!(
+            (x - 1.0).abs() < 1e-3 && (y - 2.0).abs() < 1e-3,
+            "vertex {vertex} is not around the point: {body}"
+        );
+    }
+    let area = body["area_sq_meters"].as_f64().unwrap();
     assert!(
-        status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "buffer: {status} {body}"
+        area > 0.0 && area < 0.001,
+        "a 0.01 m buffer covers about 0.0003 square metres: {area}"
     );
 }
 
@@ -5368,6 +5465,29 @@ async fn test_external_registration_probes_the_relation() {
 
     let (status, body) = register_external(&app, "ext_no_geom", "id", "label").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn test_external_registration_under_a_taken_name_is_a_conflict() {
+    let (app, state) = setup_app().await;
+    create_external_fixture(&state).await;
+    let request = json!({
+        "name": "county parcels",
+        "created_by": "test",
+        "external_table": "ext_parcels",
+        "external_id_column": "parcel_id",
+        "external_geometry_column": "geom",
+    });
+
+    let (status, body) = post_json(&app, "/api/v1/datasets", request.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = post_json(&app, "/api/v1/datasets", request).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("county parcels"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

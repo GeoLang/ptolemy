@@ -19,7 +19,9 @@ pub struct MergeRequest {
     pub description: String,
     pub author: String,
     pub status: MergeRequestStatus,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -41,5 +43,6 @@ pub struct ReviewComment {
     pub feature_id: Option<Uuid>,
     pub author: String,
     pub body: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
