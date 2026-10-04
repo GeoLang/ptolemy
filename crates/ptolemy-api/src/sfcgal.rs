@@ -61,7 +61,7 @@ async fn extrude_3d(
     Json(req): Json<ExtrudeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Extrude(ST_Force3D(geometry), 0, 0, $3))::jsonb as geojson
          FROM {source} f WHERE f.id = $1"
@@ -69,7 +69,7 @@ async fn extrude_3d(
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(req.height)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -87,14 +87,14 @@ async fn compute_volume(
     Json(req): Json<VolumeRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_3DArea(geometry) as surface_area, ST_Volume(geometry) as volume
          FROM {source} f WHERE f.id = $1"
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(serde_json::json!({
@@ -117,7 +117,7 @@ async fn intersection_3d(
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
     // both sides are the same branch, so the same scoped source twice
-    let (_, source) = store.features_source_at(branch_id, "$3").await?;
+    let (external, source) = store.features_source_at(branch_id, "$3").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_3DIntersection(a.geometry, b.geometry))::jsonb as geojson
          FROM {source} a, {source} b
@@ -126,7 +126,7 @@ async fn intersection_3d(
     .bind(req.feature_a)
     .bind(req.feature_b)
     .bind(branch_id)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -144,14 +144,14 @@ async fn straight_skeleton(
     Json(req): Json<SkeletonRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_StraightSkeleton(geometry))::jsonb as geojson
          FROM {source} f WHERE f.id = $1"
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -172,7 +172,7 @@ async fn minkowski_sum(
     require_sfcgal(&store).await?;
     let wkb = hex::decode(&req.buffer_geometry_wkb_hex)
         .map_err(|_| SfcgalError::Bad("invalid hex".into()))?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_MinkowskiSum(geometry, ST_GeomFromWKB($3, 4326)))::jsonb as geojson
          FROM {source} f WHERE f.id = $1"
@@ -180,7 +180,7 @@ async fn minkowski_sum(
     .bind(req.feature_id)
     .bind(branch_id)
     .bind(&wkb)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await
     .map_err(unsummable_or_internal)?
     .ok_or(SfcgalError::NotFound)?;
@@ -214,14 +214,14 @@ async fn tesselate(
     Json(req): Json<TesselateRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_AsGeoJSON(ST_Tesselate(geometry))::jsonb as geojson
          FROM {source} f WHERE f.id = $1"
     ))
     .bind(req.feature_id)
     .bind(branch_id)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(row.get("geojson")))
@@ -242,7 +242,7 @@ async fn visibility(
     Json(req): Json<VisibilityRequest>,
 ) -> Result<Json<serde_json::Value>, SfcgalError> {
     require_sfcgal(&store).await?;
-    let (_, source) = store.features_source_at(branch_id, "$2").await?;
+    let (external, source) = store.features_source_at(branch_id, "$2").await?;
     let row = sqlx::query(&format!(
         "SELECT ST_3DDistance(
             geometry,
@@ -262,7 +262,7 @@ async fn visibility(
     .bind(req.observer_x)
     .bind(req.observer_y)
     .bind(req.observer_z)
-    .fetch_optional(store.read_pool())
+    .fetch_optional(store.source_pool(external.as_ref()).await?)
     .await?
     .ok_or(SfcgalError::NotFound)?;
     Ok(Json(serde_json::json!({

@@ -167,8 +167,9 @@ fn valid_at_predicate(placeholder: &str) -> String {
 pub const EXTERNAL_READ_ONLY: &str =
     "dataset is external (read-only): it is a view over a PostGIS relation ptolemy does not own";
 
-/// Optional second database for external reads. Point it at a read-only role so
-/// the guarantee holds at the database, not only in this process.
+/// Database external datasets are registered and read on. Unset or empty
+/// refuses both. Point it at a read-only role so the guarantee holds at the
+/// database, not only in this process.
 pub const EXTERNAL_DATABASE_URL: &str = "PTOLEMY_EXTERNAL_DATABASE_URL";
 
 pub fn with_statement_timeout(options: PgConnectOptions, seconds: u64) -> PgConnectOptions {
@@ -191,12 +192,19 @@ pub struct PgStore {
     /// Outside this crate the only handles are [`PgStore::read_pool`] and
     /// [`PgStore::unguarded_pool`].
     pub(crate) pool: PgPool,
-    /// Built on first external read, so an unset env var costs nothing and a
-    /// bad URL fails the request rather than startup.
+    /// Built on first external read, so a bad URL fails the request rather
+    /// than startup.
     external_pool: tokio::sync::OnceCell<PgPool>,
+    external_database_url: Option<String>,
     external_statement_timeout_seconds: Option<u64>,
     analyzer: Analyzer,
     pub(crate) quotas: UserQuotas,
+}
+
+fn external_database_unset() -> StoreError {
+    StoreError::Conflict(format!(
+        "external datasets are disabled: {EXTERNAL_DATABASE_URL} is not set"
+    ))
 }
 
 impl PgStore {
@@ -211,13 +219,22 @@ impl PgStore {
             analyzer: Analyzer::new(pool.clone(), rows),
             pool,
             external_pool: tokio::sync::OnceCell::new(),
+            external_database_url: None,
             external_statement_timeout_seconds: None,
             quotas: UserQuotas::default(),
         }
+        .with_external_database_url(std::env::var(EXTERNAL_DATABASE_URL).ok())
     }
 
     pub fn with_user_quotas(self, quotas: UserQuotas) -> Self {
         Self { quotas, ..self }
+    }
+
+    pub fn with_external_database_url(self, url: Option<String>) -> Self {
+        Self {
+            external_database_url: url.filter(|url| !url.is_empty()),
+            ..self
+        }
     }
 
     pub fn with_external_statement_timeout(self, seconds: u64) -> Self {
@@ -635,19 +652,16 @@ impl PgStore {
         }
     }
 
-    /// Pool that external reads and probes run on: a second database when
-    /// `PTOLEMY_EXTERNAL_DATABASE_URL` is set (meant to hold a read-only role),
-    /// otherwise the primary pool for tables in the same database.
+    /// Pool that external reads and probes run on, connected to
+    /// `PTOLEMY_EXTERNAL_DATABASE_URL`. Never the primary pool: its role can
+    /// read every tenant's rows, so with the variable unset this refuses.
     pub async fn external_pool(&self) -> Result<&PgPool, StoreError> {
-        let Ok(url) = std::env::var(EXTERNAL_DATABASE_URL) else {
-            return Ok(&self.pool);
+        let Some(url) = &self.external_database_url else {
+            return Err(external_database_unset());
         };
-        if url.is_empty() {
-            return Ok(&self.pool);
-        }
         self.external_pool
             .get_or_try_init(|| async {
-                PgPool::connect_with(self.external_connect_options(&url)?).await
+                PgPool::connect_with(self.external_connect_options(url)?).await
             })
             .await
             .map_err(StoreError::Db)
@@ -4293,6 +4307,18 @@ mod external_pool_tests {
         let options = store().external_connect_options(EXTERNAL_URL).unwrap();
         let startup_options = options.get_options().unwrap_or_default();
         assert!(!startup_options.contains("statement_timeout"));
+    }
+
+    #[tokio::test]
+    async fn the_external_pool_refuses_without_a_url() {
+        for url in [None, Some(String::new())] {
+            let store = store().with_external_database_url(url.clone());
+            let refusal = store.external_pool().await.err();
+            assert!(
+                matches!(&refusal, Some(StoreError::Conflict(message)) if message.contains(EXTERNAL_DATABASE_URL)),
+                "{url:?}: {refusal:?}"
+            );
+        }
     }
 }
 

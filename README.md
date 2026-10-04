@@ -121,7 +121,7 @@ needs its own copy of these parameters.
 | `SMTP_URL` | SMTP relay for invitation email, e.g. `smtp://user:pass@mail.example.com:587?tls=required` | (no email) |
 | `SMTP_FROM` | Sender address on invitation email | (no email) |
 | `PUBLIC_BASE_URL` | Where the viewer is served, used to build the invitation link | (no email) |
-| `PTOLEMY_EXTERNAL_DATABASE_URL` | Database holding external datasets. Use a read-only role | (primary pool) |
+| `PTOLEMY_EXTERNAL_DATABASE_URL` | Database external datasets are registered and read on. Use a read-only role | (external datasets off) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
 | `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
 | `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` | Seconds one SQL statement may run under `serve` before Postgres cancels it. `0` turns it off. Startup migrations and the other CLI commands run without it | 30 |
@@ -217,6 +217,7 @@ curl -X POST http://localhost:3000/api/v1/datasets \
   }'
 ```
 
+Registering needs role `admin` and `PTOLEMY_EXTERNAL_DATABASE_URL`, see below.
 Registration checks the relation exists, that the column is PostGIS geometry
 and that Ptolemy can select from it, then creates the dataset and its `main`
 branch. Feature listing and paging, bbox, CQL2, OGC items, GeoJSON and CSV
@@ -238,9 +239,12 @@ slightly widened reprojected window, so the index serves it. That predicate is
 skipped for a window wider than 45 degrees or past 85 degrees latitude, and for
 a CQL2 spatial op under `or` or `not`.
 
-`PTOLEMY_EXTERNAL_DATABASE_URL` reads external datasets from another database.
-Give it a role with `SELECT` and nothing else, so PostgreSQL enforces the
-read-only part:
+External datasets are registered and read on `PTOLEMY_EXTERNAL_DATABASE_URL`,
+never on `DATABASE_URL`. Unset, registration answers `400` and an external read
+`409`, both naming the variable, and the ArcGIS facade its usual internal error.
+Give it a role with `SELECT` on the relations you register and nothing else,
+so PostgreSQL enforces the read-only part and the role cannot read Ptolemy's
+own tables. It can be the database Ptolemy runs on:
 
 ```bash
 psql yourdb -c "CREATE ROLE ptolemy_ro LOGIN PASSWORD '...'"
@@ -260,7 +264,8 @@ With auth on, a request needs:
 - any valid token for `/ws/`, `/permissions`, `/api/v1/workspaces`,
   `/api/v1/projects` and `/api/v1/invitations/accept`
 - role `admin` for webhooks, audit, `/metrics`, the replication feed and peers,
-  a dataset's event history, and every PostGIS Topology route except `validate`
+  a dataset's event history, every PostGIS Topology route except `validate`,
+  and registering an external dataset
 - role `editor` or `admin` for everything else
 
 Per-dataset grants and dataset visibility then decide which data a request may

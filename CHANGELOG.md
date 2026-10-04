@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-10-04: **registering an external dataset needs role `admin`, and
+  external datasets never run on the primary pool**. Any editor could register
+  a relation, and with `PTOLEMY_EXTERNAL_DATABASE_URL` unset the probe and
+  every read ran on the primary pool, so Ptolemy's own tables and other
+  tenants' rows were readable through the features API. An editor now gets
+  `403`. With the variable unset, registration answers `400` and an external
+  read `409`, both naming the variable. The H3 hexagon routes and the 3D
+  routes read an external dataset on the primary pool even with the variable
+  set, and now use the external one.
 - 2026-10-01: **creating a dataset under a taken name answers `409`, and
   review timestamps are RFC 3339 strings**. A duplicate name answered `500`
   from `POST /api/v1/datasets`, ordinary or external, and failed the CLI with

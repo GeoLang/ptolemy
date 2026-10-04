@@ -222,7 +222,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Commits, merges, imports, QGIS push and branch creation answer 409</li>
 <li>Geometry is served in EPSG:4326, and spatial reads also push an index-served predicate onto the relation's own column in its own SRID</li>
 <li>An ordinary GiST index on the geometry column is all it needs</li>
-<li>PTOLEMY_EXTERNAL_DATABASE_URL points this at a second database, where a SELECT-only role makes the read-only part PostgreSQL's job</li>
+<li>Registering needs the admin role and PTOLEMY_EXTERNAL_DATABASE_URL, a connection as a SELECT-only role, so PostgreSQL enforces the read-only part. Unset, external datasets are off</li>
 </ul>
 </div>
 <div class="card">

@@ -83,7 +83,7 @@ async fn get_hexagons(
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
     require_h3(&store).await?;
-    let (_, source) = store.features_source(branch_id).await?;
+    let (external, source) = store.features_source(branch_id).await?;
     let rows = sqlx::query(&format!(
         "SELECT DISTINCT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
                 ST_AsGeoJSON(h3_cell_to_boundary(h3_lat_lng_to_cell(ST_Centroid(geometry), $2))::geometry)::jsonb as boundary
@@ -91,7 +91,7 @@ async fn get_hexagons(
          WHERE geometry IS NOT NULL
          LIMIT $3"
     )).bind(branch_id).bind(q.resolution).bind(q.limit.unwrap_or(1000))
-    .fetch_all(store.read_pool()).await?;
+    .fetch_all(store.source_pool(external.as_ref()).await?).await?;
 
     let hexagons: Vec<serde_json::Value> = rows
         .iter()
@@ -115,7 +115,7 @@ async fn aggregate_by_hex(
     Query(q): Query<HexQuery>,
 ) -> Result<Json<serde_json::Value>, H3Error> {
     require_h3(&store).await?;
-    let (_, source) = store.features_source(branch_id).await?;
+    let (external, source) = store.features_source(branch_id).await?;
     let rows = sqlx::query(&format!(
         "SELECT h3_lat_lng_to_cell(ST_Centroid(geometry), $2)::text as cell,
                 COUNT(*) as feature_count
@@ -128,7 +128,7 @@ async fn aggregate_by_hex(
     .bind(branch_id)
     .bind(q.resolution)
     .bind(q.limit.unwrap_or(500))
-    .fetch_all(store.read_pool())
+    .fetch_all(store.source_pool(external.as_ref()).await?)
     .await?;
 
     let cells: Vec<serde_json::Value> = rows

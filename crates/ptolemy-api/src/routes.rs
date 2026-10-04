@@ -165,6 +165,12 @@ async fn create_dataset(
     Json(req): Json<CreateDatasetRequest>,
 ) -> Result<(StatusCode, Json<Dataset>), AppError> {
     let external = req.external()?;
+    // the relation is read through the external pool, not this caller's grants
+    if external.is_some() && actor.enforces() && !actor.is_instance_admin() {
+        return Err(AppError::Store(ptolemy_storage::StoreError::Forbidden(
+            "registering an external dataset needs the admin role".into(),
+        )));
+    }
     let geom_type = req.geometry_type.as_deref().unwrap_or("point");
     let visibility = parse_visibility(req.visibility.as_deref())?;
     let ds = Dataset {

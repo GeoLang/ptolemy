@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use ptolemy_api::{AppState, AuthConfig, Role, app_with_auth, generate_token};
-use ptolemy_storage::postgres::PgStore;
+use ptolemy_storage::postgres::{EXTERNAL_DATABASE_URL, PgStore};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -87,7 +87,12 @@ async fn fresh_store(rows: usize) -> PgStore {
     .await
     .unwrap();
 
-    let store = PgStore::with_analyze_threshold(pool, rows);
+    let external_url = std::env::var(EXTERNAL_DATABASE_URL)
+        .ok()
+        .filter(|external_url| !external_url.is_empty())
+        .unwrap_or(url);
+    let store =
+        PgStore::with_analyze_threshold(pool, rows).with_external_database_url(Some(external_url));
     store.migrate().await.unwrap();
     store
 }
@@ -5524,6 +5529,99 @@ async fn test_external_fields_are_all_or_none() {
     );
 }
 
+#[tokio::test]
+async fn test_external_registration_needs_the_admin_role() {
+    let (app, state) = setup_app_authed_with_state().await;
+    create_external_fixture(&state).await;
+    let name = format!("ext_{}", Uuid::now_v7());
+    let request = json!({
+        "name": name,
+        "created_by": "carol",
+        "external_table": "ext_parcels",
+        "external_id_column": "parcel_id",
+        "external_geometry_column": "geom",
+    });
+
+    let editor = token_for_user("carol", Role::Editor);
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&editor),
+        Some(request.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "editor: {body}");
+    let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM datasets WHERE name = $1")
+        .bind(&name)
+        .fetch_one(state.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(registered, 0, "the refused registration still created it");
+
+    let admin = token_for_user("carol", Role::Admin);
+    let (status, body) = request_as(
+        &app,
+        "POST",
+        "/api/v1/datasets",
+        Some(&admin),
+        Some(request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "admin: {body}");
+}
+
+#[tokio::test]
+async fn test_external_datasets_need_the_external_database_url() {
+    let (app, state) = setup_app().await;
+    let (dataset_id, branch_id) = setup_external(&app, &state).await;
+    let store_without_external_database = PgStore::with_analyze_threshold(
+        state.read_pool().clone(),
+        ptolemy_storage::DEFAULT_ANALYZE_ROW_THRESHOLD,
+    )
+    .with_external_database_url(None);
+    let app_without_external_database = app_with_auth(
+        Arc::new(store_without_external_database),
+        AuthConfig::disabled(),
+    );
+
+    let (status, body) = register_external(
+        &app_without_external_database,
+        "ext_parcels",
+        "parcel_id",
+        "geom",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "register: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains(EXTERNAL_DATABASE_URL),
+        "register: {body}"
+    );
+
+    for uri in [
+        format!("/api/v1/branches/{branch_id}/features"),
+        format!("/api/v1/branches/{branch_id}/features/count"),
+        format!(
+            "/api/v1/branches/{branch_id}/features/bbox?min_x=-180&min_y=-90&max_x=180&max_y=90"
+        ),
+        format!("/api/v1/branches/{branch_id}/tiles/0/0/0"),
+        format!("/api/v1/branches/{branch_id}/export/geojson"),
+        format!("/api/v1/branches/{branch_id}/export/csv"),
+        format!("/api/v1/qgis/branches/{branch_id}/layer"),
+        format!("/api/v1/ogc/collections/{dataset_id}/items"),
+    ] {
+        let (status, body) = get_json(&app_without_external_database, &uri).await;
+        assert_eq!(status, StatusCode::CONFLICT, "GET {uri}: {body}");
+        assert!(
+            body.to_string().contains(EXTERNAL_DATABASE_URL),
+            "GET {uri}: {body}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Audit identity comes from the token, not the body
 // ═══════════════════════════════════════════════════════════════════════
@@ -6684,7 +6782,7 @@ async fn test_private_external_dataset_is_covered() {
         &app,
         "POST",
         "/api/v1/datasets",
-        Some(&carol),
+        Some(&token_for_user("carol", Role::Admin)),
         Some(json!({
             "name": format!("ext_{}", Uuid::now_v7()),
             "created_by": "carol",
@@ -8187,7 +8285,7 @@ async fn test_external_dataset_cannot_be_attached() {
         &app,
         "POST",
         "/api/v1/datasets",
-        Some(&carol),
+        Some(&token_for_user("carol", Role::Admin)),
         Some(json!({
             "name": format!("ext_{}", Uuid::now_v7()),
             "created_by": "carol",
@@ -9945,7 +10043,7 @@ async fn test_projected_external_still_obeys_visibility() {
         &app,
         "POST",
         "/api/v1/datasets",
-        Some(&carol),
+        Some(&token_for_user("carol", Role::Admin)),
         Some(json!({
             "name": format!("proj_{}", Uuid::now_v7()),
             "created_by": "carol",
