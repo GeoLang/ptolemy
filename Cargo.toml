@@ -23,7 +23,7 @@ rust-version = "1.88"
 # translates a migrated dataset's stored esri drawingInfo into mapbox gl layers
 jung-esri = { git = "https://github.com/GeoLang/jung.git", branch = "master" }
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws"] }
+axum = "0.8"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json", "uuid", "time", "migrate"] }
 serde = { version = "1", features = ["derive"] }

@@ -261,7 +261,7 @@ With auth on, a request needs:
   `features/intersects`, `features/within`, `features/filter`, the point cloud
   `query` and `profile`, and the FeatureServer `query`, `queryAttachments` and
   `extractChanges`
-- any valid token for `/ws/`, `/permissions`, `/api/v1/workspaces`,
+- any valid token for `/permissions`, `/api/v1/workspaces`,
   `/api/v1/projects` and `/api/v1/invitations/accept`
 - role `admin` for webhooks, audit, `/metrics`, the replication feed and peers,
   a dataset's event history, every PostGIS Topology route except `validate`,
@@ -533,26 +533,6 @@ query string, naming the key. Exempt are the OIDC callback,
 `/api/v1/ogc/collections/{id}/items`, `/api/v1/stac/search` and the replication
 routes, whose callers are outside this codebase.
 
-### Collaboration relay
-
-`/ws/rooms/{room_id}` relays every text frame a client sends to every other
-client in the room, never back to the sender. Nothing is stored. A room exists
-while someone is connected. A message over 64 KiB is dropped and closes the
-sender's socket. The handshake needs a token, which a browser sends
-as `new WebSocket(url, ["bearer", jwt])`, and the server echoes only `bearer`.
-The subprotocol is read as a credential on `/ws/` paths only.
-
-The server does not read the messages. ViewTopia uses these shapes for view
-sync, cursors, presence and chat:
-
-```jsonc
-{ "type": "Join", "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
-{ "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
-{ "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
-{ "type": "Chat", "user_id": "u1", "user_name": "Alice", "message": "Look at this area" }
-{ "type": "Leave", "user_id": "u1", "asset_id": "my-room" }
-```
-
 ### Routes
 
 | Method | Path | Description |
@@ -670,7 +650,6 @@ sync, cursors, presence and chat:
 | GET | `/api/v1/conflicts/{branch_id}` | Conflicts between that branch and its dataset's `main` |
 | GET | `/api/v1/branches/{target}/merge/{source}/preview` | Merge preview with conflict GeoJSON |
 | POST | `/api/v1/branches/{target}/merge/{source}/resolve` | Resolve conflicts and create the merge commit |
-| WS | `/ws/rooms/{room_id}` | Collaboration relay |
 | **Networks** | | |
 | GET | `/api/v1/datasets/{id}/networks` | List geometric networks |
 | POST | `/api/v1/datasets/{id}/networks` | Create network |

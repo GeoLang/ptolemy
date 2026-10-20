@@ -128,7 +128,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td>GeoJSON export</td><td class="yes">✓</td><td class="yes">✓ <span class="note">Native format</span></td></tr>
 <tr><td>Shapefile export</td><td class="yes">✓</td><td class="no">✗ <span class="note">The CLI reads shapefiles on import. It writes GeoJSON and GeoPackage, never a shapefile</span></td></tr>
 <tr><td>CRS transformation (EPSG)</td><td class="yes">✓</td><td class="yes">✓ <span class="note">PostGIS ST_Transform, any EPSG code</span></td></tr>
-<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST, plus signed webhooks and a collaboration WebSocket relay</span></td></tr>
+<tr><td>REST API</td><td class="yes">✓</td><td class="yes">✓ <span class="note">REST, plus signed webhooks</span></td></tr>
 </table>
 
 <h2>Advanced Analytics and Extensions</h2>
@@ -166,7 +166,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <tr><td><strong>Open Source (AGPL-3.0)</strong></td><td>No per-user licensing fees. Full source access.</td></tr>
 <tr><td><strong>Git-like versioning</strong></td><td>Branches, commits, three-way merge and merge requests, rather than Esri's parent and child versions.</td></tr>
 <tr><td><strong>PostgreSQL ecosystem</strong></td><td>Routes call pgRouting, pgvector, MobilityDB, h3-pg, SFCGAL and pointcloud, which you install yourself, and answer 501 until you do. PostGIS Topology and pg_trgm are used where the server has them.</td></tr>
-<tr><td><strong>API</strong></td><td>REST, an ArcGIS FeatureServer facade, signed webhooks, a collaboration WebSocket relay.</td></tr>
+<tr><td><strong>API</strong></td><td>REST, an ArcGIS FeatureServer facade and signed webhooks.</td></tr>
 <tr><td><strong>Standards-first</strong></td><td>OGC API Features Part 1 and Part 2, CQL2-JSON, STAC 1.0 and OGC Tiles are served directly, with no proprietary protocol in between.</td></tr>
 <tr><td><strong>Deployment</strong></td><td>Single Rust binary and a public container image.</td></tr>
 <tr><td><strong>pgvector route</strong></td><td>Exact-string matching expressed as a SHA-256 hash vector. 501 unless you install pgvector yourself.</td></tr>

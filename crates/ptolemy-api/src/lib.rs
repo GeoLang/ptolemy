@@ -34,7 +34,6 @@ pub mod real_estate;
 pub mod relationships;
 pub mod replication;
 pub mod review;
-pub mod room_relay;
 pub mod routes;
 pub mod schema_evolution;
 pub mod sfcgal;
@@ -65,7 +64,6 @@ pub use delivery::{DeliveryWorker, MAX_DELIVERY_ATTEMPTS, spawn_delivery_worker}
 pub use email::EmailConfig;
 pub use metrics::{init_metrics, record_domain_event};
 pub use oidc::OidcConfig;
-pub use room_relay::RoomRelay;
 
 pub type AppState = Arc<PgStore>;
 
@@ -125,7 +123,6 @@ pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
 /// environment. A test points this at an SMTP server whose port it only learns
 /// once that server is listening.
 pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailConfig) -> Router {
-    let room_relay = Arc::new(RoomRelay::new());
     let prom_handle = init_metrics();
 
     Router::new()
@@ -170,7 +167,6 @@ pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailCo
         // /arcgis/rest/services, which is where it expects to find it
         .merge(arcgis::arcgis_routes())
         .merge(oidc::oidc_routes())
-        .nest("/ws/rooms", room_relay::room_routes(room_relay))
         .merge(metrics::metrics_routes(prom_handle))
         .layer(Extension(email))
         .layer(middleware::from_fn(metrics::metrics_middleware))

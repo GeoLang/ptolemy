@@ -39,10 +39,6 @@ use uuid::Uuid;
 /// One line per route, and the reason. Nothing else may be left out.
 const SKIPPED: &[(&str, &str)] = &[
     (
-        "GET /ws/rooms/{room_id}",
-        "needs a websocket handshake, which oneshot cannot do: api_integration.rs drives a real one",
-    ),
-    (
         "GET /auth/oidc/login",
         "redirects to the configured provider, so calling it is a network call, not a query",
     ),

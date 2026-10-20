@@ -120,7 +120,6 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Invitations grant editor or viewer and require an authenticated acceptance</li>
 <li>A dataset attached to a project is private to its members, at their project role</li>
 <li>Roles do not reach Agora permissions</li>
-<li>A WebSocket room relay that ViewTopia uses for view sync, cursors and chat</li>
 <li>Shared project state and project attachments</li>
 </ul>
 </div>
@@ -473,54 +472,6 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 </div>
-</div>
-</section>
-
-<section>
-<div class="container">
-<h2>Real-Time Collaboration Relay</h2>
-<p style="margin-bottom:16px"><code>/ws/rooms/{room_id}</code> relays every text frame a client sends
-to every other client in the room, never back to the sender. Nothing is stored. A room exists while
-someone is connected. The server does not read the messages. The cards below are what ViewTopia
-sends through it.</p>
-
-<div class="grid">
-<div class="card">
-<h3>View Sync (Follow Mode)</h3>
-<ul>
-<li>Camera state: latitude, longitude, zoom, bearing, pitch</li>
-<li>A follower's viewer mirrors the leader's view</li>
-<li>The server relays every frame it is given, so throttling is the client's job</li>
-</ul>
-</div>
-<div class="card">
-<h3>Cursor Sharing</h3>
-<ul>
-<li>Each collaborator's mouse position on the map</li>
-</ul>
-</div>
-<div class="card">
-<h3>Presence and Chat</h3>
-<ul>
-<li>Join and Leave messages for who is in the room</li>
-<li>Text chat within a room</li>
-</ul>
-</div>
-</div>
-
-<h3 style="margin-top:28px;color:var(--heading)">Protocol (JSON over WebSocket)</h3>
-<pre><code>// Connect to a room. The handshake needs a token, and a browser cannot set
-// the Authorization header on a WebSocket, so it goes in the subprotocol:
-// new WebSocket("ws://localhost:3000/ws/rooms/my-room", ["bearer", jwt])
-ws://localhost:3000/ws/rooms/my-room
-
-// Client to server, relayed to every other client in the room
-{ "type": "Join",   "user_id": "u1", "user_name": "Alice", "asset_id": "my-room" }
-{ "type": "Camera", "user_id": "u1", "latitude": 40.7, "longitude": -73.9, "zoom": 14, "bearing": 0, "pitch": 45 }
-{ "type": "Cursor", "user_id": "u1", "latitude": 40.71, "longitude": -73.91 }
-{ "type": "Chat",   "user_id": "u1", "user_name": "Alice", "message": "Look at this area" }
-{ "type": "Leave",  "user_id": "u1", "asset_id": "my-room" }</code></pre>
-<p style="margin-top:12px;color:var(--muted);font-size:.9rem">These shapes are ViewTopia's convention. The server relays any text frame.</p>
 </div>
 </section>
 

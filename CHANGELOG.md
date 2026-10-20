@@ -176,6 +176,12 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- 2026-10-19: **ptolemy serves no websocket any more**. The relay at
+  `/ws/rooms/{room_id}` is gone (`crates/ptolemy-api/src/room_relay.rs`, last
+  sha `d9be941`), and nothing in the platform connected to it. It was the last
+  route under `/ws/`, so the `Sec-WebSocket-Protocol: bearer, <jwt>` credential
+  and the `/ws/` rules in the access checks went with it, along with axum's
+  `ws` feature and the `tokio-tungstenite` dev dependency.
 - 2026-09-23: **`POST /api/v1/attribute-rules/{id}/validate` is gone**
   (`crates/ptolemy-api/src/domains.rs`, last sha `a613eb6`). It answered
   `valid: true` for any non-empty expression. The rule types are named only in a

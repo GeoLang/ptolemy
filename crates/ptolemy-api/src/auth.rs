@@ -39,9 +39,6 @@ const DATASET_PROJECT_PATH: &str = "/api/v1/datasets/{id}/project";
 /// Shortest HS256 secret we accept, matching collecta.
 pub const MIN_SECRET_LEN: usize = 32;
 
-/// Path prefix of the websocket endpoints (`/ws/branches/{id}`, `/ws/rooms/{id}`).
-pub const WS_PREFIX: &str = "/ws/";
-
 /// The ArcGIS FeatureServer frontend's root. Every route under it reads except
 /// `applyEdits` and the three attachment writes, which are gated like any other
 /// write. `extractChanges` and its two job routes read the branch's changesets,
@@ -52,10 +49,6 @@ pub const WS_PREFIX: &str = "/ws/";
 /// the Geoservices error shape. See [`ESRI_AUTHORIZATION`], [`query_token`] and
 /// [`refuse`].
 const ARCGIS_PREFIX: &str = "/arcgis/rest/services";
-
-/// Subprotocol name that marks a WebSocket handshake as carrying a bearer token.
-/// See [`request_token`] for the full contract.
-pub const BEARER_SUBPROTOCOL: &str = "bearer";
 
 /// The header an Esri-ecosystem client puts its bearer token in. verne sends
 /// exactly this and no `Authorization` of its own, which is what it is here for:
@@ -158,8 +151,7 @@ fn tool_scope(method: &Method, route: &str, access: Access) -> Option<&'static s
     if access == Access::Admin {
         return None;
     }
-    let is_write = route.starts_with(WS_PREFIX)
-        || access == Access::Write
+    let is_write = access == Access::Write
         || (matches!(
             *method,
             Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -237,15 +229,8 @@ pub enum Access {
     Admin,
 }
 
-/// Bearer token for a request: the `Authorization` header, on a websocket path a
-/// `Sec-WebSocket-Protocol: bearer, <jwt>` offer, and on the ArcGIS facade an
-/// [`ESRI_AUTHORIZATION`] header or a `token` query parameter.
-///
-/// The subprotocol form is there because a browser cannot set the Authorization
-/// header on a WebSocket handshake. It is preferred over a query parameter
-/// because proxies do not log request headers. It is scoped to [`WS_PREFIX`], so
-/// nowhere else does a subprotocol act as a credential. Mirrors tiletopia's
-/// contract so one platform token works against both services.
+/// Bearer token for a request: the `Authorization` header, and on the ArcGIS
+/// facade an [`ESRI_AUTHORIZATION`] header or a `token` query parameter.
 ///
 /// The facade takes two more forms, in this order after `Authorization`:
 ///
@@ -260,13 +245,11 @@ pub enum Access {
 ///
 /// `Authorization` wins wherever it is present, so a client that can send the
 /// standard header is never downgraded to either of these. Both are scoped to
-/// the `ARCGIS_PREFIX` paths exactly as the subprotocol is scoped to the
-/// websocket paths: nowhere else in this service is a request parameter or this
-/// header a credential.
+/// the `ARCGIS_PREFIX` paths: nowhere else in this service is a request
+/// parameter or this header a credential.
 pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
     let token = match bearer(headers, header::AUTHORIZATION.as_str()) {
         Some(token) => Some(token),
-        None if uri.path().starts_with(WS_PREFIX) => subprotocol_token(headers),
         None if uri.path().starts_with(ARCGIS_PREFIX) => {
             bearer(headers, ESRI_AUTHORIZATION).or_else(|| query_token(uri))
         }
@@ -285,9 +268,8 @@ fn bearer<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-/// Token out of a `token` request parameter. Scoped to [`ARCGIS_PREFIX`] exactly
-/// as the subprotocol form is scoped to the websocket paths, so a query
-/// parameter is a credential nowhere else in this service. Read only when
+/// Token out of a `token` request parameter. Scoped to [`ARCGIS_PREFIX`], so a
+/// query parameter is a credential nowhere else in this service. Read only when
 /// neither `Authorization` nor [`ESRI_AUTHORIZATION`] carried one, because a
 /// header is not written down by anything the way a URL is.
 ///
@@ -310,18 +292,6 @@ fn query_token(uri: &Uri) -> Option<&str> {
         let (name, value) = pair.split_once('=')?;
         name.eq_ignore_ascii_case("token").then_some(value)
     })
-}
-
-/// Token out of a `Sec-WebSocket-Protocol: bearer, <jwt>` offer. Order is fixed:
-/// the marker first, the token second, both in one header value, which is what
-/// `new WebSocket(url, ["bearer", jwt])` sends.
-fn subprotocol_token(headers: &HeaderMap) -> Option<&str> {
-    let offered = headers.get("Sec-WebSocket-Protocol")?.to_str().ok()?;
-    let mut entries = offered.split(',').map(str::trim);
-    if entries.next()? != BEARER_SUBPROTOCOL {
-        return None;
-    }
-    entries.next()
 }
 
 /// The route template a request matched, such as
@@ -458,14 +428,6 @@ pub fn needs_write_grant(method: &Method, route: &str) -> bool {
 /// when no route matched, where the answer decides which error the client sees
 /// and nothing else: no handler runs on that path.
 pub fn classify(method: &Method, route: &str) -> Access {
-    // A websocket handshake is a GET, so without this it would fall into the
-    // read-is-public rule below and both sockets would accept anonymous callers.
-    // /ws/rooms/{id} relays whatever a peer sends to every other peer in the
-    // room, so an anonymous socket is a write, not a read.
-    if route.starts_with(WS_PREFIX) {
-        return Access::Authenticated;
-    }
-
     // Grant management is authorized per dataset, not per role: the holder of an
     // `admin` grant manages their own dataset. The route alone cannot decide that,
     // so any valid token gets through to the handler, which enforces
@@ -1415,8 +1377,6 @@ mod tests {
 
         let elsewhere: Uri = "/api/v1/datasets?token=abc.def.ghi".parse().unwrap();
         assert_eq!(request_token(&headers, &elsewhere), None);
-        let ws: Uri = "/ws/rooms/r1?token=abc.def.ghi".parse().unwrap();
-        assert_eq!(request_token(&headers, &ws), None);
 
         let empty: Uri = "/arcgis/rest/services?token=".parse().unwrap();
         assert_eq!(request_token(&headers, &empty), None);
@@ -1457,7 +1417,6 @@ mod tests {
         for elsewhere in [
             "/api/v1/datasets",
             "/api/v1/audit",
-            "/ws/rooms/r1",
             "/metrics",
             "/arcgis/rest",
         ] {
@@ -1669,70 +1628,10 @@ mod tests {
         headers
     }
 
-    /// A handshake is a GET, so without the /ws rule it would fall into the
-    /// read-is-public branch and both sockets would take anonymous callers.
-    #[test]
-    fn classify_websockets_need_a_token() {
-        assert_eq!(
-            classify(&Method::GET, "/ws/branches/6f1c2d3e"),
-            Access::Authenticated
-        );
-        assert_eq!(
-            classify(&Method::GET, "/ws/rooms/design-review"),
-            Access::Authenticated
-        );
-    }
-
     #[test]
     fn request_token_reads_authorization_header() {
         let headers = headers_with("authorization", "Bearer abc.def.ghi");
         let uri: Uri = "/api/v1/datasets".parse().unwrap();
         assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
-    }
-
-    #[test]
-    fn request_token_reads_subprotocol_on_ws_paths() {
-        let headers = headers_with("sec-websocket-protocol", "bearer, abc.def.ghi");
-        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
-        assert_eq!(request_token(&headers, &uri), Some("abc.def.ghi"));
-    }
-
-    /// The subprotocol is a credential only on the websocket paths. Anywhere
-    /// else it must be ignored, or any route could be entered with a header a
-    /// browser sets from script without a preflight.
-    #[test]
-    fn subprotocol_is_not_a_credential_off_ws_paths() {
-        let headers = headers_with("sec-websocket-protocol", "bearer, abc.def.ghi");
-        let uri: Uri = "/api/v1/datasets".parse().unwrap();
-        assert_eq!(request_token(&headers, &uri), None);
-    }
-
-    #[test]
-    fn subprotocol_needs_the_marker_first_and_a_non_empty_token() {
-        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
-        // marker missing
-        let headers = headers_with("sec-websocket-protocol", "abc.def.ghi");
-        assert_eq!(request_token(&headers, &uri), None);
-        // marker not first
-        let headers = headers_with("sec-websocket-protocol", "abc.def.ghi, bearer");
-        assert_eq!(request_token(&headers, &uri), None);
-        // marker alone
-        let headers = headers_with("sec-websocket-protocol", "bearer");
-        assert_eq!(request_token(&headers, &uri), None);
-        // marker with an empty token
-        let headers = headers_with("sec-websocket-protocol", "bearer, ");
-        assert_eq!(request_token(&headers, &uri), None);
-    }
-
-    /// A real Authorization header wins, so a non-browser client is unaffected.
-    #[test]
-    fn authorization_header_wins_over_subprotocol() {
-        let mut headers = headers_with("authorization", "Bearer real.token");
-        headers.insert(
-            axum::http::HeaderName::from_static("sec-websocket-protocol"),
-            "bearer, other.token".parse().unwrap(),
-        );
-        let uri: Uri = "/ws/rooms/r1".parse().unwrap();
-        assert_eq!(request_token(&headers, &uri), Some("real.token"));
     }
 }
