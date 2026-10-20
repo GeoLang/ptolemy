@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-10-19: **dataset, branch and changeset timestamps are RFC 3339
+  strings**. `Dataset`, `Branch` and `Changeset` serialized `created_at` as a
+  number array, so a client calling `new Date()` on it got Invalid Date. The
+  dataset, branch, commit and history responses now carry an RFC 3339 string.
 - 2026-10-04: **registering an external dataset needs role `admin`, and
   external datasets never run on the primary pool**. Any editor could register
   a relation, and with `PTOLEMY_EXTERNAL_DATABASE_URL` unset the probe and

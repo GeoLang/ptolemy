@@ -773,6 +773,68 @@ async fn test_review_timestamps_are_rfc3339() {
     assert_rfc3339(&comments[0]["created_at"], "listed comment created_at");
 }
 
+#[tokio::test]
+async fn test_versioning_timestamps_are_rfc3339() {
+    let (app, _) = setup_app().await;
+
+    let (status, dataset) = post_json(
+        &app,
+        "/api/v1/datasets",
+        json!({
+            "name": format!("test_{}", Uuid::now_v7()),
+            "geometry_type": "point",
+            "srid": 4326,
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dataset}");
+    assert_rfc3339(&dataset["created_at"], "created dataset created_at");
+    let dataset_id = dataset["id"].as_str().unwrap();
+
+    let (status, fetched) = get_json(&app, &format!("/api/v1/datasets/{dataset_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_rfc3339(&fetched["created_at"], "fetched dataset created_at");
+
+    let (status, branch) = post_json(
+        &app,
+        &format!("/api/v1/datasets/{dataset_id}/branches"),
+        json!({"name": "main", "created_by": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{branch}");
+    assert_rfc3339(&branch["created_at"], "created branch created_at");
+    let branch_id = branch["id"].as_str().unwrap();
+
+    let (status, branches) =
+        get_json(&app, &format!("/api/v1/datasets/{dataset_id}/branches")).await;
+    assert_eq!(status, StatusCode::OK, "{branches}");
+    assert_rfc3339(&branches[0]["created_at"], "listed branch created_at");
+
+    let point_hex = "0101000000000000000000F03F0000000000000040";
+    let (status, changeset) = post_json(
+        &app,
+        &format!("/api/v1/branches/{branch_id}/commit"),
+        json!({
+            "message": "test commit",
+            "author": "test",
+            "operations": [
+                {"type": "insert", "feature_id": Uuid::now_v7().to_string(), "geometry_wkb_hex": point_hex, "properties": {}}
+            ],
+        }),
+    )
+    .await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::OK,
+        "{status}: {changeset}"
+    );
+    assert_rfc3339(&changeset["created_at"], "committed changeset created_at");
+
+    let (status, history) = get_json(&app, &format!("/api/v1/branches/{branch_id}/history")).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_rfc3339(&history[0]["created_at"], "history changeset created_at");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Raster Tests
 // ═══════════════════════════════════════════════════════════════════════

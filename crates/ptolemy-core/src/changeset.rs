@@ -17,5 +17,6 @@ pub struct Changeset {
     pub merge_parent_id: Option<Uuid>,
     pub message: String,
     pub author: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }

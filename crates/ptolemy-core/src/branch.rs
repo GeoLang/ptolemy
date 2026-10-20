@@ -14,6 +14,7 @@ pub struct Branch {
     pub dataset_id: Uuid,
     pub name: String,
     pub head: Option<Uuid>, // points to latest Changeset
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub created_by: String,
 }

@@ -15,6 +15,7 @@ pub struct Dataset {
     pub name: String,
     pub srid: i32,
     pub geometry_type: GeometryType,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub created_by: String,
     /// Set when the dataset is a read-only view over a PostGIS relation
