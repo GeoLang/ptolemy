@@ -230,6 +230,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-11-03: **the webhook delivery worker backs off when the queue is
+  quiet**. After 10 minutes with nothing to send it polls every 30 minutes
+  instead of every 5 seconds, and any delivery returns it to 5 seconds. The
+  pool now keeps no idle connection: `PTOLEMY_DB_MIN_CONNECTIONS` defaults to 0
+  and an idle connection closes after 60 seconds, so Aurora can pause.
 - 2026-09-22: **the JWT secret is `PLATFORM_JWT_SECRET`**, the name agora,
   sibyl, geodukt and the geolang API already read. `PTOLEMY_JWT_SECRET` is no
   longer read. The platform compose and the hosted task definition pass the

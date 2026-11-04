@@ -41,8 +41,14 @@ pub const MAX_DELIVERY_ATTEMPTS: i32 = 5;
 const BACKOFF_BASE_SECS: f64 = 1.0;
 const BACKOFF_CAP_SECS: f64 = 300.0;
 
-/// How long the worker sleeps when it found nothing due.
+/// How long the worker sleeps when it found nothing due, until the queue has
+/// been quiet for [`QUIET_BEFORE_BACKOFF`].
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+const QUIET_BEFORE_BACKOFF: Duration = Duration::from_secs(600);
+
+// aurora pauses only after 300 seconds with no open connection from ptolemy or agora
+const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1800);
 
 /// Deliveries taken per pass. Small enough that one slow batch does not hold the
 /// oldest event back for long.
@@ -273,6 +279,29 @@ impl DeliveryWorker {
     }
 }
 
+struct NextPoll {
+    wait: Duration,
+    quiet_for: Duration,
+}
+
+fn next_poll(quiet_for: Duration, tried: usize) -> NextPoll {
+    if tried > 0 {
+        return NextPoll {
+            wait: Duration::ZERO,
+            quiet_for: Duration::ZERO,
+        };
+    }
+    let wait = if quiet_for < QUIET_BEFORE_BACKOFF {
+        POLL_INTERVAL
+    } else {
+        IDLE_POLL_INTERVAL
+    };
+    NextPoll {
+        wait,
+        quiet_for: quiet_for + wait,
+    }
+}
+
 /// Start the worker. The server holds the handle only to keep the task alive for
 /// as long as it serves.
 pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()> {
@@ -291,6 +320,7 @@ pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()>
         // never swept, so the first pass sweeps: a server that was down for a
         // week has a backlog waiting, and there is no reason to sit on it
         let mut last_sweep: Option<Instant> = None;
+        let mut quiet_for = Duration::ZERO;
         loop {
             if let Some(retention) = retention
                 && last_sweep.is_none_or(|at| at.elapsed() >= RETENTION_SWEEP_INTERVAL)
@@ -298,9 +328,9 @@ pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()>
                 worker.sweep_retention(retention).await;
                 last_sweep = Some(Instant::now());
             }
-            if worker.run_once().await == 0 {
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
+            let next = next_poll(quiet_for, worker.run_once().await);
+            quiet_for = next.quiet_for;
+            tokio::time::sleep(next.wait).await;
         }
     })
 }
@@ -308,6 +338,26 @@ pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_passes_back_off_and_a_delivery_returns_to_the_short_interval() {
+        let mut quiet_for = Duration::ZERO;
+        let passes_before_backoff = QUIET_BEFORE_BACKOFF.as_secs() / POLL_INTERVAL.as_secs();
+        for _ in 0..passes_before_backoff {
+            let next = next_poll(quiet_for, 0);
+            assert_eq!(next.wait, POLL_INTERVAL);
+            quiet_for = next.quiet_for;
+        }
+
+        let backed_off = next_poll(quiet_for, 0);
+        assert_eq!(backed_off.wait, IDLE_POLL_INTERVAL);
+        let still_backed_off = next_poll(backed_off.quiet_for, 0);
+        assert_eq!(still_backed_off.wait, IDLE_POLL_INTERVAL);
+
+        let busy = next_poll(still_backed_off.quiet_for, 1);
+        assert_eq!(busy.wait, Duration::ZERO);
+        assert_eq!(next_poll(busy.quiet_for, 0).wait, POLL_INTERVAL);
+    }
 
     /// `0` is how an operator turns the sweep off, and nothing but a positive
     /// whole number may switch it on.

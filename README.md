@@ -123,7 +123,7 @@ needs its own copy of these parameters.
 | `PUBLIC_BASE_URL` | Where the viewer is served, used to build the invitation link | (no email) |
 | `PTOLEMY_EXTERNAL_DATABASE_URL` | Database external datasets are registered and read on. Use a read-only role | (external datasets off) |
 | `PTOLEMY_DB_MAX_CONNECTIONS` | Max DB pool connections | 10 |
-| `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections | 2 |
+| `PTOLEMY_DB_MIN_CONNECTIONS` | Min DB pool connections. Idle connections close after 60 seconds | 0 |
 | `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` | Seconds one SQL statement may run under `serve` before Postgres cancels it. `0` turns it off. Startup migrations and the other CLI commands run without it | 30 |
 | `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger an `ANALYZE`. `0` leaves it to autoanalyze | 1000 |
 | `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept. `0` keeps them forever | 30 |
@@ -425,6 +425,10 @@ each with `X-Ptolemy-Event`, `X-Ptolemy-Delivery` and, when the subscription has
 a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact body. It retries
 with a doubling backoff, five attempts in all, and then leaves the row with its
 last error. No endpoint returns the secret.
+
+The worker polls the queue every 5 seconds. After 10 minutes with nothing to
+send it polls every 30 minutes, so the first delivery after a quiet period can
+wait up to 30 minutes. Any delivery returns it to the 5 second poll.
 
 Once an hour the worker deletes deliveries settled more than
 `PTOLEMY_EVENTS_RETENTION_DAYS` ago, then events no pending delivery needs, in

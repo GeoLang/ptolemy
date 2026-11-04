@@ -28,7 +28,7 @@ struct Cli {
     db_max_connections: u32,
 
     /// Minimum database connections in the pool
-    #[arg(long, env = "PTOLEMY_DB_MIN_CONNECTIONS", default_value = "2")]
+    #[arg(long, env = "PTOLEMY_DB_MIN_CONNECTIONS", default_value = "0")]
     db_min_connections: u32,
 
     #[arg(
@@ -270,6 +270,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(cli.db_max_connections)
         .min_connections(cli.db_min_connections)
+        // aurora does not pause while any connection is open, idle ones included
+        .idle_timeout(std::time::Duration::from_secs(60))
         .connect_with(pool_connect_options)
         .await?;
     let quotas = UserQuotas::from_env().map_err(anyhow::Error::msg)?;
