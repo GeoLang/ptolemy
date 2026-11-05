@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AppState, auth::Actor};
+use crate::{AppState, auth::Actor, verticals::haversine_m};
 
 pub fn real_estate_routes() -> Router<AppState> {
     Router::new()
@@ -437,15 +437,4 @@ fn circle_coords(cx: f64, cy: f64, radius_deg: f64, segments: usize) -> Vec<[f64
         coords.push([cx + radius_deg * angle.cos(), cy + radius_deg * angle.sin()]);
     }
     coords
-}
-
-/// Haversine distance in meters between two lat/lng points.
-fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
-    let r = 6_371_000.0; // Earth radius in meters
-    let d_lat = (lat2 - lat1).to_radians();
-    let d_lng = (lng2 - lng1).to_radians();
-    let a = (d_lat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lng / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
-    r * c
 }

@@ -20,11 +20,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{DecodingKey, Validation, decode};
+use platform_auth::{TokenAuthority, bearer_header_value};
 use ptolemy_storage::{Reader, Writer};
 use serde::{Deserialize, Serialize};
 
-const TOOL_TOKEN_USE: &str = "tool";
 const PTOLEMY_READ_SCOPE: &str = "ptolemy:read";
 const PTOLEMY_WRITE_SCOPE: &str = "ptolemy:write";
 const COLLABORATION_PREFIX: &str = "/api/v1/workspaces";
@@ -67,24 +66,12 @@ pub struct Claims {
     pub role: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenClaims {
-    sub: String,
-    exp: usize,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    token_use: Option<String>,
-    #[serde(default)]
-    scope: Option<serde_json::Value>,
-}
-
-enum VerifiedToken {
+enum VerifiedCaller {
     Platform(Claims),
     Tool { claims: Claims, scopes: Vec<String> },
 }
 
-impl VerifiedToken {
+impl VerifiedCaller {
     fn claims(&self) -> &Claims {
         match self {
             Self::Platform(claims) | Self::Tool { claims, .. } => claims,
@@ -92,38 +79,22 @@ impl VerifiedToken {
     }
 }
 
-fn verify_token(token: &str, key: &DecodingKey) -> Result<VerifiedToken, ()> {
-    let claims = decode::<TokenClaims>(token, key, &Validation::default())
-        .map_err(|_| ())?
-        .claims;
-
-    match claims.token_use.as_deref() {
-        None => Ok(VerifiedToken::Platform(Claims {
-            sub: claims.sub,
-            exp: claims.exp,
-            role: claims.role.ok_or(())?,
+fn verified_jwt_caller(token: &str, secret: &str) -> Option<VerifiedCaller> {
+    let verified = platform_auth::verify_token(token, secret).ok()?;
+    match verified.authority {
+        TokenAuthority::Platform { role } => Some(VerifiedCaller::Platform(Claims {
+            sub: verified.sub,
+            exp: verified.exp,
+            role: role?,
         })),
-        Some(TOOL_TOKEN_USE) => {
-            if claims.sub.is_empty() || claims.role.is_some() {
-                return Err(());
-            }
-            let scopes = claims
-                .scope
-                .and_then(|scope| scope.as_array().cloned())
-                .ok_or(())?
-                .into_iter()
-                .map(|scope| scope.as_str().map(str::to_owned).ok_or(()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(VerifiedToken::Tool {
-                claims: Claims {
-                    sub: claims.sub,
-                    exp: claims.exp,
-                    role: String::new(),
-                },
-                scopes,
-            })
-        }
-        Some(_) => Err(()),
+        TokenAuthority::Tool { scopes } => Some(VerifiedCaller::Tool {
+            claims: Claims {
+                sub: verified.sub,
+                exp: verified.exp,
+                role: String::new(),
+            },
+            scopes,
+        }),
     }
 }
 
@@ -248,24 +219,14 @@ pub enum Access {
 /// the `ARCGIS_PREFIX` paths: nowhere else in this service is a request
 /// parameter or this header a credential.
 pub fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
-    let token = match bearer(headers, header::AUTHORIZATION.as_str()) {
+    let token = match bearer_header_value(headers, header::AUTHORIZATION.as_str()) {
         Some(token) => Some(token),
         None if uri.path().starts_with(ARCGIS_PREFIX) => {
-            bearer(headers, ESRI_AUTHORIZATION).or_else(|| query_token(uri))
+            bearer_header_value(headers, ESRI_AUTHORIZATION).or_else(|| query_token(uri))
         }
         None => None,
     };
     token.filter(|t| !t.is_empty())
-}
-
-/// The bearer token a header carries. The scheme is matched exactly as the
-/// standard spells it, which is what every client here sends: a value in any
-/// other shape carries no token rather than being read as one.
-fn bearer<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 /// Token out of a `token` request parameter. Scoped to [`ARCGIS_PREFIX`], so a
@@ -718,12 +679,11 @@ pub async fn auth_middleware(
         .to_owned();
     let access = classify(request.method(), &route);
     let token = request_token(request.headers(), request.uri()).map(str::to_owned);
-    let key = DecodingKey::from_secret(auth.config.secret.as_bytes());
     let esri = request.uri().path().starts_with(ARCGIS_PREFIX);
     let verified = match token.as_deref() {
         Some(raw) if raw.starts_with("ptk_") => {
             match authenticate_api_key(&auth.store, raw).await {
-                Ok(claims) => claims.map(VerifiedToken::Platform),
+                Ok(claims) => claims.map(VerifiedCaller::Platform),
                 Err(()) => {
                     return refuse(
                         esri,
@@ -734,7 +694,7 @@ pub async fn auth_middleware(
                 }
             }
         }
-        Some(raw) => verify_token(raw, &key).ok(),
+        Some(raw) => verified_jwt_caller(raw, &auth.config.secret),
         None => None,
     };
 
@@ -755,7 +715,7 @@ pub async fn auth_middleware(
                 "invalid or expired token",
             );
         }
-        if let Some(VerifiedToken::Tool { claims, scopes }) = &verified {
+        if let Some(VerifiedCaller::Tool { claims, scopes }) = &verified {
             let Some(required) = tool_scope(request.method(), &route, access) else {
                 return refuse(
                     esri,
@@ -773,7 +733,7 @@ pub async fn auth_middleware(
                 );
             }
             request.extensions_mut().insert(claims.clone());
-        } else if let Some(VerifiedToken::Platform(claims)) = verified {
+        } else if let Some(VerifiedCaller::Platform(claims)) = verified {
             request.extensions_mut().insert(claims);
         }
         return next.run(request).await;
@@ -796,13 +756,13 @@ pub async fn auth_middleware(
     };
 
     let allowed = match &verified {
-        VerifiedToken::Platform(claims) => match access {
+        VerifiedCaller::Platform(claims) => match access {
             Access::Public => true,
             Access::Authenticated => claims.parsed_role().is_some(),
             Access::Write => claims.can_write(),
             Access::Admin => claims.can_admin(),
         },
-        VerifiedToken::Tool { scopes, .. } => tool_scope(request.method(), &route, access)
+        VerifiedCaller::Tool { scopes, .. } => tool_scope(request.method(), &route, access)
             .is_some_and(|required| scopes.iter().any(|scope| scope == required)),
     };
     if !allowed {
@@ -811,8 +771,8 @@ pub async fn auth_middleware(
             StatusCode::FORBIDDEN,
             403,
             match &verified {
-                VerifiedToken::Tool { .. } => "required tool scope missing",
-                VerifiedToken::Platform(_) => match access {
+                VerifiedCaller::Tool { .. } => "required tool scope missing",
+                VerifiedCaller::Platform(_) => match access {
                     Access::Admin => "admin role required",
                     Access::Authenticated => "unknown role",
                     _ => "editor or admin role required",
@@ -1066,6 +1026,33 @@ mod tests {
             middleware_status(Method::GET, "/api/v1/datasets", &expired).await,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_platform_token_is_anonymous_on_a_public_route_and_refused_elsewhere() {
+        for claims in [
+            serde_json::json!({"sub": "user-1", "exp": live_expiry()}),
+            serde_json::json!({"sub": "user-1", "exp": live_expiry(), "role": 7}),
+            serde_json::json!({"sub": "", "exp": live_expiry(), "role": "admin"}),
+            serde_json::json!({
+                "sub": "user-1", "exp": live_expiry(), "role": "admin", "geolang_use": "mcp"
+            }),
+            serde_json::json!({
+                "sub": "user-1", "exp": live_expiry(), "role": "admin", "agora_use": "feed"
+            }),
+        ] {
+            let token = signed(claims.clone());
+            assert_eq!(
+                middleware_status(Method::POST, "/api/v1/datasets", &token).await,
+                StatusCode::UNAUTHORIZED,
+                "{claims}"
+            );
+            assert_eq!(
+                middleware_status(Method::GET, "/api/v1/datasets", &token).await,
+                StatusCode::OK,
+                "{claims}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1592,13 +1579,7 @@ mod tests {
         )
         .unwrap();
 
-        let decoded = decode::<Claims>(
-            &token,
-            &DecodingKey::from_secret(SECRET.as_bytes()),
-            &Validation::default(),
-        )
-        .unwrap()
-        .claims;
+        let decoded = platform_auth::decode_token::<Claims>(&token, SECRET).unwrap();
         assert_eq!(decoded.sub, "6f1c2d3e");
         assert_eq!(decoded.parsed_role(), Some(Role::Editor));
         assert!(decoded.can_write());
@@ -1608,13 +1589,7 @@ mod tests {
     #[test]
     fn generated_token_round_trips() {
         let token = generate_token(SECRET, "u1", Role::Admin, 60);
-        let claims = decode::<Claims>(
-            &token,
-            &DecodingKey::from_secret(SECRET.as_bytes()),
-            &Validation::default(),
-        )
-        .unwrap()
-        .claims;
+        let claims = platform_auth::decode_token::<Claims>(&token, SECRET).unwrap();
         assert_eq!(claims.role, "admin");
         assert!(claims.can_admin());
     }

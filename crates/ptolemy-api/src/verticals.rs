@@ -869,7 +869,7 @@ fn default_limit() -> i64 {
     50
 }
 
-fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
+pub(crate) fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
     let r = 6_371_000.0;
     let d_lat = (lat2 - lat1).to_radians();
     let d_lng = (lng2 - lng1).to_radians();

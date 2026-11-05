@@ -127,6 +127,7 @@ needs its own copy of these parameters.
 | `PTOLEMY_STATEMENT_TIMEOUT_SECONDS` | Seconds one SQL statement may run under `serve` before Postgres cancels it. `0` turns it off. Startup migrations and the other CLI commands run without it | 30 |
 | `PTOLEMY_ANALYZE_ROW_THRESHOLD` | Rows in one write that trigger an `ANALYZE`. `0` leaves it to autoanalyze | 1000 |
 | `PTOLEMY_EVENTS_RETENTION_DAYS` | Days a settled webhook delivery and its event are kept. `0` keeps them forever | 30 |
+| `PTOLEMY_WEBHOOK_ALLOW_PRIVATE_HOSTS` | `true` lets webhooks subscribe and deliver to loopback, private and link-local addresses, for a receiver on a local network. Any other value refuses them. With `true`, an admin's subscription can make the server post to the cloud metadata endpoint and to any service on its network, so leave it off on a shared or hosted deployment | `false` |
 | `PTOLEMY_MAX_ATTACHMENT_MEGABYTES_PER_USER` | Attachment storage one user may upload, deleted attachments included | (no limit) |
 | `PTOLEMY_MAX_ATTACHMENTS_PER_USER` | Attachments one user may upload, deleted attachments included | (no limit) |
 | `PTOLEMY_MAX_WORKSPACES_PER_USER` | Workspaces one user may create | (no limit) |
@@ -274,6 +275,13 @@ touch. `PTOLEMY_AUTH_DISABLED=true` turns off both layers.
 With auth on, attribution fields (`author`, `created_by`, `granted_by`) come
 from the token subject and the request body value is ignored.
 
+A JWT with an empty `sub`, with a `geolang_use`, `agora_use` or `aud` claim, with a
+`name` that is not a string, or a platform token with no string `role`, is
+invalid. A `token_use` of JSON null counts as a `token_use` claim and is invalid
+too. An invalid JWT with no `token_use` claim
+is anonymous on a route that needs no token. Every other invalid JWT is `401`,
+or HTTP `200` with `error.code` `498` in the body under `/arcgis/rest/services`.
+
 ### Tool tokens and API keys
 
 A token with `token_use: "tool"` carries a `scope` array and no `role`.
@@ -361,7 +369,10 @@ optional `email` and the reply carries `email: {"status": "sent"}` or
 request. With any of the three unset, `email` is a 400 and
 `GET /api/v1/capabilities` answers `{"email_configured": false}`.
 
-Project roles do not reach Agora documents.
+Agora applies these roles to a document linked to a project: `viewer` reads,
+`editor` and `owner` edit. The grant is combined with the document's members
+table, and the wider of the two applies. Agora needs `PTOLEMY_URL` set for this,
+see its README.
 
 ### Project state and attachments
 
@@ -425,6 +436,14 @@ each with `X-Ptolemy-Event`, `X-Ptolemy-Delivery` and, when the subscription has
 a `secret`, `X-Ptolemy-Signature: sha256=<hmac>` over the exact body. It retries
 with a doubling backoff, five attempts in all, and then leaves the row with its
 last error. No endpoint returns the secret.
+
+Subscribing answers 400 for a URL that is not http or https, or whose host
+resolves to a loopback, private, link-local or other non-public address. Each
+delivery attempt resolves the host again and connects to a public address it
+found, so a host that later moves to a private address records a failed attempt
+and sends nothing. Set `PTOLEMY_WEBHOOK_ALLOW_PRIVATE_HOSTS=true` for a receiver
+on a local network. Delivery follows no redirects, so a 3xx answer counts as a
+failed attempt, and it ignores `HTTP_PROXY` and `HTTPS_PROXY`.
 
 The worker polls the queue every 5 seconds. After 10 minutes with nothing to
 send it polls every 30 minutes, so the first delivery after a quiet period can
@@ -606,7 +625,7 @@ routes, whose callers are outside this codebase.
 | GET | `/api/v1/branches/{id}/quality` | Data quality report. The error and null-field lists are always empty |
 | POST | `/api/v1/branches/{id}/repair` | Repair invalid geometries with `ST_MakeValid`, as one commit |
 | GET | `/api/v1/datasets/{id}/webhooks` | List webhook subscriptions (admin) |
-| POST | `/api/v1/datasets/{id}/webhooks` | Subscribe, `url` must be http or https (admin) |
+| POST | `/api/v1/datasets/{id}/webhooks` | Subscribe, `url` must be http or https on a public host (admin) |
 | DELETE | `/api/v1/webhooks/{id}` | Delete subscription (admin) |
 | GET | `/api/v1/datasets/{id}/events` | List events, `limit` only (admin) |
 | POST | `/api/v1/datasets/{id}/events` | Emit a custom event, delivered like the built-in ones |

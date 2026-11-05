@@ -20,6 +20,7 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get},
 };
+use platform_webhook::{PrivateHosts, WebhookUrl, WebhookUrlError, check_webhook_registration};
 use ptolemy_core::event::{Event, EventType, Webhook};
 use ptolemy_storage::{WebhookInput, WriteGrant};
 use serde::Deserialize;
@@ -56,21 +57,38 @@ struct CreateWebhookRequest {
     secret: Option<String>,
 }
 
-/// The worker posts to whatever this url names, so a scheme it cannot post to is
-/// a subscription that can only ever fail, and a scheme like `file:` is a
-/// request to read the server's disk. Only http and https get in.
-fn is_deliverable_url(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+pub fn private_hosts_from_env() -> PrivateHosts {
+    private_hosts_from_setting(
+        std::env::var("PTOLEMY_WEBHOOK_ALLOW_PRIVATE_HOSTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn private_hosts_from_setting(setting: Option<&str>) -> PrivateHosts {
+    if setting == Some("true") {
+        PrivateHosts::AllowedForTestReceiver
+    } else {
+        PrivateHosts::Refused
+    }
+}
+
+async fn check_subscription_url(
+    url: &str,
+    private_hosts: PrivateHosts,
+) -> Result<(), WebhookUrlError> {
+    check_webhook_registration(&WebhookUrl::parse(url)?, private_hosts).await
 }
 
 async fn create_webhook(
     State(store): State<AppState>,
     Extension(grant): Extension<WriteGrant>,
+    Extension(private_hosts): Extension<PrivateHosts>,
     Json(req): Json<CreateWebhookRequest>,
 ) -> Result<(StatusCode, Json<Webhook>), WebhookError> {
-    if !is_deliverable_url(&req.url) {
-        return Err(WebhookError::BadUrl);
-    }
+    check_subscription_url(&req.url, private_hosts)
+        .await
+        .map_err(WebhookError::BadUrl)?;
     let wh = store
         .create_webhook(
             &grant,
@@ -149,7 +167,7 @@ async fn emit_event(
 
 enum WebhookError {
     Store(ptolemy_storage::StoreError),
-    BadUrl,
+    BadUrl(WebhookUrlError),
     ReservedEventType,
 }
 
@@ -163,10 +181,7 @@ impl IntoResponse for WebhookError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             WebhookError::Store(e) => crate::errors::store_error_status(&e),
-            WebhookError::BadUrl => (
-                StatusCode::BAD_REQUEST,
-                "webhook url must be http or https".to_string(),
-            ),
+            WebhookError::BadUrl(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             WebhookError::ReservedEventType => (
                 StatusCode::BAD_REQUEST,
                 "event_type is one the server raises itself".to_string(),
@@ -193,19 +208,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_http_urls_are_deliverable() {
-        assert!(is_deliverable_url("https://example.test/hook"));
-        assert!(is_deliverable_url("http://127.0.0.1:9000/hook"));
+    #[tokio::test]
+    async fn subscriptions_need_an_http_url_outside_the_private_network() {
+        let refused = PrivateHosts::Refused;
+        assert_eq!(
+            check_subscription_url("https://93.184.216.34/hook", refused).await,
+            Ok(())
+        );
+        for url in [
+            "http://127.0.0.1:9000/hook",
+            "http://10.0.0.7/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:9000/hook",
+        ] {
+            assert_eq!(
+                check_subscription_url(url, refused).await,
+                Err(WebhookUrlError::InsidePlatformNetwork),
+                "{url}"
+            );
+        }
         for url in [
             "file:///etc/passwd",
             "gopher://example.test/",
             "ftp://example.test/",
-            "example.test/hook",
-            "",
-            "sweep",
         ] {
-            assert!(!is_deliverable_url(url), "{url}");
+            assert_eq!(
+                check_subscription_url(url, refused).await,
+                Err(WebhookUrlError::UnsupportedScheme),
+                "{url}"
+            );
+        }
+        for url in ["example.test/hook", "", "sweep"] {
+            assert_eq!(
+                check_subscription_url(url, refused).await,
+                Err(WebhookUrlError::NotAUrl),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_private_host_opt_in_allows_a_loopback_receiver_and_keeps_the_scheme_check() {
+        let allowed = PrivateHosts::AllowedForTestReceiver;
+        assert_eq!(
+            check_subscription_url("http://127.0.0.1:9000/hook", allowed).await,
+            Ok(())
+        );
+        assert_eq!(
+            check_subscription_url("file:///etc/passwd", allowed).await,
+            Err(WebhookUrlError::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn only_the_exact_value_true_allows_private_webhook_hosts() {
+        assert_eq!(
+            private_hosts_from_setting(Some("true")),
+            PrivateHosts::AllowedForTestReceiver
+        );
+        for setting in [
+            None,
+            Some("false"),
+            Some(""),
+            Some("TRUE"),
+            Some("1"),
+            Some("yes"),
+        ] {
+            assert_eq!(
+                private_hosts_from_setting(setting),
+                PrivateHosts::Refused,
+                "{setting:?}"
+            );
         }
     }
 }

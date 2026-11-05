@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- 2026-11-04: **webhooks refuse private addresses**. A subscription could name
+  any http or https url, so the delivery worker posted to loopback, private and
+  cloud metadata addresses and followed redirects. `POST
+  /api/v1/datasets/{id}/webhooks` now answers `400` for a host that resolves to
+  a non-public address, and each delivery attempt resolves the host again and
+  connects to a public address it found. A subscription stored earlier with a
+  private address fails its attempts and sends nothing. A receiver on a local
+  network needs `PTOLEMY_WEBHOOK_ALLOW_PRIVATE_HOSTS=true`. Delivery no longer
+  follows redirects or uses `HTTP_PROXY`. A non-url subscription's refusal text
+  is now `webhook url is not a url`.
+- 2026-11-04: **tokens are checked by `platform-auth`**. A token carrying
+  `geolang_use` or `agora_use`, a token whose `name` is not a string, a token
+  with a non-string `aud`, a token whose `token_use` is null, which used to be a
+  platform token, or a platform token with an empty `sub`, is no longer accepted
+  as a caller. With no `token_use` claim, a public route treats it as anonymous,
+  and a `token_use` set to null counts as having the claim. Any other request
+  answers `401`, or HTTP `200` with `error.code` `498` in the body under
+  `/arcgis/rest/services`.
+- 2026-11-04: **the docs said project roles do not reach Agora documents**.
+  Agora applies them to a document linked to a project.
 - 2026-10-19: **dataset, branch and changeset timestamps are RFC 3339
   strings**. `Dataset`, `Branch` and `Changeset` serialized `created_at` as a
   number array, so a client calling `new Date()` on it got Invalid Date. The
@@ -230,6 +250,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-11-04: **the release workflow calls `rust-release.yml` in
+  `GeoLang/.github`**. The `ptolemy-<target>.tar.gz` archives are unchanged.
 - 2026-11-03: **the webhook delivery worker backs off when the queue is
   quiet**. After 10 minutes with nothing to send it polls every 30 minutes
   instead of every 5 seconds, and any delivery returns it to 5 seconds. The

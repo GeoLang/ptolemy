@@ -52,6 +52,7 @@ use axum::http::Uri;
 use axum::response::Html;
 use axum::routing::get;
 use axum::{Extension, Router, middleware};
+use platform_webhook::PrivateHosts;
 use ptolemy_storage::PgStore;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -116,13 +117,20 @@ pub fn app(state: AppState) -> Router {
 }
 
 pub fn app_with_auth(state: AppState, auth: AuthConfig) -> Router {
-    app_with_auth_and_email(state, auth, EmailConfig::from_env())
+    app_with_config(
+        state,
+        auth,
+        EmailConfig::from_env(),
+        webhook::private_hosts_from_env(),
+    )
 }
 
-/// Same, with invitation mail configured by the caller rather than the
-/// environment. A test points this at an SMTP server whose port it only learns
-/// once that server is listening.
-pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailConfig) -> Router {
+pub fn app_with_config(
+    state: AppState,
+    auth: AuthConfig,
+    email: EmailConfig,
+    webhook_private_hosts: PrivateHosts,
+) -> Router {
     let prom_handle = init_metrics();
 
     Router::new()
@@ -169,6 +177,7 @@ pub fn app_with_auth_and_email(state: AppState, auth: AuthConfig, email: EmailCo
         .merge(oidc::oidc_routes())
         .merge(metrics::metrics_routes(prom_handle))
         .layer(Extension(email))
+        .layer(Extension(webhook_private_hosts))
         .layer(middleware::from_fn(metrics::metrics_middleware))
         // inside the write gate, so a mutation the ladder refused is not recorded
         // as one that happened, and the audited target is the checked one

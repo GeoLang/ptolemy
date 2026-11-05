@@ -2768,6 +2768,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "platform-auth"
+version = "0.1.0"
+source = "git+https://github.com/GeoLang/platform-crates.git?branch=master#a4c0404f757ecf81ce16b536b9490dd3616467f8"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "jsonwebtoken",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "platform-webhook"
+version = "0.1.0"
+source = "git+https://github.com/GeoLang/platform-crates.git?branch=master#a4c0404f757ecf81ce16b536b9490dd3616467f8"
+dependencies = [
+ "hex",
+ "hmac 0.13.0",
+ "reqwest",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2848,6 +2872,8 @@ dependencies = [
  "metrics-exporter-prometheus",
  "openidconnect",
  "percent-encoding",
+ "platform-auth",
+ "platform-webhook",
  "ptolemy-core",
  "ptolemy-storage",
  "reqwest",

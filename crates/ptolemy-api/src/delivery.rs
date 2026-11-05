@@ -25,13 +25,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, KeyInit, Mac};
+use platform_webhook::{PrivateHosts, WebhookUrl, pinned_client, signature};
 use ptolemy_storage::{DueDelivery, EventRetentionDays, PgStore};
-use reqwest::Client;
-use sha2::Sha256;
 use tracing::{info, warn};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// How many times one event is offered to one subscriber before it is left as a
 /// dead letter. Attempts are spaced 1s, 2s, 4s, 8s by `BACKOFF_BASE_SECS`.
@@ -53,9 +49,6 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1800);
 /// Deliveries taken per pass. Small enough that one slow batch does not hold the
 /// oldest event back for long.
 const BATCH: i64 = 50;
-
-/// A receiver that never answers must not hold the batch open.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the worker keeps a settled delivery and the event behind it, unless
 /// `PTOLEMY_EVENTS_RETENTION_DAYS` says otherwise. `0` there keeps everything.
@@ -102,31 +95,17 @@ fn retention_from_env() -> Option<EventRetentionDays> {
     parse_retention_days(std::env::var(EVENTS_RETENTION_DAYS_VAR).ok().as_deref())
 }
 
-/// The `X-Ptolemy-Signature` value for a body, `None` when the secret cannot key
-/// an HMAC. Receivers verify this string, so it is a wire contract.
-fn signature_header(secret: &str, body: &[u8]) -> Option<String> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(body);
-    Some(format!(
-        "sha256={}",
-        hex::encode(mac.finalize().into_bytes())
-    ))
-}
-
 pub struct DeliveryWorker {
     store: Arc<PgStore>,
-    client: Client,
+    private_hosts: PrivateHosts,
     backoff_base_secs: f64,
 }
 
 impl DeliveryWorker {
-    pub fn new(store: Arc<PgStore>) -> Self {
+    pub fn new(store: Arc<PgStore>, private_hosts: PrivateHosts) -> Self {
         DeliveryWorker {
             store,
-            client: Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            private_hosts,
             backoff_base_secs: BACKOFF_BASE_SECS,
         }
     }
@@ -220,7 +199,12 @@ impl DeliveryWorker {
         tried
     }
 
-    async fn deliver(&self, delivery: &DueDelivery) {
+    async fn post_delivery(&self, delivery: &DueDelivery) -> Result<(), String> {
+        let url = WebhookUrl::parse(&delivery.url).map_err(|e| e.to_string())?;
+        let client = pinned_client(&url, self.private_hosts)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let body = serde_json::json!({
             "event_id": delivery.event_id.to_string(),
             "event_type": &delivery.event_type,
@@ -229,26 +213,30 @@ impl DeliveryWorker {
         });
         let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
 
-        let mut request = self
-            .client
-            .post(&delivery.url)
+        let mut request = client
+            .post(url.as_url().clone())
             .header("Content-Type", "application/json")
             .header("X-Ptolemy-Event", &delivery.event_type)
             .header("X-Ptolemy-Delivery", delivery.event_id.to_string());
-        if let Some(secret) = &delivery.secret
-            && let Some(signature) = signature_header(secret, &body_bytes)
-        {
-            request = request.header("X-Ptolemy-Signature", signature);
+        if let Some(secret) = &delivery.secret {
+            request = request.header("X-Ptolemy-Signature", signature(secret, &body_bytes));
         }
 
-        let outcome = match request.body(body_bytes).send().await {
-            Ok(response) if response.status().is_success() => None,
-            Ok(response) => Some(format!("HTTP {}", response.status())),
-            Err(e) => Some(e.to_string()),
-        };
+        let response = request
+            .body(body_bytes)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("HTTP {}", response.status()))
+        }
+    }
 
-        let result = match &outcome {
-            None => {
+    async fn deliver(&self, delivery: &DueDelivery) {
+        let result = match self.post_delivery(delivery).await {
+            Ok(()) => {
                 info!(
                     webhook_id = %delivery.webhook_id,
                     event_id = %delivery.event_id,
@@ -258,7 +246,7 @@ impl DeliveryWorker {
                     .mark_webhook_delivered(delivery.webhook_id, delivery.event_id)
                     .await
             }
-            Some(error) => {
+            Err(error) => {
                 let exhausted = delivery.attempt >= MAX_DELIVERY_ATTEMPTS;
                 warn!(
                     webhook_id = %delivery.webhook_id,
@@ -269,7 +257,7 @@ impl DeliveryWorker {
                     "webhook delivery failed"
                 );
                 self.store
-                    .record_webhook_delivery_failure(delivery.webhook_id, delivery.event_id, error)
+                    .record_webhook_delivery_failure(delivery.webhook_id, delivery.event_id, &error)
                     .await
             }
         };
@@ -306,7 +294,7 @@ fn next_poll(quiet_for: Duration, tried: usize) -> NextPoll {
 /// as long as it serves.
 pub fn spawn_delivery_worker(store: Arc<PgStore>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let worker = DeliveryWorker::new(store);
+        let worker = DeliveryWorker::new(store, crate::webhook::private_hosts_from_env());
         let retention = retention_from_env();
         match retention {
             Some(days) => info!(
@@ -377,18 +365,6 @@ mod tests {
         assert_eq!(
             parse_retention_days(None).map(|r| r.days()),
             Some(DEFAULT_EVENTS_RETENTION_DAYS)
-        );
-    }
-
-    // this digest holds a byte below 0x10, so a dropped zero pad fails here
-    #[test]
-    fn signature_header_golden() {
-        assert_eq!(
-            signature_header("ptolemy webhook golden secret", br#"{"event":"golden"}"#),
-            Some(
-                "sha256=0eb8a80f1ebdca22ca35b7d6d1687a05a0f03dda1db87ddd7788142b730a4286"
-                    .to_string()
-            )
         );
     }
 }

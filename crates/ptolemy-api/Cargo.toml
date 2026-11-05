@@ -16,9 +16,10 @@ getrandom.workspace = true
 flatgeobuf = { version = "6.0.1", default-features = false }
 geozero = { version = "0.15.1", default-features = false, features = ["with-geojson"] }
 hex = "0.4"
-hmac.workspace = true
 jsonwebtoken = { workspace = true }
 jung-esri.workspace = true
+platform-auth.workspace = true
+platform-webhook.workspace = true
 # rustls with ring, matching sqlx's tls backend; no pool, an invitation email
 # builds its own transport
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1", "tokio1-rustls-tls"] }
@@ -41,6 +42,7 @@ urlencoding = "2"
 uuid.workspace = true
 
 [dev-dependencies]
+hmac.workspace = true
 hyper = { version = "1", features = ["full"] }
 http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }

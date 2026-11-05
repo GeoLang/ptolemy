@@ -8,6 +8,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use platform_webhook::PrivateHosts;
 use ptolemy_api::{AppState, AuthConfig, Role, app_with_auth, generate_token};
 use ptolemy_storage::postgres::{EXTERNAL_DATABASE_URL, PgStore};
 use serde_json::{Value, json};
@@ -18031,7 +18032,7 @@ async fn workspace_for_invitation(app: &axum::Router, owner: &str, name: &str) -
 async fn an_invitation_naming_a_recipient_is_mailed_to_them() {
     let (port, captured) = smtp_capture().await;
     let state = fresh_state().await;
-    let app = ptolemy_api::app_with_auth_and_email(
+    let app = ptolemy_api::app_with_config(
         state,
         AuthConfig::enabled(TEST_SECRET),
         ptolemy_api::EmailConfig::new(
@@ -18039,6 +18040,7 @@ async fn an_invitation_naming_a_recipient_is_mailed_to_them() {
             "ptolemy@example.com",
             "https://maps.example.com",
         ),
+        PrivateHosts::Refused,
     );
     let owner = token_for_subject("mailing-owner");
     let workspace_id = workspace_for_invitation(&app, &owner, "mailed").await;
@@ -18077,10 +18079,11 @@ async fn an_invitation_naming_a_recipient_is_mailed_to_them() {
 #[tokio::test]
 async fn a_recipient_with_no_relay_configured_is_refused() {
     let state = fresh_state().await;
-    let app = ptolemy_api::app_with_auth_and_email(
+    let app = ptolemy_api::app_with_config(
         state.clone(),
         AuthConfig::enabled(TEST_SECRET),
         ptolemy_api::EmailConfig::default(),
+        PrivateHosts::Refused,
     );
     let owner = token_for_subject("unrelayed-owner");
     let workspace_id = workspace_for_invitation(&app, &owner, "unrelayed").await;
@@ -18126,7 +18129,7 @@ async fn a_project_invitation_that_cannot_be_delivered_still_yields_a_token() {
     drop(unused);
 
     let state = fresh_state().await;
-    let app = ptolemy_api::app_with_auth_and_email(
+    let app = ptolemy_api::app_with_config(
         state,
         AuthConfig::enabled(TEST_SECRET),
         ptolemy_api::EmailConfig::new(
@@ -18134,6 +18137,7 @@ async fn a_project_invitation_that_cannot_be_delivered_still_yields_a_token() {
             "ptolemy@example.com",
             "https://maps.example.com",
         ),
+        PrivateHosts::Refused,
     );
     let owner = token_for_subject("undeliverable-owner");
     let workspace_id = workspace_for_invitation(&app, &owner, "undeliverable").await;
@@ -18172,16 +18176,17 @@ async fn a_project_invitation_that_cannot_be_delivered_still_yields_a_token() {
 #[tokio::test]
 async fn capabilities_reports_whether_email_is_configured() {
     let state = fresh_state().await;
-    let unconfigured = ptolemy_api::app_with_auth_and_email(
+    let unconfigured = ptolemy_api::app_with_config(
         state.clone(),
         AuthConfig::disabled(),
         ptolemy_api::EmailConfig::default(),
+        PrivateHosts::Refused,
     );
     let (status, body) = get_json(&unconfigured, "/api/v1/capabilities").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["email_configured"], false);
 
-    let configured = ptolemy_api::app_with_auth_and_email(
+    let configured = ptolemy_api::app_with_config(
         state,
         AuthConfig::disabled(),
         ptolemy_api::EmailConfig::new(
@@ -18189,6 +18194,7 @@ async fn capabilities_reports_whether_email_is_configured() {
             "ptolemy@example.com",
             "https://maps.example.com",
         ),
+        PrivateHosts::Refused,
     );
     let (status, body) = get_json(&configured, "/api/v1/capabilities").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -18462,10 +18468,73 @@ async fn subscribe(app: &axum::Router, dataset_id: Uuid, url: &str, secret: &str
     Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
 }
 
+async fn setup_app_with_loopback_webhooks() -> (axum::Router, AppState) {
+    let state = fresh_state().await;
+    let router = ptolemy_api::app_with_config(
+        state.clone(),
+        AuthConfig::disabled(),
+        ptolemy_api::EmailConfig::default(),
+        PrivateHosts::AllowedForTestReceiver,
+    );
+    (router, state)
+}
+
+fn worker_for(state: &AppState) -> ptolemy_api::DeliveryWorker {
+    ptolemy_api::DeliveryWorker::new(state.clone(), PrivateHosts::AllowedForTestReceiver)
+        .with_backoff_base_secs(0.0)
+}
+
+#[tokio::test]
+async fn test_a_private_webhook_url_is_refused_at_subscribe_and_at_delivery() {
+    const REFUSAL: &str = "webhook host is inside the platform network";
+    let (receiver, log) = spawn_receiver(StatusCode::OK).await;
+    let (loopback_app, state) = setup_app_with_loopback_webhooks().await;
+    let dataset_id = create_dataset(&loopback_app).await;
+    let url = format!("{receiver}/hook");
+
+    let refusing_app = ptolemy_api::app_with_config(
+        state.clone(),
+        AuthConfig::disabled(),
+        ptolemy_api::EmailConfig::default(),
+        PrivateHosts::Refused,
+    );
+    let (status, body) = post_json(
+        &refusing_app,
+        &format!("/api/v1/datasets/{dataset_id}/webhooks"),
+        json!({"url": url}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], REFUSAL, "{body}");
+
+    let webhook_id = subscribe(&loopback_app, dataset_id, &url, "s").await;
+    let branch_id = create_branch(&loopback_app, dataset_id, "main").await;
+    commit_features(
+        &loopback_app,
+        branch_id,
+        json!([{
+            "type": "insert",
+            "feature_id": Uuid::now_v7(),
+            "geometry_wkb_hex": "0101000000000000000000F03F0000000000000040",
+            "properties": {}
+        }]),
+    )
+    .await;
+
+    let worker = ptolemy_api::DeliveryWorker::new(state.clone(), PrivateHosts::Refused)
+        .with_backoff_base_secs(0.0);
+    assert_eq!(worker.run_once().await, 1);
+    assert!(log.lock().await.is_empty(), "the receiver got a request");
+    assert_eq!(
+        delivery_state(&state, webhook_id).await,
+        (1, false, Some(REFUSAL.to_string()))
+    );
+}
+
 #[tokio::test]
 async fn test_webhook_subscribe_then_deliver_signs_what_it_sends() {
     let (receiver, log) = spawn_receiver(StatusCode::OK).await;
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let dataset_id = create_dataset(&app).await;
     let secret = "delivery-round-trip-secret";
     let webhook_id = subscribe(&app, dataset_id, &format!("{receiver}/hook"), secret).await;
@@ -18484,7 +18553,7 @@ async fn test_webhook_subscribe_then_deliver_signs_what_it_sends() {
     )
     .await;
 
-    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    let worker = worker_for(&state);
     assert_eq!(worker.run_once().await, 1, "one commit, one subscriber");
 
     let received = log.lock().await;
@@ -18523,7 +18592,7 @@ async fn test_a_wrong_secret_does_not_verify() {
 #[tokio::test]
 async fn test_delivery_retries_stop_at_the_bound() {
     let (receiver, log) = spawn_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let dataset_id = create_dataset(&app).await;
     let webhook_id = subscribe(&app, dataset_id, &format!("{receiver}/hook"), "s").await;
     let branch_id = create_branch(&app, dataset_id, "main").await;
@@ -18540,7 +18609,7 @@ async fn test_delivery_retries_stop_at_the_bound() {
     .await;
 
     // zero backoff, so every pass finds the row due until the bound stops it
-    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    let worker = worker_for(&state);
     let mut passes = 0;
     for _ in 0..(ptolemy_api::MAX_DELIVERY_ATTEMPTS + 3) {
         passes += worker.run_once().await;
@@ -18794,10 +18863,10 @@ fn retention() -> ptolemy_storage::EventRetentionDays {
 #[tokio::test]
 async fn test_the_sweep_retires_a_delivered_row_once_it_is_older_than_the_window() {
     let (receiver, _log) = spawn_receiver(StatusCode::OK).await;
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
 
-    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    let worker = worker_for(&state);
     assert_eq!(worker.run_once().await, 1);
     assert!(delivery_state(&state, webhook_id).await.1, "delivered");
 
@@ -18818,10 +18887,10 @@ async fn test_the_sweep_retires_a_delivered_row_once_it_is_older_than_the_window
 #[tokio::test]
 async fn test_the_sweep_retires_a_dead_letter_past_its_last_attempt() {
     let (receiver, _log) = spawn_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
 
-    let worker = ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0);
+    let worker = worker_for(&state);
     for _ in 0..ptolemy_api::MAX_DELIVERY_ATTEMPTS {
         worker.run_once().await;
     }
@@ -18848,7 +18917,7 @@ async fn test_the_sweep_retires_a_dead_letter_past_its_last_attempt() {
 #[tokio::test]
 async fn test_the_sweep_keeps_an_event_an_undelivered_row_still_needs() {
     // a receiver that is never asked, so the delivery stays pending
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let (dataset_id, webhook_id) =
         subscribed_commit(&app, "http://127.0.0.1:9/never-listened").await;
 
@@ -18873,10 +18942,6 @@ async fn test_the_sweep_keeps_an_event_an_undelivered_row_still_needs() {
     assert_eq!(pinned, 1);
 }
 
-fn worker_for(state: &AppState) -> ptolemy_api::DeliveryWorker {
-    ptolemy_api::DeliveryWorker::new(state.clone()).with_backoff_base_secs(0.0)
-}
-
 /// Retention off is a window that cannot be built, so the sweep has no window to
 /// run with and nothing is ever deleted. The parse that turns `0` into "off"
 /// is `only_a_positive_day_count_turns_the_sweep_on` in `delivery.rs`.
@@ -18885,7 +18950,7 @@ async fn test_retention_off_deletes_nothing() {
     assert_eq!(ptolemy_storage::EventRetentionDays::new(0), None);
 
     let (receiver, _log) = spawn_receiver(StatusCode::OK).await;
-    let (app, state) = setup_app().await;
+    let (app, state) = setup_app_with_loopback_webhooks().await;
     let (dataset_id, webhook_id) = subscribed_commit(&app, &format!("{receiver}/hook")).await;
     let worker = worker_for(&state);
     worker.run_once().await;
